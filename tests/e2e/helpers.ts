@@ -310,6 +310,11 @@ export async function launchApp(options?: {
           NODE_ENV: 'test',
           ELECTRON_DISABLE_GPU: '1',
           KANGENTIC_DATA_DIR: dataDir,
+          // This tier launches the REAL app, so without this the fork would boot
+          // it in Chinese and every assertion on English copy would fail - most
+          // importantly the New Task dialog this file drives by button label.
+          // See docs/i18n-guide.md.
+          KANGENTIC_LANGUAGE: 'en',
         },
         colorScheme: 'dark',
       });

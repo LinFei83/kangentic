@@ -5,12 +5,18 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { readPopOutDescriptor } from './pop-out/read-descriptor';
 import { PopOutSurfaceRoot } from './pop-out/PopOutSurfaceRoot';
 import { initRendererErrorReporting } from './error-reporting';
+// Fork addition: rewrites the UI into the resolved locale after React renders.
+// Installed before the first render so nothing paints untranslated. See
+// src/renderer/i18n/install.ts and docs/i18n-guide.md.
+import { installDomTranslator } from './i18n/install';
 import faviconHref from '@kangentic/branding/assets/brandmark-small.svg?url';
 import './index.css';
 
 // Before any listener or render, so the SDK's global handlers see everything.
 // No-op unless main initialized Sentry (see error-reporting.ts).
 initRendererErrorReporting();
+
+installDomTranslator();
 
 window.addEventListener('unhandledrejection', (event) => {
   const message = event.reason instanceof Error ? event.reason.message : String(event.reason);

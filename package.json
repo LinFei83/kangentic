@@ -33,6 +33,10 @@
     "demo:measure": "node demo/measure.mjs",
     "demo:serve": "node demo/measure.mjs --serve",
     "validate:kimi-mcp": "node scripts/kimi-validate-mcp.mjs",
+    "i18n:extract": "node scripts/i18n-extract.mjs",
+    "i18n:report": "node scripts/i18n-report.mjs",
+    "i18n:batches": "node scripts/i18n-batches.mjs",
+    "i18n:merge": "node scripts/i18n-merge.mjs",
     "prepare": "husky"
   },
   "keywords": [

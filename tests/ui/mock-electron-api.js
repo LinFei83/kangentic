@@ -3037,6 +3037,11 @@
       getVersion: async function () {
         return '0.1.0';
       },
+      // The mock is not the packaged app, so it reports the untranslated locale.
+      // That is what keeps the UI suite's several hundred literal English
+      // assertions valid and the web demo (which loads this same file) in English.
+      // See src/renderer/i18n/locale.ts and docs/i18n-guide.md.
+      initialLanguage: 'en',
     },
 
     shell: {

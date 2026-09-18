@@ -534,6 +534,12 @@ const api: ElectronAPI = {
 
   app: {
     getVersion: () => ipcRenderer.invoke(IPC.APP_GET_VERSION),
+    // Fork addition: the locale main resolved at startup, forwarded as an
+    // additionalArgument because this preload is sandboxed and has no
+    // `process.env`. The renderer reads it to decide whether to install the DOM
+    // translation layer. Falls back to English, which is the untranslated source,
+    // so a window created without the flag renders exactly as upstream does.
+    initialLanguage: process.argv.includes('--kangentic-language=zh-CN') ? 'zh-CN' : 'en',
   },
 
   updater: {

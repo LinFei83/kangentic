@@ -147,6 +147,11 @@ typings/
 # Electron-Forge
 out/
 
+# i18n extraction scratch: the candidate string list from `npm run i18n:extract`
+# and the per-batch translation files. Regenerated on demand; the shipped
+# dictionary is src/shared/i18n/locales/. See docs/i18n-guide.md.
+/i18n-work/
+
 # Test artifacts
 tests/screenshots/
 tests/.tmp/

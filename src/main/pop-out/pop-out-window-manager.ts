@@ -6,6 +6,9 @@ import type { PopOutChangesFileParams, PopOutDescriptor, PopOutKind, PopOutParam
 import { cascadePopOutPosition } from './cascade';
 import { trackFeatureUsed } from '../analytics/usage';
 import { isErrorReportingActive } from '../analytics/error-reporting';
+// Fork addition: a pop-out window's OS title is outside the renderer's DOM, so it
+// goes through the shared translator directly. See docs/i18n-guide.md.
+import { languageArgument, translate } from '../i18n';
 
 const BOUNDS_SAVE_DEBOUNCE_MS = 500;
 
@@ -106,7 +109,7 @@ export class PopOutWindowManager {
       ...(savedBounds ?? meta.defaultBounds),
       minWidth: meta.minSize.width,
       minHeight: meta.minSize.height,
-      title: resolveSurfaceTitle(meta, params),
+      title: translate(resolveSurfaceTitle(meta, params)),
       backgroundColor: resolveBackgroundColor(),
       show: false,
       titleBarStyle: 'hidden',
@@ -118,6 +121,9 @@ export class PopOutWindowManager {
         webviewTag: meta.needsWebview,
         additionalArguments: [
           `${POPOUT_ARG_PREFIX}${encodedDescriptor}`,
+          // Fork addition: the renderer's locale, mirroring createWindow() in
+          // index.ts. A window factory that omits it leaves that window in English.
+          languageArgument(),
           // Mirrors createWindow() in index.ts: preload derives
           // analytics.errorReportingEnabled per-window from this flag, so a
           // window factory that omits it silently disables renderer Sentry

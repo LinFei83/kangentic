@@ -4,6 +4,10 @@ import {
   isAllowedExternalUrl,
 } from '../shared/external-url';
 import { detectEmbeddedSignInRefusal, type EmbeddedSignInRefusal } from './browser/embedded-signin-refusal';
+// Fork addition: these two window titles are the only user-visible English on the
+// sign-in popup. The translation is applied at the call sites rather than inside
+// popupWindowTitleForUrl, whose exact English output the unit tier pins.
+import { translate } from './i18n';
 
 /**
  * Builds the `setWindowOpenHandler` callback for non-webview WebContents (the
@@ -221,7 +225,7 @@ export function createWebviewWindowOpenHandler(
         // window is labelled before its first byte loads.
         frame: true,
         autoHideMenuBar: true,
-        title: popupWindowTitleForUrl(details.url),
+        title: translate(popupWindowTitleForUrl(details.url)),
         backgroundColor: '#ffffff',
         webPreferences: {
           // The guest's hardening, restated in full. NOT inherited on Electron
@@ -268,7 +272,7 @@ export function hardenWebviewPopupWindow(
   // 'Unknown site' until the first navigation commits.
   const applyOriginTitle = () => {
     if (popupWindow.isDestroyed()) return;
-    popupWindow.setTitle(popupWindowTitleForUrl(popupContents.getURL()));
+    popupWindow.setTitle(translate(popupWindowTitleForUrl(popupContents.getURL())));
   };
   popupWindow.on('page-title-updated', (titleEvent) => {
     titleEvent.preventDefault();

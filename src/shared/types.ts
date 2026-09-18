@@ -1,4 +1,5 @@
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from './pop-out';
+import type { Locale } from './i18n/types';
 import type {
   Announcement,
   AnnouncementArchiveEntry,
@@ -5851,6 +5852,13 @@ export interface ElectronAPI {
   // App
   app: {
     getVersion: () => Promise<string>;
+    /**
+     * The locale main resolved at startup, carried as a `--kangentic-language=`
+     * additionalArgument because a sandboxed preload has no `process.env`. The
+     * renderer reads it to decide whether to install the DOM translation layer
+     * (src/renderer/i18n/locale.ts). Fork addition, see docs/i18n-guide.md.
+     */
+    initialLanguage: Locale;
   };
 
   // Updater

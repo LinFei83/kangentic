@@ -4,6 +4,7 @@ import { PATHS } from '../config/paths';
 import { IPC } from '../../shared/ipc-channels';
 import { getGlobalDb, resetGlobalDb } from './database';
 import { describeSqliteFailure } from './sqlite-error';
+import { translate } from '../i18n';
 
 /**
  * The user-facing policy for an unreadable global database.
@@ -38,16 +39,20 @@ async function askRetryOrQuit(error: unknown, parent: BrowserWindow | null): Pro
     '',
     describeSqliteFailure(error),
     '',
-    'This usually means another program is holding the file: an antivirus scan, '
-    + 'a OneDrive or Dropbox sync, or a failing drive.',
+    translate(
+      'This usually means another program is holding the file: an antivirus scan, '
+      + 'a OneDrive or Dropbox sync, or a failing drive.',
+    ),
   ].join('\n');
 
   const options: Electron.MessageBoxOptions = {
     type: 'error',
     title: 'Kangentic',
-    message: "Kangentic can't read its database",
+    message: translate("Kangentic can't read its database"),
     detail,
-    buttons: ['Retry', 'Quit'],
+    // Fork addition: a native dialog is outside the renderer's DOM, so its copy
+    // goes through the shared translator directly. See docs/i18n-guide.md.
+    buttons: [translate('Retry'), translate('Quit')],
     defaultId: RETRY_BUTTON,
     cancelId: 1,
     noLink: true,

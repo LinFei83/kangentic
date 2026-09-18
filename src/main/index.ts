@@ -92,7 +92,13 @@ import {
   type WebviewPopupPolicy,
 } from './window-open-policy';
 import { installWebviewDownloadPolicy } from './browser/webview-download-policy';
+// Fork addition: resolves the main process's locale before anything can render a
+// window title or a startup dialog in the wrong language. See docs/i18n-guide.md.
+import { installMainLocale, languageArgument, translate } from './i18n';
 
+// Before every other module-scope statement, so no translated string main owns
+// can be produced in the default locale first.
+installMainLocale();
 initStartupTimer(PROCESS_START);
 mark('process_start');
 
@@ -741,7 +747,7 @@ function showTerminalAwareContextMenu(
 
   template.push(
     {
-      label: 'Copy',
+      label: translate('Copy'),
       accelerator: 'CmdOrCtrl+C',
       enabled: params.editFlags.canCopy || true,
       click: () => {
@@ -760,7 +766,7 @@ function showTerminalAwareContextMenu(
       },
     },
     {
-      label: 'Paste',
+      label: translate('Paste'),
       accelerator: 'CmdOrCtrl+V',
       enabled: params.editFlags.canPaste,
       click: () => {
@@ -777,7 +783,7 @@ function showTerminalAwareContextMenu(
     },
     { type: 'separator' },
     {
-      label: 'Select All',
+      label: translate('Select All'),
       accelerator: 'CmdOrCtrl+A',
       click: () => {
         wc.executeJavaScript(`
@@ -860,6 +866,10 @@ const createWindow = () => {
       // stay out of the regular `npm start` dogfood. The title is base64-encoded so a
       // value with spaces / `:` / `/` survives command-line round-tripping intact.
       additionalArguments: [
+        // Fork addition: the renderer's locale. Its preload is sandboxed and has no
+        // process.env, so the resolved language travels as a flag. See
+        // src/main/i18n.ts.
+        languageArgument(),
         ...(isErrorReportingActive() ? ['--kangentic-error-reporting'] : []),
         ...(__KANGENTIC_DEV__ && isEphemeral
           ? [
@@ -1094,7 +1104,7 @@ const createWindow = () => {
     if (params.mediaType === 'image' && params.hasImageContents) {
       const imageMenu = Menu.buildFromTemplate([
         {
-          label: 'Copy Image',
+          label: translate('Copy Image'),
           click: () => {
             try {
               const image = nativeImage.createFromDataURL(params.srcURL);
@@ -1105,14 +1115,14 @@ const createWindow = () => {
           },
         },
         {
-          label: 'Copy',
+          label: translate('Copy'),
           accelerator: 'CmdOrCtrl+C',
           enabled: params.editFlags.canCopy || true,
           click: () => { wc.executeJavaScript(`document.execCommand('copy')`); },
         },
         { type: 'separator' },
         {
-          label: 'Select All',
+          label: translate('Select All'),
           accelerator: 'CmdOrCtrl+A',
           click: () => { wc.executeJavaScript(`document.execCommand('selectAll')`); },
         },
@@ -1157,18 +1167,20 @@ const createWindow = () => {
     if (isE2ETest) return;
     const sample = getLastHostMemorySample();
     const detail = [
-      `The window crashed (${details.reason}) and could not recover after `
-        + `${RENDERER_RELOAD_MAX} attempts in ${RENDERER_RELOAD_WINDOW_MS / 60_000} minutes.`,
+      translate(
+        `The window crashed (${details.reason}) and could not recover after `
+          + `${RENDERER_RELOAD_MAX} attempts in ${RENDERER_RELOAD_WINDOW_MS / 60_000} minutes.`,
+      ),
       formatHostMemoryDetailLine(sample),
-      'Your agents are still running in the background. Restart Kangentic to reconnect to them.',
+      translate('Your agents are still running in the background. Restart Kangentic to reconnect to them.'),
     ].filter((line): line is string => line !== null).join('\n\n');
     const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
     const options: Electron.MessageBoxOptions = {
       type: 'error',
       title: 'Kangentic',
-      message: "Kangentic's window stopped responding",
+      message: translate("Kangentic's window stopped responding"),
       detail,
-      buttons: ['OK'],
+      buttons: [translate('OK')],
     };
     void (parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options)).catch(
       (dialogError) => {
