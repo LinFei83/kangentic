@@ -1,4 +1,7 @@
+import { createElement } from 'react';
+import type { ReactElement } from 'react';
 import { Bell, Bot, MessageSquare, SquareTerminal, Webhook, Zap, type LucideIcon } from 'lucide-react';
+import type { LucideProps } from 'lucide-react';
 
 /**
  * Resolve an automation type's kebab-case icon NAME to a lucide component.
@@ -21,6 +24,13 @@ const ICONS: Record<string, LucideIcon> = {
   zap: Zap,
 };
 
-export function automationIcon(name: string): LucideIcon {
-  return ICONS[name] ?? Zap;
+/**
+ * Render an automation type's icon by name.
+ *
+ * Same shape as `RegistryIcon` in `utils/swimlane-icons.tsx`, and for the same
+ * reason: see that JSDoc for why the lookup goes through `createElement` in one
+ * place instead of `const Icon = lookup(name)` at each call site.
+ */
+export function AutomationIcon({ name, ...iconProps }: { name: string } & LucideProps): ReactElement {
+  return createElement(ICONS[name] ?? Zap, iconProps);
 }

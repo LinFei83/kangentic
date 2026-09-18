@@ -205,12 +205,21 @@ async function uploadNativeDebugFiles() {
       + 'prebuilds (a partial or pruned npm ci drops them).',
     );
   }
-  const SentryCli = require('@sentry/cli');
+  // Named export since @sentry/cli 3; the package used to BE the class.
+  const { SentryCli } = require('@sentry/cli');
   const sentryCli = new SentryCli(null, { authToken: sentryAuthToken, silent: false });
   try {
     await sentryCli.execute(
       ['debug-files', 'upload', '--org', SENTRY_ORG, '--project', SENTRY_PROJECT, ...debugFileDirs],
-      'rejectOnError',
+      // `true` is what `'rejectOnError'` used to be. @sentry/cli 3 collapsed the
+      // two live modes into one: `true` now inherits stdio AND rejects on a
+      // non-zero exit, and the old string is gone from both the API and the
+      // types. 3.8.0's `execute` happens to branch on a bare `if (live)` and
+      // rejects independently of the value, so the old string would still work
+      // there by accident. Pass the documented value rather than lean on that:
+      // a truthiness coincidence is not something the release gate in
+      // .claude/rules/release-gates-fail-loudly.md should rest on.
+      true,
     );
   } catch (error) {
     console.error('[build] node-pty debug-file upload FAILED; refusing to ship a release whose native frames cannot symbolicate.');
