@@ -57,6 +57,7 @@ The in-memory `SessionStatus` does not include `orphaned` (that is a DB-only con
 | `suspended` | `exited` | Replaced by a new session on resume (`retireRecord`) |
 | `orphaned` | `running` | Session recovery on project open |
 | `orphaned` | `exited` | Recovery dedup, or failed recovery (`retireRecord`) |
+| `exited` | `exited` | A resume replaces a record that had already ended on its own (`retireRecord`'s fallback CAS). Confirms the row is out of the way without restamping `exited_at`, so the CLI's real end time survives a later restart; only the `suspended` and `orphaned` rows above get a fresh stamp |
 | `orphaned` | `suspended` | Pause-on-restart setting upgrades a crashed session (`markRecordSuspended`) |
 | `exited` | `running` | OS-killed (abnormal `exit_code`) session resumed by recovery on project open (`getInterruptedExited`) |
 | `exited` | `suspended` | Interrupted-exited record CAS-upgraded by recovery (non-target / non-auto-spawn / auto-resume-off), or a PTY exit during app shutdown (onExit hardening) |
@@ -83,6 +84,7 @@ module's `resolveEffectivePermissionMode` (a lane forcing `plan` always wins, el
 | MCP create (`kangentic_create_task`) | `autoSpawnForTask` | `spawnAgent` |
 | Column auto-spawn switched on | a column edit or a Board Profile edit, from either the Board Manager or the MCP `update_column` / profile tools, via `reconcileAutoSpawnChange` | `autoSpawnForTask` -> `spawnAgent` (sequential, skips user-paused, active project only) |
 | Unarchive (single + bulk) | Completed Tasks restore / `TASK_UNARCHIVE` | `spawnAgent`, `skipPromptTemplate` + `suppressAutoCommand` (recovery move) |
+| Phone Start (`start-session` verb) | "Start again" from the phone's ended state, via `startTaskSession` (`handlers/session-start.ts`) | `autoSpawnForTask` -> `spawnAgent`, `explicitStart` (lifts the column's `auto_spawn` default and a user pause, as the desktop Resume button does; the role gate stays) |
 | Startup crash recovery | project open, `resumeSuspendedSessions` | `prepareAgentSpawn` (`session-startup/prepare-spawn.ts`) |
 | Startup reconcile | project open, `autoSpawnTasks` | `prepareAgentSpawn` |
 
@@ -266,8 +268,9 @@ them on exactly the slow path where the later read matters most.
 
 `SESSION_RESUME` (the task detail's Pause/Resume toggle) restarts a suspended session **in
 place**, in the task's current column. It is refused for three states, resolved by one shared
-predicate (`src/shared/session-resume-eligibility.ts`) that both the main-process handler and the
-task detail read, and whose role set startup recovery shares:
+predicate (`src/shared/session-resume-eligibility.ts`) that the main-process handler, the task
+detail, and the phone's `startTaskSession` (`handlers/session-start.ts`, the `start-session` verb)
+all read, and whose role set startup recovery shares:
 
 | State | Why |
 |---|---|
@@ -400,6 +403,19 @@ exited, queue slot freed, hooks stripped, transcript flushed, and `intentionalEx
 renderer's false "Session crashed" toast. Once the tab is gone the leftover shell is unreachable,
 so leaving it alive would only leak a process.
 
+**It first emits `agent-absent`, so a failure the CLI named is not lost with it.** The kill's
+`intentionalExit` also silences the exit listener's startup-failure read, and a CLI that ended at
+boot with its own account of why (Claude's "No conversation found with session ID" on a `--resume`
+whose transcript was cleaned up or whose project folder moved) reached the user as a card that
+went quiet: exit code 0, no toast, a dead row (#682 follow-up). The retirement therefore announces
+the absence before the kill, while the ring still holds the CLI's last words; `handlers/sessions.ts`
+asks the session's adapter to read them (`AgentAdapter.describeStartupFailure`, implemented by
+Claude) and raises `notifySpawnBlocked`'s "Agent did not start" notice when they name a failure. The
+rare direct PTY exit (the CLI was the root, or its shell ended with it) takes the same read from the
+exit listener when the exit is not intentional. A notice after the fact, deliberately not a
+pre-spawn guard: see the `isResumeConversationAbsent` section above for why a computed-path
+downgrade was reverted in #255.
+
 **It must also emit `session-changed`, and that emit is load-bearing.** Measured in a live preview:
 with `kill()` alone, main and the DB were both correct (`exited`, code 0) while the board kept
 counting the agent and the bottom panel kept its tab - the exact two symptoms the sweep exists to
@@ -451,6 +467,15 @@ respawn left the card reading "Paused" and the detail offering a manual "Resume 
 whole unlocked worktree/branch-checkout window between the suspend and the eventual
 `starting-agent` label.
 
+The in-place restart, `restartSessionForSettingsChange` (`src/main/ipc/handlers/session-reconcile.ts`),
+follows the same contract with a required `phase`: the ContextBar model pick and a Board Profile
+propagation emit `switching-model` (or `applying-settings` for an effort-only restart), and the
+auto_command escalation emits `resending-command` ("Re-sending command..."). It emits before its
+suspend and clears the label in a `finally` once the resume has returned or failed, the ordering
+task-move's Phase 3 uses. The emit is what lets the mobile bridge tell this respawn from a park
+(see [Mobile Bridge](mobile-bridge.md)); until #682 this path emitted nothing, and the phone showed
+"Session ended" for the swap.
+
 That main-side emit alone is not sufficient: `SessionManager.suspend()` pushes the session's
 `suspended` row to the renderer almost immediately, well before its own graceful-shutdown wait
 completes, and the renderer's `upsertSession` (`src/renderer/stores/session-store.ts`) used to
@@ -497,9 +522,14 @@ When a suspended task moves to an active column:
   That restart is gated on the turn-completion predicate (activity idle AND a
   quiet PTY) so it can never kill live work, is attempted at most once, and
   carries only the user's `auto_command` - never an adapter-emitted settings
-  write, which would arrive as literal message text. Unlike the ordinary
-  settings-change restart it does NOT assert idle-authoritative afterwards,
-  because a resume with a prompt starts a real turn. See
+  write, which would arrive as literal message text. While the gate waits, the
+  scheduler re-polls the verifier against the burst's original first-Enter
+  watermark, and a late confirmation cancels the restart: a command that went
+  in but confirmed late (a late transcript flush, or a submission the CLI
+  queued behind a running turn) must not be run a second time, which is what
+  happened on every observed Tests-to-Ship-It move before #682. Unlike the
+  ordinary settings-change restart it does NOT assert idle-authoritative
+  afterwards, because a resume with a prompt starts a real turn. See
   [Command Injection](command-injection.md) for the full delivery ladder.
 - The **first move OUT of Done** (the recovery / restore move, whatever the
   destination column) resumes the session WITHOUT delivering the destination
@@ -1265,15 +1295,19 @@ When a task moves rapidly between columns (e.g. drag-and-drop corrections), spaw
 
 The `isAbortError()` utility in `src/shared/abort-utils.ts` provides a type guard for distinguishing abort errors from real errors in catch blocks.
 
+The board-driven spawn chokepoint `autoSpawnForTask` (`src/main/ipc/helpers/agent-spawn.ts`: the MCP create, the auto-spawn reconcile, and the phone's `start-session` verb) is cancellable the same way. It registers an `AbortController` on the per-task registry `SESSION_RESUME` uses (`handlers/session-resume-controllers.ts`), so `SESSION_SUSPEND`, `SESSION_RESET`, a newer `SESSION_RESUME`, and a project relocation cancel its in-flight git phase through `abortInFlightResume`, and the signal reaches `ensureTaskWorktree`, `ensureTaskBranchCheckout`, and `spawnAgent`. It registers WITHOUT aborting an existing controller first, unlike `SESSION_RESUME`: a phone Start never cancels desktop work, and two starts converge on one session through the gates below. The registry holds every in-flight controller per task (a `Set`, not one slot), so that second registration does not displace the desktop resume's controller: the next Pause reaches both. `tests/unit/session-resume-controllers.test.ts` pins that. Its lock is split the way `SESSION_RESUME`'s is: Phase 1 runs the gates (column re-check, live-session check, profile fold, `auto_spawn`, role) under `withTaskLock`, Phase 2 releases it for the worktree ensure and branch checkout (serialized per project by `WorktreeManager.projectQueues`), and Phase 3 re-acquires it, re-runs the same gates as the compare-and-swap, and spawns. Holding the lock across the fetch used to make a desktop Pause or move on the same task wait behind a phone Start. An abort is logged and swallowed, never counted as a spawn failure, and cleans up no session state: the engine's last abort checkpoint precedes the PTY spawn, and the `session_id` write follows it with no further checkpoint, so an abort never leaves a half-written session for the aborter to trip over.
+
 ## Terminal Paste Strategy
 
-Terminal paste operations use xterm.js's built-in `terminal.paste()` method, which handles bracketed paste mode for the PTY. The paste path is unified:
+Terminal paste operations use xterm.js's built-in `terminal.paste()` method, which brackets the text (`ESC[200~ ... ESC[201~`) exactly when the foreground app enabled mode 2004 and leaves it plain otherwise. The paste path is unified:
 
 - **Ctrl+V / Cmd+V** - intercepted by a custom key handler, reads clipboard, calls `terminal.paste()`
+- **Ctrl+V with a clipboard image** - the image is saved to a temp PNG by the main process (`clipboard:readImage`) and its shell-quoted path goes through the same `terminal.paste()`; what is pasted (the bare path, or the adapter's fallback template) comes from the agent's `PastedImageCapability` (`resolveImagePasteText` in `terminal-clipboard.ts`)
+- **File drop** - `useTerminalFileDrop` delivers every dropped path through `useTerminal`'s `paste` handle, one `terminal.paste()` per file so each path is its own packet under bracketed-paste mode; never a raw `sessions.write`. An image in a format the agent cannot attach from a path (`needsImageNormalization`) is first re-encoded as PNG in the renderer (`encodeImageFileAsPng`, Chromium's decoder) and saved by main through `clipboard:saveImage`, and the copy's path is what gets pasted
 - **Context menu paste** - follows the same clipboard-read-then-paste path
 - **Built-in xterm paste suppressed** - a `paste` event listener on the xterm helper textarea prevents the browser's native paste from double-sending text through xterm's `onData` handler
 
-This ensures consistent behavior across keyboard shortcuts and context menu paste.
+The bracketing is load-bearing for images: Claude Code scans a paste packet for tokens ending in png/jpg/jpeg/gif/webp and attaches the file as an `[Image #N]` chip in the user turn, so a pasted or dropped image reaches the model with no `Read` tool call. Typed bytes never reach that scan, which is why the image paths do not use a raw write. Main's write queue (`src/main/pty/write-queue.ts`) keeps a packet whole across chunk boundaries, and the PTY buffer manager re-asserts mode 2004 on replay, so a reattached session brackets the next paste correctly.
 
 ## Terminal Copy Strategy
 

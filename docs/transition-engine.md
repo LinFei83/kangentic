@@ -20,6 +20,8 @@ When a task moves from one column to another, the IPC handler (`task:move`) chec
 
 The SOURCE column's On exit group runs ahead of all five, in Phase 1. See [Triggers](#triggers).
 
+"Active session" is decided against the registry, not the raw `task.session_id`. Phase 1 runs `reconcileTaskSessionRef` (`session-reconcile.ts`, the same self-heal `SESSION_RESUME`, `SESSION_RECONCILE`, `SESSION_SUSPEND`, and `task:setRuntimeOverride` use) before the ladder: a pointer at a non-live registry row (an agent that exited on its own, a `--resume` that could not read its transcript) is cleared so the move takes Priority 4 and resumes the record, and a live PTY the pointer lost is re-linked so the move takes Priority 3 instead of spawning a second agent. Before #682 the raw pointer decided, and a task whose CLI had ended by itself was "kept alive" on every move with nothing running.
+
 ### Priority 3: Active Session Handling
 
 Priority 3 has five sub-cases, checked in order:
@@ -121,7 +123,7 @@ The runner never throws for an automation's sake. It rethrows exactly one thing:
 
 ### What the user sees
 
-Nothing on success. A `failed` or `interrupted` run raises ONE error toast naming the automation and the column, with a Run again action, behind a 60s cooldown keyed on the project and the AUTOMATION. Keyed on the automation rather than the task deliberately: a bulk move of twelve tasks through one column fails the same webhook twelve times, and the run rows record all twelve, which is where a count belongs. The Column Manager row shows its last run under its sentence, so "did my automation work" is answered where the automation lives. `emitSpawnProgress` carries the running row's name, which closes the gap where a column with `autoSpawn: false` and a slow webhook showed the user nothing at all.
+Nothing on success. A `failed` or `interrupted` run raises ONE error toast naming the automation and the column, with a Run again action, behind a 60s cooldown keyed on the project and the AUTOMATION. Keyed on the automation rather than the task deliberately: a bulk move of twelve tasks through one column fails the same webhook twelve times, and the run rows record all twelve, which is where a count belongs. The Column Manager row shows no run history (it used to print its last run under its sentence, which made rows in one list differ in height); the toast and `kangentic_get_automation_runs` are where "did my automation work" is answered. `emitSpawnProgress` carries the running row's name, which closes the gap where a column with `autoSpawn: false` and a slow webhook showed the user nothing at all.
 
 **Run again re-executes ONE automation against the task's CURRENT state** and writes a fresh run row. The toast and the row both say "current state", because a task may have moved twice since the failure and re-running a stale context would be a worse lie than not offering it.
 

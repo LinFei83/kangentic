@@ -1,11 +1,12 @@
 import React, { useCallback, useMemo, useRef } from 'react';
 import { GripVertical, Pencil, Plus, Trash2, Zap } from 'lucide-react';
-import { DndContext, closestCenter, PointerSensor, KeyboardSensor, useSensor, useSensors, type CollisionDetection, type DragEndEvent, type Modifier } from '@dnd-kit/core';
+import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, type CollisionDetection, type DragEndEvent, type Modifier } from '@dnd-kit/core';
 import { SortableContext, useSortable, verticalListSortingStrategy, sortableKeyboardCoordinates } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { AUTOMATION_MANIFEST } from '../../../../shared/automation-manifest';
 import type { AutomationTrigger, Swimlane } from '../../../../shared/types';
 import { useHmrGeneration } from '../../../utils/hmr-generation';
+import { IntentKeyboardSensor } from '../../../utils/intent-keyboard-sensor';
 import { SETTING_DESCRIPTION_CLASS, SETTING_LABEL_CLASS } from '../../SettingText';
 import { ToggleSwitch } from '../../settings/shared';
 import { AutomationIcon } from './automation-icons';
@@ -46,7 +47,6 @@ export interface AutomationsPaneProps {
    * now be an editor for a value nothing reads.
    */
   readOnly: boolean;
-  lastRunLabel?: (draftId: string) => string | null;
   onAdd: (trigger: AutomationTrigger, anchor: HTMLElement) => void;
   onEdit: (draft: AutomationDraft) => void;
   onDelete: (draft: AutomationDraft) => void;
@@ -123,9 +123,12 @@ export function AutomationsPane(props: AutomationsPaneProps) {
   // Pattern C: a DndContext's internal subscriptions go stale across a Fast
   // Refresh, so it is re-keyed on the HMR generation.
   const hmrGeneration = useHmrGeneration();
+  // Never the stock KeyboardSensor: a click on the grip focuses it, Enter would
+  // lift the row, and an Enter in a field of this dialog would drop it. See
+  // intent-keyboard-sensor.ts and keyboard-drag-intent.md.
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    useSensor(IntentKeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
   /**
@@ -308,7 +311,6 @@ function AutomationRow({
   index,
   column,
   readOnly,
-  lastRunLabel,
   onEdit,
   onDelete,
   onToggle,
@@ -319,7 +321,6 @@ function AutomationRow({
   const runnable = canRunRow(draft, column);
   const entry = AUTOMATION_MANIFEST[draft.type];
   const legacy = entry.status === 'legacy';
-  const lastRun = lastRunLabel?.(draft.id) ?? null;
 
   // A row the column cannot run is shown OFF with its switch disabled, and the
   // draft keeps its stored `enabled`, so turning the setting back on restores it
@@ -449,18 +450,15 @@ function AutomationRow({
           {isDirty(draft) && <span title="Unsaved" className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />}
         </span>
         <span className={`block truncate ${SETTING_DESCRIPTION_CLASS}`}>{describeDraft(draft)}</span>
+        {/* No last-run line. One used to print under the description once a row
+            had run, so rows in one list differed in height by their history,
+            and nobody found the history valuable here: a failure reaches the
+            user as the toast with Run again, and every run stays queryable
+            through the MCP run tool. The legacy lint below is a warning about
+            the row itself, not history, so it stays. */}
         {legacy && (
           <span data-testid="column-automation-lint" className="block truncate text-xs text-warning">
             This is handled by the column&apos;s settings now. Remove it to use them.
-          </span>
-        )}
-        {lastRun && (
-          <span
-            data-testid="column-automation-last-run"
-            title={lastRun}
-            className={`block truncate ${SETTING_DESCRIPTION_CLASS}`}
-          >
-            {lastRun}
           </span>
         )}
       </span>

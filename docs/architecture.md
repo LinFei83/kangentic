@@ -182,7 +182,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `swimlane:reorder` | invoke | Reorder swimlanes by ID array |
 | `swimlane:updatedByAgent` | on | Push event when an MCP agent changes a project's columns: a column create, update, or delete, or (reusing the same deliberately kind-agnostic signal) a same-column task reorder via `kangentic_reorder_tasks` / `kangentic_move_task`'s `position`, where no swimlane field itself changed |
 
-### Automations (7 channels)
+### Automations (6 channels)
 
 Replaced the `action:*` and `transition:*` channels, which had no renderer callers.
 
@@ -191,7 +191,6 @@ Replaced the `action:*` and `transition:*` channels, which had no renderer calle
 | `automation:list` | invoke | Fetch every column's automations |
 | `automation:replaceForColumn` | invoke | Replace one column's whole list (the Column Manager's Save) |
 | `automation:runsForTask` | invoke | Run history for a task, newest first |
-| `automation:latestRuns` | invoke | The newest run per automation, for the row's last-run line |
 | `automation:runAgain` | invoke | Re-run ONE automation against the task's current state, writing a fresh run row |
 | `automation:runFailed` | on | Push event when a run failed or was interrupted, rationed per automation |
 | `automation:runsInterrupted` | on | Push event after the project-open sweep, one summary per open |
@@ -319,7 +318,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `mobile:getStatus` | invoke | Report bridge status: enabled, secure-storage availability, identity fingerprint, relay URL, relay transport state, paired device count, pairing-in-progress |
 | `mobile:startPairing` | invoke | Mint a pairing token, connect the pairing relay slot, and return the QR payload URI. Supersedes a stale in-progress ceremony rather than throwing |
 | `mobile:cancelPairing` | invoke | Cancel an in-progress pairing ceremony |
-| `mobile:listDevices` | invoke | List paired devices (id, display name, capabilities, paired-at, live connection state) |
+| `mobile:listDevices` | invoke | List paired devices (id, display name, capabilities, paired-at, live connection state and the time it last changed) |
 | `mobile:revokeDevice` | invoke | Revoke a paired device: drop it from the signed roster and tear down its session |
 | `mobile:renameDevice` | invoke | Rename a paired device (re-signs the roster entry, preserves paired-at) |
 | `mobile:setDeviceCapabilities` | invoke | Update a paired device's granted capability verbs (re-signs the roster entry); no longer surfaced as settings-tab UI, kept as the enforcement/future-preset seam |
@@ -346,7 +345,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 ### Agents (2 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `agent:list` | invoke | List all detected agent CLIs as `AgentDetectionInfo` (name, displayName, found, path, version, authenticated, permissions, defaultPermission, liveTelemetryUnsupported, reportsRateLimits, pastedImageReferenceTemplate, supportsSummarize, remoteExecution) |
+| `agent:list` | invoke | List all detected agent CLIs as `AgentDetectionInfo` (name, displayName, found, path, version, authenticated, permissions, defaultPermission, liveTelemetryUnsupported, reportsRateLimits, pastedImageNativeExtensions, pastedImageReferenceTemplate, supportsSummarize, capabilities, remoteExecution, launchOptions) |
 | `agent:probeExecutionServer` | invoke | Reachability probe for an agent's configured remote execution server ("Test connection" in the Agent settings tab, shown when the selected agent declares remote-execution support). Returns `RemoteServerStatus`. |
 
 ### Handoffs (1 channel)
@@ -423,10 +422,11 @@ Detach a registered UI surface (usage stats, git changes, a single changed file'
 |---------|---------|---------|
 | `app:getVersion` | invoke | Get Electron app version string |
 
-### Clipboard (2 channels)
+### Clipboard (3 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `clipboard:readImage` | invoke | Read the native clipboard image, cap its long edge at `IMAGE_LONG_EDGE_CAP`, prune stale `pasted-image-*` files from the temp directory (24h age limit, 40-file cap), save it to a temp file, returns file path or null |
+| `clipboard:saveImage` | invoke | Save PNG bytes the renderer decoded from a dropped image (a format the agent CLI cannot attach from a path, such as bmp) into the same temp directory under the same cap and prune; returns the file path, or null when the bytes are not a decodable image or the write failed |
 | `clipboard:writeText` | invoke | Write text to the native clipboard (focus-independent; used by terminal copy and the OSC 52 handler) |
 
 ### Browser pane (17 channels)
@@ -492,7 +492,7 @@ Conversation-memory semantic layer (Smart-mode search). See the Memory settings 
 ### Diagnostics (2 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `diagnostics:logAppend` | invoke | Renderer / preload forwards a `LogEntry` to the main process. The main-side log mirror persists `error` and `warn` levels unconditionally and `info` / `debug` / `log` when `developer.persistConsoleLogs` is on. NDJSON written to `<projectRoot>/.kangentic/logs/<YYYY-MM-DD>.log`. |
+| `diagnostics:logAppend` | invoke | Renderer / preload forwards a `LogEntry` to the main process. The main-side log mirror persists `error` and `warn` levels unconditionally and `info` / `debug` / `log` when `developer.persistConsoleLogs` is on. NDJSON written to `<projectRoot>/.kangentic/logs/<YYYY-MM-DD>.log`, falling back to `<configDir>/logs/` while no project is open (the same fallback crash capture uses). |
 | `diagnostics:crashReport` | invoke | Renderer forwards a `CrashRecord` (window.onerror, unhandledrejection) to the main process. Crash capture writes one JSON file per record to `<projectRoot>/.kangentic/logs/crashes/<ts>.json`, falling back to the app's own config directory when no project is open (a crash must never be silently dropped for that reason). Always-on - no toggle. |
 
 ### Dictation (14 channels)
@@ -727,7 +727,7 @@ All stores in `src/renderer/stores/`. They call `window.electronAPI.*` for IPC a
 
 ### BoardStore (`board-store.ts`)
 
-State: `tasks`, `swimlanes`, `automations`, `automationsLoaded`, `automationRuns`, `archivedTasks`, `loading`, `completingTask`, `completingTaskIds`, `completionGates`, `recentlyArchivedId`, `lanePins`, `pendingMoveConfirms` (with `pendingMoveConfirm` as its head)
+State: `tasks`, `swimlanes`, `automations`, `automationsLoaded`, `archivedTasks`, `loading`, `completingTask`, `completingTaskIds`, `completionGates`, `recentlyArchivedId`, `lanePins`, `pendingMoveConfirms` (with `pendingMoveConfirm` as its head)
 
 - **Optimistic updates** -- all mutations update UI immediately, then sync via IPC. Errors revert via full `loadBoard()`.
 - **Stale move protection** - per-task `moveGenerations` counters prevent older async reloads from clobbering newer moves of the same task.
@@ -735,7 +735,7 @@ State: `tasks`, `swimlanes`, `automations`, `automationsLoaded`, `automationRuns
 - **Move confirmations queue** - `pendingMoveConfirms` is FIFO. As a single slot, a second confirmation overwrote the first, and that move had already returned `ok` without calling the IPC, leaving an optimistic placement no write backed.
 - **Session cascade** -- after task move, reloads sessions to detect spawns/kills from transition engine. Auto-activates new sessions with toast notification.
 - **Completion animation** -- `setCompletingTask()` mounts the FlyingCard with the captured drop rect; a per-task completion gate joins the fly finishing (`markCompletionAnimationDone`) and the move being approved (`approveCompletion`, after a clean worktree probe or a confirmed dialog), and `persistCompletion` runs the actual move once both signals land.
-- **Automations** (`board-store/automations-slice.ts`) -- `loadAutomations()` fetches every column's list, `loadAutomationRuns()` fetches the newest run per automation for the row's last-run line, and `replaceAutomationsForColumn()` writes one column's whole list and re-reads. `selectAutomationCounts(swimlaneId)` derives the runnable enter/exit counts the rail, the board glyph and the overview all read, so the same number cannot mean three things.
+- **Automations** (`board-store/automations-slice.ts`) -- `loadAutomations()` fetches every column's list, `replaceAutomationsForColumn()` writes one column's whole list and re-reads, and `runAutomationAgain()` re-runs one row for the failure toast's Run again and returns the result. `selectAutomationCounts(swimlaneId)` derives the runnable enter/exit counts the rail, the board glyph and the overview all read, so the same number cannot mean three things.
 
 ### SessionStore (`session-store.ts`)
 

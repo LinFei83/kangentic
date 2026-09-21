@@ -137,6 +137,8 @@ The agent keeps its conversation across these moves; the message is the only new
 
 Each column chooses WHEN its message arrives via **Message timing**: `immediate` sends it on arrival (the agent queues it if mid-turn), while `deferred` holds it until the current turn genuinely finishes.
 
+**From the keyboard.** Tab to a card, press Space to pick it up, move it with the arrow keys, and press Space again to drop it; Escape puts it back. The pickup only arms from a Tab-placed focus: a card you clicked or dragged with the mouse stays put on Space and Enter, and a picked-up card is released the moment you click anywhere or focus lands in a terminal. The same keys reorder columns (from the grip in the column header), backlog rows, Column Manager rows, priorities, and shortcuts.
+
 ### Complete a Task
 
 Drag to Done. The worktree directory is removed to reclaim disk, the session is suspended (not destroyed), the task is archived, and the conversation ID is preserved. The branch is deleted too when **git.autoCleanup** is on (the default) and kept when it is off. A clean move happens silently; a confirmation dialog appears only when the move would destroy real work - uncommitted files, or commits that exist only on the local branch about to be deleted - and it spells out exactly what is at risk (worktree deleted, branch kept or deleted, session history kept). If you later unarchive the task and drag it to an active column, Kangentic recreates the worktree and the agent resumes with full conversation context.
@@ -181,11 +183,13 @@ The leftmost tab shows an activity log - structured events from all sessions. Th
 
 ### Clipboard Paste
 
-Press **Ctrl+V** (Cmd+V on macOS) in the terminal to paste. Text on the clipboard is pasted directly. If the clipboard contains an image (and no text), the image is saved to a temporary file, capped at a 2000px long edge so a 4K or 5K grab does not land on disk at full size; the agent then reliably reads it as a vision input, since a bare file path alone is not recognized as an image by most CLIs. The cap costs no detail - it sits at the point above which the extra pixels are discarded before an agent ever sees them. Saved pastes are pruned by age and count, so the temp directory no longer grows for the life of the install. Claude Code receives an explicit "Read this image: ..." instruction pointing at the saved file (this is more reliable than the CLI's own clipboard reader, which can silently miss a Windows Snipping Tool image); other agents receive the bare file path today. Paths are automatically quoted for the active shell (PowerShell, bash, cmd, WSL, etc.).
+Press **Ctrl+V** (Cmd+V on macOS) in the terminal to paste. Text on the clipboard is pasted directly. If the clipboard contains an image (and no text), the image is saved to a temporary PNG, capped at a 2000px long edge so a 4K or 5K grab does not land on disk at full size. The cap costs no detail - it sits at the point above which the extra pixels are discarded before an agent ever sees them. Saved pastes are pruned by age and count, so the temp directory no longer grows for the life of the install. The saved file's path is then pasted into the terminal the way a native terminal delivers a dropped file: as a bracketed paste when the program in the terminal asked for one, as plain text otherwise. With Claude Code in the foreground, the pasted path becomes an `[Image #1]` chip and the image lands in your next message directly, with no `Read` tool call and no extra model round trip; Claude still knows the file's path on disk. Kangentic's own capture is more reliable than the CLI's clipboard reader, which can silently miss a Windows Snipping Tool image. Gemini CLI and OpenCode attach the pasted capture the same way. Agents that do not attach from a pasted path receive the quoted path as text. At a plain shell prompt the quoted path is inserted as text and nothing runs. Paths are automatically quoted for the active shell (PowerShell, bash, cmd, WSL, etc.).
 
 ### File Drop to Terminal
 
-Drag files from your file manager onto the terminal to insert their file paths into the active session. An image file (PNG, JPEG, GIF, WebP, BMP, SVG) is inserted the same way as a pasted image (Claude Code gets an explicit "Read this image: ..." reference); any other file is inserted as its bare file path. Paths containing spaces are automatically quoted. Multiple files are inserted as a space-separated list. A visual overlay appears when files are dragged over the terminal area.
+Drag files from your file manager onto the terminal to insert their file paths into the active session. Every dropped path is delivered as a paste, the same way a native terminal delivers a drop. With Claude Code in the foreground, a PNG, JPEG, GIF, or WebP file becomes an `[Image #N]` chip, one per file, and the images land in your next message directly. Gemini CLI and OpenCode attach PNG, JPEG, and GIF drops the same way. An image in a format the agent does not attach from a path (a BMP, an ICO) is converted to a PNG copy first, saved next to the clipboard captures, and that copy is what gets pasted, so it attaches too. An SVG, or a file whose bytes are not an image, gets an explicit "Read this image: ..." instruction under Claude Code (Claude reads SVG markup with its Read tool) and the bare path under other agents. Any other file is inserted as its bare file path. Paths containing spaces are automatically quoted. Dropping several files inserts them separated by spaces. A visual overlay appears when files are dragged over the terminal area.
+
+Two shell-specific limits apply to a dropped or pasted image on Windows. Under Git Bash the path is converted to `/c/...`, which Claude Code (a Windows process) cannot open, so the image arrives as text; WSL's `/mnt/c/...` form reads fine. Under a Unix-style shell a file name containing an apostrophe is quoted with `'\''`, which the path scan cannot undo, so that file also arrives as text.
 
 ### Resize
 
@@ -309,7 +313,7 @@ When multiple items are selected and you right-click one of them, the context me
 
 ### Drag to Reorder
 
-Drag rows by the grip handle on the left to manually reorder items. Drag-to-reorder is available when no column sort is active. When you sort by a column header (priority, title, created date), manual reorder is disabled until the sort is cleared.
+Drag rows by the grip handle on the left to manually reorder items, or Tab to the grip and use Space and the arrow keys. Drag-to-reorder is available when no column sort is active. When you sort by a column header (priority, title, created date), manual reorder is disabled until the sort is cleared.
 
 ### Promoting to the Board
 
@@ -342,6 +346,15 @@ Click **Import** in the backlog toolbar to pull tasks from external project mana
 3. Use the "Imported" toggle to hide already-imported items (on by default)
 4. Click anywhere on a row to select it (or use the checkbox)
 5. Click **Import (N)** to pull selected items into the backlog
+
+The dialog opens from a per-project cache of the source's items, so the list paints at once, and a
+"Syncing..." line at the bottom shows while it fetches only the items changed since the last sync in
+the background. The cache survives an app restart and a project switch. The **Open / Closed / All**
+toggle filters that cache on the spot, without another fetch. If the sync fails, the error banner
+carries a **Retry**; once every item is imported, **Refresh to check for new items** on the empty
+state refetches the whole source rather than only the changes.
+See [board-integration.md](board-integration.md) for the adapter contract behind the incremental
+fetch.
 
 Imported items include the title, description (markdown), labels, and assignee from the source. Inline images in issue bodies are downloaded as backlog attachments. A small GitHub icon appears on imported items linking back to the original ticket.
 
@@ -404,6 +417,9 @@ automations on the right.
 The column's message to its agent is no longer a field here. It is an automation, and it lives in
 the list on the right: see [Automations](#automations) below.
 
+**Remove column**, at the left of the dialog's footer, stages the removal until you save; Cancel
+keeps the column. A column that still has tasks cannot be removed.
+
 When a column's agent override differs from the current session's agent, moving a task into that column triggers a cross-agent handoff. The outgoing agent's context (transcript, git changes, metrics) is automatically packaged and delivered to the incoming agent.
 
 ### Automations
@@ -440,9 +456,9 @@ row. On enter, Kangentic starts the column's agent right before the first automa
 one, which today means a **Send message to agent** row. On exit there is no agent to start, so
 such a row is skipped with that reason recorded.
 
-**When something fails.** Every run is recorded, whatever happens, and the row shows its last run
-under its description. A failure raises one toast naming the automation and the column, with a
-**Run again** action that re-runs it against the task's current state. Nothing is retried
+**When something fails.** Every run is recorded, whatever happens. A failure raises one toast
+naming the automation and the column, with a **Run again** action that re-runs it against the
+task's current state. Nothing is retried
 automatically: a fired webhook and a half-run script are not safe to repeat blind. A run that was
 in flight when Kangentic quit is marked interrupted the next time the project opens.
 
@@ -455,7 +471,7 @@ every column's counts side by side.
 
 ### Reorder Columns
 
-Drag column headers to reorder.
+Drag a column by the grip in its header to reorder, or Tab to the grip and use Space and the arrow keys (see [Move Between Active Columns](#move-between-active-columns)). To Do stays first.
 
 ### Delete a Column
 
@@ -735,7 +751,7 @@ Enable the toggle, then pick a **Relay**: *Kangentic Relay* (the default, the on
 
 Click **Pair a device** to display a QR code; scanning it with the Kangentic mobile app starts an end-to-end encrypted pairing handshake. Once the handshake completes, both the desktop and the phone show the same short code - compare them, then tap **Confirm** on the phone. The desktop auto-enrolls the device as soon as it hears back; there is no second confirmation to make on the desktop. This catches a photographed or relayed QR, since an attacker cannot make both sides show the same code. To back out, cancel on the phone (or close the desktop's pairing panel) before confirming.
 
-The phone is treated as an extension of your own desktop, not a separate integration to configure: pairing grants it full access to the same ten capabilities the protocol defines (there is no shell, file, or arbitrary-command access in the protocol at all). Paired devices appear in a list below, identified by a key fingerprint you can compare against the phone's own Settings > Devices screen, along with their connection status and paired date. Rename a device from that list, or revoke it - revoking removes it from the desktop's signed roster immediately, and a revoked phone must be paired again from scratch to reconnect. See [Mobile Bridge](mobile-bridge.md) for the underlying protocol, pairing ceremony, and security design.
+The phone is treated as an extension of your own desktop, not a separate integration to configure: pairing grants it full access to every capability the protocol defines (there is no shell, file, or arbitrary-command access in the protocol at all). Paired devices appear in a list below, identified by a key fingerprint you can compare against the phone's own Settings > Devices screen, along with their connection status and paired date. Rename a device from that list, or revoke it - revoking removes it from the desktop's signed roster immediately, and a revoked phone must be paired again from scratch to reconnect. See [Mobile Bridge](mobile-bridge.md) for the underlying protocol, pairing ceremony, and security design.
 
 The Mobile section closes with **How to install and pair**, which opens the [Kangentic Mobile docs](https://www.kangentic.com/mobile/): installing the app, pairing a phone, and push notifications. It is always present, in both directions - it stays usable with the bridge toggle off, since someone who has not installed the app yet is exactly the person who has not enabled the bridge, and it does not disappear once phones are paired, since that link is a docs landing page rather than an install page and you may well be adding a second device. Install instructions live on the website so they stay current between desktop releases; while a store rollout is in progress, the in-app Announcements dialog carries the signup steps for the current phase.
 
@@ -893,6 +909,7 @@ Task detail (whichever panel is open):
 - **Mod+Shift+B** - Toggle the browser pane inside the task detail dialog
 - **Mod+Shift+G** - Toggle the changes (diff) panel inside the task detail dialog
 - **Mod+Shift+K** - Toggle the description panel inside the task detail dialog
+- **Alt+Shift+Left** / **Alt+Shift+Right** - Move the open task one column left / right without closing its window. Stops at the first and last board columns; Done is never a target. Column automations and move confirmations apply exactly as they do for the kebab's "Move to"
 - **Middle-click the window header** - Close a modeless task-detail window (default `Mouse:Middle`; routes through the same unsaved-edits guard as the close button)
 
 Description editor (mounts in task detail and in the New Task / New Backlog Task dialogs). All four are fixed, not rebindable:

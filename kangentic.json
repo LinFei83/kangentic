@@ -61,7 +61,17 @@
       "permissionMode": "bypassPermissions",
       "agentOverride": "claude",
       "modelOverride": "deepseek-flash",
-      "effortOverride": "medium"
+      "effortOverride": "medium",
+      "automations": {
+        "onEnter": [
+          {
+            "name": "Message",
+            "type": "send_message",
+            "message": "/pull-request",
+            "mode": "immediate"
+          }
+        ]
+      }
     },
     {
       "id": "8adfe5cc-955c-4c4f-83a2-461e2a9d3c14",

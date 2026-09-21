@@ -15,8 +15,8 @@
   // what the app now does too (the seeded actions that used to become them were
   // each a no-op or a duplicate of the fallback spawn).
   let automations = [];
-  // Run records. Seedable through `__mockPreConfigure` so a spec can drive the
-  // last-run line without executing anything; `runAgain` appends to it.
+  // Run records. Seedable through `__mockPreConfigure` so a spec can read run
+  // history (`runsForTask`) without executing anything; `runAgain` appends to it.
   let automationRuns = [];
   let automationFailureListeners = [];
   let automationInterruptedListeners = [];
@@ -1427,6 +1427,15 @@
         };
       },
       unarchive: async function (input) {
+        // Test hook: record every call (task id), mirroring tasks.move's
+        // __mockMoveProjectIds counter, so a test can assert this path was
+        // never reached (e.g. a gate that should keep a hotkey off an
+        // archived task's window).
+        if (typeof window !== 'undefined') {
+          if (!window.__mockUnarchiveCallIds) window.__mockUnarchiveCallIds = [];
+          window.__mockUnarchiveCallIds.push(input.id);
+        }
+
         // Test hook: simulate a main-process failure (e.g. worktree conflict).
         // Real main process leaves archivedTasks unchanged before throwing, so
         // the mock also leaves them unchanged and throws. The renderer's catch
@@ -1797,18 +1806,6 @@
           .slice()
           .sort(function (left, right) { return left.started_at < right.started_at ? 1 : -1; })
           .map(function (run) { return Object.assign({}, run); });
-      },
-      latestRuns: async function () {
-        // Newest per automation id, mirroring `latestByAutomation()`.
-        var newest = {};
-        automationRuns.forEach(function (run) {
-          var current = newest[run.automation_id];
-          if (!current || current.started_at < run.started_at) newest[run.automation_id] = run;
-        });
-        return Object.keys(newest).reduce(function (out, key) {
-          out[key] = Object.assign({}, newest[key]);
-          return out;
-        }, {});
       },
       runAgain: async function (automationId, taskId) {
         var automation = automations.find(function (row) { return row.id === automationId; });
@@ -2707,8 +2704,12 @@
             // KEEP IN SYNC with ClaudeAdapter.reportsRateLimits: gates the ContextBar
             // rate-limit pill on the agent capability (account-wide snapshot).
             reportsRateLimits: true,
-            // KEEP IN SYNC with ClaudeAdapter.pastedImageReferenceTemplate: the text
-            // injected for a pasted/dropped image instead of a bare file path.
+            // KEEP IN SYNC with ClaudeAdapter.pastedImageNativeExtensions: the image
+            // extensions Claude attaches natively from a bracketed-paste path, so the
+            // renderer pastes the bare quoted path for these.
+            pastedImageNativeExtensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'],
+            // KEEP IN SYNC with ClaudeAdapter.pastedImageReferenceTemplate: the fallback
+            // text pasted for an image outside the native set (bmp, svg).
             pastedImageReferenceTemplate: 'Read this image: {path} ',
             // Capabilities mirror what discoverClaudeCapabilities() would return
             // for a real Claude install: parsed from `claude --help` plus the
@@ -3726,7 +3727,7 @@
     //     desktop auto-enrolling on the phone's confirm frame. Production
     //     pairing is driven by a main-process PUSH (mobile:pairingConfirmed),
     //     not a renderer-initiated confirm call, so this seeds a device with
-    //     the full ten-verb grant and fires that push directly, exactly as
+    //     the full every-verb grant and fires that push directly, exactly as
     //     MobileBridgeService does on a successful ceremony.
     mobile: (function () {
       var state = {
@@ -3745,11 +3746,13 @@
       var mockDeviceCounter = 0;
 
       // Mirrors packages/protocol/src/capabilities/verbs.ts's CAPABILITY_VERBS -
-      // pairing grants all ten, not a read-only subset.
+      // pairing grants every verb, not a read-only subset. Hand-mirrored, so a
+      // new verb is appended here too; tests/unit/mobile-capability-verbs-parity.test.ts
+      // reads this literal as text and fails when it drifts from the protocol.
       var FULL_CAPABILITY_SET = [
         'read-stream', 'read-board', 'read-diff', 'send-user-message', 'move-task',
         'answer-permission-prompt', 'interactive-terminal', 'board-tool-read',
-        'board-tool-write', 'register-push',
+        'board-tool-write', 'register-push', 'start-session',
       ];
 
       if (typeof window !== 'undefined') {
@@ -3792,6 +3795,7 @@
             capabilities: FULL_CAPABILITY_SET.slice(),
             pairedAt: new Date().toISOString(),
             connectionState: 'connected',
+            connectionStateSince: new Date().toISOString(),
           };
           state.devices.push(device);
           state.pairingInProgress = false;
@@ -4164,6 +4168,15 @@
 
     clipboard: {
       readImage: function () { return Promise.resolve('/tmp/kangentic-clipboard/pasted-image-1234567890.png'); },
+      // Call log for test assertions (each entry is the PNG byte length the drop
+      // path handed over). Reset with window.electronAPI.clipboard.__saveImageCalls.length = 0.
+      // Answers with a fixed path, the way main answers a decodable image; a spec
+      // that needs the "not an image" null overrides this per page.
+      __saveImageCalls: [],
+      saveImage: function (pngBytes) {
+        window.electronAPI.clipboard.__saveImageCalls.push(pngBytes ? pngBytes.byteLength : 0);
+        return Promise.resolve('/tmp/kangentic-clipboard/pasted-image-normalized.png');
+      },
       // Call log for test assertions. Reset with window.electronAPI.clipboard.__writeTextCalls.length = 0.
       __writeTextCalls: [],
       writeText: function (text) {

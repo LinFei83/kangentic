@@ -118,9 +118,14 @@ export interface AgentDetectionInfo {
   /** True if the adapter streams account-wide rate-limit windows; gates the ContextBar
    *  rate-limit pill so any session of this agent shows the shared global snapshot. */
   reportsRateLimits?: boolean;
-  /** Template for the text injected when a clipboard/dropped image is captured to a temp PNG
-   *  (e.g. "Read this image: {path} "), so the agent reliably reads it as an image instead of
-   *  treating a bare file path as inert text. Undefined = inject the bare quoted path. */
+  /** Image extensions (lowercase, no dot) the CLI attaches natively when the file's path
+   *  arrives as a bracketed paste (Claude Code: png, jpg, jpeg, gif, webp become an
+   *  `[Image #N]` chip). The renderer pastes the bare shell-quoted path for these. A string
+   *  array, never a RegExp: this crosses IPC. Undefined = the CLI attaches nothing from a path. */
+  pastedImageNativeExtensions?: readonly string[];
+  /** Fallback text pasted for an image outside `pastedImageNativeExtensions` (or for every
+   *  image when that set is undefined), e.g. "Read this image: {path} ", so the agent reads an
+   *  explicit instruction instead of an inert path. Undefined = paste the bare quoted path. */
   pastedImageReferenceTemplate?: string;
   /** True if the adapter exposes a one-shot summarize capability (used by auto-name task title). */
   supportsSummarize?: boolean;
@@ -134,6 +139,18 @@ export interface AgentDetectionInfo {
    *  Apps"). Absent/empty = this agent declares none; the Agent settings tab renders nothing. */
   launchOptions?: readonly AgentLaunchOptionInfo[];
 }
+
+/**
+ * The two adapter-declared facts the terminal needs to deliver a captured (pasted or
+ * dropped) image: which extensions the CLI attaches natively from a pasted path, and the
+ * fallback text for the rest. An `AgentDetectionInfo` entry satisfies it directly, so a
+ * terminal host passes the agent's entry and never branches on agent name
+ * (agent-adapters-boundary.md).
+ */
+export type PastedImageCapability = Pick<
+  AgentDetectionInfo,
+  'pastedImageNativeExtensions' | 'pastedImageReferenceTemplate'
+>;
 
 /**
  * Renderer-facing description of a single adapter-declared launch-option toggle
@@ -4016,6 +4033,7 @@ export const MOBILE_CAPABILITY_VERBS = [
   'board-tool-read',
   'board-tool-write',
   'register-push',
+  'start-session',
 ] as const;
 export type MobileCapabilityVerb = (typeof MOBILE_CAPABILITY_VERBS)[number];
 
@@ -4070,6 +4088,8 @@ export interface MobilePairedDevice {
   pairedAt: string;
   /** Live, not persisted - this device's own connection state (transport refined by whether the phone is actually attached), not the panel-wide aggregate. */
   connectionState: MobileDeviceConnectionState;
+  /** ISO 8601, live, not persisted - when `connectionState` last changed, so a row can say "Offline since 3:17 PM" rather than only "Offline". Null before the device's session has opened. */
+  connectionStateSince: string | null;
 }
 
 export interface MobilePairingSasPayload {
@@ -5544,8 +5564,6 @@ export interface ElectronAPI {
       projectId?: string | null,
     ) => Promise<ColumnAutomation[]>;
     runsForTask: (taskId: string, projectId?: string | null) => Promise<AutomationRun[]>;
-    /** The newest run per automation id, for the last-run line in Board setup. */
-    latestRuns: (projectId?: string | null) => Promise<Record<string, AutomationRun>>;
     /**
      * Re-run ONE automation against the task's CURRENT state. Mutating, so it
      * carries the interaction-time projectId.
@@ -6120,7 +6138,14 @@ export interface ElectronAPI {
 
   // Clipboard
   clipboard: {
+    /** Save the OS clipboard image as a capped temp PNG; its path, or null when
+     *  the clipboard holds no image (or the write failed). */
     readImage: () => Promise<string | null>;
+    /** Save PNG bytes the renderer decoded from a dropped image into the same
+     *  temp directory as `readImage`; its path, or null when the bytes are not
+     *  a decodable image (or the write failed). The drop path uses it for a
+     *  format the agent CLI cannot take from a path. */
+    saveImage: (pngBytes: Uint8Array) => Promise<string | null>;
     writeText: (text: string) => Promise<void>;
   };
 
