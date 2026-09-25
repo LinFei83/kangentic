@@ -27,7 +27,6 @@ Eighteen event types are tracked, all on critical-path actions only:
 | `update_outcome` | Next launch after the app version changed | result (`applied` / `rolled_back`), fromVersion, toVersion |
 | `spawn_failed` | An agent spawn failed (born-into-column create, MCP auto-spawn, any board-driven resume including a drag move, startup recovery) | agent, reason (`create_spawn`, `auto_spawn`, `resume`, `unknown_agent`, `cli_not_found`) |
 | `utility_worker_crashed` | A Kangentic utility process exited unexpectedly (not an idle recycle or quit): at most twice per service per app run, on the first crash and when the restart cap latches | service (`kangentic-embeddings`, `kangentic-line-count`, `kangentic-dictation`), exitCode (see below), phase (`first` / `latched`) |
-| `foreign_minidump_dropped` | A native crash dump reached us from a process that is not ours, and was filtered out before upload (see "Error Reporting" below) | module (the crashing executable's file name, never a path) |
 | `gpu_process_gone` | The GPU process exited abnormally (not a clean exit on quit): at most twice per app run, on the first death and when the escalation threshold latches | reason (Electron's `child-process-gone` reason), exitCode, phase (`first` / `latched`) |
 | `mobile_bridge_forced_redial` | The mobile bridge abandoned a relay socket that still read connected but carried nothing (a socket the relay reaped while the network was away; see `docs/mobile-bridge.md`): at most once per reason per app run | reason (`paired-silent` / `parked-stale`) |
 
@@ -41,6 +40,13 @@ that reached the app, an update install), `failsafe` (the quit path ran but Elec
 hung and the hard failsafe force-killed the process), or `abrupt` (nothing was recorded: a crash, a
 kill, a power loss). Uptime is wall-clock and includes time asleep. Aptabase's own session
 duration is coarse by comparison, since heartbeats are the only events a long agent run emits.
+
+Each write also stamps `at`, the wall-clock moment of that write, so the last record on disk says
+when the run was last known alive. For a `clean` or `failsafe` exit that is the exit itself; for an
+`abrupt` one it is the final checkpoint, which is the only clock an abrupt ending leaves behind.
+It is read locally rather than reported: `previousRunLastAliveAt()` feeds the GPU report gate,
+which needs to tell "the GPU died as this run ended" from "the GPU died once, forty minutes before
+something unrelated killed it".
 
 `utility_worker_crashed`'s `exitCode` is the raw value Electron's `utilityProcess` `exit` event
 reports, so it is NOT comparable across platforms (POSIX derives it from `waitpid`, Windows from
@@ -63,11 +69,14 @@ the phase gate is per-run, not per-window, which is what keeps this at exactly t
 matter how many separate incidents one launch has. `exitCode`'s `-1` sentinel does NOT carry the same
 meaning it does for `utility_worker_crashed` above: there it means the fork never started, but here it
 means Electron's `child-process-gone` event reported no exit code, a routine and more common case.
-Reaching the latch also writes a durable escalation record for the NEXT launch to report to Sentry
-(see "Error Reporting" below) - live reporting is not possible here, because the GPU process
-exhausting every fallback mode can end in Chromium killing the browser process outright
-(`LOG(FATAL)`, DESKTOP-W), which happens before an async Sentry POST queued at that moment could
-ever transmit.
+The latch governs this Aptabase tick ONLY. The durable escalation record is written on every death
+from the first (see "Error Reporting" below), because the death that actually kills the app is one
+JS never hears about: Chromium calls `RecordProcessCrash`, and the `LOG(FATAL)` under it, from the
+delegate rather than from the observer notification Electron emits `child-process-gone` from. Live
+reporting is impossible here for the same reason - the browser process is gone before an async
+Sentry POST queued at that moment could transmit. A GPU fallback that the tracker records from
+`gpu-info-update` ticks no Aptabase event, because it is not a death. So a launch-failure ladder,
+which produces no `child-process-gone` at all, leaves this count at zero.
 
 The curated `feature` vocabulary is `ANALYTICS_FEATURES` in `src/main/analytics/usage.ts`:
 `command_terminal`, `worktree_session`, `board_profile`, `popout_window`, `browser_pane`,
@@ -198,18 +207,20 @@ in one Sentry org, one triage surface.
   decision, so the two processes can never disagree.
 - **Scrubbing is the SDK's and Sentry's job, not custom code:** the SDK's default
   `normalizePathsIntegration` rewrites stack-frame paths and URLs relative to the app root (the
-  user's home directory never reaches Sentry for app code), `sendDefaultPii` stays `false`, and
-  Sentry's server-side data scrubbing is on by default. Any further scrubbing rule belongs in the
-  Sentry UI (Advanced Data Scrubbing), not in a `beforeSend` here. The one capture-site exception
-  is the utility worker's stderr tail (below): it is free text, not a stack frame, and Node's
-  `Require stack:` lines print absolute install paths under the user's profile, so
-  `src/main/utility-process/stderr-tail.ts` replaces the home directory with `~` before the text
-  goes anywhere. Same shape as the component-stack reduction above: data minimization at the
-  source, not a scrubbing rule.
-- **Filtering is a different concern and does live in code,** in `ignoreErrors`, plus a `beforeSend`
-  for the one class `ignoreErrors` cannot see (native crashes, below). Scrubbing removes data from an
-  event we keep; filtering decides a whole class of event is un-actionable and should never become an
-  issue. Five classes are filtered:
+  user's home directory never reaches Sentry through an app stack frame; breadcrumbs are a separate
+  path, below), `sendDefaultPii` stays `false`, and Sentry's server-side data scrubbing is on by
+  default. Any further scrubbing rule belongs in the Sentry UI (Advanced Data Scrubbing), not in a
+  `beforeSend` here. There are three exceptions, all data minimization at the source rather than
+  scrubbing rules, the same shape as the component-stack reduction above. The utility worker's
+  stderr tail (below) is free text, not a stack frame, and Node's `Require stack:` lines print
+  absolute install paths under the user's profile, so `src/main/utility-process/stderr-tail.ts`
+  replaces the home directory with `~` before the text goes anywhere. A foreign process's crash
+  loses its dump, breadcrumbs and full module name in `beforeSend` (see "Native crashes in
+  processes that are not ours" below). And every breadcrumb passes a policy before it is recorded
+  (see "Breadcrumbs are filtered at the source" below).
+- **Filtering is a different concern and does live in code,** in `ignoreErrors`. Scrubbing removes
+  data from an event we keep; filtering decides a whole class of event is un-actionable and should
+  never become an issue. Four classes are filtered:
   - Benign Windows stdio write artifacts, in two message shapes. Node's `errnoException` reads
     `write EAGAIN` / `write EPIPE` (the dev `npm start` TTY case) and is matched by those two
     string literals; libuv's `uvException` reads `EPIPE: broken pipe, write` (a packaged GUI
@@ -228,43 +239,143 @@ in one Sentry org, one triage surface.
     `'GPU' process exited with 'abnormal-exit'` only, not every reason. A lone GPU death Chromium
     recovers from on its own (DESKTOP-15) is the same un-attributable noise as a utility exit, and
     Kangentic's own GPU health tracker now reports a repeated one (see "A GPU health escalation is
-    reported once" below). `'launch-failed'` is deliberately left unfiltered as a backstop: Chromium
-    can walk several GPU launch failures before giving up
-    (`GpuDataManagerImplPrivate::FallBackToNextGpuMode`), and the self-report cannot be verified to
-    fire when the LAST one ends in `LOG(FATAL)` killing the process first (DESKTOP-W) - see below.
+    reported once" below). `'launch-failed'` is left unfiltered, but it is not a backstop: the
+    integration rides `child-process-gone`, which Electron 41 never emits for a launch failure
+    (it overrides no `BrowserChildProcessLaunchFailed`). DESKTOP-W's launch-failure ladder is caught
+    by the GPU health tracker's fallback record instead - see below.
   - `BENIGN_RENDERER_ERRORS` (`src/shared/benign-renderer-errors.ts`) is spread in, so the one
     registry drives the monaco error funnel, the UI-test collector, and Sentry. Patterns there
     must stay unanchored: monaco re-throws as `message + '\n\n' + stack`.
-  - **Native crashes in processes that are not ours**, filtered in `beforeSend`
-    (`filterNativeCrashEvent`) rather than in `ignoreErrors`. On macOS a task's mach exception ports
-    are inherited across exec, so a process spawned from a Kangentic PTY writes ITS crashes into our
-    Crashpad database and the SDK uploads them as ours. DESKTOP-K was Homebrew ffmpeg's `ffprobe`
-    failing to start, ten fatal events; DESKTOP-N was a Puppeteer `chrome-headless-shell`;
-    DESKTOP-Q was `/usr/local/share/dotnet/dotnet`, ten more. None loaded a single Kangentic
-    image. This class cannot go in `ignoreErrors`, which is the
+- **Native crashes in processes that are not ours become one warning, and their dumps never
+  upload.** This happens in `beforeSend` (`beforeSendEvent` -> `filterNativeCrashEvent`), the only
+  hook that can see the minidump attachment. On macOS a task's mach exception ports are inherited
+  across exec, so a process Kangentic starts writes ITS crashes into our Crashpad database and the
+  SDK uploads them as ours. DESKTOP-K was Homebrew ffmpeg's `ffprobe` failing to start, ten fatal
+  events; DESKTOP-N was a Puppeteer `chrome-headless-shell`; DESKTOP-Q was
+  `/usr/local/share/dotnet/dotnet`, ten more. None loaded a single Kangentic image. DESKTOP-1D was
+  another project's dev Electron Helper, killed mid-launch. It loaded Electron Framework like every
+  Electron app does, but from that project's own `node_modules/electron/dist/Electron.app`.
+  - **Telling them apart.** This class cannot go in `ignoreErrors`, which is the
     `eventFiltersIntegration` and matches only an event's message and its exception type and value:
     a minidump event has none of those, so the matcher sees an empty candidate list and does
     nothing. It also cannot key off the SDK's `event.process` tag, because that reads `unknown` for
     real macOS crashes too (DESKTOP-E is one). The discriminator is the dump's own loaded-image
-    list, read from the attachment in `src/main/analytics/native-crash-event.ts`: the event is
-    dropped only when no image sits under the install root, matches the app executable's name, or is
-    the Electron framework. Every uncertain path keeps the event, because a foreign crash that slips
-    through is noise while a real crash dropped by a parser bug is gone. Each drop increments
-    `foreign_minidump_dropped`, which is the only fleet-wide evidence left once the events stop
-    arriving, and the before-and-after number for resetting the exception ports at spawn.
+    list, read from the attachment in `src/main/analytics/native-crash-event.ts`: a crash is foreign
+    only when no image sits under the install root, matches the app executable's name, or is the
+    Electron framework inside our own `Kangentic.app` bundle. An unpackaged run checks the install
+    root alone, because its `Electron` executable and `Electron.app` bundle are names every dev
+    Electron app shares. Every uncertain path keeps the event as ours, because a foreign crash that
+    slips through is noise while a real crash misread as foreign loses its dump. One real crash does
+    read as foreign on purpose: a helper crash from a bundle the user renamed and then moved between
+    the crash and the upload, since nothing left in its image list names us.
+  - **What a foreign crash sends.** It is still our defect, since our port leaked, so it is
+    reported rather than dropped: level `warning` with a fixed fingerprint, so every one lands in the
+    single issue "Foreign process crash reached Kangentic's crash database". Its minidump is removed
+    from `hint.attachments` before the SDK builds the envelope, because the dump holds another
+    program's memory. That is the second exception to "scrubbing is Sentry's job", next to the
+    stderr tail, because no Sentry-side rule can scrub a file it has already received.
+    `tests/unit/foreign-crash-real-client.test.ts` pins it against the real client. The event also
+    loses the `event.process` and `exit.reason` tags and the dump's own `crashpad.*` annotations,
+    all of which describe the wrong process, and its breadcrumbs. The breadcrumb policy (below)
+    keeps the `SHELL_EXEC` command line out of the trail, but Node's `child_process` breadcrumb
+    still carries the spawned file's name, and a dump found at startup can carry an older build's
+    unfiltered trail, so either could name the very program the `module` tag withholds. It keeps a
+    small `native_crash` context (crash time,
+    whether the dump was found at startup, the uploading version), enough to tell the one-time tail
+    of dumps written before an upgrade from what follows it.
+  - **The `module` tag** names the crashing program only when an installer or a package manager put
+    it where it crashed (`src/main/analytics/reportable-module-name.ts`): system directories,
+    Homebrew, MacPorts, Nix, per-user toolchain directories such as `~/.cargo/bin` and
+    `~/.local/bin`, the browsers Puppeteer and Playwright download, and any `node_modules`. Anything
+    else reads `user-binary`, so the name of a user's own build output never leaves the machine. A
+    bare file name is not enough on its own: 0.43.0 sent the names of one user's project test
+    binaries. One gap is accepted: `cargo install --path .` and `go install ./...` put a user's own
+    binary in `~/.cargo/bin` and `~/go/bin`, and `make install` puts one in `/usr/local`. All stay
+    on the list, because the program behind most of the pre-change baseline lives in one of them.
+  - **Where the port leaks now, and the before-and-after.** PTY children no longer inherit it: the
+    packaged macOS app ships its own node-pty `spawn-helper`, which clears the task's exception
+    ports before exec, and the four `child_process` shell launches (the login-shell probe,
+    shortcuts, `run_script` automations, the post-worktree init script) run through it too (see
+    "PTY children and mach exception ports" in `docs/cross-platform.md`). This check stays as the
+    backstop for older builds, for an unpackaged run with error reporting switched on (`npm start`
+    keeps node-pty's stock helper), and for anything else started outside those paths. Earlier
+    builds dropped these events and counted them as the Aptabase event `foreign_minidump_dropped`
+    instead, with a bare-basename `module`. That counter is the "before": 33 events over 0.41.0 to
+    0.43.0, all macOS, 27 of them from one command-line tool. The Sentry issue is the "after", so
+    the comparison crosses from Aptabase to Sentry once. On a release with the change, expect a
+    one-time tail from dumps written before the upgrade and uploaded at its first launch
+    (`native_crash.crash_time` separates it), then only the residue.
+- **Tagging shares that hook, and runs before the split.** `beforeSend` is `beforeSendEvent`,
+  which tags and then delegates to `filterNativeCrashEvent`. `tagTruncatedStack` sets
+  `stack_truncated: 'true'` on any event whose parsed stack sits exactly on the SDK's 50-frame
+  cap. The parser reads a V8 stack innermost-first and stops there, so a capped event has lost its
+  OUTER frames - the app code that called into the library and the timer it ran under - and reads
+  as a self-contained third-party failure with `in_app: false` everywhere. Sentry DESKTOP-19 is
+  the case that earned the tag: six events, fifty monaco frames each, no in-app frame, and the app
+  frame that armed the call truncated away. The tag makes "no app frames survived" distinguishable
+  from "no app frames" without counting by hand. Tagging is annotation, not filtering: it never
+  drops an event.
 - **Errors only:** release-health session tracking (the SDK's `MainProcessSession` integration,
   on by default) is filtered out, and tracing and session replay are never enabled.
+- **Breadcrumbs are filtered at the source, in both processes.** Every event carries the trail
+  of what happened before it: up to 100 breadcrumbs from main and 100 from the renderer. Nothing
+  filtered them, and `normalizePathsIntegration` never touches them, so a sample of 23 production
+  events carried home paths, agent command lines, task titles, column prompt text, branch names,
+  project and file paths inside click selectors, and a Browser pane search URL.
+  `filterBreadcrumb` (`src/shared/sentry-breadcrumbs.ts`) is now the `beforeBreadcrumb` in both
+  processes. It has to be both: main adds a forwarded renderer crumb with `scope.addBreadcrumb`,
+  which never calls main's hook. Dropping a crumb before it is added also keeps it out of the ring;
+  on one event, `[agent-push]` debug lines had evicted every click. By category:
+  - `console`: kept only under a tag in `CONSOLE_BREADCRUMB_TAGS` (`[UPDATER]`,
+    `[electron-updater]`, `[SHUTDOWN]`, `[terminal-webgl]`, `[gpu]`, `[GPU-HEALTH]`, `[APP]`) or
+    Electron's own `Error occurred in handler for '<channel>'`, and never at debug level. A kept
+    line is rebuilt from its arguments: the tagged string with paths redacted, each Error reduced
+    to its name and code, numbers and booleans. A name that is not an identifier reads `Error`, and
+    a code is kept only when it is an upper-case constant (`ENOENT`) or an integer. Other arguments
+    and raw stacks go, because git and fs error text can hold a branch named after a task. `tests/unit/sentry-breadcrumbs.test.ts`
+    parses every literal that opens with one of those tags and fails an interpolation that names
+    user content (a title, a branch, a path, an error's text) unless the site carries
+    `// breadcrumb-ok: <reason>`. A tag built at runtime (`[${label}]`) is invisible to that scan;
+    none resolves to an allowlisted tag today.
+  - `ui.click` / `ui.input`: the selector stays, but `title`, `aria-label`, `name` and `alt` lose
+    their values (`[title]`), and `type` keeps its value. A crumb with any other quoted value left
+    is dropped.
+  - `electron`: the lifecycle message and the webContents id stay. A URL stays only when it is the
+    app's own `app:///` page, without its query.
+  - Request crumbs (`http`, `electron.net`, `fetch`, `xhr`): method and status stay. The URL stays
+    only under a Kangentic prefix (our GitHub repository and release assets, Aptabase), without its
+    query. Main's fetch also reaches the board adapters and the webhook automation, whose URLs can
+    name an organization or hold a secret.
+  - Node's `child_process`: the message is path-redacted and `spawnfile` keeps only its file name.
+    Electron's `child-process` is kept whole.
+  - Anything else, `sentry.event` and `navigation` included, is dropped, so a category a new SDK
+    version adds stays out until someone decides otherwise.
+
+  The filter fails closed, the opposite of `beforeSendEvent`: a throw drops the crumb. The
+  `[SHUTDOWN] pty-drain:*` lines pass byte-identical. electron-updater's own lines, which carried
+  the Squirrel and package-manager detail on past updater issues, go through a tagged logger in
+  `src/main/updater.ts`, with its debug output kept out. Events uploaded before this change still
+  carry the unfiltered trail.
 - **Boundary-caught errors** never reach the SDK's global handlers (React swallows them), so
-  both error boundaries hand the real `Error` to `captureException` explicitly, alongside the
-  existing Aptabase funnel.
+  all three error boundaries hand the real `Error` to `captureException` explicitly. Two of them
+  also keep the existing Aptabase funnel (`ErrorBoundary` as `boundary: 'root'`,
+  `PanelErrorBoundary` as `boundary: 'panel'`); `DiffErrorBoundary` reports to Sentry only.
 - **Handled errors are forwarded too** (`reportHandledError`): the deliberate catch sites that
   otherwise emit only a sanitized count - updater structural failures (`source: updater`), PTY
   spawn failures (`source: pty_spawn`), the silent agent-spawn catches (`source: spawn`, with a
   `reason` tag), a Kangentic utility worker that has crashed past its restart cap
   (`source: utility_process`, with `service`, `exitCode`, and `crashCount`), and a GPU health
   escalation reported on the next launch (`source: gpu_process`, with `reason`, `exitCode`, and
-  `crashCount` - see the GPU health bullet below) - send the real error to Sentry so hidden issues
-  are diagnosable, not just counted. The utility-worker report also
+  `crashCount` - see the GPU health bullet below), and a guarded synchronous write that could not
+  reach disk (`src/main/config/write-failure-notice.ts`, one report per failing `source` tag per
+  outage: `config`, `config_dirs`, `config_project_override`, `import_source`, `browser_url`, the
+  three `mobile_bridge_*` stores, `asana_credential`, plus an `errno` tag when the error carries
+  one) - send the real error to Sentry so hidden issues
+  are diagnosable, not just counted. ENOSPC arrives on that last path and is deliberately NOT
+  filtered: it is a host condition rather than a defect, but it is also the only evidence the
+  user-facing toast fires at all, and the per-source latch already caps the volume at one event
+  per outage. The `errno` tag is what makes muting it later a Sentry-UI change rather than a code
+  change (Sentry DESKTOP-1C). The utility-worker report also
   carries a `utility_process` context block with the last 8 KiB of the worker's stderr (home
   directory redacted). Both workers are forked with stderr piped for this; with Electron's
   `inherit` default, a packaged GUI build sent the worker's uncaught-exception dump nowhere, so
@@ -276,7 +387,7 @@ in one Sentry org, one triage surface.
   minimal reading like that took a multi-hour investigation to establish because the diagnosis
   lived only in the minidump's `chromium_stability_report`, not on the event proper). The main
   process samples `process.getSystemMemoryInfo()` every 60s and calls `Sentry.setContext` on the
-  ambient scope (not `beforeSend`, which is already `filterNativeCrashEvent` below and has no
+  ambient scope (not `beforeSend`, which is already `beforeSendEvent` below and has no
   transaction for `setMeasurement` to hang on), so whatever event fires next - including a native
   crash - carries the freshest sample. `correctNativeCrashEvent` prunes `host_memory` under the
   same stale-dump condition as `app_memory`/`free_memory`, since a startup-found dump can otherwise
@@ -302,29 +413,86 @@ in one Sentry org, one triage surface.
   `UtilityRestartPolicy` counts a worker's, but cannot report live: the failure sequence this exists
   for can end in Chromium calling `LOG(FATAL)` (`IntentionallyCrashBrowserForUnusableGpuProcess`),
   which kills the whole process before an async Sentry POST queued at that moment would ever
-  transmit - the reason a 90-day search never turned up a single `'GPU' process exited with
-  'launch-failed'` event despite the SDK capturing that reason by default. Reaching the threshold
-  (three deaths in five minutes, matching Chromium's own `kForgiveGpuCrashMinutes` judgment) writes a
-  durable record to `<configDir>/gpu-health.json`, carrying `app.getGPUFeatureStatus()` AT THAT
-  MOMENT; further deaths in the same run keep updating count, lastAt, and that status rather than
-  freezing the record at the threshold, so a chronic looper's report does not read identically to a
-  run that latched once and ended. `src/main/index.ts` reads the record once `app.whenReady()`
-  resolves on the FOLLOWING launch, **clears it BEFORE reporting** (so a launch with error reporting
+  transmit. (A 90-day search never turned up a `'GPU' process exited with 'launch-failed'` event
+  for a different reason: Electron never emits `child-process-gone` for a launch failure at all.)
+  EVERY death writes the durable record at `<configDir>/gpu-health.json`, from the first - not
+  just a threshold breach.
+  The ordering is why: Chromium calls `GpuProcessHost::RecordProcessCrash` (and the `LOG(FATAL)`
+  under it) from the delegate, BEFORE the observer notification Electron emits
+  `child-process-gone` from, so the death that actually kills the app is one JS never hears about.
+  A write gated on three observed deaths can therefore lose the whole incident, which is what
+  DESKTOP-18's seven 8-to-12-second launches would have done. Each write carries
+  `app.getGPUFeatureStatus()` AT THAT MOMENT plus a bounded `deaths` sequence (20 entries, middle
+  trimmed, first and last kept) recording the reason, exit code, GPU mode and timestamp of each
+  death in order - the sequence is the only thing that can show how Chromium walked its ladder,
+  where a single end-state snapshot cannot. Each entry's mode is read after Chromium handled that
+  death, so it names the rung the death left behind: the death that triggers a fallback already
+  reads the lower rung. The FALLBACK writes too, from
+  `gpu-info-update`: once this run has been seen compositing on the GPU, the moment
+  `gpu_compositing` leaves it, and each later status change, appends to a bounded `modeChanges`
+  list (8 entries) and moves the record's `lastAt`. That is DESKTOP-W's only trace. Its deaths
+  were launch failures, which Electron never forwards to JS, and on Linux the running GPU
+  process's death through a dead zygote reads as a normal exit that fires nothing either (see
+  "When the GPU process is unusable" in [cross-platform.md](cross-platform.md)). A fallback-only
+  record has `count: 0` and `reason: 'hardware-fallback'`. On Linux each fallback entry also
+  carries a `linux` block from `src/main/diagnostics/linux-gpu-zygote.ts`: the GPU zygote's state
+  (`alive`, `dead`, `unknown`), the system-wide thread count, and the soft process limit. A dead
+  zygote and a fork refused at the limit produce the same DESKTOP-W stack, and this block is what
+  tells them apart. A dead zygote also records a fallback on a machine that never composited on the
+  GPU. `src/main/index.ts` reads the record once `app.whenReady()`
+  resolves on the FOLLOWING launch, skips it if `isEscalationFromCurrentRun` says THIS run wrote it
+  (the writer is installed at module scope and the reader runs after `createWindow` and an `await`,
+  so a GPU crash-looping from startup writes into that gap; consuming it there would burn the
+  report on a run about to be killed and leave the next launch with nothing),
+  **clears it BEFORE reporting** (so a launch with error reporting
   off - the kill switch, or `KANGENTIC_ERROR_REPORTING=0` - still consumes it silently rather than
   carrying it forward to a later launch that might have reporting on; the local crash JSONs and the
-  `gpu_process_gone` Aptabase count exist either way), then calls `reportHandledError` with tags
+  `gpu_process_gone` Aptabase count exist either way). The clear is a compare-and-clear against the
+  `lastAt` that was reported, because a crash loop can write a FRESH record between the read and the
+  clear and an unconditional unlink would take it. The reverse race is not guarded: the writers are
+  installed at module scope and each write rebuilds the file from this run's state alone, so a
+  boot-time death or fallback on THIS run can overwrite the previous run's record before the report
+  block reads it. A VM or broken-GL machine that falls back at every boot makes that common. The
+  recovery decision is safe, because it reads the record at module scope before any GPU process
+  exists, and the software mode it engages never writes. What can be lost is the report of something
+  the previous run survived: a fallback, or a crash loop that reached the report threshold. Not
+  every pending record earns an issue:
+  `shouldReportEscalation` reports on `count >= 3`, OR when the previous run ended `abrupt` AND the
+  record's `lastAt` (the last death or fallback) sits within 90s of that run's last known sign of
+  life (`run-uptime.ts`'s `at` checkpoint). The second arm needs both halves - `abrupt` alone means
+  only that no exit was recorded, which covers a renderer OOM, a task-manager kill and a power loss,
+  and pairing it with "the GPU died once at some point" would blame graphics for a death it had
+  nothing to do with. A fallback the run survived is not reported: VMs and broken-GL machines can
+  fall back at every boot. When it does report, `src/main/index.ts` calls `reportHandledError` with
+  the message `GPU process exited repeatedly (...)`, or `GPU left hardware acceleration with no GPU
+  process exit reported` for a fallback-only record, which groups the launch-failure shape as its
+  own issue. It carries tags
   `source: gpu_process`, `reason`, `exitCode`, `crashCount`, and a `gpu_process` context carrying
   `reason`, `exitCode`, `count`, `firstAt`, `lastAt`, `escalatedInVersion` (the app version that
   produced the escalation, not the one reporting it - the same build-attribution concern the native
   crash correction below exists for), `featureStatusAtEscalation`, `featureStatusOnReport`, and
   `previousRunExit`. The last three are deliberately three separate facts, not one:
-  `featureStatusAtEscalation` is what Chromium's GPU mode was AT THE DEATH that produced the record
-  (the one fact neither DESKTOP-W nor DESKTOP-15 could say); `featureStatusOnReport` is what it is on
+  `featureStatusAtEscalation` is what Chromium's GPU mode was at the record's LATEST WRITE, a death
+  or a fallback (the one fact neither DESKTOP-W nor DESKTOP-15 could say); `featureStatusOnReport` is what it is on
   THIS boot, read live, which may already differ (a machine can recover on its own between launches);
   and `previousRunExit` is the previous run's `run-uptime.ts` exit kind (`abrupt` means that run ended
   in a process kill, the DESKTOP-W shape; `clean` or `failsafe` means Chromium recovered on its own,
   the DESKTOP-15 shape; `unknown` on a first launch or a wiped config dir), so the two failure shapes
-  are distinguishable on arrival.
+  are distinguishable on arrival. The context also carries `deaths` (the sequence above),
+  `modeChanges` (the fallback steps above),
+  `gpuInfoOnReport` (`app.getGPUInfo('complete')`, the one call of it in this path, naming the
+  machine's actual graphics stack), `killedTheLastRun`, and `softwareRenderingEngaged`.
+- **A GPU failure that killed the last run also downgrades this one, once.** When
+  `killedTheLastRun` holds, `src/main/index.ts` has already started Chromium with
+  `app.disableHardwareAcceleration()` and `--in-process-gpu` (decided at module scope, because
+  that API throws once the app is ready), and now persists `graphicsAccelerationEnabled: false` with
+  `graphicsAccelerationOffBy: 'app'` so later launches read the setting instead of re-deriving it
+  from a record that is about to be cleared. `graphicsAccelerationOffBy` is what stops a later
+  failure overwriting a choice the user made themselves. The renderer PULLS this state
+  (`IPC.GPU_HEALTH_STATUS`) rather than main pushing it: both facts are decided during boot, when a
+  `webContents.send` can land before any listener is registered and be dropped silently, and the
+  record behind them is already gone. Reading consumes the notice, so a reload cannot re-toast.
+  See "Graphics failures" in [user-guide.md](user-guide.md) for what the user sees.
 - **A transient updater feed failure is counted, not reported.** `hasTransientNetworkCause`
   (`src/main/updater.ts`) gates the `reportHandledError` call in the `autoUpdater.on('error')`
   handler, and sits deliberately AFTER `trackEvent('app_error')` so the "how often do update
@@ -360,6 +528,72 @@ in one Sentry org, one triage surface.
   or KDE desktop, which is the case that ships. Because the pattern hand-matches a third-party
   template, `tests/unit/updater-error-classifier.test.ts` reads the installed
   `electron-updater` and fails if that template is reworded or a fifth sudo front-end appears.
+- **A read-only volume is counted, not reported, and is the one condition the user hears about.**
+  `isReadOnlyVolumeError` (`src/main/updater.ts`) gates the same `reportHandledError` call from
+  the same position as the two above. A macOS app launched straight from the mounted DMG, or
+  running translocated, cannot write over itself, so Squirrel.Mac refuses the install. That is a
+  property of where the user put the app, not a defect: no build of ours would behave
+  differently. DESKTOP-1A filed it 11 times from a single install.
+
+  Unlike every other suppressed branch, this one also pushes `updater:blocked` to the renderer,
+  which toasts a sentence pointing at the Applications folder. The reason is that the condition
+  is permanent and silent: an install in this state never updates again and says nothing, so
+  dropping the Sentry issue without telling anyone would leave the user on a frozen version
+  indefinitely. The push is latched in main for the app's lifetime, so a condition every 4-hour
+  check rediscovers still produces one toast per run.
+
+  The pattern matches Squirrel's opening sentence only. Squirrel appends a recovery suggestion
+  naming Downloads, macOS Sierra and a GitHub issue URL, none of which identifies the condition.
+- **An EAGAIN install failure is counted, not reported.** `isResourceUnavailableError`
+  (`src/main/updater.ts`), the branch below. DESKTOP-1B is the POSIX `EAGAIN` reaching us through
+  macOS's `NSError` rendering rather than through Node, which is the only reason
+  `isTransientUpdaterError` misses it: `ECONNRESET` and friends sit beside `EAGAIN` in the same
+  errno table, but a Squirrel.Mac error carries no `code` for those branches to read. It is as
+  transient as the network blips above and gets the same treatment.
+
+  The pattern matches `Resource temporarily unavailable`, the strerror text, and ignores the
+  `The operation couldn't be completed.` sentence in front of it. That half is `NSError`
+  boilerplate identifying nothing, and it carries a typographic apostrophe no source pattern
+  should have to reproduce.
+- **A prerelease build with no matching release is counted, not reported.**
+  `isPrereleaseWithNoMatchingRelease` (`src/main/updater.ts`), the last branch before the report.
+  `AppUpdater` derives `allowPrerelease` from whether the running version has a prerelease
+  component, so a `0.41.0-dev.1` build asks `GitHubProvider` for a `dev` channel, finds nothing
+  in the feed, and throws. We publish no such channel, so that is the build's expected steady
+  state. DESKTOP-17.
+
+  The predicate is conjunctive and the version half is the point of it. `GitHubProvider` throws
+  the same `No published versions on GitHub` sentence from two places: the tag-is-null throw,
+  which carries `ERR_UPDATER_NO_PUBLISHED_VERSIONS` and needs `allowPrerelease`, and the feed's
+  own entry lookup, which throws it codeless when the Atom feed has no entries at all. On a
+  stable build that second one means our releases feed is empty or broken, which still reports.
+  `tests/unit/updater-error-classifier.test.ts` pins both throw sites against the installed
+  `electron-updater`, and pins the stable-build negative.
+
+  Two gaps are named rather than left implicit. The macOS predicates above get no upstream drift
+  guard and cannot: Squirrel.Mac is compiled into Electron and the EAGAIN text is macOS
+  localization, so neither string has a source on disk to assert against. A reword would cost a
+  rediscovery, not a silent regression, since the issue would simply reappear.
+- **Reading `app_error` / `source: updater`: the count is not every updater failure.** The five
+  suppressions above are not uniform about it, and the split is older than any of them.
+  `isTransientUpdaterError` gates ABOVE `trackEvent`, so the classes it catches (a raw
+  `ECONNRESET`, `ETIMEDOUT`, `EAI_AGAIN`, `ENOTFOUND`, `ENETUNREACH`, `EPIPE`, an `HTTP_ERROR_5xx`
+  / `408` / `429` / `618`, a `net::ERR_`, an aborted request, a failed pipe) produce no event at
+  all. That was the deliberate call when it was written: keep network blips out of `app_error`
+  entirely. Every gate added since sits BELOW `trackEvent` and keeps the count.
+
+  The practical consequence: one underlying network failure is counted or not depending on
+  whether electron-updater rewrapped it. A feed fetch that fails with an intact errno is
+  suppressed silently; the same fetch failing through `GitHubProvider`'s double rewrap loses its
+  code, falls through to `hasTransientNetworkCause`, and IS counted. So "how often do update
+  checks fail" undercounts by exactly the class that kept its errno. Moving
+  `isTransientUpdaterError` below `trackEvent` would make the file consistent, and is the obvious
+  cleanup, but it would redefine a metric that has counted the same way since April 2026
+  (`5513c7cc`). Treat it as a telemetry decision, not a refactor.
+
+  Also note `sanitizeErrorMessage` truncates to 180 characters, which is shorter than the
+  read-only-volume message. The classes are still distinguishable by their opening sentence,
+  since there is no per-class tag on the event.
 - **Affected-install counts:** the same anonymous, non-reversible `clientId` documented under
   "Unique Installs" is attached as the Sentry user id, so an issue's Users column means
   "installs affected." It contains no personal data and shares the same kill switches.
@@ -393,14 +627,14 @@ in one Sentry org, one triage surface.
   `child-process-gone` in the session that is still running: they build the event fresh, so its
   breadcrumbs and app context really are the crashed session's and correcting them would delete a
   good trail. Those two are also the only paths that stamp an `exit.reason` tag, which is what the
-  correction is gated on. The ownership filter above stays unconditional, since a live crash event
+  correction is gated on. The ownership check above stays unconditional, since a live crash event
   can still pick up a stray foreign dump sitting in the same directory. What the dump itself says
-  lands in a `native_crash` context on every kept event whose dump PARSED: crash time, crashed
+  lands in a `native_crash` context on every event of ours whose dump PARSED: crash time, crashed
   version, uploading version, the main module's file name, the module count, whether the dump was
   found at startup, and which corrections fired. A dump the reader cannot parse keeps its event
   untouched and carries no context block, so the absence of one is itself a signal when triaging.
   Note the SDK decrements its 10-minidumps-per-session budget at capture time, before `beforeSend`
-  runs, so dropped foreign dumps still consume it.
+  runs, so foreign dumps consume it too, even though their dumps never upload.
 - **Native debug files** ride the same gate: the Windows release build (`scripts/build.js`) also
   uploads node-pty's shipped Windows PDBs (`node_modules/node-pty/prebuilds/win32-*/`) as Sentry
   debug files, so a native crash inside `conpty.node` symbolicates server-side to function and
@@ -427,6 +661,10 @@ in one Sentry org, one triage surface.
 - Task titles, descriptions, or any user-generated content
 - File paths, project names, or code (stack-frame paths are normalized to the app root before
   they leave the machine)
+- Console output in Sentry breadcrumbs, except lines under a short list of diagnostic tags, which
+  are rebuilt without error text and with paths redacted. Click breadcrumbs lose their title and
+  label text, and request breadcrumbs lose any URL that is not Kangentic's own (see "Breadcrumbs
+  are filtered at the source" above)
 - Usernames, emails, or any personally identifiable information
 - Task creation, task start, or mid-board task moves (only done-entry is tracked)
 - Per-feature content: `feature_used` says a feature was touched that day, never what it was
@@ -503,7 +741,7 @@ Sentry). `KANGENTIC_ERROR_REPORTING` controls Sentry alone:
 | `KANGENTIC_TELEMETRY` | `0` or `false` | ALL telemetry disabled: analytics and error reporting (opt-out) |
 | `KANGENTIC_TELEMETRY` | `1` or `true` | Telemetry enabled, even in dev builds (for local debugging) |
 | `KANGENTIC_TELEMETRY` | *(unset)* | Enabled in production only (default) |
-| `KANGENTIC_ERROR_REPORTING` | `0` or `false` | Error reporting disabled; analytics unaffected, except `foreign_minidump_dropped`, which fires from the Sentry `beforeSend` hook and so never installs |
+| `KANGENTIC_ERROR_REPORTING` | `0` or `false` | Error reporting disabled; analytics unaffected |
 | `KANGENTIC_ERROR_REPORTING` | `1` or `true` | Error reporting enabled, even in dev builds (unless `KANGENTIC_TELEMETRY=0`) |
 | `KANGENTIC_ERROR_REPORTING` | *(unset)* | Inherits the `KANGENTIC_TELEMETRY` behavior |
 | `KANGENTIC_APTABASE_APP_KEY` | an Aptabase app key | Replaces the production key; an `A-DEV-*` key routes every event to `http://localhost:3000` (see "Local verification") |

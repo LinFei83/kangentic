@@ -25,6 +25,7 @@ import { buildCellWidthTable, loadDemoChanges, loadDemoEnds, loadDemoHistory, lo
 // The cap main keeps per session, so a replayed trail slices exactly as a pushed one does.
 import { MESSAGE_TRAIL_MAX_ENTRIES } from '../src/main/agent/message-trail-tracker';
 import { SCENES } from '../tests/captures/scenes';
+import { DEFAULT_CONFIG } from '../src/shared/types';
 
 // Vite keeps an ambient NODE_ENV, and "development" from a shell or IDE ships React's development
 // build plus every `import.meta.env.DEV` branch while the build still exits 0 (measured: the
@@ -86,9 +87,11 @@ function hashedName(name: string, source: string): string {
 /**
  * Everything the page fetches besides Vite's bundle, planned once so the HTML tags and the
  * emitted files agree on the hashed names: one JSON file per recording under `recordings/` (the
- * timed stream, the serialized final frame, its last lines, its grid, how the capture ended, and
- * the frame timeline a terminal on any other grid plays instead of the bytes),
- * then the four classic scripts in the order they must execute. The seed embeds only each
+ * timed stream, the serialized final frame, its last lines, its grid, and how the capture ended),
+ * then the four classic scripts in the order they must execute. The recording's frame timeline
+ * stays in the fixture and is not shipped: a terminal on any other grid plays the stream through
+ * the page's own emulator (demo/replay-emulator.ts), and the timeline was a third to half of
+ * every file. The seed embeds only each
  * session's final frame (a still and a first paint need nothing more); the streams are fetched
  * when a terminal mounts.
  */
@@ -100,7 +103,7 @@ function planDemoAssets(version: string, base: string): { scripts: string[]; fil
   // at that grid (demo-dataset.ts, the sessions.resize wrapper).
   interface IndexEntry { file: string; cols: number; rows: number; tiled?: IndexEntry }
   const emitRecording = (entry: DemoRecordingEntry): IndexEntry => {
-    const source = JSON.stringify({ serialized: entry.serialized, stream: entry.stream, peek: entry.peek, cols: entry.cols, rows: entry.rows, stopReason: entry.stopReason, frameTimeline: entry.frameTimeline });
+    const source = JSON.stringify({ serialized: entry.serialized, stream: entry.stream, peek: entry.peek, cols: entry.cols, rows: entry.rows, stopReason: entry.stopReason });
     const fileName = hashedName(`recordings/${entry.file}`, source);
     files.push({ fileName, source });
     return { file: fileName.slice('recordings/'.length), cols: entry.cols, rows: entry.rows };
@@ -126,13 +129,14 @@ function planDemoAssets(version: string, base: string): { scripts: string[]; fil
     sessions: Object.fromEntries(Object.entries(recordings.sessions).map(([id, entry]) => [id, indexEntryOf(entry)])),
     spawns: Object.fromEntries(Object.entries(recordings.spawns).map(([key, entry]) => [key, indexEntryOf(entry)])),
     terminals: Object.fromEntries(Object.entries(recordings.terminals).map(([id, entry]) => [id, indexEntryOf(entry)])),
+    resumes: Object.fromEntries(Object.entries(recordings.resumes).map(([id, entry]) => [id, indexEntryOf(entry)])),
     geometry: recordings.geometry,
     transcriptsBase: `${base}transcripts/`,
     transcripts,
   };
   const tiledCount = Object.values(index.sessions).filter((entry) => entry.tiled).length;
-  console.log(`[demo] recordings emitted: ${Object.keys(index.sessions).length} sessions (${tiledCount} with a tiled sibling), ${Object.keys(index.spawns).length} spawn boots, ${Object.keys(index.terminals).length} terminal boots, ${Object.keys(transcripts).length} transcripts`);
-  // The guest pages: what each project renders at its dev URL, for the Browser pane's iframe
+  console.log(`[demo] recordings emitted: ${Object.keys(index.sessions).length} sessions (${tiledCount} with a tiled sibling), ${Object.keys(index.spawns).length} spawn boots, ${Object.keys(index.terminals).length} terminal boots, ${Object.keys(index.resumes).length} resume boots, ${Object.keys(transcripts).length} transcripts`);
+  // The guest pages: what each project's dev URL shows, for the Browser pane's iframe
   // stand-in (demo/webview-shim.js). Keyed by the URL the pane shows, valued by the hashed file.
   const guestPages: Record<string, string> = {};
   for (const project of DEMO_PROJECTS) {
@@ -154,8 +158,34 @@ function planDemoAssets(version: string, base: string): { scripts: string[]; fil
   return { scripts: scripts.map((script) => script.fileName), files };
 }
 
+/**
+ * The field names each POPULATED nested block of `AppConfig` carries, so `demo/boot.js` can refuse
+ * a `state=` blob that names only some of them.
+ *
+ * A config override is merged with a shallow `Object.assign`, twice (boot.js into
+ * `__mockConfigOverrides`, then the mock into its own defaults), so a nested block REPLACES the
+ * default rather than merging into it. Naming one field of `monitor` therefore leaves the other
+ * six undefined, on settings nothing in the frame shows. The scene registry's own test catches
+ * that for `SCENES`; a hand-written `state=` URL has no such check, and that is the audience the
+ * README points at this escape hatch. Emitted rather than restated in boot.js, which is a classic
+ * script and cannot import the type.
+ *
+ * Empty and non-object defaults are skipped: they have no shape to match, and a map keyed by
+ * project id (`workspaceByProject`) is meant to carry only the entries a scene names.
+ */
+function nestedConfigShape(): Record<string, string[]> {
+  const shape: Record<string, string[]> = {};
+  for (const [key, value] of Object.entries(DEFAULT_CONFIG as Record<string, unknown>)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+    const fields = Object.keys(value);
+    if (fields.length === 0) continue;
+    shape[key] = fields;
+  }
+  return shape;
+}
+
 function buildScenesScript(version: string, recordingsScript: string): string {
-  return `window.__demoScenes = ${JSON.stringify(SCENES)};\nwindow.__demoVersion = ${JSON.stringify(version)};\n${recordingsScript}`;
+  return `window.__demoScenes = ${JSON.stringify(SCENES)};\nwindow.__demoVersion = ${JSON.stringify(version)};\nwindow.__demoConfigShape = ${JSON.stringify(nestedConfigShape())};\n${recordingsScript}`;
 }
 
 /** The frame every scene is authored at: the site's 1600 by 1000 (demo/stage.html). */

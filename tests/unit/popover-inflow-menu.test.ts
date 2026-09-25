@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { hasJsxOptOutMarker, hasLineOnlyOptOutMarker } from './helpers/opt-out-marker';
 
 // Guards the combobox-clipping regression: a scrollable menu rendered IN FLOW as
 // `absolute top-full ...` is confined to its nearest clipping ancestor, because
@@ -48,11 +49,7 @@ import path from 'node:path';
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const RENDERER_DIR = path.join(REPO_ROOT, 'src/renderer');
 
-const OPT_OUT_MARKER = 'popover-inflow-ok:';
-/** A runaway guard on the upward comment walk, not the association rule. The
- *  rule is the contiguous comment block (see `hasOptOut`); this only stops a
- *  file that is one enormous comment from being walked end to end. */
-const MARKER_WALK_CAP = 60;
+const OPT_OUT_MARKER = 'popover-inflow-ok';
 
 function collectSourceFiles(directory: string): string[] {
   const found: string[] = [];
@@ -134,7 +131,19 @@ const HOOK_CALL = 'usePopoverPosition(';
 const HOOK_DEFINITION_FILE = path.join(RENDERER_DIR, 'hooks', 'usePopoverPosition.ts');
 
 const TRIGGER_WIDTH_READ = 'getBoundingClientRect().width';
-const WIDTH_OPT_OUT_MARKER = 'popover-width-ok:';
+/**
+ * Line-only on purpose: what it waives is a single
+ * `getBoundingClientRect().width` read, and a file may hold several, so a
+ * marker that reached into the comment block above would waive the wrong one.
+ *
+ * That association rule is right, but it used to be the reason this marker kept
+ * a private `line.includes(...)` reader, which was a non-sequitur: line-only and
+ * shared are independent. `hasLineOnlyOptOutMarker` is the degenerate walk, so
+ * the association is unchanged while the marker picks up the two properties the
+ * other rules have - a reason is required, and a marker has to open a comment,
+ * so prose quoting one no longer counts as taking it.
+ */
+const WIDTH_OPT_OUT_MARKER = 'popover-width-ok';
 
 /**
  * Line indexes where a file that calls `usePopoverPosition` measures a trigger
@@ -155,9 +164,10 @@ const WIDTH_OPT_OUT_MARKER = 'popover-width-ok:';
 function triggerWidthReadLineIndexes(fileText: string): number[] {
   if (!fileText.includes(HOOK_CALL)) return [];
   const offenders: number[] = [];
-  fileText.split('\n').forEach((line, lineIndex) => {
+  const lines = fileText.split('\n');
+  lines.forEach((line, lineIndex) => {
     if (!line.includes(TRIGGER_WIDTH_READ)) return;
-    if (line.includes(WIDTH_OPT_OUT_MARKER)) return;
+    if (hasLineOnlyOptOutMarker(lines, lineIndex, WIDTH_OPT_OUT_MARKER)) return;
     offenders.push(lineIndex);
   });
   return offenders;
@@ -222,28 +232,10 @@ function dropdownCallOffsetsMissingFixedStrategy(fileText: string): number[] {
  * climb the contiguous comment block above it. Anything else ends the search.
  */
 function hasOptOut(lines: string[], lineIndex: number): boolean {
-  if (lines[lineIndex]?.includes(OPT_OUT_MARKER)) return true;
-
-  let passedOpeningTag = false;
-  for (let scan = lineIndex - 1; scan >= 0 && lineIndex - scan <= MARKER_WALK_CAP; scan--) {
-    const trimmed = lines[scan].trim();
-    if (trimmed === '') continue;
-    if (trimmed.includes(OPT_OUT_MARKER)) return true;
-
-    const isComment = /^(\/\/|\/\*|\*)/.test(trimmed);
-    if (isComment) continue;
-    // A closing tag means we have climbed out of this element into a sibling:
-    // whatever is above belongs to something else.
-    if (trimmed.startsWith('</')) return false;
-    if (passedOpeningTag) return false;
-    // The opening tag itself. Above it, only a comment block still counts.
-    if (trimmed.startsWith('<')) {
-      passedOpeningTag = true;
-      continue;
-    }
-    // Still inside the attribute list.
-  }
-  return false;
+  // The JSX-aware walk now lives in helpers/opt-out-marker.ts, which this file's
+  // implementation became the basis for. It climbs the element's attribute list
+  // and the comment block above its opening tag, and stops at a sibling.
+  return hasJsxOptOutMarker(lines, lineIndex, OPT_OUT_MARKER);
 }
 
 const inFlowClassOffenders: string[] = [];
@@ -278,7 +270,7 @@ describe('in-flow scrollable popover menus (clipping regression guard)', () => {
       inFlowClassOffenders,
       `These elements position themselves in flow (absolute top-full / bottom-full) AND scroll or cap their own height, so an ancestor's overflow clip will cut them off.\n`
         + `Portal them instead: OverlayPopover with the \`portal\` prop plus usePopoverPosition({ strategy: 'fixed' }) - see src/renderer/components/dialogs/ModelCombobox.tsx.\n`
-        + `If the element genuinely has no clipping ancestor at any mount site, add a "${OPT_OUT_MARKER} <reason>" comment on the line or just above it.\n\n`
+        + `If the element genuinely has no clipping ancestor at any mount site, add a "${OPT_OUT_MARKER}: <reason>" comment on the line or just above it.\n\n`
         + inFlowClassOffenders.join('\n'),
     ).toEqual([]);
   });
@@ -289,7 +281,7 @@ describe('in-flow scrollable popover menus (clipping regression guard)', () => {
       `These usePopoverPosition calls ask for mode: 'dropdown' without strategy: 'fixed', so the hook writes top/bottom: 100% imperatively and the menu stays IN FLOW - clipped by any ancestor overflow: hidden / overflow-y-auto, no matter how high its z-index.\n`
         + `This is the shape a class-string scan cannot see (there is no \`top-full\` class to match), and it was the pre-fix shape of most of the popovers .claude/rules/popover-escapes-clipping.md was written for.\n`
         + `Pass { mode: 'dropdown', strategy: 'fixed' } and render through OverlayPopover's \`portal\` prop - see src/renderer/components/dialogs/ModelCombobox.tsx.\n`
-        + `If the popover genuinely has no clipping ancestor at any mount site, add a "${OPT_OUT_MARKER} <reason>" comment on the call line or just above it.\n\n`
+        + `If the popover genuinely has no clipping ancestor at any mount site, add a "${OPT_OUT_MARKER}: <reason>" comment on the call line or just above it.\n\n`
         + inFlowDropdownCallOffenders.join('\n'),
     ).toEqual([]);
   });
@@ -333,13 +325,13 @@ describe('in-flow scrollable popover menus (clipping regression guard)', () => {
     const offending = '  className="absolute top-full max-h-48 overflow-y-auto"';
 
     // On the line itself.
-    expect(hasOptOut([`${offending} // ${OPT_OUT_MARKER} inline`], 0)).toBe(true);
+    expect(hasOptOut([`${offending} // ${OPT_OUT_MARKER}: inline`], 0)).toBe(true);
 
     // Among the element's own attributes, however long the justification runs.
     const inAttributes = [
       '<OverlayPopover',
       '  open={open}',
-      `  // ${OPT_OUT_MARKER} no clipping ancestor at any mount site.`,
+      `  // ${OPT_OUT_MARKER}: no clipping ancestor at any mount site.`,
       ...Array.from({ length: 12 }, (unused, index) => `  // continued reason line ${index}`),
       offending,
     ];
@@ -348,7 +340,7 @@ describe('in-flow scrollable popover menus (clipping regression guard)', () => {
     // In the comment block above the opening tag, with attributes in between -
     // the shape TemplateTextField uses.
     const aboveTag = [
-      `// ${OPT_OUT_MARKER} no clipping ancestor at its only mount site.`,
+      `// ${OPT_OUT_MARKER}: no clipping ancestor at its only mount site.`,
       '// A second line of justification.',
       '<div',
       '  data-testid={`${testId}-inline-picker`}',
@@ -358,7 +350,7 @@ describe('in-flow scrollable popover menus (clipping regression guard)', () => {
 
     // A marker on a SIBLING element does not carry over.
     const siblingsMarker = [
-      `// ${OPT_OUT_MARKER} this justifies the menu below, not the one after it.`,
+      `// ${OPT_OUT_MARKER}: this justifies the menu below, not the one after it.`,
       '<div className="absolute top-full max-h-48 overflow-y-auto" />',
       '<div',
       offending,
@@ -434,7 +426,7 @@ describe('trigger-width matching goes through usePopoverPosition', () => {
       triggerWidthReadOffenders,
       `These files call usePopoverPosition AND read a trigger width themselves. Measured in a later layout effect and passed through style.width, that width lands one commit after the hook has already measured and placed the menu, so the first open per mount is positioned against an inflated shrink-to-fit width.\n`
         + `Pass { matchTriggerWidth: true } to the hook instead (it writes the width before it measures) and delete the measurement - see src/renderer/components/dialogs/Combobox.tsx.\n`
-        + `If the read is genuinely not sizing the popover, add a "${WIDTH_OPT_OUT_MARKER} <reason>" comment on the line.\n\n`
+        + `If the read is genuinely not sizing the popover, add a "// ${WIDTH_OPT_OUT_MARKER}: <reason>" comment on the line itself - the reason is required, and this marker is read line-only, so a comment above waives nothing.\n\n`
         + triggerWidthReadOffenders.join('\n'),
     ).toEqual([]);
   });
@@ -461,8 +453,22 @@ describe('trigger-width matching goes through usePopoverPosition', () => {
 
     // The marker waives the line.
     const waived = [...preFix];
-    waived[6] = `${waived[6]} // ${WIDTH_OPT_OUT_MARKER} sizes a sibling, not the popover`;
+    waived[6] = `${waived[6]} // ${WIDTH_OPT_OUT_MARKER}: sizes a sibling, not the popover`;
     expect(triggerWidthReadLineIndexes(waived.join('\n'))).toEqual([]);
+
+    // A bare marker does not. This marker accepted one until it moved onto the
+    // shared reader, which is the whole gain here: the association rule is the
+    // same line-only one, but an unexplained waiver is no longer a waiver.
+    const bare = [...preFix];
+    bare[6] = `${bare[6]} // ${WIDTH_OPT_OUT_MARKER}:`;
+    expect(triggerWidthReadLineIndexes(bare.join('\n'))).toEqual([6]);
+
+    // Neither does a comment ABOVE the line, which is what line-only means and
+    // is why this marker does not use the block-climbing rule: one line here
+    // can hold several width reads, and a marker above could not say which.
+    const above = [...preFix];
+    above.splice(6, 0, `      // ${WIDTH_OPT_OUT_MARKER}: sizes a sibling, not the popover`);
+    expect(triggerWidthReadLineIndexes(above.join('\n'))).toEqual([7]);
   });
 
   it('sizes the popover before it measures it', () => {

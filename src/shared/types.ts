@@ -1877,6 +1877,26 @@ export interface UsageKpis {
   compactionCount: number;
   totalDurationMs: number;
   /**
+   * Milliseconds the agent was actually WORKING in this window, from the
+   * activity-interval ledger, and how many sessions that ledger covers here.
+   *
+   * These two travel together because they are the numerator and denominator
+   * of one average. `sessionCount` above counts `usage_history` rows, which is
+   * a different and larger population: per-interval recording shipped later,
+   * so dividing `activeMs` by `sessionCount` would mix two ledgers and
+   * under-report every historical range.
+   *
+   * Active means agent-working, not session-open. `totalDurationMs` above is
+   * the agent's own wall clock, which counts every hour a session sat idle;
+   * measured on the dogfooding install, active time is 39% of it. This is the
+   * metric Claude Code publishes as `claude_code.active_time.total`.
+   *
+   * `activeSessionsCovered` of 0 means the ledger reaches none of this range,
+   * which the UI reports as "not covered" rather than as zero activity.
+   */
+  activeMs: number;
+  activeSessionsCovered: number;
+  /**
    * Turn-derived totals (conversation_turn_usage; true per-turn tokens).
    *
    * MAIN THREAD ONLY. These four, and both chart series, count the driver's
@@ -1908,11 +1928,23 @@ export interface UsageKpis {
    *  already inside the four `subagent*` totals above. Zero for an agent that
    *  forbids nesting (Gemini) or reports no depth. */
   subagentNestedCount: number;
-  /** Tokens per hour over the effective window (turn-derived); null when no turn data. */
+  /** Main-thread turn tokens over the whole selected range, idle time
+   *  included. Null for a range with no sessions. */
   burnRateTokensPerHour: number | null;
-  /** Dollars per hour via proportional allocation of each session's reported
-   *  cost across its turns by token share. API-equivalent and approximate;
-   *  null when no cost or no turn data is available. */
+  /**
+   * Ledger cost over that SAME range, so `rate x range hours` reproduces
+   * `totalCostUsd` and the two lines describe one window.
+   *
+   * It used to divide turn-ALLOCATED cost (each session's cost spread across
+   * its turns by token share) by the range, which covers only the span the
+   * turn ledger reaches - about 29% of lifetime cost on the dogfooding
+   * install - while the Cost tile showed the full ledger. Dividing one tile by
+   * the other implied two different window lengths. That allocation is still
+   * the right input for the per-bucket burn CHART, which needs cost attributed
+   * to a timestamp; it is wrong for a headline rate beside a full-range total.
+   *
+   * API-equivalent list price. Null when no session or no cost is in range.
+   */
   burnRateUsdPerHour: number | null;
 }
 
@@ -1986,7 +2018,7 @@ export interface EffortUsageBreakdown {
 
 /** Per-project sub-totals for the app-wide rollup's comparison table. All
  *  fields fold out of the rows already read for the range (zero extra
- *  queries); ratios (cost share, blended $/Mtok, avg session) are derived
+ *  queries); ratios (cost share, avg active time) are derived
  *  client-side from these. */
 export interface ProjectUsageSummary {
   projectId: string;
@@ -2000,6 +2032,11 @@ export interface ProjectUsageSummary {
   linesRemoved: number;
   filesChanged: number;
   totalDurationMs: number;
+  /** Active (agent-working) ms in range, and the sessions the interval ledger
+   *  covers. Same pair and same reason as on `UsageKpis`: the average is over
+   *  `activeSessionsCovered`, never over `sessionCount`. */
+  activeMs: number;
+  activeSessionsCovered: number;
   /** Most recent session start in range (epoch ms); null when no sessions. */
   lastActiveMs: number | null;
   /** Dominant agent by tokens in range; null when none recorded. */
@@ -2082,6 +2119,38 @@ export interface UsageDashboardStats {
    * name outside the adapters.
    */
   subagentBlindAgents: string[];
+  /**
+   * What this window's ledger ALREADY holds for the sessions the renderer is
+   * about to layer its in-memory live overlay on top of.
+   *
+   * The Cost and Tokens tiles add `useLiveUsageAggregate` to the ledger totals
+   * for instant reactivity. But a running session is upserted into
+   * `usage_history` every 45s by the metrics timer, so the ledger already
+   * carries it: adding the overlay on top counted it twice, which is why the
+   * Cost tile floated $758 above the by-model / by-agent / by-effort
+   * breakdowns, none of which get an overlay. The renderer subtracts this
+   * first, so the overlay contributes only the not-yet-snapshotted delta and
+   * the tile equals the breakdown sum whenever nothing is running.
+   *
+   * Zero when no live session is in scope, and when the range is a day drill
+   * or custom window (those pass no live sessions at all).
+   *
+   * Cost only: the token tiles read the per-turn ledger, which is written at
+   * index time rather than live, so there is no token overlay to correct.
+   */
+  liveLedgerBaseline: { costUsd: number };
+  /**
+   * Oldest timestamp in the per-turn ledger across the scoped projects, or
+   * null when no project has turn rows.
+   *
+   * The token and cost ledgers do not start at the same time. `usage_history`
+   * reaches back to the install's first session; per-turn capture shipped
+   * later, and the CLI prunes the transcripts that would let us backfill it.
+   * So when `rangeStartMs` is earlier than this, the token figures cover a
+   * genuinely shorter span than the cost beside them, and the UI says so
+   * rather than letting a June-onward number read as a March-onward one.
+   */
+  earliestTurnMs: number | null;
   /** Present only for scope.kind === 'all'. */
   perProject?: ProjectUsageSummary[];
   /** Projects whose DB was missing or unreadable and were skipped (app-wide scope). */
@@ -3001,6 +3070,31 @@ export interface AppConfig {
   terminalPanelVisible: boolean;
   animationsEnabled: boolean;
   statusBarVisible: boolean;
+  /**
+   * Chromium hardware rendering for the app window and terminals.
+   *
+   * A plain boolean, never a tri-state. An "automatic" that silently resolved
+   * to software would leave the control reading Automatic while acceleration
+   * was off, which is a control that lies about its own state. The value
+   * always matches what the app is actually doing, and the recovery path in
+   * index.ts SETS it to false rather than shadowing it. Being genuinely
+   * binary, it renders as a toggle like every other boolean here, including
+   * `animationsEnabled` beside it in the same tab.
+   *
+   * Read synchronously at module scope, before app.whenReady(), because
+   * app.disableHardwareAcceleration() only works before ready.
+   */
+  graphicsAccelerationEnabled: boolean;
+  /**
+   * Who last turned `graphicsAccelerationEnabled` off, or null while it is on.
+   *
+   * The only reason this exists: a later GPU failure must never rewrite a
+   * choice the user made themselves, and the Settings callout explaining the
+   * downgrade must show for our 'off' and not for theirs. Everything else
+   * about the incident (the death sequence, counts, timestamps, the adapter)
+   * lives in the Sentry escalation record, which is where it gets read.
+   */
+  graphicsAccelerationOffBy: 'app' | 'user' | null;
   diffViewMode: 'split' | 'inline'; // split = side-by-side, inline = unified
   diffDefaultScope: GitDiffScope; // default scope a freshly opened Changes panel uses
   diffIgnoreWhitespace: boolean; // hide whitespace-only changes in the diff
@@ -3539,6 +3633,20 @@ export type SerializedTileNode =
       sizes: number[];
     };
 
+/**
+ * What a config write reports back. `persisted` is false when the write did not reach
+ * disk - `ConfigManager.save()` / `saveProjectOverrides()` degrade rather than throw
+ * (see `src/main/safe-write.ts`), so without this the renderer could not tell a stored
+ * setting from a dropped one.
+ *
+ * Only the settings panel acts on it, and deliberately so: these channels also carry
+ * window-layout blobs, model caches and announcement dismissals, none of which
+ * represent something a user just asked for. Sentry DESKTOP-1C.
+ */
+export interface ConfigSetResult {
+  persisted: boolean;
+}
+
 export const DEFAULT_CONFIG: AppConfig = {
   theme: 'dark',
   themeFollowsSystem: false,
@@ -3553,6 +3661,11 @@ export const DEFAULT_CONFIG: AppConfig = {
   terminalPanelVisible: true,
   animationsEnabled: true,
   statusBarVisible: true,
+  // Matches today's behaviour exactly: the app has never set a Chromium GPU
+  // switch, so Electron's own default (hardware on) is what every existing
+  // install already runs. Upgrading changes nothing and needs no migration.
+  graphicsAccelerationEnabled: true,
+  graphicsAccelerationOffBy: null,
   diffViewMode: 'split',
   diffDefaultScope: 'working',
   diffIgnoreWhitespace: false,
@@ -3764,9 +3877,27 @@ export interface HostMemorySample {
 /** Pushed when host commit headroom crosses below the warning threshold (an
  *  edge-triggered, hysteresis-gated event - see `evaluateHostMemoryPressure`).
  *  Not a per-tick heartbeat. */
+/** How this launch is rendering, and whether the user still needs telling. */
+export interface GpuGraphicsStatus {
+  /** True when Chromium was started with --disable-gpu and --in-process-gpu.
+   *  The terminal renderer reads this to stop retrying WebGL forever against
+   *  a context it can never get (src/renderer/utils/terminal-webgl.ts). */
+  softwareRendering: boolean;
+  /** True exactly once, on the launch that recovered from a GPU-fatal run.
+   *  Reading the status consumes it. */
+  noticePending: boolean;
+}
+
 export interface HostMemoryPressureEvent {
   sample: HostMemorySample;
   activeAgentCount: number;
+}
+
+/** Pushed when host commit headroom recovers past the hysteresis line after a
+ *  warning was latched - the clear-side edge for `HostMemoryPressureEvent`.
+ *  Fires once per recovery, never on a healthy tick with no prior warning. */
+export interface HostMemoryRecoveryEvent {
+  sample: HostMemorySample;
 }
 
 // === Backlog ===
@@ -5783,15 +5914,16 @@ export interface ElectronAPI {
   config: {
     get: () => Promise<AppConfig>;
     getGlobal: () => Promise<AppConfig>;
-    set: (config: DeepPartial<AppConfig>) => Promise<void>;
+    set: (config: DeepPartial<AppConfig>) => Promise<ConfigSetResult>;
     /** Synchronous, blocking persist of a config partial. Used only on the quit/unload
      *  path so the final state reaches disk before the renderer tears down (an async
-     *  set() can be dropped mid-teardown). Same merge semantics as set(). */
+     *  set() can be dropped mid-teardown). Same merge semantics as set(). Returns
+     *  nothing on purpose: there is no renderer left to tell. */
     setSync: (config: DeepPartial<AppConfig>) => void;
     getProjectOverrides: () => Promise<DeepPartial<AppConfig> | null>;
-    setProjectOverrides: (overrides: DeepPartial<AppConfig>) => Promise<void>;
+    setProjectOverrides: (overrides: DeepPartial<AppConfig>) => Promise<ConfigSetResult>;
     getProjectOverridesByPath: (projectPath: string) => Promise<DeepPartial<AppConfig> | null>;
-    setProjectOverridesByPath: (projectPath: string, overrides: DeepPartial<AppConfig>) => Promise<void>;
+    setProjectOverridesByPath: (projectPath: string, overrides: DeepPartial<AppConfig>) => Promise<ConfigSetResult>;
     syncDefaultToProjects: (partial: DeepPartial<AppConfig>) => Promise<number>;
     /** Fires after ANY window's config:set persists (including this one). Bare signal;
      *  re-fetch via config.get()/loadConfig() to pick up the new effective config. Lets
@@ -5944,12 +6076,35 @@ export interface ElectronAPI {
     checkForUpdate: () => Promise<void>;
     installUpdate: () => Promise<void>;
     onUpdateDownloaded: (callback: (info: UpdateDownloadedInfo) => void) => () => void;
+    /**
+     * This install cannot update itself until the user moves it (DESKTOP-1A).
+     * Carries the whole sentence to toast: main composes and latches it, so the
+     * renderer neither formats nor deduplicates. The updater's only other push
+     * is `onUpdateDownloaded`; ordinary update failures stay silent.
+     */
+    onUpdateBlocked: (callback: (message: string) => void) => () => void;
   };
 
   // Host memory pressure (Sentry DESKTOP-16): a push-only notification, no
   // corresponding invoke - main owns the sampler and decides when to fire.
   hostMemory: {
     onPressure: (callback: (event: HostMemoryPressureEvent) => void) => () => void;
+    onRecovery: (callback: (event: HostMemoryRecoveryEvent) => void) => () => void;
+  };
+
+  // Graphics state for THIS launch (Sentry DESKTOP-18/DESKTOP-W).
+  //
+  // A pull, not a push: both facts are decided during boot, before the
+  // renderer can be listening, and the escalation record behind them is
+  // cleared by then. Both travel together rather than `softwareRendering`
+  // coming from config, because on the launch that RECOVERS, main writes the
+  // setting inside whenReady - after createWindow - so a renderer reading
+  // config at boot would race it and see 'on'.
+  //
+  // `noticePending` is consumed by the read, so a renderer reload cannot
+  // re-toast the same incident. `softwareRendering` is not.
+  gpuHealth: {
+    readStatus: () => Promise<GpuGraphicsStatus>;
   };
 
   // Announcements (remote feed; active = filtered for this client in main.
@@ -6231,6 +6386,53 @@ export interface ElectronAPI {
      */
     onAgentInput: (callback: (webContentsId: number, active: boolean) => void) => () => void;
     /**
+     * An agent set or cleared the viewport this guest lays out against.
+     *
+     * The pane cannot observe this for itself: an override is a property of
+     * main's CDP session with the guest, and the guest's own element never
+     * changes size, so the page simply starts rendering at a width nothing on
+     * screen accounts for. `null` means the override was dropped.
+     *
+     * `webContentsId` identifies WHICH guest, since one window can host several
+     * panes and each must ignore the others'.
+     */
+    onViewportOverride: (
+      callback: (webContentsId: number, override: BrowserViewportOverride | null) => void,
+    ) => () => void;
+    /**
+     * The `<webview>` element's own size in CSS pixels.
+     *
+     * Only this side can measure it. Main's view is the whole app window, and
+     * the pane is one side of a split inside a task-detail window inside it,
+     * so a viewport fitted against main's number comes out unfitted. Reported
+     * on mount and whenever the element resizes (a splitter drag, a window
+     * resize).
+     */
+    setPaneWidgetSize: (webContentsId: number, width: number, height: number) => Promise<void>;
+    /** The override this guest is already under, asked once on registration so
+     *  a pane that mounted after it was set (a pop-out) still shows it. */
+    getViewportOverride: (webContentsId: number) => Promise<BrowserViewportOverride | null>;
+    /** Drop this guest's viewport override, from the pane's own chip. The
+     *  user's escape hatch when the agent that set it has finished. */
+    clearViewportOverride: (webContentsId: number) => Promise<boolean>;
+    /**
+     * Which tasks currently hold their one browser surface OFFSCREEN.
+     *
+     * The whole set on every change, never a delta: a renderer that missed one
+     * push would otherwise stay wrong for the rest of the session. The card
+     * globe and the Browser pill light up from this exactly as they do from
+     * `browserGuestTasks`, which only a real `<webview>` can write.
+     */
+    onOffscreenSurfaces: (callback: (taskIds: string[]) => void) => () => void;
+    /** The same set, asked for on mount and after an HMR update, since an
+     *  offscreen surface can sit unchanged for a whole session and a
+     *  push-only channel would leave a reloaded renderer blank. */
+    getOffscreenSurfaces: () => Promise<string[]>;
+    /** The user's Close, for a task whose surface is offscreen: there is no
+     *  guest to retire and no pane to unmount, so main destroys the offscreen
+     *  window directly. True when something was closed. */
+    closeOffscreenSurface: (taskId: string, projectId?: string | null) => Promise<boolean>;
+    /**
      * A file download started from a Browser pane has finished. The pane saves
      * silently to the OS Downloads folder (what Chrome does), so this push is
      * what stops an agent-triggered download from being invisible.
@@ -6278,6 +6480,9 @@ export interface ElectronAPI {
   // Conversation memory (search index) status + proactive surfaces.
   memory: {
     getStatus: () => Promise<MemoryStatus>;
+    /** Spawn + init the embedding worker ahead of the first Smart query, so
+     *  Quick Find's typing time covers the cold start. Fire-and-forget. */
+    prewarm: () => void;
     /** Purge the project's conversation index and re-run the backfill sweep
      *  (recovery from a corrupt/stale index). Resolves when the purge is done;
      *  the rebuild sweep continues in the background. */
@@ -6366,6 +6571,27 @@ export interface BrowserPaneRegisterInput {
   url: string | null;
   /** Where the pane is at registration time. Defaults to `showing`. */
   visibility?: BrowserPaneVisibility;
+}
+
+/**
+ * The viewport an agent has imposed on a Browser surface, as the renderer sees
+ * it.
+ *
+ * `measured` is the viewport the PAGE reported after the change settled, and it
+ * is what the pane's chip shows. It can differ from `requested`: a window loses
+ * its frame and the pane's chrome to the viewport and is capped by the display,
+ * and an override composes with the zoom factor. Showing the request would put
+ * a number on screen the page never laid out against.
+ */
+export interface BrowserViewportOverride {
+  /** Which mechanism produced it. `device-emulation` is the only one that can
+   *  leave the pane showing a crop of a larger layout. */
+  mechanism: 'device-emulation' | 'window-resize' | 'lane-resize';
+  requested: { width: number; height: number };
+  measured: { width: number; height: number };
+  deviceScaleFactor: number;
+  /** ISO 8601 UTC. */
+  appliedAt: string;
 }
 
 /** A finished Browser-pane download, reported to the renderer so it can toast. */
@@ -6664,6 +6890,18 @@ export interface ProcessMetrics {
   platform: NodeJS.Platform;
   arch: string;
   versions: { kangentic: string; electron: string; node: string; chrome: string };
+  /** The main process's own `process.memoryUsage()`, in bytes: how much of
+   *  its footprint is V8 heap (`heapUsedBytes` of `heapTotalBytes`), Node
+   *  external allocations (`externalBytes`, of which `arrayBuffersBytes` are
+   *  Buffers and ArrayBuffers), against its resident set (`rssBytes`). The
+   *  per-process table below cannot split those apart. */
+  main: {
+    rssBytes: number;
+    heapTotalBytes: number;
+    heapUsedBytes: number;
+    externalBytes: number;
+    arrayBuffersBytes: number;
+  };
   processes: {
     pid: number;
     type: string;

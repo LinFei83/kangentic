@@ -24,6 +24,9 @@ node demo/measure.mjs --geometry      # the grid each terminal surface fits, at 
 npm run demo:serve                    # serve dist/demo/ and stay up for a manual look
 npm run capture                       # build, then one still per scene and theme (and the marketing
                                       # video and walkthrough), into a gitignored captures/<timestamp>/
+npm run demo:posters                  # build first; every scene in clay and rust at 2x, verified and
+                                      # zipped with a manifest into dist/demo-posters-<version>.zip,
+                                      # the release asset the site's docs figures read
 ```
 
 `demo:serve` prints a board URL. The one to open for a look is `stage.html`, the fixed-size host a
@@ -40,9 +43,12 @@ serves none of this; the web build is a separate artifact and needs a static ser
 
 **A dataset change is not finished until the captures are re-run.** The web demo rebuilds itself on
 every release (`deploy-demo.yml`), and the marketing PNGs do not: no workflow runs `npm run capture`.
-The scene stills are shot FROM the built demo (`tests/captures/features/scenes.capture.ts` opens
-each registry scene by URL and screenshots it), so they cannot describe a state the live embed does
-not, but a PNG someone copied into the site stays as old as the day it was shot. The hover video
+The one set a workflow does shoot is the poster set (`npm run demo:posters`, driving only
+`scenes.capture.ts`; see "The poster set" below), which `release.yml` attaches to every release, so
+a docs figure's poster is as fresh as the release it names and never fresher. The scene stills are
+shot FROM the built demo (`tests/captures/features/scenes.capture.ts` opens each registry scene by
+URL and screenshots it), so they cannot describe a state the live embed does not, but a marketing
+PNG someone copied into the site stays as old as the day it was shot. The hover video
 (`agent-orchestration.capture.ts`) is now the only capture that seeds the dev server with
 `marketing-fixture.ts` (the walkthrough builds its own state), and
 `tests/unit/demo-dataset-consumer-parity.test.ts` keeps that seed and the build's in step; retire
@@ -101,8 +107,8 @@ On success the frame stamps `data-demo-ready="1"` and `data-demo-scene` on `<htm
 `{ type: 'kangentic-demo-ready', scene, version, focus }` to its parent; a page fades the frame in
 on that message. Ready fires only once the scene's `ready` element exists (a restored task window
 mounts a beat after the swimlanes, and a page lifting its poster on the message must not see the
-board without the window the caption describes). `focus` is the rect of the scene's `focus`
-element as fractions of the frame (`{ x, y, w, h }`), or null when the scene names none: a dialog
+board without the window the caption describes). `focus` is the rect around the scene's `focus`
+elements as fractions of the frame (`{ x, y, w, h }`), or null when the scene names none: a dialog
 scene is small inside a 1600 by 1000 frame scaled into a docs column, and the rect is what lets the
 page crop to the dialog without knowing the layout. It is posted once, at ready, and that is
 enough: the frame is a fixed 1600 by 1000 inside the iframe whatever the host does, so the
@@ -112,21 +118,89 @@ malformed `state=` renders a full-frame error card, logs the reason, posts
 `{ type: 'kangentic-demo-error', reason }`, and seeds nothing: a page can never caption a scene
 the visitor is not looking at.
 
+One more message goes out, and it is the only one tied to a keystroke.
+`{ type: 'kangentic-demo-escape', scene }` fires when an Escape keydown reaches the frame and the
+app has nothing of its own to close, so a host showing the frame in a dialog can close it. A host
+cannot do this itself: the frame is cross-origin, and the renderer's arrival-focus arbiter focuses
+a mounted terminal exactly as it does on the desktop, so from then on every key goes to the
+terminal's textarea and no listener on the parent page sees one. Nothing in `demo/` takes that
+focus and nothing here declines it, because the renderer never branches on being embedded.
+
+What counts as "the app owns this Escape" is not invented here. `boot.js` mirrors the ladder in
+`src/renderer/pop-out/PopOutWindowFrame.tsx`, which already answers the same question for a pop-out
+window: a focused text field, an open `[data-dismissable-layer]`, an open window frame, or Monaco's
+find widget each keep the key. Two differences, both deliberate. The listener is CAPTURE phase
+where the pop-out's is bubble, because xterm can consume Escape inside its own key pipeline and a
+bubble listener would never see the one case that matters; capture also reads the guards while an
+overlay about to be dismissed is still in the DOM, which is the property the pop-out's own comment
+relies on. And the xterm helper textarea is exempted from the focused-text-field guard, since it is
+a textarea and it is precisely the case that must post.
+
+A window owns the first Escape, as it does on the desktop: on the `task` and `windows-tiled`
+scenes the visitor presses Escape twice, once to close the window and once to close the host's
+dialog. That holds wherever the pointer is. On the desktop a task window's terminal keeps Escape
+for the agent while the pointer is over it, and a card click leaves the pointer exactly there once
+the window opens. Here the terminal replays a recording with no agent to interrupt, so `boot.js`
+does what the desktop does with the pointer outside: the terminal never gets the key, and the
+window closes through its own X.
+
+Three kinds of open frame are no sign the app will act on the key, so none of them is claimed:
+
+- The Command Terminal has no Escape of its own. Its layer hides on the panel-close combo, the
+  toggle, or a backdrop click. On the `command-terminal` scenes the first Escape is posted and the
+  window stays open.
+- Any frame at all, when the key sits in a terminal outside a task window: the bottom panel's, or
+  a Command Terminal's. xterm stops propagation of the Escape it handles, so the document listener
+  a window closes on never sees it. A visitor reaches this by clicking into the panel's terminal,
+  which light dismiss leaves the window open for.
+- A parked or retained window. A task window closed with a live Browser guest stays mounted at
+  zero opacity so the guest survives, and `WindowFrame` marks it `inert`. It has nothing left to
+  close, so on the `browser` scene the second Escape is posted.
+
+`tests/unit/scene-registry.test.ts` pins each marker `boot.js` looks for against the renderer file
+that stamps it, including the hover test it mirrors from `terminal-clipboard.ts` and the `inert`
+mark on a parked or retained window, so a rename fails there rather than quietly changing what the
+site's figures do.
+
 A `DemoState` (also the shape of every registry entry) is:
 
 ```ts
 {
-  config?: Record<string, unknown>;     // merged into window.__mockConfigOverrides; nested objects replace whole
+  config?: Record<string, unknown>;     // merged into window.__mockConfigOverrides; a nested block REPLACES the default
   tasks?: Array<{ id: string } & Record<string, unknown>>;   // patches merged by id into the sample install's rows
-  sessions?: Record<string, { activity?: 'thinking' | 'idle' | 'permission' }>;
+  sessions?: Record<string, {                   // patches on sessions the sample install seeds
+    activity?: 'thinking' | 'idle' | 'permission';    // the session's activity state
+    status?: 'running' | 'suspended' | 'queued';      // a paused or queued card
+    resuming?: true;                                  // a running session respawned on relaunch, not yet printing
+  }>;
   seeds?: Record<`__mock${string}`, unknown>;   // window globals the mock reads (diffs, branch summary, ...)
   steps?: Array<                                        // played before the reveal, in order
-    | { click: string; waitFor?: string }               // a selector to click
+    | { click: string; waitFor?: string }               // a selector to click; a text field is focused first
     | { type: string; text: string; waitFor?: string }  // a field selector and the text set in it
     | { press: string; waitFor?: string }               // a hotkey in the registry's spelling, held
   >;
 }
 ```
+
+A session patch is an input to the seed, not a pass over its output. `boot.js` publishes the
+merged patches as `window.__demoSessionPatches` before the seed runs, and the seed folds each one
+into its session before it derives anything from it: the row, the Monitor row, the usage, the
+activity stats, and a working session's clock. Applied to the rows afterwards, as it once was, a
+paused card's Monitor row still read working. `resuming` is the moment after a relaunch, when main
+has respawned the agent on its own conversation and it has not printed yet: the seed holds the
+session's usage back, so the card and the context bar read "Resuming agent..." rather than a
+model. A still holds that moment. The live frame plays what main sends next, the same way a
+visitor's Resume click does: first output a beat after page open, then the usage, which is when
+the card trades "Resuming agent..." for its model. The flag itself stays set, as it does in main:
+it means the session was spawned as a resume. `validateState` refuses a field outside these
+three, a value outside its set, and a resume on a session it also stops.
+
+A nested config block replaces the default rather than merging into it: the merge is a shallow
+`Object.assign` here and again in the mock. So naming one field of `monitor` would leave the other
+six undefined, on settings nothing in the frame shows, which is a figure that is quietly wrong
+rather than one that fails. A partial block is therefore REFUSED with the missing fields named, in
+a scene (`tests/unit/scene-registry.test.ts`) and in a `state=` URL (`validateState`, against the
+shape the build emits as `window.__demoConfigShape`). Spell the block whole.
 
 Example: open the Changes panel on a different file with no registry change.
 
@@ -156,7 +230,11 @@ beside the state it describes (nobody else knows what the frame shows) and emitt
 the boot script waits for it before the reveal, the smoke tier asserts it visible for every
 bootable entry, and the rig shoots after it. `focus`, when set, is the element whose rect rides
 the ready message; name the box a reader would crop to, never an overlay's backdrop (the smoke
-tier fails a focus that matches nothing, is empty, or is the whole frame). A scene may also say
+tier fails a focus that matches nothing, is empty, or is the whole frame). A selector list
+(`a, b`) names several elements and the rect is the box around all of them, which is how
+`session-resume` crops to its two cards; the smoke tier fails a list whose selectors do not each
+match exactly one element, so a single selector that starts matching a second one cannot quietly
+widen a figure's crop. A scene may also say
 `install: 'empty'`, which seeds no project at all (the
 welcome screen). `tests/unit/scene-registry.test.ts` pins the rest: a `state` scene has no
 steps, a `boot` scene carries only boot steps (a `click`, a `type` with `text`, or a `press` of a
@@ -172,22 +250,30 @@ lists it, with no other file touched. What the catalog holds, and where each com
 
 | Scene | reach | Built from |
 |---|---|---|
-| `welcome` | state | `install: 'empty'`: no project seeded, the boot gate is the scene's own ready element |
+| `welcome` | state | `install: 'empty'`: no project seeded, so the boot gate is the app having rendered at all |
+| `welcome-setup` | state | the same empty install plus `__mockAgentListOverrides`, one agent signed out and several not installed. No click: the screen opens its own setup list whenever anything is missing, which is what the seed produces |
 | `board` | boot | one click on the panel tab for the working middleware session |
+| `session-states` | boot | `sessions` patches: one session to `suspended` (a paused card in Planning), one to `queued` (Code Review). Both columns are in frame at 1600px, which Merge is not |
+| `session-resume` | boot | `sessions` patches: the Planning WebSocket session `resuming` and `idle` (a resumed agent starts idle and keeps its trail), the card below it `suspended`. `focus` names both cards, so the rect is the box around the pair. Show it as a still or its poster: live, the resume resolves about 1.5 seconds after page open, as the desktop's does |
+| `activity-overlay` | state | `config.developer.activityDebugOverlay`; the snapshot each panel draws is derived from that session's own seeded events by `activityStatsFor` (Activity stats below) |
+| `notification-toast` | state | `__mockInitialExit`, fired once when `sessions.onExit` registers, so App.tsx raises the toast itself; `notifications.toasts.durationSeconds` holds it up |
+| `board-config-change` | state | `__mockBoardConfigChanged`, fired once when `boardConfig.onChanged` registers, which App.tsx turns into its own reconciliation dialog |
+| `edit-columns`, `column-automation`, `column-handoff` | boot | the column's edit button (and, for `column-handoff`, the All columns tab), plus one shared `__mockSwimlanePatches` ladder (`COLUMN_LADDER` in `scenes.ts`) so the three describe one board: Claude Code plans on Opus 5 at xhigh and builds on Sonnet 5, Codex CLI reviews in an isolated session, Claude tests, and GitHub Copilot CLI merges, with handoff on at each change of agent. `column-automation` and `column-handoff` add the Code Review automation through `__mockAutomations`; `edit-columns` keeps both slots empty. Never the dataset: an automation draws a glyph in the BOARD column header, so seeding one there would change every figure already placed. The forms show Model and Effort because the sample install reports each agent's capabilities (`DEMO_AGENT_OVERRIDES`), and Codex has no Effort field because it takes none from Kangentic |
 | `board-filter`, `activity-tab` | boot | one click each (the Filter button, the panel's Activity tab) |
 | `announcements`, `announcement-dialog` | state, boot | `__mockActiveAnnouncements` seeded from the app's own `announcements.json` (dates dropped, `links` normalized); the dialog is one click on Learn more |
-| `task`, `browser` | state | `workspaceByProject` (a floating window at 0.64 of the frame, a maximized one) and `detail_view_state.browserOpen`; the guest is the project's dev URL (Browser guest below) |
+| `task`, `browser` | state | `workspaceByProject` (a floating window sized to its session's recording, a maximized one) and `detail_view_state.browserOpen`; the guest is the project's dev URL (Browser guest below) |
 | `windows-tiled` | state | `workspaceByProject` with two `tiled` windows under one horizontal split, in the footprint a dock produces; both sessions have a recording at the tiled width (Terminal recordings below) |
 | `conversation` | state | `workspaceByProject` with one `conversation` window anchored on the middleware session id; the transcript is the one recorded beside the session (Transcripts below) |
 | `dictation` | boot | `config.dictation.enabled` and a held `press` of `Mouse:Back` (Dictation below) |
+| `dictation-field` | boot | the same config, the gear and the Dictation tab, a `click` on the Settings search box (which focuses it), then the held `Mouse:Back`, so the chip anchors under a text field instead of a terminal (Dictation below) |
 | `changes`, `changes-working`, `changes-staged`, `changes-history` | state | a maximized window plus `detail_view_state` (`changesScope`, `changesSelectedFile`, `changesViewedFiles`, `changesHistoryOpen`, `changesSelectedCommit`); the scopes, the graph, and the commit diff come from the seed (Git history below) |
 | `changes-blame` | boot | the View options menu, then Show blame (blame is per-file view state, never persisted) |
 | `monitor`, `monitor-table` | boot | one click; the layout is `config.monitor.layout`, which persists |
-| `command-terminal` | boot | the title-bar toggle; the window's rect is the global `commandTerminalWorkspace` blob the scene seeds (the same 0.64 as the task window, for the same reason) |
+| `command-terminal` | boot | the title-bar toggle; the window's rect is the global `commandTerminalWorkspace` blob the scene seeds, sized to the terminal session's recording like the task window |
 | `command-terminal-tiled` | boot | the toggle, then New terminal, which docks a second window beside the first and boots the project's default agent from the boot recorded at the tiled width; the first switches to its own tiled recording as it narrows |
-| `usage`, `backlog`, `quick-find`, `new-task`, `edit-columns`, `completed-tasks` | boot | one click each; `usage` also sets `usageStatsScope` and `usageStatsPeriod` |
+| `usage`, `backlog`, `quick-find`, `new-task`, `completed-tasks` | boot | one click each; `usage` also sets `usageStatsScope` and `usageStatsPeriod` |
 | `quick-find-results` | boot | the palette, then `type` a query; the seed answers with a keyword match over its own rows (Quick Find below) |
-| `settings-<tab>`, one per tab in `settings-tabs.ts` | boot | the gear, then the tab button; generated from one tab-to-alt map the unit test pins to `SETTINGS_TABS` |
+| `settings-<tab>`, one per tab in `settings-tabs.ts` | boot | the gear, then the tab button; generated from one tab-to-alt map the unit test pins to `SETTINGS_TABS`. An entry may carry config: `settings-dictation` switches dictation on, since off it greys out every row below the switch |
 | `card-drag`, `card-menu`, `window-dock` | driver | a held drag over Executing, a right-click on a card, a window dragged to the right edge |
 
 Three things the catalog corrected against the source while it was seeded, recorded so the next
@@ -197,32 +283,54 @@ config, so a settings tab is a click, not a config key; the Monitor's layout doe
 
 Terminal type size is decided per scene by one rule: a terminal that is the SUBJECT of its
 figure is at native type, and a terminal that is context beside a panel may be held. Every task
-recording is 154 columns, and at the rig's launch (a real 2x scale, where the renderer rounds
-the 12px Consolas cell to 6.5 CSS px) the window manager's default window (0.58 of the frame)
-fits 142, so the seed holds the recording's grid at 0.92 of the type size. The floating scenes
-(`task`, `dictation`, `window-dock`, `command-terminal`, `conversation`) therefore open their
-window at 0.64 of the frame instead: 157 columns fit, the hold lands at 154 with the native cell
-(a held grid never scales up), and the terminal reads at the size the board's bottom panel does.
+recording is 154 columns, and the width 154 columns take depends on the display: xterm's WebGL
+renderer floors the cell to device pixels, so the 12px Consolas cell is 6.0 CSS px at 100
+percent, 6.4 at 125 and 6.5 at 200, and a machine without Consolas draws Courier New or its
+metric clone Liberation Mono (what CI's runner has, and so what the posters are shot with) at
+7.0. No fixed fraction of the frame fits all of them. The floating terminal scenes (`task`,
+`dictation`, `window-dock`, `command-terminal`) therefore mark their window `fitToRecording`
+with the session it shows, and the seed sizes it before the renderer mounts
+(`fitLayoutBlob` in `demo-dataset.ts`): the cell measured the way xterm's `CharSizeService`
+measures it and floored the way its renderer floors it, the scrollbar gutter measured the way
+`fit-addon.ts` measures it (the app's 8px on classic scrollbars, 0 on overlay or hidden ones),
+and the frame's border. The terminal then takes exactly the recording's columns at native
+type, and nothing is left empty on the right. At 100 percent the window comes out at about 0.58
+of the frame, the window manager's own default; at 2x with Liberation Mono, about 0.68. The rect
+carries about a row and a half of margin over the recording's 37 rows, so the recording's rows
+always fit whatever the face's line height; the spare rows show the rows above the recording's
+screen, as a taller terminal on the desktop does (Live replay below). The width is fixed at load,
+and against the 1600px frame the recordings are measured at (or the frame itself when that is
+wider), so a smaller embed keeps the stage's proportions.
+
+Before this, the floating scenes opened at 0.64 of the frame, sized for the rig's 2x Consolas
+cell, and two bands followed. At 100 percent the window fitted 170 columns and held 154 at
+native type, about 100px empty. At a 7.0 px cell it fitted 146, which the old width-only
+layout choice answered with the 115-column tiled recording at native type: a fifth of the pane
+empty, the v0.43.0 posters. The `conversation` scene keeps that plain 0.64 rect, since it has
+no terminal to fit.
 
 In a tiled figure the terminals ARE the subject, and a half-width pane holds a 154-column
 recording at about two-thirds type, so the two tiled scenes rest on a second recording of each
 session at the tiled width, the way the Command Terminal boots carry one
 (`terminal-<project>-tiled.json`): the manifest's `tiled` field names the sibling, the matrix
 records it at `geometry.taskWindowTiled` (or `commandTerminalTiled` for a Command Terminal
-session), and the seed shows whichever of the two the window's width asks for (Terminal
+session), and the seed shows whichever of the two fills more of the window's pane (Terminal
 recordings below). `windows-tiled` tiles the middleware and api-client windows in the footprint a
 dock produces (two panes at the engine's 750px minimum, at the floating window's height, so the
 rows stay 37 and only the width changes); `command-terminal-tiled` is the toggle and then New
 terminal, so its second window is the boot the frame starts for a visitor. Both terminals of each
 are at native type at the rig's launch.
 
-The same rule gives the Browser and Changes scenes their held terminal. The panel is the
+The same rule gives the Browser and Changes scenes their narrow terminal. The panel is the
 subject there, and the width a native terminal needs truncates the address bar and the note
-field, or clips a split diff mid-line. Because the middleware session now has a tiled recording,
-a pane narrower than the single width takes it (the seed's `layoutFor`), and those scenes hold
-the tiled recording at about 0.9 of the type size where they once held the single at 0.67 and
-0.71. Below the seed's 0.6 floor the terminal would play frames at native type instead, each row
-cut at the edge, so the context terminal is never narrowed past it.
+field, or clips a split diff mid-line. Because the middleware session has a tiled recording, a
+pane that narrow is shown better by it (the seed's `layoutFor`): about 110 to 118 columns
+against its 115, so at the configured type where the pane is at least 113 columns, and at about
+0.85 of it where it is narrower, the pane held at the grid it takes there. Either way the
+terminal fills the tall pane, with the rows above the recording's screen, where holding the
+recording at its own grid once left 300px empty below it. Below the seed's 0.6 floor the
+terminal would keep the configured type with each row cut at the edge, so the context terminal
+is never narrowed past it.
 
 One scene needs dataset work the sample install does not carry for every session: the
 conversation viewer opens on the one session with a transcript (Transcripts below). Two settings
@@ -272,22 +380,82 @@ events the pane waits on as the iframe loads. The renderer is untouched (a custo
 do this, since `webview` has no hyphen). What the iframe loads is `window.__demoGuestPages`,
 built at build time from the sample install: a project's Browser default URL (`dev_url` on the
 project, which the seed writes into its project config) maps to a bundled page under
-`demo/guest/` that is what the project renders there (`guest_page`), so the address bar shows the
-desktop's URL and the page shows the desktop's page. `demo/guest/contoso-web.html` is what
-`scripts/demo-repos/contoso-web`'s `src/App.tsx` renders signed in as the store's admin user,
-unstyled because the scaffold ships no stylesheet. Any other URL loads nothing. Inert: Inspect
-(finds nothing), Draw capture (rejects), history (always empty), and the agent driving the pane.
+`demo/guest/` that stands in for what the project serves there (`guest_page`), so the address bar
+shows the desktop's URL and the pane shows that app's page. Any other URL loads nothing. Inert:
+Inspect (finds nothing), Draw capture (rejects), history (always empty), and the agent driving the
+pane.
+
+`demo/guest/contoso-web.html` has the scaffold's data and an authored presentation. The data is
+`scripts/demo-repos/contoso-web`'s, signed in as the store's admin user (`server/store.ts`): that
+user, the one team subscription, and the two invoices, with a nav and a button that name the
+routes in `server/routes.ts`. No value on the page is invented. The layout and the styling are not
+the scaffold's. The scaffold ships no stylesheet, and its `src/App.tsx` renders a serif heading and
+one bullet, with no header and no invoices. That matters because kangentic.com's landing page shows
+this scene as its Embedded Browser panel, where the page is most of the picture.
+
+Building that presentation into `App.tsx` would have kept the page and the scaffold identical, and
+three recordings rule it out. The api-client session edits that file in both its single and its
+tiled recording, and each recorded diff carries the old file whole. The auth task's accept-edits
+boot (`spawn-task-cw-auth-acceptEdits.json`) reads it with the other front-end files and prints
+their combined line count. Changing the file means re-recording all three on Claude, and the new
+runs would change the api-client card's message trail, its Monitor peeks, and the `windows-tiled`
+scene. Regenerating the history fixture without them would also leave the api-client blame marking
+untouched lines as the agent's. So the guest drifts from the scaffold in presentation only. The
+next time those sessions are re-recorded, give `App.tsx` this page's header, subscription card, and
+invoices list plus a stylesheet, and rebuild the guest from what it renders.
+
+Three constraints hold whatever the page shows. It fetches nothing off-origin, like the rest of the
+build (the smoke tier asserts that on the `board` scene, which never loads this page), so no remote
+font or icon can land late or fail. It has one fixed light palette and no `prefers-color-scheme`,
+because the iframe sees the visitor's OS setting and not the frame's `theme=`. And it never
+animates, so stills and posters stay deterministic. `tests/unit/demo-guest-pages.test.ts` holds
+every page `DEMO_PROJECTS` names to all three.
 
 ### Dictation
 
 `demo/boot.js` replaces `getUserMedia` with a silent stream from an audio graph, so a press of
 the push-to-talk hotkey runs the renderer's whole pipeline with no permission prompt: the mock
 grants the mic, starts a stub engine session, and the app's own audio worklet runs over silence.
-The chip appears anchored to the target terminal in its live state, which is what `dictation`
-shows. The words themselves land in the terminal on release (the popup experience), drawn by
-the CLI's own echo of what main typed into the PTY, and no mock can draw that; so nothing is
-transcribed and nothing authored ships. A visitor who presses the button sees the chip and,
-on release, nothing typed, which is the one place the frame is quieter than the desktop.
+The chip appears anchored to the target in its live state: a task terminal in `dictation`, the
+Settings search box in `dictation-field`. The second one is the point of having both. Dictation
+types into any text field in the app, and a figure of the terminal alone reads as a terminal
+feature.
+
+Nothing is transcribed and nothing authored ships. The dataset answers `dictation.stop` with an
+empty string, which is what a silent microphone transcribes to. The mock's stock answer is a
+sentence, and in `dictation-field` a visitor who released the button would have it typed into the
+search box, filtering the tab away. In a terminal the words would be the CLI's own echo of what
+main typed into the PTY, which no mock can draw either. So a visitor who presses the button sees
+the chip and, on release, nothing typed, which is the one place the frame is quieter than the
+desktop.
+
+The Dictation tab reads `dictation.getInfo`, and the mock's own answer lists no models, so both
+model rows read None whatever the config says. The dataset answers it instead with main's
+`buildDictationInfo` (`src/main/transcription/dictation-info.ts`, the same function
+`TranscriptionService.getInfo` calls) over a seeded machine on the accurate tier
+(`DEMO_DICTATION_INFO`). The default config therefore selects what the desktop does: the Best
+accuracy preset, Streaming Zipformer live and Parakeet to refine, both cached and Ready.
+`tests/unit/demo-dictation-info.test.ts` fails if that answer ever loses a model. The answer is
+fixed at the default config: after a visitor changes Mode, the dropdowns follow the new choice
+but the status row under them still names the default pair.
+
+`dictation-field` resolves its target from `document.activeElement`, where `dictation` resolves
+it from the restored window's focus. So the scene needs DOM focus, which a boot `click` on a text
+field gives it. Under the boot veil that needs one more step: the veil hides the app with
+`visibility: hidden`, and Chromium focuses nothing under a hidden ancestor, so a click on a text
+field swaps the veil for opacity before it focuses. Every other scene keeps the visibility veil,
+so none of their terminals or dialogs take focus they did not have before. The scene also waits
+for the settings panel's slide-in to end before it presses: the chip anchors to the field wherever
+the field is at that moment, and the ready message measures the chip once.
+
+Where this scene can boot live, as checked against the build: a top-level page, `stage.html`, and
+a cross-origin iframe on a secure page (the site's case) all focus the field and post the chip's
+rect. Two hosts cannot. An `inert` iframe focuses nothing, so the ready gate times out; the embed
+snippet above uses `inert`. And a page that is not a secure context (plain http, or the
+`about:blank` host the smoke tier builds) has no `navigator.mediaDevices` in its frames, so the
+silent microphone is never installed and the chip shows the error. That second one is shared with
+`dictation`, whose gate is the chip alone and so boots on the error. A poster is shot in a real page
+and is unaffected by either.
 
 ### scenes.json, the hand-off to the site
 
@@ -305,7 +473,97 @@ figure's scene name (an unknown name or a `driver` scene fails the site build ra
 rendering the error card inside a captioned figure), and takes `alt` and `version` from it. A URL
 cannot lag the way a vendored package does, which is the failure `@kangentic/branding` plus
 `scripts/sync-brand.mjs` is known for. Placing frames on pages is the site's job (kangentic.com
-#78 and #79); this file and the registry are the whole app-side contract.
+#78 and #79); this file, the registry, and the poster set below are the whole app-side contract.
+
+### The poster set, the second hand-off
+
+A docs figure is an iframe of one scene, and before that frame boots, and instead of it in print,
+under no JS, on a phone, and in a browser without CSS trig functions, the figure shows a poster:
+a still of the same scene in the same theme. The site does not shoot its own (it would duplicate
+the rig, and it could never build the three `driver` scenes); the rig shoots them here and every
+release attaches the set:
+
+```
+demo-posters-<version>.zip
+  manifest.json
+  board.clay.frame.png
+  board.rust.frame.png
+  ...                       one pair per scene in scenes.json, driver scenes included
+```
+
+```json
+{ "version": "0.42.0", "frame": { "width": 1600, "height": 1000 }, "scale": 2,
+  "scenes": { "board": { "clay": "board.clay.frame.png", "rust": "board.rust.frame.png" }, ... },
+  "focus": { "board": { "clay": null, "rust": null },
+             "new-task": { "clay": { "x": 0.2375, "y": 0.1735, "w": 0.525, "h": 0.653 }, "rust": { ... } }, ... } }
+```
+
+The themes are `clay` and `rust`, the product pair the site embeds with (the rig's own default is
+`night,sand`, which the site does not use). Every poster is the frame at 2x, 3200 by 2000, with
+the 40px title bar kept; the site crops it. `version` is the string `scenes.json` carries, and the
+site fails its build when the two differ, when a figure names a scene the manifest lacks, or when
+a named file is absent, so a stale or partial set cannot ship quietly. That is the
+`sync-brand.mjs` precedent with its failure mode fixed.
+
+`focus` gives every poster the rect around its scene's `focus` elements as fractions of the frame, the
+same `{ x, y, w, h }` the ready message posts, so one crop routine serves the live frame and the
+poster. It is `null` for a scene that names no focus element. The rig measures it on the still it
+just shot, through `boot.js`'s own `__demoBoot.focusRectOf`, so a driver scene gets its rect after
+its gesture, and it writes one `<scene>.<theme>.frame.focus.json` beside each PNG. A scene that
+names a focus element the rig cannot find fails the run instead of writing `null`. The map sits
+beside `scenes` rather than inside it, so a `scenes` entry still holds only theme keys. The rect
+is only as tight as the element the scene names: the Column Manager scenes name the whole dialog,
+so a crop to one row of it is still the site's to choose.
+
+`npm run demo:posters` (`demo/posters.mjs`) is the command. It refuses a missing or stale build
+(`dist/demo/scenes.json` has to carry `package.json`'s version), runs
+`tests/captures/features/scenes.capture.ts` with `CAPTURE_THEMES=clay,rust`,
+`CAPTURE_RESOLUTIONS=frame`, and `CAPTURE_OUTPUT_ROOT=dist/demo-posters/` (so the shots land in
+one known directory instead of a timestamped `captures/` run, which a Playwright retry would
+otherwise split), then checks the shots against `scenes.json` (every scene at every theme, every
+PNG exactly 3200 by 2000 by its header and whole by its IEND trailer, every focus sidecar present
+and either `null` or a rect with a positive size, no PNG the manifest would not name) and zips
+them, posters stored rather than deflated and the sidecars folded into the manifest, as
+`dist/demo-posters-<version>.zip`. Nothing decodes a poster along the way; the two ends are what
+a header-only check misses when a shot is cut short. The pure half is
+`scripts/lib/demo-posters.mjs`, covered by `tests/unit/demo-posters.test.ts`.
+
+`release.yml`'s `demo-posters` job runs it after `publish-release`, beside `deploy-demo`, and
+attaches the zip with `gh release upload --clobber`, so a re-run of a finished release replaces
+the asset in place. It is deliberately not in `scripts/release-assets.js`: that manifest is
+verified before the job runs, and a twelfth expected asset would fail every release. Being after
+publish also means the release stands when the job fails; the run goes red and the site's own
+sync fails on the missing asset.
+
+The posters are shot on `ubuntu-latest` in Roboto, which the job installs (`fonts-roboto`) before
+it shoots. The app sets no UI font of its own, so its text is Tailwind's default `--font-sans`:
+`-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'Noto Sans', Arial`.
+A bare runner has none of the first five, so Chromium fell through to Arial's metric alias,
+Liberation Sans. That face has no medium weight, so every `font-medium` label rendered Regular,
+and it set the Column Manager's 11px Profile label 17 percent wider than Segoe UI does. Since
+kangentic.com's landing page shows the posters with no live frame beside them, that swap was the
+app's face as a visitor saw it. Roboto is the first family in the stack a runner can have, so
+installing it decides the face, and it ships the medium weight. Measured on the same dialog,
+Roboto's labels land within 6 percent of Segoe UI's widths. Noto Sans, the other candidate, ran
+up to 9 percent wide and `fonts-noto-core` rendered medium labels Regular. The job's gate compares
+`fc-match`'s family exactly, because `fc-match` answers with some font for any name, and
+`tests/unit/release-workflow-gates.test.ts` fails when a Tailwind bump drops Roboto from the stack.
+
+No single poster matches every reader's fonts: a reader on Windows or macOS sees Segoe or SF in
+the live frame. The live frame renders Roboto on Android and ChromeOS, and the desktop app renders
+it on Linux when the font is installed. The terminals fill their panes whatever the font (Live
+replay below). A local `npm run demo:posters` on Windows still renders Segoe UI, so a set shot
+there is not the release set.
+
+A scoped run for a look at one scene, from PowerShell at the repository root (a relative
+`CAPTURE_OUTPUT_ROOT` resolves against the shell's working directory, so run it from the root;
+`demo/posters.mjs` always passes an absolute one):
+
+```
+$env:CAPTURE_SCENES='board,card-drag'; $env:CAPTURE_THEMES='clay,rust'; $env:CAPTURE_RESOLUTIONS='frame'
+$env:CAPTURE_OUTPUT_ROOT='dist/demo-posters'
+npx playwright test --project=captures tests/captures/features/scenes.capture.ts
+```
 
 ### One viewport, one scale
 
@@ -381,6 +639,14 @@ Every timestamp is an offset from boot, so cards read "3 min ago" whenever the f
 Sessions cover every state the app distinguishes (thinking, needs-you, a permission prompt,
 suspended, queued) plus a Command Terminal; Monitor rows are derived from the session rows so the
 two views cannot disagree; the usage dashboard is a seeded, deterministic fourteen-day series.
+Each archived task carries the stats its last session left (`DEMO_ARCHIVED_SUMMARIES`, what the
+Completed Tasks dialog lists). No recording stands behind an archived task, so these are authored
+and were reviewed as a set: the model is the project's default agent's, the tool count is the sum
+of the breakdown, and every cost sits under the lightest weekday the dashboard draws for one
+project. They do not reconcile with the dashboard beyond that. Its series is seeded noise with idle
+and weekend days far below any of these costs, and the weekday an archive date lands on moves with
+the day the frame is opened. The mock answers the archived list per project, as each project's
+own DB does on the desktop, so contoso-web's dialog lists its three, not all seven.
 
 ### Terminal recordings
 
@@ -401,6 +667,9 @@ Only the serialized stream is kept, with the raw byte count beside it: the raw s
 wrapped fragment of every path the agent ever printed, and a recording is a tenth of the size
 without it.
 
+Before re-recording the contoso-web api-client session (single or tiled) or the auth task's
+accept-edits boot, read Browser guest above, which asks for an `App.tsx` change in the same pass.
+
 Each recording also carries the working tree the agent left behind (`changes`, in the shape
 `git.diffFiles` returns), and the dataset seeds it per task through the mock's
 `__mockGitDiffByWorktree`, so the Changes panel of any recorded task shows the real diff next to
@@ -410,20 +679,26 @@ would show too. The one recording without a `changes` field is the Gemini sessio
 the rig captured diffs and not repeatable until its quota resets; re-run it with
 `--only gemini` to fill it in. The Monitor's output peek is each recording's own last displayed
 lines (`peek`, read from the rendered headless terminal at record time, with each CLI's footer
-and status chrome skipped), never authored; the concurrency cap is set to the number of running
-sessions, so the one queued spawn is waiting on a genuinely full set of slots.
+and status chrome skipped), never authored. The concurrency cap is the number of running sessions
+plus four, so a visitor's drag into an auto-spawn column starts an agent the way it does on the
+desktop rather than queueing it. The sample install queues nothing: the one Queued card, in
+`session-states`, is a scene patch, and it waits with free slots.
 
 A manifest entry with `tiled` is recorded a second time at the tiled surface's width, under the
 file it names: the same prompt run again, in a PTY the size of one pane of a tiled pair. The seed
-pairs the two the way it pairs a Command Terminal's two boots, and a window narrower than the
-single recording takes the tiled one (`layoutFor` in `demo-dataset.ts`), which it then holds or
-plays as frames like any other recording. It is a second run, so it says different things: the
+pairs the two the way it pairs a Command Terminal's two boots, and a window's pane takes whichever
+of the two it shows better (`layoutFor` in `demo-dataset.ts`: the type it is shown at, times the
+share of the pane its own layout spans), which it then plays like any other recording. It is a
+second run, so it says different things: the
 session's clock, its card's message trail, its Monitor peeks, and its working-tree diff stay the
 single recording's, and only the terminal's bytes are the tiled one's, played from the moment
 that clock began; a variant that has already ended by the time its window opens shows its final
 frame and stays there. A still frame paints the same: the tiled
-recording's frame at the moment the single's clock opens at, derived from its frame timeline
-(`tiledFrames` in the seed, inline like the open frames, since a still fetches nothing). Three sessions carry one, the two the
+recording's own open frame, cut at the moment the single's clock opens at with every row above
+its screen (`node scripts/backfill-demo-timelines.mjs` cuts it, since the capture cannot: the
+moment is the single recording's; `tiledFrames` in the seed, inline like the open frames, since a
+still fetches nothing). A tiled recording without one, or with one cut for another moment, is
+refused at build time with that command. Three sessions carry one, the two the
 `windows-tiled` scene tiles and the Command Terminal session `command-terminal-tiled` narrows.
 The three were made on Claude Code 2.1.275, which asks before a PowerShell command with an
 expandable string, so both task runs end at that permission prompt rather than at a summary (the
@@ -554,7 +829,7 @@ a finished summary above an empty prompt.
 
 `sess-pc-flaky-tests` stays short at 5. It was cut at 20 seconds, so raising the manifest's
 `stopAfter` and re-recording is the fix, and that needs Codex credits (exhausted 2026-09-13). Its
-terminal is live either way now that a frame timeline rides along, and `loop=1` cycles it. When a session's replay reaches the end it finishes as it always does, waits six
+terminal is live on any grid either way, played through the page's emulator, and `loop=1` cycles it. When a session's replay reaches the end it finishes as it always does, waits six
 seconds so the state it finished in is readable, and starts the same stretch over. Each session
 loops on its own clock, so the Monitor keeps changing rather than going quiet until the longest
 recording comes round. A mounted terminal is repainted from the opening frame first (1.8 KB for
@@ -570,6 +845,29 @@ A recording made before either timeline existed gets both from
 `node scripts/backfill-demo-timelines.mjs`, which derives them from the stream that is already on
 disk. Same module as the capture script (`scripts/lib/demo-replay-timelines.js`), so a backfilled
 recording and a fresh one agree; no agent, no API credit, and no re-record.
+
+### Activity stats, for the debug overlay
+
+`sessions.getActivityStats` answers null in the mock, which is the production "session unknown"
+path and also the shape of a bridge method that exists and says nothing. Behind the Developer tab's
+activity debug overlay that reads as a feature with no data, so the seed fills it
+(`activityStatsFor` in `demo-dataset.ts`) for every session that has an activity state.
+
+It is DERIVED, never authored. The state, the reason and its current tool, the signal ages, and the
+transition log all come from that session's own seeded `events` and `activity`: the overlay's whole
+job is to explain why the engine reports what it reports, and a panel of invented counters beside a
+real activity pill would be the one thing on this board that does not agree with itself.
+
+Most of the rest has a documented correct value rather than a derived one, which is not a shortcut.
+`compensationCounters` is "in a clean session, all eight fields read 0", and no seeded session has
+had a watchdog fire. `recentPtyChunks` is "empty in production builds where the recorder is
+dead-code-eliminated", which is the build this renderer IS. The background-shell and subagent
+counters are zero because no seeded session runs either.
+
+One field is a placeholder and is named as one rather than faked. `permissionAwaitedToolId` wants
+the tool_use_id a PermissionRequest hook carried, and a recording keeps the agent's BYTES, not its
+hook payloads. Null is what the overlay shows for "not captured"; a plausible id would be an
+invention.
 
 ### The agent's message trail
 
@@ -611,6 +909,34 @@ too, by `scripts/capture-demo-sessions.mjs` from the dataset rather than from a 
   header, the prompt Kangentic's default template sends, its first tool calls). A live session
   follows the card, as the engine's create-or-resume does; a paused one resumes on its own
   transcript and waits.
+- Pause stops a session where it is: its clock stops, so the card's trail, the Monitor's peek, and
+  the finish hold, and the Monitor shows it paused. Resume, from the task window or a drag into an
+  auto-spawn column, finds that paused session the way main does. Main clears the task's session
+  pointer on a pause and resumes the task's latest paused record, so the demo does not read the
+  pointer either; reading only the pointer is what once made Pause then Resume start the task's
+  recorded boot from scratch. The paused row is retired and the resumed session is the task's
+  only one, as main's respawn leaves it. Its trail and its usage carry over, the usage once the
+  resumed agent's first output lands. What its terminal shows depends on where the pause landed:
+  - At the recording's end (a session idle or waiting on the user), the terminal plays that
+    session's recorded resume boot (`resume-<sessionId>.json`): the real `claude --resume`, the CLI
+    reprinting the conversation and stopping at an empty prompt. The reprint covers exactly what
+    the frame had shown, so it is honest, and first output lands at the boot's own first byte.
+    The `session-resume` scene's live frame resolves its resuming card the same way.
+  - Mid-recording (a working session), a real resume would reprint the WHOLE recorded
+    conversation, including what the frame had not reached, so the terminal carries the paused
+    one's view over instead, as main carries the scrollback: the same recording played through
+    the page's emulator to the moment of the pause and frozen there, fitted to whatever grid the
+    new terminal has. Pause mid-turn and that frame still holds the
+    turn's spinner line, where the desktop's resumed CLI would redraw at its prompt.
+
+  The capture matrix records the resume boots (the `resumes` kind in
+  `scripts/capture-demo-sessions.mjs`) for every Claude task session whose conversation is still
+  in Claude's history on the recording machine, found by the recording's own trail uuids. Two
+  things keep them honest. The rig ends every recording by typing `/exit`, and Claude logs that
+  into the conversation, so the driver records against a copy of the history without it (a
+  resume would otherwise end on the rig's "Goodbye!"). And a resume appends to that history,
+  which the committed trails and transcripts were derived from, so the driver puts the file back
+  byte for byte afterwards. Other agents have no resume recording and take the frozen view.
 - A new Command Terminal boots the project's default agent with no prompt, which is what the
   desktop starts: `terminal-<projectId>.json` when its window opens alone,
   `terminal-<projectId>-tiled.json` when it opens beside the project's running terminal. When a
@@ -638,49 +964,81 @@ pair (115 wide), and a Command Terminal boot at both sizes its window can open a
 115 wide tiled beside an existing terminal), the frame picking one at spawn time. A grid moves with
 the device scale, since the renderer rounds the cell to device pixels, so each surface in the
 manifest names the scale it was measured at: the two single windows at scale 1 (the demo tier's
-launch; at the rig's 2x they fit 142, which the wider floating scenes absorb), the two tiled panes
+launch; at the rig's 2x the default window fits 142, and the floating scenes size their window to
+the recording instead, see the type-size rule above), the two tiled panes
 at scale 2 (the rig's launch, so a tiled figure is at native type there; at scale 1 the pane fits
-125 or 124 and holds the recording letterboxed). The spring-petclinic and online-boutique tiled
+123 and plays the recording widened to it). The spring-petclinic and online-boutique tiled
 boots are still at the earlier 124, recorded before the launch was pinned and not re-recordable
-until Codex credits return; a recording carries its own grid, so those hold at 0.93. The rows
+until Codex credits return; a recording carries its own grid, so a pane plays those at its own. The rows
 follow the agent, because the window's context bar
 does: a Claude session's bar carries the account's rate-limit pills and wraps to two rows,
 leaving 37, while every other agent's bar is one row, leaving 39 (`rowsByAgent` in the
 manifest). The Codex task sessions and spawn boots are still at 37 rows, recorded before that
-was measured and not re-recordable until Codex credits return, and the Gemini session is still
-at the rig's 120 by 40 until its quota allows a re-run. Neither matters to the replay any more:
-a terminal is held at its recording's grid whatever that grid is (Live replay below), so a
-37-row Codex boot in a 39-row window and the 120-column Gemini session both stream their bytes,
-at a font a little smaller than the window's own fit. A boot wider than its window would still
-be a real miss on the desktop, where an inline TUI's repaint lands on wrapped rows and the frame
-ends up blank, which is why the matrix records at the surface's size rather than relying on the
-hold.
+was measured and not re-recordable until Codex credits return; a 39-row window shows the two
+rows above their screen, so that no longer shows (Live replay below). The Gemini session is
+still at the rig's 120 by 40, and that does show: the fitter runs its rules, bands and borders
+out to a 154-column window, but only the CLI could re-wrap its prose, which stays 120 wide. A
+re-run needs Gemini quota. On 2026-09-23 the key on the recording machine answered the CLI's
+automatic model choice (Pro) with a free-tier limit of 0, and a pinned `gemini-3-flash`, the model
+the card names, with 503 "high demand" on every retry; setting the manifest entry's `model` to
+`gemini-3-flash` and running `--only gemini` when Flash answers is the fix. A boot wider than its
+window would still be a real miss on the desktop, where an inline TUI's repaint lands on wrapped
+rows, which is why the matrix records at the surface's size rather than relying on the fitter.
 
 The grid a visitor's terminal mounts with is theirs, not the recording's. The bottom panel is 15
-rows tall, and the task window fits 154 by 37 only at the 1600 by 1000 frame with the sample
-install's Consolas at a device pixel ratio of 1: the site's take-control dialog on a 1440 by 900
-display fits 118 by 26, a Windows display scaled to 125 percent fits 144 by 36, and a machine
+rows tall, and a task window at the default rect fits 154 by 37 only at the 1600 by 1000 frame
+with the sample install's Consolas at a device pixel ratio of 1: the site's take-control dialog on a 1440 by 900
+display fits 118 by 26, a Windows display scaled to 125 percent fits 143 by 36, and a machine
 without Consolas measures another font. A recording's bytes address rows for its own grid
 (Windows ConPTY re-emits even Claude's classic renderer with absolute cursor positions), so
 replayed into any other grid they land two frames' text on one row. Main applies one rule to
 that on the desktop, and the frame applies the same: bytes replay only into a terminal whose
 grid equals the recording's.
 
-So the terminal is brought to the recording's grid wherever the pane can show it. The seed
-answers a replayed session's resize the way main answers one it refuses: with the grid it holds
-(`SessionResizeResult.held`, here the recording's), and the terminal conforms to it, resizing to
-that grid and scaling its font to fit the pane, letterboxed (`conformToHeldGrid` in
-`useTerminal`). The picture is then the recording's, exact, at whatever size the host gave the
-frame and on any display: the dialog at 1440 by 900 fits 131 by 26, narrower than the single
-recording, so the middleware window holds the session's tiled recording (115 by 37) at about
-8 px type, its rows rather than its width setting the scale. Whether to hold is decided by the
-scale the pane would need (`HOLD_MIN_SCALE` in
-the seed's resize wrapper, 0.6): below it the type would be unreadable, so the terminal keeps
-its own grid and plays frames instead. The bottom panel is that case, 15 rows against a
-recording's 37 or 39. The conform only ever scales DOWN (`CONFORM_MAX_SCALE` in `useTerminal`
-is 1): a pane larger than the held grid needs, a 2560 by 1440 display say, shows it at the
-configured size and letterboxes the rest, so a held terminal is never in bigger type than the
-panel beside it. Two font sizes on one screen was the first thing a live look caught. A held terminal keeps probing with the grid
+Every other grid is FILLED, never letterboxed. This demo once held the recording at its own grid
+inside a bigger pane, and what that left empty was on nearly every surface at some display
+scale: 56px beside and 23px below every card window at 125 percent, 314px below the Browser
+scene's terminal at 100, 60px beside a tiled window in the posters' face. So a terminal always
+takes a grid that fills its pane (`displayFor` in the seed), and the recording plays into that
+grid through the page's own emulator (below):
+
+- A pane at least the recording's width, or a column or two short of it (`NEAR_MISS_COLUMNS`),
+  keeps the configured type at its own grid, and the recording is widened or cut to it. Smaller
+  type is not worth a column or two: at 100 percent it would cost a sixth of the cell, since xterm
+  floors the cell to device pixels. That is the default task window on a desktop browser at 100
+  percent, whose 8px scrollbar gutter leaves it 153 columns for a 154-column recording. The seed
+  once held that pane and the conform declined, so the terminal kept 153 columns while the bytes
+  it was sent addressed 154: every padded row wrapped into a blank one, and Copilot's scrollbar
+  landed in column zero.
+- A pane further short is HELD at a smaller type. The seed answers the terminal's resize the way
+  main answers one it refuses, with the grid it holds (`SessionResizeResult.held`), and the
+  terminal conforms (`conformToHeldGrid` in `useTerminal`), scaling its font down. The held grid is
+  the one the WHOLE pane takes at the largest type that carries the recording's columns (or all but
+  a column or two of them, a near miss at that size as at the configured one), predicted from the
+  conform's own rule (it lands on the largest quarter-pixel size at which the grid fits) and from
+  the cell xterm rounds that size to (`terminalDeviceCell`). What is left over is under a cell or
+  two each way. A card window at 125 percent is held at 163 by 38 for a 154-column recording, at
+  seven-eighths of the type.
+- Below `HOLD_MIN_SCALE` (0.6) the type would be unreadable, so the pane keeps the configured type
+  and the recording is cut at its edge.
+- Rows never set the type. A shorter pane shows the bottom of the screen, as a terminal scrolled to
+  the bottom does, and a taller one shows the rows above it.
+
+The conform used to land short of that largest size. It proposes a font from a linear model of the
+cell and stepped only down from there, but a cell is not linear: several quarter-pixel sizes draw
+the same device-pixel width, and Courier New's height at 11 px is a whole pixel under 12 scaled
+down. So it could stop a size below the largest that fits and letterbox rows the pane had room
+for: three empty rows under a tiled window in the posters' face. It now steps back up while the
+grid still fits, never past the configured size, and the desktop's own hold (a phone streaming a
+session) gets the same. A hold the terminal never reports back within two seconds was declined,
+and the seed shows that pane at the configured type instead. The demo tier asserts the invariant
+rather than the path, since the path rides on the platform's font: every terminal fills its pane,
+and a terminal handed bytes is on its recording's grid.
+
+The conform only ever scales DOWN (`CONFORM_MAX_SCALE` in `useTerminal` is 1), so a held terminal
+is never in bigger type than the panel beside it. Two font sizes on one screen was the first
+thing a live look caught; a pane wider than a recording keeps the configured type and the
+recording is widened to it instead. A held terminal keeps probing with the grid
 it would fit on its own, so a Command Terminal that tiles still switches to the boot recorded at
 the tiled width, and the desktop's own hold (a phone streaming the session) ends the moment
 main accepts the probe. A real window resize repaints; the terminal reporting the grid it was
@@ -688,17 +1046,33 @@ just held at does not, being the conform landing rather than the window moving. 
 report as a resize repaints on every conform, which put a whole frame into a terminal whose
 session was already at its recording's end and should have received nothing.
 
-A terminal that keeps its own grid plays the recording's FRAMES instead of its bytes, which is
-what keeps the panel live. Every recording carries a `frameTimeline` beside its stream, the
-screen every 250 ms with unchanged screens dropped, derived from the bytes already on disk. A
-frame is PHYSICAL rows (`scripts/lib/demo-frame-serializer.js`): one row per recorded row, each
+A terminal on any grid but its recording's is fed by the page's OWN emulator
+(`demo/replay-emulator.ts`, a 4 KB chunk fetched the first time one mounts, over the renderer's
+own xterm and its Unicode 11 widths). The recording's bytes are written into it at the RECORDED
+grid on the session's clock, and after each write the visitor's terminal is repainted from what
+it shows, as a frame fitted to the visitor's grid. It is what main does on the desktop for a PTY
+whose grid the renderer does not share, at the stream's own pace: a spinner turns and a reply
+streams as they do on the bytes path, where the `frameTimeline` each recording carries sampled
+four screens a second (the fixtures keep it; the build no longer ships it). Parsing is cheap: the
+4 MB Gemini stream parses in about 50 ms, and a frame serializes in about 1 ms. Each frame carries
+the rows above the screen that a taller grid shows, and the cursor shown or hidden as the CLI
+left it. The first paint clears the terminal and writes the screen with 500 rows above it to
+scroll back through. After that a repaint builds on the last, the way a stream does: the rows that
+scrolled up since are scrolled into the terminal's own scrollback, and the screen is redrawn in
+place, so a visitor who scrolls up while an agent streams stays where they are. A new grid, the
+alternate screen, or the CLI clearing its own history takes a full paint again. A session no
+terminal shows keeps writing and skips the repaint (`sessions.setMounted`). If the chunk does not
+load, the terminal shows the recorded frame for the moment it opens at, and the page says why.
+
+A frame is PHYSICAL rows (`scripts/lib/demo-frame-serializer.js`): one row per recorded row, each
 self-contained in its styling, joined with line breaks, behind the alternate-screen switch when
 the CLI was on it, and ending in one absolute cursor position. It is not the serialize addon's
 output, which joins a row onto the row before it wherever the terminal had wrapped and relies on
 the same width to wrap it again: on a grid 20 columns wider every continuation spilled its first
 20 characters onto the row above and started its own row 20 characters in, which read as a cut
 left edge and a phantom sidebar (task #673). The final frame and the open frame are serialized
-the same way, so an idle session on the frames path scrolls through its whole history.
+the same way, with every row above the screen, so a still or an idle session scrolls through its
+whole history and fills a taller pane without the emulator.
 
 The alternative was recording each surface at its own grid, and it does not work. The panel is 15
 rows against a recording's 37, and no font size reconciles them: 154 columns needs about 16 px
@@ -710,61 +1084,98 @@ A geometry change also does not END the session. It does not finish an agent's t
 desktop, where main routes that session to its parsed frame and the agent goes on working, so it
 must not here: a session the board shows as working keeps the clock the seed started, along with
 its card, its sidebar count and its Monitor peeks. Only a session already at its end paints its
-end.
+end. The emulator runs on the same clock the bytes path does (`frameScrollback` beside
+`liveScrollback`): a spawn plays its boot from the moment it started, rather than jumping to the
+boot's end and reading as finished, and a window resized to another grid keeps its emulator and
+is repainted for the new grid, rather than painting the recording's end and stopping the card and
+the Monitor where they stood.
 
 The applier (`fitFrameToGrid` in `demo-dataset.ts`) fits each frame to the mounted grid row by
 row, and the serializer already dropped the plain spaces ConPTY pads every row with. A row wider
 than the grid is CUT at the edge, never left to wrap: the CLI would have re-laid its prose out at
 this width, and a wrap mid-word is what nothing would draw. Before the cut, a cursor-forward gap
 ahead of a right-aligned tail is shrunk so the tail lands at the edge (Claude's "/rc" at the
-footer's edge, Copilot's timing beside its border). A row narrower than the grid whose last glyph
-is a HORIZONTAL rule is extended with that glyph, so rules reach the edge the way the desktop
-drew them; the bottom panel is 219 columns against a recording's 154, and without this a quarter
-of it read as empty. Only horizontal glyphs: a vertical border extended sideways is a stripe,
-which is what the striped block in #673 was (Copilot's right border, grown 20 wide by a rule
-that stretched any box-drawing glyph). Gaps are never grown either, because a box border
-followed by a one-cell gap and a sentence would put the sentence at the right margin. Widths are
+footer's edge, Copilot's timing beside its border). A row that ENDS in a vertical edge glyph (a
+box's right side, corner or tee, or Copilot's scrollbar, U+2503) keeps that glyph at the edge in
+the style it was drawn in, and the rest of the row is fitted one column narrower: a plain cut
+dropped the glyph from rows padded with spaces up to it and kept it on rows a gap pulled in,
+which broke Copilot's scrollbar into segments one column short.
+
+A grid WIDER than the recording gets what the CLI drew to its own edge drawn to the new one
+(`widenRow`), the way the desktop's TUI would lay it out at that width: a right-hand border or
+scrollbar moves to the new last column and the gap before it takes the extra cells, so a box
+widens and its left side stays put; a background band (an erase to the edge, Codex's and
+Copilot's input bands, Claude's diff lines seven columns short of it) runs on; a horizontal rule
+runs on, and one right before a corner runs on to the corner; a panel's styled padding (OpenCode)
+runs on; and right-aligned text after a gap of four cells or more moves out with the gap
+(Claude's "/rc", Copilot's model and session usage). That text may be several styled words
+(Claude's "◐ medium · /effort" footer, a subagent's timing), and it may sit a cell from a border
+or scrollbar (Copilot's "10s ┃"), where it stays against the edge. It must end inside the CLI's
+right padding (Claude keeps two cells, Copilot one) and take at most half the row. A row that runs
+to the edge itself, a tail cut to fit with an ellipsis, and a tail that is most of its row (Codex's
+search hits, whose code follows an indentation gap) are content the CLI filled the width with, so
+they stay as recorded. A box drawn inside the padding widens like one drawn to the edge (Copilot's
+welcome box, two cells short). Each applies only to a row that reached the
+recorded edge. A row that stopped short of it is prose or a short rule and stays as drawn, one-cell
+gaps are never grown (a box border and a sentence would part), and a vertical bar is never
+extended sideways, which is what the striped block in #673 was (Copilot's right border, grown 20
+wide by a rule that stretched any box-drawing glyph). The bottom panel is the widest case, 219
+columns against 154. A TALLER grid on the alternate screen gets rows inserted where the TUI would
+grow (`altRowsInsertion`): below the last of the rows that run down a right-hand scrollbar
+(Copilot), each new row that scrollbar alone, or below the last blank row in the lower half
+(OpenCode, above its input), so the input and the footer stay at the bottom. A normal-screen frame
+needs nothing there: it carries the rows above its screen. `demo-frame-fit.test.ts` runs every
+recording 1, 9 and 64 columns wider and holds each to drawing, at the new last column, whatever
+it drew at its own. OpenCode's sidebar is the one layout the fitter only approximates: it stays
+where it was drawn with its background run on to the edge, where OpenCode itself would dock it
+right. Widths are
 counted in cells from the app's own Unicode 11 table, inlined into the seed at build time
 (`buildCellWidthTable`), and autowrap is off while the rows are written, so a cell the two still
 disagree on overwrites the last column instead of wrapping. The cursor is recomputed for the
 mounted row count: a 37-row frame in the 15-row panel scrolls 22 rows up, and the cursor's row
 moves with them. Prose keeps its recorded wrap points, because the CLI chose them at that width
-and wrote them into the bytes as line breaks; only the CLI could re-wrap that, which is why the
-task window is held at the recording's grid rather than fitted. A still frame goes through the
-same applier: the renderer resizes before it asks for the scrollback, so the mounted grid is
-known, and the frame a still paints (a working session's opening frame, an idle session's end)
-is fitted to it. Held, that is the frame itself; below the hold floor, each row is cut at the
-edge rather than wrapped, which is what a `state=` blob that narrows a Changes pane to a quarter
-of the window gets.
+and wrote them into the bytes as line breaks; only the CLI could re-wrap that, which is why a
+pane more than a column or two short of the recording is held at a smaller type rather than cut.
+A still frame goes through the same applier: the renderer resizes before it asks for the
+scrollback, so the mounted grid is known (the held one when there is a hold), and the frame a
+still paints (a working session's opening frame, an idle session's end) is fitted to it. Below the
+hold floor each row is cut at the edge rather than wrapped, which is what a `state=` blob that
+narrows a Changes pane to a quarter of the window gets.
 
 One thing the frame path does not do is make text bigger on a display scaled to 200 percent.
 That report (kangentic.com #76) came from a capture at an emulated device pixel ratio of 2, and
 it is the capture, not the frame: under Playwright's `deviceScaleFactor` the `device-pixel-content-box`
 a `ResizeObserver` reports is the CSS size, and xterm's WebGL addon, which trusts that observer
 for its canvas backing store, draws 2x glyphs into a 1x buffer. A real 2x display reports real
-device pixels. A 2x poster is captured with WebGL off (`chromium.launch({ args: ['--disable-webgl'] })`),
-which puts every terminal on the DOM renderer at the right size.
+device pixels, and so does Chromium when the scale is forced on the browser rather than only
+emulated on the context: the rig launches with `--force-device-scale-factor=2` on top of the
+context's `deviceScaleFactor` (`launchCaptureBrowser` in `tests/captures/helpers/capture-page.ts`),
+the forced scale reaches the compositor, the observer reports 3200 by 2000 device pixels for the
+1600 by 1000 frame, and the WebGL renderer draws each glyph into a buffer of the right size. That
+is the recipe every 2x poster is shot with, and it is the only one that is: `--disable-webgl` puts
+the terminals on the DOM renderer, which sizes right but is not what a reader's frame draws, and
+an emulated scale alone is the bug above. WebGL stays on.
 
 ## What the page ships, and what it costs
 
-Measured with `npm run demo:measure` on the build of 2026-09-17, headless Chromium, a plain
+Measured with `npm run demo:measure` on the build of 2026-09-23, headless Chromium, a plain
 static server on localhost, warm disk.
 
 ### Before first paint (gzipped)
 
 | File | Raw | Gzip |
 |---|---|---|
-| index (the renderer) | 1935 KB | 536 KB |
+| index (the renderer) | 1954 KB | 542 KB |
 | xterm | 435 KB | 110 KB |
-| demo-seed.js (the sample install: opening and final frames, tiled frames, diffs, peek timelines, message trails, the cell-width table) | 783 KB | 129 KB |
-| mock-electron-api.js (the bridge) | 217 KB | 49 KB |
+| demo-seed.js (the sample install: opening and final frames, tiled frames, diffs, peek timelines, message trails, the cell-width table) | 809 KB | 136 KB |
+| mock-electron-api.js (the bridge) | 239 KB | 55 KB |
 | react-vendor | 214 KB | 66 KB |
-| index.css + xterm.css | 115 KB | 19 KB |
-| Pill + datetime chunks | 90 KB | 29 KB |
-| demo-boot.js + demo-scenes.js + demo-webview.js | 76 KB | 20 KB |
-| **Eager total** | | **959 KB** |
+| index.css + xterm.css | 117 KB | 19 KB |
+| Pill + datetime chunks | 91 KB | 31 KB |
+| demo-boot.js + demo-scenes.js + demo-webview.js | 95 KB | 26 KB |
+| **Eager total** | | **984 KB** |
 
-The whole `dist/demo/assets` is 16.7 MB raw, almost all of it monaco's lazy language and worker
+The whole `dist/demo/assets` is 16.8 MB raw, almost all of it monaco's lazy language and worker
 chunks, which only load when a Changes panel opens (the `changes` scene adds 4 requests).
 `demo-seed.js` carries each session's terminal frame and the working-tree diff it left behind;
 it is the one eager file that grows with the dataset (112 KB gzipped for 16 sessions and 10
@@ -777,20 +1188,24 @@ became physical rows and the seed took on the cell-width table the applier clips
 17 KB more for the tiled frames of the three sessions with a tiled recording (a final frame and
 a working session's opening frame each), which is what lets a still of a tiled window paint the
 right recording without a fetch.
-The 39 recordings under `recordings/` (three of them the tiled siblings) are 38.3 MB raw and
-832 KB gzipped in total, fetched one at a time as terminals mount, so none of it is on the boot
-path. Each carries its timed stream and its frame timeline, and the frames are roughly half that
-weight: they are what keeps a terminal live where no grid can be held, which is the bottom panel.
-The largest single file is the Gemini owner-search session at 101 KB gzipped. The one transcript
-under `transcripts/` is 31 KB raw and 8 KB gzipped, fetched only when a conversation viewer opens.
+The 44 recordings under `recordings/` (six of them tiled siblings, five of them resume boots) are
+17.3 MB raw and 543 KB gzipped in total, fetched one at a time as terminals mount, so none of it
+is on the boot path. The resume boots are 204 KB raw and 29 KB gzipped of that, and one is fetched
+only when a visitor resumes a session paused at its recording's end. Each carries its timed
+stream, final frame and grid. They were 38.3 MB and 832 KB while each also shipped its frame
+timeline, which the page's emulator made redundant (Live replay); the fixtures keep it. The
+largest single file is the Codex OpenTelemetry session at 70 KB gzipped. The emulator is a 4 KB
+chunk that shares the renderer's xterm, fetched the first time a terminal mounts on a grid other
+than its recording's. The one transcript under `transcripts/` is 32 KB raw and 8 KB gzipped,
+fetched only when a conversation viewer opens.
 
 ### Cold boot per scene
 
 | Scene | Requests | Off-origin | First contentful paint | Ready |
 |---|---|---|---|---|
-| board | 14 | 0 | 256 ms | 330 ms |
-| task | 14 | 0 | 248 ms | 380 ms |
-| changes | 19 | 0 | 256 ms | 513 ms |
+| board | 14 | 0 | 292 ms | 354 ms |
+| task | 14 | 0 | 260 ms | 393 ms |
+| changes | 19 | 0 | 128 ms | 544 ms |
 | monitor | 17 | 0 | (paint inside the veil) | 430 ms |
 
 Zero off-origin requests on every scene: the renderer's Sentry SDK has no network path of its
@@ -802,9 +1217,9 @@ so the site's privacy page needs no line for the frame.
 
 | Frames | All ready | Script time | JS heap |
 |---|---|---|---|
-| 1 | 321 ms | 176 ms | 18 MB |
-| 4 | 707 ms | 368 ms | 36 MB |
-| 8 | 1296 ms | 668 ms | 70 MB |
+| 1 | 310 ms | 171 ms | 16 MB |
+| 4 | 725 ms | 380 ms | 34 MB |
+| 8 | 1321 ms | 695 ms | 66 MB |
 
 The bundle downloads once and caches; each frame parses and executes it again for roughly 70 ms of
 script and 5 to 10 MB of heap. Eight live frames on one docs page cost about 1.3 seconds on a
@@ -824,10 +1239,10 @@ every bridge method (`tests/unit/mock-electron-api-parity.test.ts` keeps that tr
 | Command Terminal | The window opens on the project's default agent booting, from its recording; typing into it reaches no process. |
 | Drag into an auto-spawn column, Resume | The agent starts from the boot recorded for that task and mode, or resumes on its transcript (Live replay above). |
 | Add project | The mock's folder dialog returns a fixed path; a fourth project appears in the sidebar. |
-| Task-detail Browser pane | The pane is the real renderer; its `<webview>` is stood in for by `demo/webview-shim.js`, an iframe onto a bundled copy of what the project renders at its dev URL (Browser guest below). Inspect finds nothing, capture rejects, and history is empty. |
+| Task-detail Browser pane | The pane is the real renderer; its `<webview>` is stood in for by `demo/webview-shim.js`, an iframe onto a bundled page with the project's own data at its dev URL (Browser guest below). Inspect finds nothing, capture rejects, and history is empty. |
 | Folder pill, PR links, external links | Inert: `shell.openPath` and `openExternal` are logged by the mock. |
 | Pop-out (Monitor, Changes, Stats) | Inert: the in-app surface stays where it is. |
-| Dictation | The whole renderer pipeline runs on a press, over a silent microphone `demo/boot.js` supplies (the mic is never requested), and the chip shows its live state. The words land in the terminal on release as the CLI's echo, which cannot be shown (Dictation below). |
+| Dictation | The whole renderer pipeline runs on a press, over a silent microphone `demo/boot.js` supplies (the mic is never requested), and the chip shows its live state over a terminal or a text field. A silent mic transcribes to nothing, so release types nothing (Dictation below). |
 | Updater | Silent: no update is ever "downloaded". |
 
 Two things stay out of reach of a live frame: the Browser pane's REAL guest (a page the agent is driving) and a dictated transcript landing in the terminal.
@@ -859,14 +1274,14 @@ Two things stay out of reach of a live frame: the Browser pane's REAL guest (a p
 index.html                       the entry, five classic scripts then the module bundle
 stage.html                       the fixed-size host a direct visit lands on
 scenes.json                      the scene list the site reads at build time: name, reach, alt, version
-demo-scenes-<hash>.js            the registry, the app version, the recordings and transcripts index, the guest pages
+demo-scenes-<hash>.js            the registry, the app version, the config shape a state= blob is checked against, the recordings and transcripts index, the guest pages
 demo-boot-<hash>.js              demo/boot.js verbatim
 demo-webview-<hash>.js           demo/webview-shim.js verbatim: the iframe standing in for <webview>
 mock-electron-api-<hash>.js      tests/ui/mock-electron-api.js verbatim
 demo-seed-<hash>.js              the sample install, final frames, diffs, and history embedded
 recordings/<name>-<hash>.json    one timed stream per recording, fetched when a terminal mounts
 transcripts/<session>-<hash>.json  the agent transcript behind a session, fetched when a conversation viewer opens
-guest/<name>-<hash>.html         what a project renders at its dev URL, for the Browser pane
+guest/<name>-<hash>.html         the page a project's dev URL shows in the Browser pane
 assets/                          the renderer's hashed chunks and stylesheets, monaco's lazy chunks and workers
 ```
 
@@ -877,3 +1292,8 @@ a recording replays only into the grid its seed describes, and a stale one lands
 text on one row. With the hash in the name a changed file is a new URL, an unchanged one is
 still cached, and `index.html` is the only file whose cached copy can lag, for ten minutes, as a
 whole and self-consistent page.
+
+`npm run demo:posters` writes beside this tree, never into it: the shots go to
+`dist/demo-posters/scenes/` and the zip to `dist/demo-posters-<version>.zip`, so a poster run
+leaves the deployable build untouched and `build:demo` (which empties only `dist/demo/`) leaves
+the last poster set where it was.

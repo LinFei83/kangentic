@@ -108,14 +108,17 @@ export interface DemoTiledFrames {
 /**
  * Every recording on disk, by what the frame replays it for: a session the boards show, the
  * agent starting on a task in a permission mode (a drag into an auto-spawn column), or the
- * project's default agent starting with no prompt (a new Command Terminal). The spawn and
- * terminal recordings are named by the driver (spawn-<taskId>-<mode>.json,
- * terminal-<projectId>.json), so the listing is the index.
+ * project's default agent starting with no prompt (a new Command Terminal), or a paused session
+ * resumed on its own conversation (a Resume). The spawn, terminal, and resume recordings are
+ * named by the driver (spawn-<taskId>-<mode>.json, terminal-<projectId>.json,
+ * resume-<sessionId>.json), so the listing is the index.
  */
 export interface DemoRecordingsIndex {
   sessions: Record<string, DemoRecordingEntry>;
   spawns: Record<string, DemoRecordingEntry>;
   terminals: Record<string, DemoRecordingEntry>;
+  /** Keyed by the dataset session the resume continues. */
+  resumes: Record<string, DemoRecordingEntry>;
   /** The surface sizes the recordings were made at, so the frame can tell which boot fits a window. */
   geometry: Record<string, { cols: number; rows: number }>;
 }
@@ -152,7 +155,7 @@ export function buildCellWidthTable(): DemoCellWidthTable {
 
 export function loadDemoRecordings(fixturesDir: string = DEMO_FIXTURES_DIR): DemoRecordingsIndex {
   const manifest = JSON.parse(fs.readFileSync(path.join(fixturesDir, 'manifest.json'), 'utf-8')) as DemoManifest;
-  const index: DemoRecordingsIndex = { sessions: {}, spawns: {}, terminals: {}, geometry: manifest.geometry ?? {} };
+  const index: DemoRecordingsIndex = { sessions: {}, spawns: {}, terminals: {}, resumes: {}, geometry: manifest.geometry ?? {} };
   // Built in one place so a new DemoRecordingEntry field cannot reach the spawn and terminal
   // entries below while the session entries keep the old shape. The sessions loop takes the
   // record loadRecordings already parsed; only spawns and terminals, which the manifest does not
@@ -177,12 +180,16 @@ export function loadDemoRecordings(fixturesDir: string = DEMO_FIXTURES_DIR): Dem
   for (const file of fs.readdirSync(fixturesDir)) {
     const spawn = /^spawn-(.+)-(plan|acceptEdits|default|dontAsk|bypassPermissions|auto)\.json$/.exec(file);
     const terminal = /^terminal-(.+)\.json$/.exec(file);
+    const resume = /^resume-(.+)\.json$/.exec(file);
     if (spawn) {
       const entry = read(file);
       if (entry) index.spawns[`${spawn[1]}:${spawn[2]}`] = entry;
     } else if (terminal) {
       const entry = read(file);
       if (entry) index.terminals[terminal[1]] = entry;
+    } else if (resume) {
+      const entry = read(file);
+      if (entry) index.resumes[resume[1]] = entry;
     }
   }
   return index;
@@ -329,11 +336,17 @@ function checkedOpenFrame(sessionId: string, record: DemoCaptureRecord, liveTail
  *
  * The opening moment is the SINGLE recording's: a session's clock runs on the single recording
  * (its duration and tail), and a terminal on the tiled layout plays the tiled bytes from that
- * same offset. So the frame is the tiled recording's own frame timeline at
- * `single duration - tail`, derived here rather than kept by the capture, whose open frame would
- * be a tail before the VARIANT's end, a different moment whenever the second run is a different
+ * same offset. So the frame is the tiled recording's state at `single duration - tail`, not the
+ * cut the capture script would make, a tail before the VARIANT's end, which is a different
+ * moment whenever the second run is a different
  * length (it always is). A variant shorter than that offset has already ended when the live
  * frame opens it, so its still is its final frame, as the terminal would show.
+ *
+ * The frame painted mid-run is the tiled recording's own open frame, which the backfill cuts at
+ * that moment with every row above the screen (scripts/backfill-demo-timelines.mjs): a pane
+ * taller than the recording shows those rows, where a timeline frame carries the screen alone and
+ * would leave blank rows under it. A tiled recording without one, or with one cut for another
+ * moment (a re-record of either run, or a new tail), is refused with the command that cuts it.
  */
 export function loadDemoTiledFrames(fixturesDir: string = DEMO_FIXTURES_DIR): Record<string, DemoTiledFrames> {
   const liveTailMs = readLiveTailMs(fixturesDir);
@@ -355,13 +368,18 @@ export function loadDemoTiledFrames(fixturesDir: string = DEMO_FIXTURES_DIR): Re
       if (timeline.length === 0) {
         throw new Error(`${tiled.file} carries no frame timeline, so the moment the live frame opens ${sessionId} at cannot be painted; re-run "node scripts/backfill-demo-timelines.mjs"`);
       }
-      let current = timeline[0].frame;
-      for (const step of timeline) {
-        if (step.t > opensAtMs) break;
-        current = step.frame;
-      }
       const tiledDurationMs = timeline[timeline.length - 1].t;
-      openFrame = { serialized: opensAtMs >= tiledDurationMs ? tiled.record.serialized : current, peek: [] };
+      if (opensAtMs >= tiledDurationMs) {
+        openFrame = { serialized: tiled.record.serialized, peek: [] };
+      } else {
+        const tiledStream = Array.isArray(tiled.record.stream) ? tiled.record.stream : [];
+        const expectedBeforeEndMs = (tiledStream.length > 0 ? tiledStream[tiledStream.length - 1].t : 0) - opensAtMs;
+        const stored = tiled.record.openFrame;
+        if (!stored || stored.beforeEndMs !== expectedBeforeEndMs || typeof stored.serialized !== 'string') {
+          throw new Error(`${tiled.file} carries no open frame cut ${expectedBeforeEndMs} ms before its end, where the live frame opens ${sessionId}; re-run "node scripts/backfill-demo-timelines.mjs"`);
+        }
+        openFrame = { serialized: stored.serialized, peek: [] };
+      }
     }
     frames[sessionId] = { serialized: tiled.record.serialized, openFrame };
   }

@@ -14,12 +14,15 @@
  *
  * Every test owns its own page (the built-in fixture), so nothing leaks between cases.
  */
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, chromium, type Page, type Locator } from '@playwright/test';
 import path from 'node:path';
 import { startDemoServer } from '../../demo/static-server.mjs';
 import { isBenignRendererError } from '../ui/helpers';
 import { SCENES } from '../captures/scenes';
-import { DEMO_LANES_BY_PROJECT, DEMO_SESSIONS, PROJECT_CONTOSO } from '../captures/helpers/demo-dataset';
+import {
+  DEMO_ARCHIVED_SUMMARIES, DEMO_LANES_BY_PROJECT, DEMO_SESSIONS, DEMO_TASKS, PROJECT_CONTOSO,
+  SESSION_CONTOSO_TERMINAL, SESSION_EMPTY_STATES, SESSION_MIDDLEWARE, SESSION_RATE_LIMIT, SESSION_WEBSOCKET, TASK_MIDDLEWARE, TASK_WEBSOCKET,
+} from '../captures/helpers/demo-dataset';
 
 const DIST_DIR = path.resolve(__dirname, '..', '..', 'dist', 'demo');
 
@@ -35,15 +38,19 @@ const MONITOR_ROW_COUNT = DEMO_SESSIONS.length;
 type DemoServer = Awaited<ReturnType<typeof startDemoServer>>;
 
 interface DemoBootGlobal {
-  __demoBoot?: { sceneName: string | null };
+  __demoBoot?: {
+    sceneName: string | null;
+    focusRectOf(selector: string): { x: number; y: number; w: number; h: number } | null;
+  };
 }
 
 let server: DemoServer;
 
 // The site frame's size, which every terminal recording was made for (demo/README.md,
-// geometry): the task-detail window geometry in the scenes is fractional, so this is what
-// gives the window its recorded 154 by 37 grid, and it is wide enough for the Changes panel's
-// file tree and split diff to lay out side by side.
+// geometry): the window geometry in the scenes and the state blobs below is fractional, so this
+// is what gives a default-rect window its recorded 154 by 37 grid (a fitted floating window takes
+// its recording's grid at any display scale), and it is wide enough for the Changes panel's file
+// tree and split diff to lay out side by side.
 test.use({ viewport: { width: 1600, height: 1000 } });
 
 test.beforeAll(async () => {
@@ -119,6 +126,133 @@ const SCENE_MARKERS: Record<string, (page: Page) => Promise<void>> = {
     await expect(page.locator('[data-testid="monitor-page"]')).toBeVisible();
     await expect(page.locator('[data-testid="monitor-card"]')).toHaveCount(MONITOR_ROW_COUNT);
   },
+  'column-handoff': async (page) => {
+    // The scene's __mockSwimlanePatches seed only takes effect if hydrateSeededSwimlanePatches
+    // actually finds and patches the lanes; the `ready` selector alone (the tab having switched)
+    // proves nothing about the patch landing. OverviewToggle renders the column page's own
+    // read-only ToggleSwitch, so this is the same aria-checked a visitor would read.
+    const row = (name: string): Locator => page.locator('[data-testid="board-manager-overview-row"]').filter({ hasText: name });
+    const handoff = (name: string): Locator => row(name).getByRole('switch', { name: 'Hand off context when the agent changes' });
+    // On exactly where the agent changes, as the alt says. The two off are the sibling negatives
+    // that keep the switch from simply always reading on: the dataset leaves every lane off.
+    for (const name of ['Code Review', 'Testing', 'Merge']) await expect(handoff(name)).toHaveAttribute('aria-checked', 'true');
+    for (const name of ['Planning', 'Executing']) await expect(handoff(name)).toHaveAttribute('aria-checked', 'false');
+    await expect(row('Code Review')).toContainText('Codex CLI');
+    await expect(row('Merge')).toContainText('GitHub Copilot CLI');
+    // A model reads the way its column's form reads it: the name Claude reports, Codex's raw id.
+    await expect(row('Planning')).toContainText('Opus 5');
+    await expect(row('Code Review')).toContainText('gpt-5.5');
+    // Every value reads whole at the site's frame. Before DataTable's colgroup carried the widths,
+    // every column was an equal tenth of the table and "Plan (Read-Only)" was cut mid-glyph. The 1px
+    // allowance absorbs sub-pixel rounding between font stacks; a real clip loses whole glyphs.
+    const clipped = await page.evaluate(() => Array.from(document.querySelectorAll(
+      '[data-testid="board-manager-overview-row"] [data-state="changed"] > span, [data-testid="board-manager-overview-row"] [data-state="unchanged"]',
+    )).filter((label) => label.scrollWidth - label.clientWidth > 1).map((label) => label.textContent));
+    expect(clipped).toEqual([]);
+  },
+  'edit-columns': async (page) => {
+    // The Code Review form on the shared ladder: Codex CLI reviews on the model it was recorded on,
+    // and there is no Effort field because Codex takes none from Kangentic. Without the dataset's
+    // Codex capabilities the Model field would be missing too.
+    const dialog = page.locator('[data-testid="board-manager-dialog"]');
+    await expect(dialog.locator('input[data-testid="column-agent-override"]')).toHaveValue('Codex CLI');
+    await expect(dialog.locator('input[data-testid="column-model-override"]')).toHaveValue('gpt-5.5');
+    await expect(dialog.locator('[data-testid="column-effort-override"]')).toHaveCount(0);
+    // Automation-free on purpose: column-automation is the configured counterpart.
+    await expect(dialog.locator('[data-testid="column-automation-row"]')).toHaveCount(0);
+  },
+  'column-automation': async (page) => {
+    // The same column as edit-columns, plus the one row column-handoff counts in its On enter cell.
+    const dialog = page.locator('[data-testid="board-manager-dialog"]');
+    await expect(dialog.locator('input[data-testid="column-agent-override"]')).toHaveValue('Codex CLI');
+    await expect(dialog.locator('[data-testid="column-automation-row"]')).toHaveCount(1);
+    await expect(dialog.locator('[data-testid="column-automation-row"]')).toContainText('Ask for a review pass');
+  },
+  'session-states': async (page) => {
+    // The scene's `ready` selector (the Onboarding empty states card existing at all) resolves
+    // whether or not demo/boot.js's new session.status patch actually landed: that card is in the
+    // sample install either way. CardStatusBar's own testid is what a visitor reads the state from.
+    const pausedCard = page.locator('[data-task-id="task-cw-empty-states"]');
+    await expect(pausedCard.locator('[data-testid="status-bar"]')).toContainText('Paused');
+    const queuedCard = page.locator('[data-task-id="task-cw-rate-limit"]');
+    await expect(queuedCard.locator('[data-testid="status-bar"]')).toContainText('Queued');
+    // Sibling negative, in the SAME boot rather than a second one: the scene's own click step
+    // targets the middleware session, which the patch does not name and which stays 'running' in
+    // the dataset, so its card keeps the running footer instead of picking up Paused or Queued
+    // from a patch that landed on the wrong row.
+    const middlewareCard = page.locator(`[data-task-id="${TASK_MIDDLEWARE}"]`);
+    await expect(middlewareCard.locator('[data-testid="usage-bar"]')).toBeVisible();
+    await expect(middlewareCard.locator('[data-testid="status-bar"]')).toHaveCount(0);
+    // The seed folds the patches in before it builds the Monitor, so the Monitor shows the two
+    // stopped as the board does. Applied to the rows afterwards, both rows still read running.
+    expect((await monitorFields(page, SESSION_EMPTY_STATES))?.status).toBe('suspended');
+    expect((await monitorFields(page, SESSION_RATE_LIMIT))?.status).toBe('queued');
+    // A card that is not live shows its task's description (monitorSlotKind), which main's
+    // snapshot always carries; without it the paused and queued cards printed agent output.
+    const description = (taskId: string) => DEMO_TASKS.find((task) => task.id === taskId)?.description;
+    expect((await monitorFields(page, SESSION_EMPTY_STATES))?.description).toBe(description('task-cw-empty-states'));
+    expect((await monitorFields(page, SESSION_RATE_LIMIT))?.description).toBe(description('task-cw-rate-limit'));
+    // A queued session has never started, so it has no usage: no model and no context.
+    expect(await monitorFields(page, SESSION_RATE_LIMIT)).toMatchObject({ modelDisplayName: null, contextPercent: null });
+    const queuedUsage = await page.evaluate(async (sessionId) => {
+      const usage = await (window as unknown as { electronAPI: { sessions: { getUsage: () => Promise<Record<string, unknown>> } } }).electronAPI.sessions.getUsage();
+      return usage[sessionId] ?? null;
+    }, SESSION_RATE_LIMIT);
+    expect(queuedUsage).toBeNull();
+  },
+  'session-resume': async (page) => {
+    // The resuming card draws the spinner footer rather than a model: main has no usage for a
+    // respawned agent until its status line paints, and the seed holds the session's back.
+    const resumingCard = page.locator(`[data-task-id="${TASK_WEBSOCKET}"]`);
+    await expect(resumingCard.locator('[data-testid="usage-bar"]')).toContainText('Resuming agent...');
+    await expect(resumingCard.locator('[data-testid="usage-bar-model"]')).toHaveCount(0);
+    // A resumed agent keeps what its previous run said (message-trail-tracker.ts reads it at once).
+    await expect(resumingCard.locator('[data-testid="task-card-trail"]')).toBeVisible();
+    const pausedCard = page.locator('[data-task-id="task-cw-empty-states"]');
+    await expect(pausedCard.locator('[data-testid="status-bar"]')).toContainText('Paused');
+    // Sibling negative: a session the scene does not patch keeps its model footer, so the held
+    // usage landed on the resuming session alone.
+    await expect(page.locator(`[data-task-id="${TASK_MIDDLEWARE}"] [data-testid="usage-bar-model"]`)).toBeVisible();
+    // The Monitor row agrees with the card: no model and no context before the usage arrives.
+    expect(await monitorFields(page, SESSION_WEBSOCKET)).toMatchObject({ status: 'running', modelDisplayName: null, contextPercent: null });
+  },
+  'completed-tasks': async (page) => {
+    // Only the open project's archive, as the desktop's per-project DB answers, and every row
+    // carries the stats its last session left, so the footer is not "$0.00 total cost".
+    const contosoArchived = DEMO_TASKS.filter((task) => task.projectId === PROJECT_CONTOSO && task.archivedDaysAgo);
+    const dialog = page.locator('[data-testid="completed-tasks-dialog"]');
+    await expect(dialog).toContainText(`Completed Tasks (${contosoArchived.length})`);
+    await expect(dialog).toContainText(`${contosoArchived.length} tasks`);
+    await expect(dialog).not.toContainText('$0.00 total cost');
+    const summarized = new Set(DEMO_ARCHIVED_SUMMARIES.map((summary) => summary.taskId));
+    for (const task of contosoArchived) expect(summarized.has(task.id), `${task.id} has no summary`).toBe(true);
+  },
+  'activity-overlay': async (page) => {
+    const overlay = page.locator('[data-testid="activity-debug-overlay"]');
+    // `ready` only waits for this element to mount, which happens as soon as ANY session in the
+    // project is 'running' - with or without real snapshot data (ActivityDebugOverlayContent
+    // renders on `projectSessionIds.length > 0` alone). If activityStatsCache never populated, or
+    // activityStatsFor threw while the seed built it, the panel falls back to its own "no state"
+    // diagnostic instead of failing the boot, which the ready gate would not catch.
+    await expect(overlay).not.toContainText('Activity engine has no state');
+    // One row per running contoso-web session, proving activityStatsCache was populated for
+    // every one of them and not just enough to dodge the diagnostic above.
+    const runningContosoSessionIds = DEMO_SESSIONS
+      .filter((session) => session.projectId === PROJECT_CONTOSO && session.status === 'running')
+      .map((session) => session.id);
+    for (const sessionId of runningContosoSessionIds) {
+      await expect(overlay.locator(`[data-session-id="${sessionId}"]`)).toBeVisible();
+    }
+    // The derived reason branches, read off one session of each activity kind: activityStatsFor's
+    // three-way switch (permission / thinking-with-tool / idle) drives the pill label straight
+    // from the seeded session, so a wrong branch here means the derivation broke, not the wiring
+    // checked above. currentTool is the seeded session's own last event, not an invented value.
+    const middlewareRow = overlay.locator(`[data-session-id="${SESSION_MIDDLEWARE}"]`);
+    await expect(middlewareRow).toContainText('Thinking');
+    await expect(middlewareRow).toContainText('running Bash');
+    await expect(overlay.locator(`[data-session-id="${SESSION_WEBSOCKET}"]`)).toContainText('Awaiting permission');
+    await expect(overlay.locator(`[data-session-id="${SESSION_RATE_LIMIT}"]`)).toContainText('Idle');
+  },
 };
 
 test('every deep marker names a scene the build can boot', () => {
@@ -135,19 +269,39 @@ for (const scene of BOOTABLE_SCENES) {
     // boot.js waited for this before it revealed; asserting it VISIBLE is the half boot.js cannot
     // see, since it polls for existence and a mounted-but-hidden element would pass it.
     await expect(page.locator(scene.ready).first()).toBeVisible();
+    // A field-focusing step swaps the boot veil from `visibility: hidden` to `opacity: 0` plus
+    // `pointer-events: none` on #root (clickTarget), and unveil() then clears all three inline
+    // styles on both its success and error paths. toBeVisible() above ignores opacity and
+    // pointer-events entirely, so a regression that left #root at opacity: 0 (the veil never
+    // lifted) would still pass it; this reads the inline styles boot.js itself sets and clears.
+    const rootVeilStyles = await page.evaluate(() => {
+      const root = document.getElementById('root');
+      return root ? { visibility: root.style.visibility, opacity: root.style.opacity, pointerEvents: root.style.pointerEvents } : null;
+    });
+    expect(rootVeilStyles, `${scene.name} has no #root`).not.toBeNull();
+    expect(rootVeilStyles, `${scene.name} left the boot veil applied to #root`).toEqual({ visibility: '', opacity: '', pointerEvents: '' });
     const deepMarker = SCENE_MARKERS[scene.name];
     if (deepMarker) await deepMarker(page);
     if (scene.focus) {
       // A focus the site crops to must be a real region: not a missing element (the ready
       // message would carry null), not a zero box, and not the whole frame (the Quick Find
-      // scenes once named the palette's full-frame backdrop, which crops to nothing).
+      // scenes once named the palette's full-frame backdrop, which crops to nothing). The rect is
+      // the box around every element the selector names, which is how boot.js measures it.
       const focusRect = await page.evaluate((selector) => {
-        const element = document.querySelector(selector);
-        if (!element) return null;
-        const box = element.getBoundingClientRect();
-        return { w: box.width / window.innerWidth, h: box.height / window.innerHeight };
+        const elements = Array.from(document.querySelectorAll(selector));
+        if (elements.length === 0) return null;
+        const boxes = elements.map((element) => element.getBoundingClientRect());
+        const left = Math.min(...boxes.map((box) => box.left));
+        const top = Math.min(...boxes.map((box) => box.top));
+        const right = Math.max(...boxes.map((box) => box.right));
+        const bottom = Math.max(...boxes.map((box) => box.bottom));
+        return { w: (right - left) / window.innerWidth, h: (bottom - top) / window.innerHeight, count: elements.length };
       }, scene.focus);
       expect(focusRect, `${scene.name}.focus (${scene.focus}) matches no element`).not.toBeNull();
+      // Each selector in the list names exactly one element. A single selector that began matching
+      // a second element would widen that figure's crop to take both in without failing anything.
+      const selectorCount = scene.focus.split(',').length;
+      expect(focusRect?.count, `${scene.name}.focus should name ${selectorCount} element(s)`).toBe(selectorCount);
       const focusArea = (focusRect?.w ?? 0) * (focusRect?.h ?? 0);
       expect(focusArea, `${scene.name}.focus is an empty box`).toBeGreaterThan(0);
       expect(focusArea, `${scene.name}.focus is the whole frame`).toBeLessThan(0.95);
@@ -219,9 +373,249 @@ test('the ready message carries the focus rect of a dialog scene, and null for a
   expect(area, 'the dialog covers a real region of the frame').toBeGreaterThan(0.1);
   expect(area, 'the dialog is not the whole frame').toBeLessThan(0.9);
 
+  // The capture rig measures each poster's focus through this same function, so the rect in the
+  // poster manifest and the rect a live frame posts are one measure (demo/posters.mjs).
+  const frame = await (await page.locator('#demo').elementHandle())?.contentFrame();
+  if (!frame) throw new Error('the demo iframe has no content frame');
+  const rigRect = await frame.evaluate((selector) => (window as DemoBootGlobal).__demoBoot?.focusRectOf(selector) ?? null, focusScene.focus ?? '');
+  expect(rigRect).toEqual(focused.focus);
+
   const plain = await readyMessageFor(page, 'board');
   expect(plain.scene).toBe('board');
   expect(plain.focus).toBeNull();
+});
+
+/** Host the frame in an iframe the site's way and hand back the frame plus a message reader. */
+async function hostFrame(page: Page, sceneName: string): Promise<() => Promise<DemoReadyMessage[]>> {
+  const src = demoUrl({ view: sceneName, embed: '1', still: '1' });
+  await page.setContent(
+    '<script>window.__demoMessages = []; window.addEventListener("message", (event) => { window.__demoMessages.push(event.data); });</script>'
+    + `<iframe id="demo" width="1600" height="1000" style="border:0" src="${src}"></iframe>`,
+  );
+  await expect(page.frameLocator('#demo').locator('html')).toHaveAttribute('data-demo-ready', '1', { timeout: READY_TIMEOUT_MS });
+  return () => page.evaluate(() => (window as { __demoMessages?: DemoReadyMessage[] }).__demoMessages ?? []);
+}
+
+const hasEscape = (messages: DemoReadyMessage[]) => messages.some((message) => message.type === 'kangentic-demo-escape');
+
+/**
+ * Focus an element inside the cross-origin `#demo` iframe and wait for the TOP-LEVEL browsing
+ * context's focus to actually land there before returning.
+ *
+ * `Locator.focus()` calls the element's `focus()` inside the iframe's own renderer, which
+ * updates that document's `activeElement` immediately. But `page.keyboard.press()` at the top
+ * level dispatches through whichever frame the BROWSER PROCESS currently believes is focused,
+ * and for a cross-origin iframe that hand-off is a separate, asynchronous step (an IPC round
+ * trip between renderer processes on Chromium). Pressing Escape right after `.focus()` can race
+ * that hand-off: the key lands on the top-level document (which has no listener) instead of the
+ * iframe, so the dialog never sees it and stays open until Playwright's retry. `document.hasFocus()`,
+ * read from INSIDE the iframe, reflects the browser process's actual routing rather than just the
+ * iframe's local `activeElement`, so polling it (instead of a fixed pad) makes the wait real.
+ */
+async function focusAcrossFrame(locator: Locator): Promise<void> {
+  await locator.focus();
+  await expect
+    .poll(() => locator.evaluate((element) => document.hasFocus() && document.activeElement === element))
+    .toBe(true);
+}
+
+test('Escape posts an escape message when the app has nothing of its own to close', async ({ page }) => {
+  // The case a host cannot handle itself: keyboard focus is inside the cross-origin frame, on the
+  // terminal's textarea, where the renderer's arrival-focus arbiter puts it, so every key goes
+  // there and no listener on the parent page ever sees one.
+  const readMessages = await hostFrame(page, 'board');
+  const textarea = page.frameLocator('#demo').locator('.xterm-helper-textarea').first();
+  await textarea.waitFor({ state: 'attached', timeout: READY_TIMEOUT_MS });
+  await textarea.focus();
+  // The keyboard, not `locator('#demo').press()`: that form focuses the iframe ELEMENT first, so
+  // the keystroke reaches the textarea only by Chromium restoring the frame's previously focused
+  // descendant. That is the one thing this test is proving, so it must not also be the mechanism.
+  await page.keyboard.press('Escape');
+
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
+  const escape = (await readMessages()).find((message) => message.type === 'kangentic-demo-escape');
+  expect(escape?.scene).toBe('board');
+});
+
+test('Escape posts nothing while a plain text field is focused, with no dialog or window involved', async ({ page }) => {
+  // The BASE rule the xterm-helper-textarea case above carves its one exemption out of: a focused
+  // INPUT/TEXTAREA/contenteditable blocks the post on its own, with no dialog and no restored
+  // window anywhere in the DOM. The board scene's search field is always mounted (no click needed
+  // to reveal it), which is what keeps this rung 1 rather than accidentally exercising rung 2
+  // ([data-dismissable-layer]) or rung 3 ([data-testid^="window-frame-"]).
+  const readMessages = await hostFrame(page, 'board');
+  const frame = page.frameLocator('#demo');
+  // Pin the isolation: nothing in the DOM could make this pass on rung 2 or 3 instead of rung 1.
+  await expect(frame.locator('[data-dismissable-layer]')).toHaveCount(0);
+  await expect(frame.locator('[data-testid^="window-frame-"]')).toHaveCount(0);
+
+  const searchInput = frame.locator('[data-testid="board-search"]');
+  await searchInput.focus();
+  await page.keyboard.press('Escape');
+  // Fixed wait, not a poll: this is a negative assertion (nothing posted). Polling "is it still
+  // false" would pass the instant it is called, whether or not the guard is even wired up.
+  await page.waitForTimeout(500);
+  expect(hasEscape(await readMessages()), 'a focused text field owns Escape before xterm is ever asked').toBe(false);
+
+  // Positive control, same frame: focusing the terminal's helper textarea (the one exemption)
+  // does post, so the absence above is the base rule firing rather than dead plumbing.
+  const textarea = frame.locator('.xterm-helper-textarea').first();
+  await textarea.waitFor({ state: 'attached', timeout: READY_TIMEOUT_MS });
+  await textarea.focus();
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
+});
+
+test('Escape posts nothing while the app owns it, and the app closes its own surface', async ({ page }) => {
+  // Each case settles on the app's OWN visible answer (the surface closing), never on a timer:
+  // that is both the proof the keystroke was processed and the behaviour being asserted. A
+  // second Escape, which this does not press, is what would then reach the host.
+  //
+  // Both cases focus a BUTTON inside the frame and press through the frame's own keyboard, for two
+  // separate reasons. `page.locator('#demo').press()` focuses the iframe ELEMENT, so the key
+  // reaches the frame's content only if Chromium restores the frame's previously focused
+  // descendant: it does on Windows and does NOT on the headless Linux runner, where this read
+  // green locally and red on every CI push. And a button rather than a text field keeps each case
+  // on the rung it is named for, since a focused input would satisfy rung 1 first and the assertion
+  // would hold for the wrong reason (rung 1 has its own test above).
+  const readDialogMessages = await hostFrame(page, 'new-task');
+  const dialog = page.frameLocator('#demo').locator('[data-testid="new-task-dialog"]');
+  await expect(dialog).toBeVisible();
+  await focusAcrossFrame(dialog.getByRole('button', { name: 'Cancel' }));
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  expect(hasEscape(await readDialogMessages()), 'a dialog owns the first Escape').toBe(false);
+
+  // A restored task window owns it the same way, through the [data-testid^="window-frame-"] rung.
+  const readWindowMessages = await hostFrame(page, 'task');
+  const frame = page.frameLocator('#demo');
+  const detail = frame.locator('[data-testid="task-detail-titlebar"]');
+  await expect(detail).toBeVisible();
+  // Pin the isolation the way the rung-1 test does: no dialog is open, so this can only be rung 3.
+  await expect(frame.locator('[data-dismissable-layer]')).toHaveCount(0);
+  await focusAcrossFrame(frame.locator('[data-testid="task-detail-close"]'));
+  await page.keyboard.press('Escape');
+  await expect(detail).toBeHidden();
+  expect(hasEscape(await readWindowMessages()), 'a task window owns the first Escape').toBe(false);
+});
+
+test('Escape in a task window terminal under the pointer closes the window, then the next one posts', async ({ page }) => {
+  // The reported case. A task window's terminal keeps Escape for the agent while the pointer is
+  // over it (terminal-clipboard.ts, `releaseEscapeWhenPointerOutside`), and a card click leaves
+  // the pointer exactly there once the window opens. The web build's terminals replay a recording
+  // with no agent to interrupt, so the key did nothing: the window stayed open and nothing posted.
+  const readMessages = await hostFrame(page, 'task');
+  const frame = page.frameLocator('#demo');
+  const detail = frame.locator('[data-testid="task-detail-titlebar"]');
+  await expect(detail).toBeVisible();
+  const terminal = frame.locator('[data-testid^="window-frame-"] .xterm').first();
+  // Page coordinates: `setContent` gives body a margin, so the iframe is not at 0,0.
+  const box = await terminal.boundingBox();
+  expect(box, 'the task window terminal has a box to hover').not.toBeNull();
+  if (!box) return;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  // The predicate the terminal itself reads, so a pointer that missed cannot pass this vacuously.
+  await expect.poll(() => terminal.evaluate((element) => element.parentElement?.matches(':hover') ?? false)).toBe(true);
+  await focusAcrossFrame(frame.locator('[data-testid^="window-frame-"] .xterm-helper-textarea').first());
+
+  await page.keyboard.press('Escape');
+  await expect(detail).toBeHidden();
+  expect(hasEscape(await readMessages()), 'the window takes the first Escape').toBe(false);
+
+  // The focused textarea left with its window. A visitor presses again without clicking, so the
+  // second key must still route into the frame. Read that from inside it rather than assume it.
+  await expect.poll(() => frame.locator('html').evaluate(() => document.hasFocus())).toBe(true);
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
+});
+
+test('Escape in a Command Terminal posts, since the desktop never closes that window on Escape', async ({ page }) => {
+  // A Command Terminal renders through WindowFrame like a task window, but its layer hides on the
+  // panel-close combo, the toggle, or a backdrop click, never on Escape. An open frame alone is
+  // therefore no sign the app will use the key, and without this the frame never posted at all.
+  const readMessages = await hostFrame(page, 'command-terminal');
+  const frame = page.frameLocator('#demo');
+  const commandWindow = frame.locator('[data-testid="command-terminal-window"]');
+  await expect(commandWindow).toBeVisible();
+  await focusAcrossFrame(commandWindow.locator('.xterm-helper-textarea').first());
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
+  await expect(commandWindow, 'the app keeps the window open, as the desktop does').toBeVisible();
+});
+
+test('Escape in a Command Terminal still posts when a header control holds focus, not the terminal', async ({ page }) => {
+  // The test above focuses the terminal's own textarea. For that focus, `terminalKeepsKey` in
+  // isEscapeTheAppOwns skips the frame loop, so the Command Terminal frame skip never runs there.
+  // A control in the window's chrome sends the key through the frame loop, which must pass over
+  // this frame as it does an inert one. The maximize button opens no menu or dialog, and unlike
+  // the tiled-only pop-out button it renders in every window state.
+  const readMessages = await hostFrame(page, 'command-terminal');
+  const frame = page.frameLocator('#demo');
+  const commandWindow = frame.locator('[data-testid="command-terminal-window"]');
+  await expect(commandWindow).toBeVisible();
+  // Pin the isolation the way the rung-1 and rung-3 tests do, so this can only be decided by the
+  // frame loop.
+  await expect(frame.locator('[data-dismissable-layer]')).toHaveCount(0);
+  await focusAcrossFrame(commandWindow.locator('[data-testid="command-bar-maximize"]'));
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
+  await expect(commandWindow, 'the app keeps the window open, as the desktop does').toBeVisible();
+});
+
+test('Escape in a Command Terminal under the pointer still posts and leaves the window open', async ({ page }) => {
+  // The other hovered case is a task window's terminal. A Command Terminal frame has no
+  // `task-detail-close`, so `taskWindowOf` returns null and closeHoveredTerminalWindow must decline
+  // rather than call `.querySelector` on it. Neither Command Terminal test above moves the pointer,
+  // so both stop at the hover check and a missing guard would still read as covered.
+  const readMessages = await hostFrame(page, 'command-terminal');
+  const frame = page.frameLocator('#demo');
+  const commandWindow = frame.locator('[data-testid="command-terminal-window"]');
+  await expect(commandWindow).toBeVisible();
+  const terminal = commandWindow.locator('.xterm').first();
+  const box = await terminal.boundingBox();
+  expect(box, 'the Command Terminal terminal has a box to hover').not.toBeNull();
+  if (!box) return;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  // The predicate the terminal itself reads, so a pointer that missed cannot pass this vacuously.
+  await expect.poll(() => terminal.evaluate((element) => element.parentElement?.matches(':hover') ?? false)).toBe(true);
+  await focusAcrossFrame(commandWindow.locator('.xterm-helper-textarea').first());
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
+  await expect(commandWindow, 'the app keeps the window open, as the desktop does').toBeVisible();
+});
+
+test('Escape in the bottom panel terminal posts even with a task window open', async ({ page }) => {
+  // xterm stops propagation of every key it handles, so an Escape in a terminal outside the task
+  // window never reaches the document listener the window closes on. A visitor gets here by
+  // clicking into the panel's terminal, which light dismiss deliberately leaves the window open
+  // for. The open window alone used to read as "the app owns this", so nothing ever posted.
+  const readMessages = await hostFrame(page, 'task');
+  const frame = page.frameLocator('#demo');
+  const detail = frame.locator('[data-testid="task-detail-titlebar"]');
+  await expect(detail).toBeVisible();
+  await focusAcrossFrame(frame.locator('[data-testid="terminal-session-pane"] .xterm-helper-textarea').first());
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
+  await expect(detail, 'the app keeps the window open, as the desktop does').toBeVisible();
+});
+
+test('a parked task window does not hold Escape once it is closed', async ({ page }) => {
+  // Closing a task window whose Browser pane has a live guest PARKS it: the frame stays mounted,
+  // invisible and inert, so the guest survives a reopen. A parked frame has nothing left to close,
+  // so the next Escape must reach the host rather than being held by a window nobody can see.
+  const readMessages = await hostFrame(page, 'browser');
+  const frame = page.frameLocator('#demo');
+  const windowFrame = frame.locator('[data-testid^="window-frame-"]').first();
+  await expect(windowFrame).toBeVisible();
+  await focusAcrossFrame(windowFrame.locator('.xterm-helper-textarea').first());
+  await page.keyboard.press('Escape');
+  // Parked, not unmounted: without this the case would pass on a window that simply went away.
+  await expect(windowFrame).toHaveAttribute('inert', '');
+  expect(hasEscape(await readMessages()), 'the window takes the first Escape').toBe(false);
+
+  await expect.poll(() => frame.locator('html').evaluate(() => document.hasFocus())).toBe(true);
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => hasEscape(await readMessages())).toBe(true);
 });
 
 test('embed=1 hides the OS window controls; without it they render', async ({ page }) => {
@@ -307,6 +701,27 @@ test('the build carries production semantics: no dev badge, no dev-only store ex
   expect(hasDevStores).toBe(false);
 });
 
+test('the emitted config-shape guard omits a block with no populated default', async ({ page }) => {
+  // nestedConfigShape() (demo/vite.config.mts) is what lets boot.js refuse a state= blob naming
+  // only part of a nested config block ("a state= blob naming only part of a nested config block
+  // is refused", above); nothing asserted its SKIP branches actually leave a block out rather than
+  // emitting it empty. Read off the real built asset rather than re-implemented here: the function
+  // is private to the Vite config, and reaching it would need either exporting it (a production
+  // change with no other motivation) or importing dist/demo from the unit tier, which breaks tier
+  // isolation (web-demo-parity.md) - so this lives in the tier that already boots the real build.
+  await gotoScene(page, { view: 'board', embed: '1', still: '1' });
+  const shape = await page.evaluate(() => (window as { __demoConfigShape?: Record<string, string[]> }).__demoConfigShape ?? {});
+  // A populated object block is kept, with every field named.
+  expect(Object.keys(shape)).toContain('monitor');
+  expect(shape.monitor).toContain('layout');
+  // A zero-key object default (a project-keyed map with nothing in DEFAULT_CONFIG) is skipped.
+  expect(Object.keys(shape)).not.toContain('workspaceByProject');
+  // A primitive default is skipped.
+  expect(Object.keys(shape)).not.toContain('theme');
+  // A null default is skipped.
+  expect(Object.keys(shape)).not.toContain('commandTerminalWorkspace');
+});
+
 test('the board scene makes no request off the serving origin', async ({ page }) => {
   const requestUrls: string[] = [];
   page.on('request', (request) => {
@@ -319,6 +734,36 @@ test('the board scene makes no request off the serving origin', async ({ page })
   expect(requestUrls.length).toBeGreaterThan(0);
   const offOrigin = requestUrls.filter((url) => !url.startsWith(`${server.origin}/`));
   expect(offOrigin).toEqual([]);
+});
+
+test('releasing push-to-talk over the focused Settings search box lands no text in it', async ({ page }) => {
+  // The dictation-field scene's own steps only PRESS Mouse:Back over the Settings search box and
+  // never release it (tests/captures/scenes.ts), so nothing before this exercised the release.
+  // demo-dataset.ts overrides window.electronAPI.dictation.stop to resolve '' rather than the
+  // mock's stock 'This is a test of dictation.' (tests/ui/mock-electron-api.js), because a
+  // silent microphone transcribes to nothing and no transcript is authored here - so releasing
+  // over a focused field must leave it exactly as the visitor found it.
+  const getUnexpectedErrors = collectUnexpectedErrors(page);
+  await gotoScene(page, { view: 'dictation-field', embed: '1', still: '1' });
+  const searchInput = page.locator('[data-testid="settings-search"]');
+  await expect(searchInput).toHaveValue('');
+
+  // The release half of the same gesture boot.js's pressCombo started: a pointerup on the same
+  // button (Mouse:Back is button 3, src/shared/keybindings.ts), dispatched on `document` the way
+  // boot.js dispatches its pointerdown, which useDictation's capture-phase `window` listener
+  // (src/renderer/hooks/useDictation.ts) matches via matchesMouseRelease(event, 'Mouse:Back').
+  await page.evaluate(() => {
+    document.dispatchEvent(new PointerEvent('pointerup', {
+      button: 3, buttons: 0, bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+    }));
+  });
+
+  // LiveDictationChip renders null once the dictation store is back to 'idle', which
+  // finalizeOnRelease reaches only after stop() has resolved and the input sink's submit() has
+  // run - the observable end of the release, not a fixed wait for it.
+  await expect(page.locator('[data-testid="dictation-live-chip"]')).toHaveCount(0, { timeout: 5000 });
+  await expect(searchInput).toHaveValue('');
+  expect(getUnexpectedErrors()).toEqual([]);
 });
 
 // ---- live replay and what a visitor can start ----------------------------------------------
@@ -346,7 +791,20 @@ interface DemoElectronWindow {
 }
 
 interface DemoMonitorWindow {
-  __mockMonitorRows?: Array<{ sessionId: string; activity: string; outputPeek?: string[] }>;
+  __mockMonitorRows?: Array<{
+    sessionId: string; activity: string; outputPeek?: string[];
+    status?: string; modelDisplayName?: string | null; contextPercent?: number | null; description?: string | null;
+  }>;
+}
+
+interface MonitorFields { status?: string; modelDisplayName?: string | null; contextPercent?: number | null; description?: string | null }
+
+/** The Monitor snapshot fields a row carries beyond its activity: the status, model, context, and description. */
+function monitorFields(page: Page, sessionId: string): Promise<MonitorFields | null> {
+  return page.evaluate((id) => {
+    const row = ((window as unknown as DemoMonitorWindow).__mockMonitorRows ?? []).find((candidate) => candidate.sessionId === id);
+    return row ? { status: row.status, modelDisplayName: row.modelDisplayName, contextPercent: row.contextPercent, description: row.description } : null;
+  }, sessionId);
 }
 
 /** The Monitor row state the mock publishes: what a card shows without opening a terminal. */
@@ -405,31 +863,49 @@ async function countTrailChanges(page: Page, sessionId: string, spanMs: number):
   }), { id: sessionId, span: spanMs });
 }
 
+interface WindowGeometry { x: number; y: number; w: number; h: number }
+
+/** The window manager's DEFAULT rect (defaultWindowGeometry: 0.58 of the frame, centred). */
+const DEFAULT_WINDOW_GEOMETRY: WindowGeometry = { x: 0.21, y: 0.15, w: 0.58, h: 0.7 };
+
 /**
- * A task-detail window on "Add rate limiting", whose session the board seeds IDLE. Same shape as
- * the task scene's workspace, so the window mounts its terminal on the grid the recording fits
- * and takes the live path rather than the frame fallback.
+ * One floating task-detail window, by default at the window manager's default rect: the window a
+ * visitor's own click opens and the one each task session was recorded at. Unlike the fitted
+ * `task` scene it is a fixed fraction, so its grid moves with the display, which is what the hold
+ * cases below need.
  */
-const RATE_LIMIT_WINDOW_STATE = {
-  config: {
-    workspaceByProject: {
-      'proj-contoso-web': {
-        version: 1,
-        windows: [{
-          taskId: 'task-cw-rate-limit',
-          kind: 'task-detail',
-          title: 'Add rate limiting',
-          geometry: { x: 0.21, y: 0.15, w: 0.58, h: 0.7 },
-          restoreGeometry: null,
-          state: 'floating',
-        }],
-        tileTree: null,
-        tileTreeRect: { x: 0, y: 0, w: 1, h: 1 },
-        focusedTaskId: 'task-cw-rate-limit',
+function floatingWindowState(taskId: string, title: string, geometry: WindowGeometry = DEFAULT_WINDOW_GEOMETRY) {
+  return {
+    config: {
+      workspaceByProject: {
+        'proj-contoso-web': {
+          version: 1,
+          windows: [{
+            taskId,
+            kind: 'task-detail',
+            title,
+            geometry,
+            restoreGeometry: null,
+            state: 'floating',
+          }],
+          tileTree: null,
+          tileTreeRect: { x: 0, y: 0, w: 1, h: 1 },
+          focusedTaskId: taskId,
+        },
       },
     },
-  },
-};
+  };
+}
+
+/**
+ * A task-detail window on "Add rate limiting", whose session the board seeds IDLE, at the default
+ * rect, so the window mounts its terminal on the grid the recording fits and takes the live path
+ * rather than the frame fallback.
+ */
+const RATE_LIMIT_WINDOW_STATE = floatingWindowState('task-cw-rate-limit', 'Add rate limiting');
+
+/** The middleware task at the default rect, where a display at another scale fits another grid. */
+const MIDDLEWARE_DEFAULT_WINDOW_STATE = floatingWindowState(TASK_MIDDLEWARE, 'Extract auth middleware');
 
 function encodeState(state: unknown): string {
   return Buffer.from(JSON.stringify(state)).toString('base64url');
@@ -453,6 +929,22 @@ function recordingRequests(page: Page): () => string[] {
     if (request.url().includes('/recordings/')) urls.push(request.url());
   });
   return () => urls.slice();
+}
+
+/**
+ * A terminal frame as plain text. A frame spells runs of spaces as cursor-forward moves, so those
+ * become a space before the rest of the escapes go.
+ */
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[\d*C/g, ' ').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/ +/g, ' ');
+}
+
+/** The ids of every session row the mock lists for one task. */
+function sessionIdsForTask(page: Page, taskId: string): Promise<string[]> {
+  return page.evaluate(async (wantedTaskId) => {
+    const sessions = await (window as unknown as DemoElectronWindow).electronAPI.sessions.list();
+    return sessions.filter((session) => session.taskId === wantedTaskId).map((session) => session.id);
+  }, taskId);
 }
 
 /**
@@ -511,6 +1003,127 @@ const MIDDLEWARE_RECORDED_GRID: Grid = { cols: 154, rows: 37 };
 const MIDDLEWARE_TILED_GRID: Grid = { cols: 115, rows: 37 };
 
 /**
+ * The most a terminal may leave empty around its screen, beside it and below it: the leftover of
+ * whole cells a fit always has, twice over, since a held pane is taken at the least its natural
+ * grid allows and then filled at a smaller cell (displayFor in demo-dataset.ts). A letterboxed
+ * recording left 56px beside and 23px below every card window at 125 percent, and 314px below the
+ * Browser scene's terminal at 100; a pane the seed fills stays inside these on every display.
+ */
+const MAX_EMPTY_BESIDE_PX = 16;
+const MAX_EMPTY_BELOW_PX = 30;
+
+interface PaneBands { right: number; below: number }
+
+/** The empty band beside and below the screen of every terminal on the page, as the fit addon measures its box. */
+function paneBands(page: Page): Promise<PaneBands[]> {
+  return page.evaluate(() => Array.from(document.querySelectorAll<HTMLElement>('.xterm')).flatMap((xterm) => {
+    const parent = xterm.parentElement;
+    const viewport = xterm.querySelector<HTMLElement>('.xterm-viewport');
+    const screen = xterm.querySelector<HTMLElement>('.xterm-screen');
+    if (!parent || !viewport || !screen) return [];
+    const parentBox = parent.getBoundingClientRect();
+    if (parentBox.width === 0 || parentBox.height === 0) return [];
+    const style = getComputedStyle(xterm);
+    const screenBox = screen.getBoundingClientRect();
+    const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+    return [{
+      right: Math.round(parentBox.width - padding - (viewport.offsetWidth - viewport.clientWidth) - screenBox.width),
+      below: Math.round(parentBox.height - screenBox.height),
+    }];
+  }));
+}
+
+/**
+ * Every terminal on the page fills its pane. Polled, because a held terminal conforms a resize
+ * debounce after it mounts, and a window's layout lands a frame after its first report.
+ */
+async function expectPanesFilled(page: Page, label: string): Promise<void> {
+  await expect.poll(async () => {
+    const bands = await paneBands(page);
+    if (bands.length === 0) return ['no terminal on the page'];
+    return bands.filter((band) => band.right > MAX_EMPTY_BESIDE_PX || band.below > MAX_EMPTY_BELOW_PX);
+  }, { timeout: 15_000, message: `${label}: a terminal left its pane empty around it` }).toEqual([]);
+}
+
+interface ReplayState { mode: 'bytes' | 'frames' | null; held: Grid | null }
+
+/** How the seed is feeding a session's terminal (window.__demoReplayMode) and the grid it holds it at, if any (window.__demoHeldGrid). */
+function replayState(page: Page, sessionId: string): Promise<ReplayState> {
+  return page.evaluate((id) => {
+    const demo = window as unknown as { __demoReplayMode?: Record<string, 'bytes' | 'frames'>; __demoHeldGrid?: Record<string, Grid | null> };
+    return { mode: demo.__demoReplayMode?.[id] ?? null, held: demo.__demoHeldGrid?.[id] ?? null };
+  }, sessionId);
+}
+
+/** The grids a session was recorded at: its single recording's, and its tiled sibling's when it has one. */
+function recordingGridsOf(page: Page, sessionId: string): Promise<Grid[]> {
+  return page.evaluate((id) => {
+    interface Indexed { cols: number; rows: number; tiled?: Indexed }
+    const sessions = (window as unknown as { __demoRecordings?: { sessions: Record<string, Indexed> } }).__demoRecordings?.sessions ?? {};
+    const indexed = sessions[id];
+    if (!indexed) return [];
+    return [indexed, ...(indexed.tiled ? [indexed.tiled] : [])].map((entry) => ({ cols: entry.cols, rows: entry.rows }));
+  }, sessionId);
+}
+
+/**
+ * The replay invariant: bytes reach a terminal only on its recording's grid, and every other grid
+ * plays frames from the page's emulator. A session the seed holds at a smaller type has to see
+ * the terminal report the held grid back, which is the conform landing: a hold with no report back
+ * is the decline that wrapped every padded row into a blank one and put Copilot's scrollbar in
+ * column zero. Which path a pane takes rides on the platform's font metrics, so this asserts
+ * whichever one the seed took rather than predicting it.
+ */
+async function expectFaithfulReplay(page: Page, sessionId: string): Promise<ReplayState> {
+  await expect.poll(async () => (await replayState(page, sessionId)).mode, { timeout: 15_000, message: `${sessionId} was never fed` }).not.toBeNull();
+  const state = await replayState(page, sessionId);
+  if (state.held) {
+    await expect.poll(() => sentGrids(page, sessionId), { timeout: 10_000, message: `${sessionId} was held at ${state.held.cols}x${state.held.rows} and never conformed` }).toContainEqual(state.held);
+  }
+  if (state.mode === 'bytes') {
+    const recorded = await recordingGridsOf(page, sessionId);
+    const terminalGrid = state.held ?? await naturalGrid(page, sessionId);
+    if (recorded.length > 0) expect(recorded, `${sessionId} was handed bytes on a grid none of its recordings has`).toContainEqual(terminalGrid);
+  }
+  return state;
+}
+
+/** The natural grid the seed last recorded for a session (window.__demoNaturalGeometry): what its window fits, before any hold. */
+function naturalGrid(page: Page, sessionId: string): Promise<Grid | null> {
+  return page.evaluate((id) => {
+    const natural = (window as unknown as { __demoNaturalGeometry?: Record<string, Grid> }).__demoNaturalGeometry ?? {};
+    return natural[id] ?? null;
+  }, sessionId);
+}
+
+/**
+ * The floating terminal scenes, each with the session its window is fitted to
+ * (FITTED_FLOATING_GEOMETRY in scenes.ts) and that session's single recording, whose grid the
+ * window must take: 154 columns and 37 rows, both Claude sessions recorded at the task window.
+ */
+const FITTED_WINDOW_SCENES = [
+  { view: 'task', sessionId: SESSION_MIDDLEWARE, fileStem: 'contoso-web-claude-middleware' },
+  { view: 'command-terminal', sessionId: SESSION_CONTOSO_TERMINAL, fileStem: 'contoso-web-claude-terminal' },
+] as const;
+
+/**
+ * Opens a fitted scene and asserts its window's terminal took exactly the recording's columns,
+ * rows to spare, and the SINGLE recording's bytes. Polls for the columns because a terminal
+ * reports once at a transitional size before its window's layout lands (demo/measure.mjs); a
+ * window that never lands on the recording's width fails the poll.
+ */
+async function expectFittedToRecording(page: Page, scene: typeof FITTED_WINDOW_SCENES[number], label: string): Promise<void> {
+  const getRecordingRequests = recordingRequests(page);
+  await page.goto(demoUrl({ view: scene.view, embed: '1' }));
+  await waitForDemoReady(page);
+  await expect.poll(async () => (await naturalGrid(page, scene.sessionId))?.cols, { timeout: 10_000, message: `${label}: the window's terminal columns` })
+    .toBe(MIDDLEWARE_RECORDED_GRID.cols);
+  expect((await naturalGrid(page, scene.sessionId))?.rows ?? 0, `${label}: the window's terminal rows`).toBeGreaterThanOrEqual(MIDDLEWARE_RECORDED_GRID.rows);
+  await expect.poll(() => getRecordingRequests().some((url) => url.includes(`/recordings/${scene.fileStem}-`) && !url.includes('-tiled-')), { timeout: 15_000 }).toBe(true);
+  await expectFaithfulReplay(page, scene.sessionId);
+}
+
+/**
  * The same, for the Copilot rate-limit session. Claude's context bar wraps to two rows and every
  * other agent's does not, so a non-Claude session records two rows taller (manifest geometry,
  * rowsByAgent).
@@ -520,7 +1133,9 @@ const RATE_LIMIT_RECORDED_GRID: Grid = { cols: 154, rows: 39 };
 /**
  * Every frame the mock paints into a terminal on the frames path, parsed: the rows between the
  * autowrap-off and autowrap-on brackets, each measured in cells (code points plus cursor-forward
- * gaps; the sample install's frames carry no wide glyph). What the bottom-panel case asserts on.
+ * gaps; the sample install's frames carry no wide glyph). A full paint joins its rows with line
+ * breaks; a repaint that builds on the last one redraws each screen row in place behind a cursor
+ * move to its first column. What the bottom-panel case asserts on.
  */
 function paintedFrameRowWidths(page: Page, sessionId: string, spanMs: number): Promise<number[][]> {
   return page.evaluate(({ id, span }) => new Promise<number[][]>((resolve) => {
@@ -531,7 +1146,7 @@ function paintedFrameRowWidths(page: Page, sessionId: string, spanMs: number): P
       const start = data.indexOf('\x1b[?7l');
       const end = data.lastIndexOf('\x1b[?7h');
       if (start === -1 || end === -1 || end < start) return;
-      frames.push(data.slice(start + 5, end).split('\r\n').map((row) => {
+      frames.push(data.slice(start + 5, end).split(/\r\n|\x1b\[\d+;1H/).filter((row, index) => index > 0 || row !== '').map((row) => {
         const text = row.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
         const gaps = (row.match(/\x1b\[(\d*)C/g) ?? []).reduce((sum, move) => sum + Number(move.replace(/\D/g, '') || '1'), 0);
         return Array.from(text).length + gaps;
@@ -635,25 +1250,20 @@ test('the conversation scene shows the transcript recorded beside the middleware
   expect(getUnexpectedErrors()).toEqual([]);
 });
 
-test('the tiled task windows take each session\'s tiled recording, held at its grid, on the session\'s own clock', async ({ page }) => {
+test('the tiled task windows take each session\'s tiled recording, fill their panes, on the session\'s own clock', async ({ page }) => {
   const getUnexpectedErrors = collectUnexpectedErrors(page);
   const getRecordingRequests = recordingRequests(page);
   await gotoScene(page, { view: 'windows-tiled', embed: '1' });
   for (const [sessionId, fileStem] of [['sess-cw-middleware', 'contoso-web-claude-middleware'], ['sess-cw-api-client', 'contoso-web-claude-api-client']] as const) {
     await expect.poll(() => sentGrids(page, sessionId), { timeout: 10_000 }).not.toHaveLength(0);
-    // The pane's natural width decides the layout (a pane narrower than the single recording
-    // takes the tiled one); the font metrics decide the natural width, and they differ between
-    // Windows and CI's Linux, so the expectation follows the width the page measured.
-    const natural = (await sentGrids(page, sessionId))[0];
-    const tiled = natural.cols < MIDDLEWARE_RECORDED_GRID.cols;
-    const expectedGrid = tiled ? MIDDLEWARE_TILED_GRID : MIDDLEWARE_RECORDED_GRID;
-    if (natural.cols !== expectedGrid.cols || natural.rows !== expectedGrid.rows) {
-      await expect.poll(() => sentGrids(page, sessionId), { timeout: 10_000 }).toContainEqual(expectedGrid);
-    }
-    const expectedFile = tiled ? `${fileStem}-tiled-` : `${fileStem}-`;
-    await expect.poll(() => getRecordingRequests().some((url) => url.includes(`/recordings/${expectedFile}`)), { timeout: 15_000 }).toBe(true);
-    if (tiled) expect(getRecordingRequests().some((url) => url.includes(`/recordings/${fileStem}-`) && !url.includes('-tiled-'))).toBe(false);
+    // A tiled pane is within about eight columns either side of the tiled recording's 115 on every
+    // platform (123 at 100 percent on Windows, 107 on this runner's Liberation Mono), and the tiled
+    // recording shows it at a larger type than the single one could (layoutFor).
+    await expectFaithfulReplay(page, sessionId);
+    await expect.poll(() => getRecordingRequests().some((url) => url.includes(`/recordings/${fileStem}-tiled-`)), { timeout: 15_000 }).toBe(true);
+    expect(getRecordingRequests().some((url) => url.includes(`/recordings/${fileStem}-`) && !url.includes('-tiled-'))).toBe(false);
   }
+  await expectPanesFilled(page, 'windows-tiled');
   // A variant is a second run with its own length, played from the moment the SESSION's clock
   // began, and the clock stays the single recording's. A tiled window therefore opens partway
   // into the variant and the session goes on working for the stretch its single recording has
@@ -664,6 +1274,157 @@ test('the tiled task windows take each session\'s tiled recording, held at its g
     expect((await monitorRow(page, sessionId))?.activity, `${sessionId} finished when its tiled window opened`).toBe('thinking');
   }
   expect(getUnexpectedErrors()).toEqual([]);
+});
+
+// The floating terminal scenes size their window to the recording at the visitor's own cell
+// (FITTED_FLOATING_GEOMETRY in scenes.ts, fitLayoutBlob in demo-dataset.ts), so the terminal takes
+// exactly the recording's columns and fills its pane at native type on every display. At a fixed
+// 0.64 of the frame it did not: at 100 percent the 6.0 px Consolas cell fitted 170 columns and left
+// about 100px empty on the right, and at a 7.0 px cell (Liberation Mono on this runner, where the
+// release posters are shot) the window fitted 146, took the 115-column tiled recording, and left a
+// fifth of the pane empty. Each scale here rounds the cell to device pixels differently (6.0, 6.4,
+// 6.5 CSS px for Consolas), which is what a fixed fraction cannot follow.
+for (const deviceScaleFactor of [1, 1.25, 2]) {
+  test(`a floating terminal window fits its recording's columns at device scale ${deviceScaleFactor}`, async ({ browser }) => {
+    test.setTimeout(120_000);
+    const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor });
+    try {
+      for (const scene of FITTED_WINDOW_SCENES) {
+        const page = await context.newPage();
+        const getUnexpectedErrors = collectUnexpectedErrors(page);
+        await expectFittedToRecording(page, scene, `${scene.view} at scale ${deviceScaleFactor}`);
+        await expectPanesFilled(page, `${scene.view} at scale ${deviceScaleFactor}`);
+        expect(getUnexpectedErrors()).toEqual([]);
+        await page.close();
+      }
+    } finally {
+      await context.close();
+    }
+  });
+}
+
+// Every scene with a terminal in it, at the display scales a visitor has: the terminal fills its
+// pane, wider or narrower than its recording, taller or shorter. Before the fill, the Browser
+// scene's terminal left 314px below it at 100 percent, the tiled windows 52px beside them, and
+// the Changes scene 300px below at 125. A still fills too, since the posters are stills, shot at
+// twice scale; this runner's Liberation Mono is the face whose heights round unevenly, the case
+// the renderer's conform used to stop short on.
+const TERMINAL_SCENES = ['task', 'windows-tiled', 'browser', 'changes', 'command-terminal', 'command-terminal-tiled', 'board'] as const;
+for (const [deviceScaleFactor, still] of [[1, false], [1.25, false], [2, false], [2, true]] as const) {
+  test(`every terminal scene fills its panes at device scale ${deviceScaleFactor}${still ? ', as a still' : ''}`, async ({ browser }) => {
+    test.setTimeout(180_000);
+    const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor });
+    try {
+      for (const view of TERMINAL_SCENES) {
+        const page = await context.newPage();
+        const getUnexpectedErrors = collectUnexpectedErrors(page);
+        await gotoScene(page, { view, embed: '1', ...(still ? { still: '1' } : {}) });
+        await expectPanesFilled(page, `${view} at scale ${deviceScaleFactor}${still ? ' (still)' : ''}`);
+        expect(getUnexpectedErrors()).toEqual([]);
+        await page.close();
+      }
+    } finally {
+      await context.close();
+    }
+  });
+}
+
+test('a card opened on a desktop browser at 100 percent replays its terminal on the grid the terminal has', async () => {
+  // A desktop browser reserves the app's 8px scrollbar gutter, which leaves the default task
+  // window a column short of a 154-column recording on Consolas. The seed used to hold that pane
+  // anyway; the conform declined (four quarter-pixel font steps cannot move a 6px cell to 5), the
+  // terminal kept its own 153 columns, and the bytes it was sent addressed 154: every padded row
+  // wrapped into a blank one and Copilot's right-edge scrollbar landed in column zero. A near
+  // miss now plays frames at the pane's grid, and anything held has to land. Copilot and Claude,
+  // the two renderers the report showed, opened the way a visitor opens them: a click on the card.
+  test.setTimeout(120_000);
+  const browserWithScrollbars = await chromium.launch({ headless: true, ignoreDefaultArgs: ['--hide-scrollbars'] });
+  try {
+    const context = await browserWithScrollbars.newContext({ viewport: { width: 1600, height: 1000 } });
+    for (const [taskId, sessionId] of [['task-cw-rate-limit', SESSION_RATE_LIMIT], [TASK_MIDDLEWARE, SESSION_MIDDLEWARE]] as const) {
+      const page = await context.newPage();
+      const getUnexpectedErrors = collectUnexpectedErrors(page);
+      await gotoScene(page, { view: 'board', embed: '1' });
+      await page.locator(`[data-task-id="${taskId}"]`).first().click();
+      await expect(page.locator('[data-testid^="window-frame-"] .xterm-screen')).toBeVisible({ timeout: 15_000 });
+      await expectFaithfulReplay(page, sessionId);
+      await expectPanesFilled(page, `${taskId} at 100 percent`);
+      expect(getUnexpectedErrors()).toEqual([]);
+      await page.close();
+    }
+  } finally {
+    await browserWithScrollbars.close();
+  }
+});
+
+test('a window one column short of its recording plays frames at its own grid rather than holding', async ({ browser }) => {
+  // The case above reaches one column short only on Windows' Consolas; this runner's Liberation
+  // Mono floors to a wider cell, the default window fits far fewer columns, and the pane holds.
+  // So this builds the near miss on any font: the fitted window, one cell narrower. The fit leaves
+  // half a cell of slack, so that floors to exactly one column under the recording. Smaller type
+  // is not worth a column (NEAR_MISS_COLUMNS in demo-dataset.ts), so the seed plays frames at the
+  // pane's grid at the configured type, with nothing held.
+  test.setTimeout(120_000);
+  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+  try {
+    const fittedPage = await context.newPage();
+    await expectFittedToRecording(fittedPage, FITTED_WINDOW_SCENES[0], 'the fitted task window');
+    const fitted = await fittedPage.evaluate(async (taskId) => {
+      // The stored workspace, which the seed rewrote with the fitted rect on the renderer's first read.
+      const api = (window as unknown as { electronAPI: { config: { getGlobal: () => Promise<{
+        workspaceByProject: Record<string, { windows: Array<{ taskId: string; geometry: WindowGeometry }> }>;
+      }> } } }).electronAPI;
+      const config = await api.config.getGlobal();
+      const managedWindow = config.workspaceByProject['proj-contoso-web'].windows.find((candidate) => candidate.taskId === taskId);
+      const screen = document.querySelector<HTMLElement>('[data-testid="task-detail-dialog"] .xterm-screen');
+      return { geometry: managedWindow?.geometry ?? null, screenWidth: screen ? screen.getBoundingClientRect().width : null };
+    }, TASK_MIDDLEWARE);
+    await fittedPage.close();
+    expect(fitted.geometry, 'the fitted window geometry').not.toBeNull();
+    expect(fitted.screenWidth, 'the fitted terminal screen').not.toBeNull();
+    const cellWidth = (fitted.screenWidth ?? 0) / MIDDLEWARE_RECORDED_GRID.cols;
+    const fittedGeometry = fitted.geometry as WindowGeometry;
+    const width = fittedGeometry.w - cellWidth / 1600;
+    const shortGeometry: WindowGeometry = { x: (1 - width) / 2, y: fittedGeometry.y, w: width, h: fittedGeometry.h };
+
+    const page = await context.newPage();
+    const getUnexpectedErrors = collectUnexpectedErrors(page);
+    await gotoScene(page, { view: 'task', embed: '1', state: encodeState(floatingWindowState(TASK_MIDDLEWARE, 'Extract auth middleware', shortGeometry)) });
+    // Not vacuous: the pane really is one column short, with the recording's rows to spare.
+    await expect.poll(async () => (await naturalGrid(page, SESSION_MIDDLEWARE))?.cols, { timeout: 10_000, message: 'the narrowed window\'s terminal columns' })
+      .toBe(MIDDLEWARE_RECORDED_GRID.cols - 1);
+    expect((await naturalGrid(page, SESSION_MIDDLEWARE))?.rows ?? 0).toBeGreaterThanOrEqual(MIDDLEWARE_RECORDED_GRID.rows);
+    await expect.poll(() => replayState(page, SESSION_MIDDLEWARE), { timeout: 15_000, message: 'a near miss was held rather than left on frames' })
+      .toEqual({ mode: 'frames', held: null });
+    expect(getUnexpectedErrors()).toEqual([]);
+  } finally {
+    await context.close();
+  }
+});
+
+test('a floating terminal window fits its recording with the scrollbar gutter a desktop browser reserves', async () => {
+  // Headless Chromium hides scrollbars, so every other case here measures a zero gutter. A browser
+  // on Windows reserves the app's 8px (index.css), and the fitted width has to carry it or the
+  // window lands a column short. The seed measures the gutter the way fit-addon.ts does; this is
+  // the one launch that exercises that measurement with a gutter to measure.
+  test.setTimeout(120_000);
+  const browserWithScrollbars = await chromium.launch({ headless: true, ignoreDefaultArgs: ['--hide-scrollbars'] });
+  try {
+    const context = await browserWithScrollbars.newContext({ viewport: { width: 1600, height: 1000 } });
+    const page = await context.newPage();
+    const getUnexpectedErrors = collectUnexpectedErrors(page);
+    const scene = FITTED_WINDOW_SCENES[0];
+    await expectFittedToRecording(page, scene, 'task with visible scrollbars');
+    // Not vacuous: the gutter this case exists for is really there.
+    const gutter = await page.evaluate(() => {
+      const viewport = document.querySelector<HTMLElement>('[data-testid="task-detail-dialog"] .xterm-viewport');
+      return viewport ? viewport.offsetWidth - viewport.clientWidth : null;
+    });
+    expect(gutter).toBeGreaterThan(0);
+    expect(getUnexpectedErrors()).toEqual([]);
+  } finally {
+    await browserWithScrollbars.close();
+  }
 });
 
 test('a still paints a working session at the moment the live frame opens it', async ({ page }) => {
@@ -821,51 +1582,61 @@ test('loop=1 leaves a session that was never working alone', async ({ page }) =>
   expect(getUnexpectedErrors()).toEqual([]);
 });
 
+/**
+ * The rate-limit window in the 1233px frame, wide enough that the seed HOLDS it on either runner
+ * font: 139 columns in Consolas's 6px cell and 119 in Liberation Mono's 7px one, inside the bands
+ * displayFor holds a 154-column recording at (102 to 151 columns and 109 to 151). The default
+ * rect fits 101 in Liberation Mono there, below its band, so nothing would be held on CI.
+ */
+const RATE_LIMIT_HELD_WINDOW_STATE = floatingWindowState('task-cw-rate-limit', 'Add rate limiting', { x: 0.16, y: 0.15, w: 0.68, h: 0.7 });
+
 test('a held terminal reporting its conformed grid is not a resize, so a finished session stays silent', async ({ browser }) => {
-  // The case above runs at the frame size, where the task window already fits 154 by 39 and the
-  // hold never engages. Narrow the frame and it does: the terminal takes the held grid and its own
-  // xterm resize reports that grid straight back. That report is the conform landing, not the
-  // window moving, and reading it as a resize repaints a session whose replay is at its end,
-  // which is a whole frame arriving in a terminal that should get nothing. It reached CI as one
-  // retried run out of many, because whether the hold engages at all rides on the runner's font
-  // metrics; this viewport puts the natural grid a fifth of the columns short on every platform.
+  // The case above runs at the frame size, where the default-rect window fits the recording's
+  // columns or a near miss of them and the hold never engages. Narrow the frame and it does: the
+  // terminal takes the held grid and its own xterm resize reports that grid straight back. That
+  // report is the conform landing, not the window moving, and reading it as a resize repaints a
+  // session whose replay is at its end, which is a whole frame arriving in a terminal that should
+  // get nothing. It reached CI as one retried run out of many, because whether the hold engages
+  // at all rides on the runner's font metrics; the window is sized to be held on both faces
+  // (RATE_LIMIT_HELD_WINDOW_STATE).
   test.setTimeout(120_000);
   const context = await browser.newContext({ viewport: { width: 1233, height: 771 }, deviceScaleFactor: 1 });
   const page = await context.newPage();
   const getUnexpectedErrors = collectUnexpectedErrors(page);
-  await page.goto(demoUrl({ view: 'task', embed: '1', loop: '1', state: encodeState(RATE_LIMIT_WINDOW_STATE) }));
+  await page.goto(demoUrl({ view: 'task', embed: '1', loop: '1', state: encodeState(RATE_LIMIT_HELD_WINDOW_STATE) }));
   await waitForDemoReady(page);
   await expect(page.locator('[data-testid="task-title-text"]')).toHaveText('Add rate limiting');
-  await expect.poll(() => sentGrids(page, 'sess-cw-rate-limit'), { timeout: 10_000 }).toContainEqual(RATE_LIMIT_RECORDED_GRID);
+  const state = await expectFaithfulReplay(page, 'sess-cw-rate-limit');
+  expect(state.held, 'the narrowed window was not held').not.toBeNull();
   expect((await sentGrids(page, 'sess-cw-rate-limit'))[0].cols).toBeLessThan(RATE_LIMIT_RECORDED_GRID.cols);
+  await expectPanesFilled(page, 'the narrowed window');
   expect(await streamedBytes(page, 'sess-cw-rate-limit', 15_000)).toBe(0);
   expect(getUnexpectedErrors()).toEqual([]);
   await context.close();
 });
 
-test('a display that fits another grid holds the task window at the recording\'s grid and streams its bytes', async ({ browser }) => {
-  // A display at 125 percent scaling fits fewer columns and rows in the task window than the
-  // recorded 154 by 37 (144 by 36 on Windows, 141 by 36 on CI's Linux fonts), and a recording's
-  // bytes address rows for their own grid. The mock answers the terminal's resize with the grid it
-  // holds and the terminal conforms: it takes that grid and scales its font to fit the pane, so
-  // the bytes replay exactly here too. Which recording is held follows the width the page
-  // measured: a pane narrower than the single recording takes the session's tiled one (the seed's
-  // layoutFor), played from the moment the session's clock began. Either recording has a stretch
-  // left when the page opens (the single 38 s, the variant 26 s), so its bytes stream on either
-  // layout, and the session goes on working through it on its own clock, as an agent does on the
-  // desktop when its window is resized.
+test('a display that fits another grid replays the task window on the grid it shows, and the session keeps streaming', async ({ browser }) => {
+  // A display at 125 percent scaling fits fewer columns and rows in the default-rect window than
+  // the recorded 154 by 37 (143 by 36 on Windows, 128 by 36 on CI's Linux fonts), and a
+  // recording's bytes address rows for their own grid. The pane is held at a smaller type, at the
+  // grid the WHOLE pane takes there, and the page's emulator plays the recording into it, so the
+  // terminal fills the window where the recording held at its own grid left 56px beside it and
+  // 23px below. The window is the default rect rather than the `task` scene's, which is fitted to
+  // the recording at every scale. Which recording plays follows the grid the page measured (the
+  // seed's layoutFor), from the moment the session's clock began, and the session goes on working
+  // through it on its own clock, as an agent does on the desktop when its window is resized.
   test.setTimeout(120_000);
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor: 1.25 });
   const page = await context.newPage();
   const getUnexpectedErrors = collectUnexpectedErrors(page);
-  await page.goto(demoUrl({ view: 'task', embed: '1', loop: '1' }));
+  await page.goto(demoUrl({ view: 'task', embed: '1', loop: '1', state: encodeState(MIDDLEWARE_DEFAULT_WINDOW_STATE) }));
   await waitForDemoReady(page);
   await SCENE_MARKERS.task(page);
   await expect.poll(() => sentGrids(page, 'sess-cw-middleware'), { timeout: 10_000 }).not.toHaveLength(0);
   const natural = (await sentGrids(page, 'sess-cw-middleware'))[0];
   expect(natural.rows).toBeLessThan(MIDDLEWARE_RECORDED_GRID.rows);
-  const heldGrid = natural.cols < MIDDLEWARE_RECORDED_GRID.cols ? MIDDLEWARE_TILED_GRID : MIDDLEWARE_RECORDED_GRID;
-  await expect.poll(() => sentGrids(page, 'sess-cw-middleware'), { timeout: 10_000 }).toContainEqual(heldGrid);
+  await expectFaithfulReplay(page, 'sess-cw-middleware');
+  await expectPanesFilled(page, 'the default window at 125 percent');
   expect(await firstStreamedSession(page, 10_000, 'sess-cw-middleware')).toBe('sess-cw-middleware');
   const peekChanges = countPeekChanges(page, 'sess-cw-middleware', 30_000);
   expect(await streamedBytes(page, 'sess-cw-middleware', 30_000)).toBeGreaterThan(0);
@@ -909,6 +1680,325 @@ test('a state= blob carrying a capture-rig step is refused', async ({ page }) =>
   await gotoScene(page, { state: pressStepBlob, embed: '1', still: '1' });
   await expect(page.locator('[data-testid="demo-error"]')).toHaveCount(0);
   await expect(page.locator('html')).toHaveAttribute('data-demo-scene', 'state');
+});
+
+test('a state= blob naming only part of a nested config block is refused', async ({ page }) => {
+  // The merge is a shallow Object.assign twice over (boot.js into __mockConfigOverrides, then the
+  // mock into its defaults), so a nested block REPLACES the default. A partial block used to boot
+  // fine with its unnamed siblings undefined, which is a figure that is quietly wrong rather than
+  // one that fails. The registry test catches this for SCENES; this is the same guard for the
+  // hand-written state= URL the README points developers at.
+  const partialBlock = encodeState({ config: { monitor: { layout: 'table' } } });
+  await page.goto(demoUrl({ state: partialBlock, embed: '1', still: '1' }));
+  const errorCard = page.locator('[data-testid="demo-error"]');
+  await expect(errorCard).toBeVisible();
+  await expect(errorCard).toContainText('must name every field');
+  // Named, so the fix is mechanical rather than a hunt through AppConfig.
+  await expect(errorCard).toContainText('groupBy');
+  await expect(page.locator('html')).not.toHaveAttribute('data-demo-ready');
+
+  // Positive control: the same block spelled whole boots, and so does a flat key on its own.
+  const wholeBlock = encodeState({
+    config: {
+      monitor: {
+        layout: 'table', groupBy: 'project', sort: 'longest-running', liveOnly: false,
+        projectFilter: [], stateFilter: [], textFilter: '',
+      },
+    },
+  });
+  await gotoScene(page, { state: wholeBlock, embed: '1', still: '1' });
+  await expect(page.locator('[data-testid="demo-error"]')).toHaveCount(0);
+  await expect(page.locator('html')).toHaveAttribute('data-demo-scene', 'state');
+});
+
+test('a state= blob that resumes a stopped session is refused', async ({ page }) => {
+  // Main marks only a live respawn as resuming, so a resume on a paused session is a state the
+  // desktop never draws. validateState refuses it before anything is seeded.
+  const stoppedResumeBlob = encodeState({ sessions: { [SESSION_WEBSOCKET]: { resuming: true, status: 'suspended' } } });
+  await page.goto(demoUrl({ state: stoppedResumeBlob, embed: '1', still: '1' }));
+  const errorCard = page.locator('[data-testid="demo-error"]');
+  await expect(errorCard).toBeVisible();
+  await expect(errorCard).toContainText('a resuming session is running');
+  await expect(page.locator('[data-swimlane-name]')).toHaveCount(0);
+
+  // Positive control, same plumbing: a resume alone boots, and the card reads it.
+  await gotoScene(page, { state: encodeState({ sessions: { [SESSION_WEBSOCKET]: { resuming: true } } }), embed: '1', still: '1' });
+  await expect(page.locator(`[data-task-id="${TASK_WEBSOCKET}"] [data-testid="usage-bar"]`)).toContainText('Resuming agent...');
+});
+
+test('a resuming card comes back in the live frame the way a Resume click does', async ({ page }) => {
+  // A still holds the moment (the per-scene boot above). Live, the seed plays what main sends:
+  // first output a beat after page open, then the status line's usage, so the card ends on its
+  // model and the Monitor row gains its model and context with it.
+  const getUnexpectedErrors = collectUnexpectedErrors(page);
+  const getRecordingRequests = recordingRequests(page);
+  await gotoScene(page, { view: 'session-resume', embed: '1' });
+  const card = page.locator(`[data-task-id="${TASK_WEBSOCKET}"]`);
+  // The resume starts when the frame reveals, as auto-resume starts once the desktop's window is
+  // up, so a live visitor sees the moment the scene is named for. Started at page open, it had
+  // already resolved by the reveal.
+  expect(await card.locator('[data-testid="usage-bar"]').textContent()).toContain('Resuming agent...');
+  await expect(card.locator('[data-testid="usage-bar-model"]')).toBeVisible({ timeout: 10_000 });
+  // Its first output is timed off the recorded resume boot, so the frame fetched it.
+  expect(getRecordingRequests().some((url) => url.includes('/recordings/resume-sess-cw-websocket-'))).toBe(true);
+  await expect(card.locator('[data-testid="usage-bar"]')).not.toContainText('Resuming agent...');
+  const websocket = DEMO_SESSIONS.find((session) => session.id === SESSION_WEBSOCKET);
+  await expect.poll(() => monitorFields(page, SESSION_WEBSOCKET)).toMatchObject({
+    modelDisplayName: websocket?.model?.displayName, contextPercent: websocket?.contextPercent,
+  });
+  // The paused card stays paused: a session paused on purpose does not come back on relaunch.
+  await expect(page.locator('[data-task-id="task-cw-empty-states"] [data-testid="status-bar"]')).toContainText('Paused');
+  expect(getUnexpectedErrors()).toEqual([]);
+});
+
+test('resuming a paused card keeps what its agent last said, and the card never reads Starting agent', async ({ page }) => {
+  // A resume continues the paused session's transcript, and main's trail tracker reads its tail on
+  // the new session's first read, so the card shows the previous run's last line at once rather
+  // than falling back to the task description. The resume goes through the bridge method the
+  // task window's Resume control calls.
+  const getUnexpectedErrors = collectUnexpectedErrors(page);
+  await gotoScene(page, { view: 'session-resume', embed: '1', still: '1' });
+  const pausedCard = page.locator('[data-task-id="task-cw-empty-states"]');
+  await expect(pausedCard.locator('[data-testid="task-card-trail"]')).toHaveCount(0);
+  const footerLabels: string[] = [];
+  await page.exposeFunction('__recordFooter', (label: string) => { footerLabels.push(label); });
+  await page.evaluate(() => {
+    const read = () => document.querySelector('[data-task-id="task-cw-empty-states"] [data-testid="usage-bar"]')?.textContent ?? '';
+    new MutationObserver(() => { (window as unknown as { __recordFooter: (label: string) => void }).__recordFooter(read()); })
+      .observe(document.body, { subtree: true, childList: true, characterData: true });
+  });
+  await page.evaluate(() => (window as unknown as { electronAPI: { sessions: { resume: (taskId: string) => Promise<unknown> } } })
+    .electronAPI.sessions.resume('task-cw-empty-states'));
+  await expect(pausedCard.locator('[data-testid="task-card-trail"]')).toBeVisible({ timeout: 10_000 });
+  await expect(pausedCard.locator('[data-testid="usage-bar-model"]')).toBeVisible({ timeout: 10_000 });
+  // Between the resume and the model, the spinner says Resuming the whole way through.
+  expect(footerLabels.some((label) => label.includes('Resuming agent...'))).toBe(true);
+  expect(footerLabels.some((label) => label.includes('Starting agent...'))).toBe(false);
+  expect(getUnexpectedErrors()).toEqual([]);
+});
+
+test('pausing and resuming a working agent brings back the same session and view, not a fresh boot', async ({ page }) => {
+  // Main clears the task's session pointer on a pause and finds the paused record again on
+  // Resume, and the respawn carries the paused terminal's scrollback over. The demo once read
+  // only the pointer, so a Pause then Resume started the task's recorded boot from scratch.
+  const getUnexpectedErrors = collectUnexpectedErrors(page);
+  const getRecordingRequests = recordingRequests(page);
+  await gotoScene(page, { view: 'task', embed: '1' });
+  const toggle = page.locator('[data-testid="header-toggle-session-btn"]');
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+  await toggle.click();
+  await expect.poll(async () => (await monitorFields(page, SESSION_MIDDLEWARE))?.status).toBe('suspended');
+  // A paused agent stops: its Monitor peek, which changes every 2.5 to 6 seconds while the
+  // recording plays, holds still for longer than the longest gap.
+  expect(await countPeekChanges(page, SESSION_MIDDLEWARE, 7000)).toBe(0);
+
+  // Pausing closed the window; the card reopens it on the Resume prompt.
+  await page.locator(`[data-task-id="${TASK_MIDDLEWARE}"]`).click();
+  await expect(toggle).toHaveAttribute('title', 'Resume session');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+
+  const readRows = () => page.evaluate(async (taskId) => {
+    const sessions = await (window as unknown as { electronAPI: { sessions: { list: () => Promise<Array<{ id: string; taskId: string; status: string; resuming: boolean }>> } } }).electronAPI.sessions.list();
+    return sessions.filter((session) => session.taskId === taskId).map((session) => ({ id: session.id, status: session.status, resuming: session.resuming }));
+  }, TASK_MIDDLEWARE);
+  // The task's only row is the resume: main deletes the paused row when it respawns.
+  const rows = await readRows();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ status: 'running', resuming: true });
+  expect(rows[0].id).toContain('-resumed-');
+
+  // The terminal opens on the conversation the paused one showed, not on a fresh CLI's prompt.
+  const handed = stripAnsi(await page.evaluate((sessionId) => (window as unknown as DemoElectronWindow).electronAPI.sessions.getScrollback(sessionId), rows[0].id));
+  expect(handed).toContain('routes file');
+  expect(handed).not.toContain('Try "');
+  // And it stays there: a resumed agent waits for the user, so nothing streams on.
+  const handedAgain = stripAnsi(await page.evaluate((sessionId) => (window as unknown as DemoElectronWindow).electronAPI.sessions.getScrollback(sessionId), rows[0].id));
+  expect(handedAgain).toBe(handed);
+  // The usage carries over once the resumed agent's status line lands.
+  await expect.poll(() => monitorFields(page, rows[0].id), { timeout: 10_000 }).toMatchObject({ status: 'running', contextPercent: DEMO_SESSIONS.find((session) => session.id === SESSION_MIDDLEWARE)?.contextPercent });
+  // Paused mid-recording, so the recorded resume boot, which reprints the WHOLE conversation,
+  // would show what the frame had not reached: it is never fetched.
+  expect(getRecordingRequests().filter((url) => url.includes('/recordings/resume-'))).toEqual([]);
+  expect(getUnexpectedErrors()).toEqual([]);
+});
+
+test('resuming a session paused at its recording\'s end replays the recorded resume boot', async ({ page }) => {
+  // The WebSocket session waits on the user at its recording's end, so the conversation a real
+  // resume reprints is exactly the one the frame showed: Resume plays the boot the capture matrix
+  // recorded (claude --resume, resume-<sessionId>.json) rather than freezing the paused frame.
+  const getUnexpectedErrors = collectUnexpectedErrors(page);
+  const getRecordingRequests = recordingRequests(page);
+  await gotoScene(page, { view: 'board', embed: '1' });
+  const card = page.locator(`[data-task-id="${TASK_WEBSOCKET}"]`);
+  const toggle = page.locator('[data-testid="header-toggle-session-btn"]');
+  await card.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+  await toggle.click();
+  await expect.poll(async () => (await monitorFields(page, SESSION_WEBSOCKET))?.status).toBe('suspended');
+  await card.click();
+  await expect(toggle).toHaveAttribute('title', 'Resume session');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+
+  await expect.poll(() => getRecordingRequests().some((url) => url.includes('/recordings/resume-sess-cw-websocket-')), { timeout: 10_000 }).toBe(true);
+  const resumedId = await sessionIdsForTask(page, TASK_WEBSOCKET);
+  expect(resumedId).toHaveLength(1);
+  // The card goes from Resuming to its model once the boot's first output and usage land.
+  await expect(card.locator('[data-testid="usage-bar-model"]')).toBeVisible({ timeout: 10_000 });
+  // The terminal was handed the resumed CLI reprinting the session's own conversation.
+  const handed = stripAnsi(await page.evaluate((sessionId) => (window as unknown as DemoElectronWindow).electronAPI.sessions.getScrollback(sessionId), resumedId[0]));
+  expect(handed).toContain('exponential');
+  expect(getUnexpectedErrors()).toEqual([]);
+});
+
+test('a second Pause then Resume on that same session replays the recorded resume boot again', async ({ page }) => {
+  // The sibling test above resumes a session paused at its own recording's end, and that resume
+  // boot itself counts as "at its end" the moment it starts (resumeBootEntry's endMs: 0), so a
+  // SECOND Pause then Resume must replay the same recorded resume boot again rather than freezing
+  // whatever frame the resumed terminal happened to show. The lookup for which resume-*.json to
+  // fetch has to walk back through recordedIdBySession to the ORIGINAL dataset session
+  // (sess-cw-websocket): the first resumed session's own id has no resume-*.json recording of its
+  // own, since only an original seeded session was ever captured pausing at a recording's end.
+  const getUnexpectedErrors = collectUnexpectedErrors(page);
+  const getRecordingRequests = recordingRequests(page);
+  await gotoScene(page, { view: 'board', embed: '1' });
+  const card = page.locator(`[data-task-id="${TASK_WEBSOCKET}"]`);
+  const toggle = page.locator('[data-testid="header-toggle-session-btn"]');
+
+  // First cycle: identical to the sibling test above.
+  await card.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+  await toggle.click();
+  await expect.poll(async () => (await monitorFields(page, SESSION_WEBSOCKET))?.status).toBe('suspended');
+  await card.click();
+  await expect(toggle).toHaveAttribute('title', 'Resume session');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+  await expect.poll(() => getRecordingRequests().some((url) => url.includes('/recordings/resume-sess-cw-websocket-')), { timeout: 10_000 }).toBe(true);
+  const firstResumedIds = await sessionIdsForTask(page, TASK_WEBSOCKET);
+  expect(firstResumedIds).toHaveLength(1);
+  const firstResumed = firstResumedIds[0];
+  expect(firstResumed).toContain('-resumed-');
+  await expect(card.locator('[data-testid="usage-bar-model"]')).toBeVisible({ timeout: 10_000 });
+
+  // Second cycle, on the resumed session. The window stays open across a resume (only a pause
+  // closes it), so there is no card click to reopen it before pausing again here.
+  await toggle.click();
+  await expect.poll(async () => (await monitorFields(page, firstResumed))?.status).toBe('suspended');
+  await card.click();
+  await expect(toggle).toHaveAttribute('title', 'Resume session');
+  // Listen for streamed bytes BEFORE the click that starts the second resume: the resume-boot
+  // path streams the recording live through onData, while a frozen fallback emits nothing at all,
+  // so which one (if either) streams for the new session id is the direct signal that the second
+  // resume took the boot-replay branch rather than silently falling back to a frozen frame.
+  const pendingStreamedSessionId = firstStreamedSession(page, 8000);
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+
+  const secondResumedIds = await sessionIdsForTask(page, TASK_WEBSOCKET);
+  expect(secondResumedIds).toHaveLength(1);
+  const secondResumed = secondResumedIds[0];
+  expect(secondResumed).not.toBe(firstResumed);
+  expect(secondResumed).toContain('-resumed-');
+
+  expect(await pendingStreamedSessionId).toBe(secondResumed);
+  await expect(card.locator('[data-testid="usage-bar-model"]')).toBeVisible({ timeout: 10_000 });
+
+  const handedSecond = stripAnsi(await page.evaluate((sessionId) => (window as unknown as DemoElectronWindow).electronAPI.sessions.getScrollback(sessionId), secondResumed));
+  expect(handedSecond).toContain('exponential');
+
+  const description = DEMO_TASKS.find((task) => task.id === TASK_WEBSOCKET)?.description;
+  expect((await monitorFields(page, secondResumed))?.description).toBe(description);
+
+  expect(getUnexpectedErrors()).toEqual([]);
+});
+
+test('a second Pause then Resume on a working agent frozen mid-recording opens on the same frame, not a later one', async ({ page }) => {
+  // The middleware session pauses mid-recording (the sibling test above), so its resume takes the
+  // frozen-frame path rather than replaying a recorded resume boot. A session resumed that way is
+  // itself pausable and resumable again, and on a SECOND cycle the seed must carry the ORIGINAL
+  // freeze forward rather than re-deriving a later one from a fresh wall-clock elapsed time: "a
+  // session already frozen by an earlier resume stays on its frame". So the second resumed
+  // terminal must open on exactly the frame the first one did, not one further into the recording.
+  const getUnexpectedErrors = collectUnexpectedErrors(page);
+  const getRecordingRequests = recordingRequests(page);
+  await gotoScene(page, { view: 'task', embed: '1' });
+  const toggle = page.locator('[data-testid="header-toggle-session-btn"]');
+  const readScrollback = async (sessionId: string): Promise<string> => {
+    // Read only once the renderer has resized this session's own terminal: getScrollback fits its
+    // frozen frame to the LAST grid it was told about (mountedGeometry), which is unset until that
+    // resize call lands. A read before it returns the raw frame and a read after returns the
+    // grid-fitted one, a difference the fitter introduces on its own and not the bug this guards.
+    await expect.poll(() => mountedGrid(page, sessionId), { timeout: 10_000 }).not.toBeNull();
+    return stripAnsi(await page.evaluate((id) => (window as unknown as DemoElectronWindow).electronAPI.sessions.getScrollback(id), sessionId));
+  };
+
+  // First cycle.
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+  await toggle.click();
+  await expect.poll(async () => (await monitorFields(page, SESSION_MIDDLEWARE))?.status).toBe('suspended');
+  await page.locator(`[data-task-id="${TASK_MIDDLEWARE}"]`).click();
+  await expect(toggle).toHaveAttribute('title', 'Resume session');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+
+  const firstResumedIds = await sessionIdsForTask(page, TASK_MIDDLEWARE);
+  expect(firstResumedIds).toHaveLength(1);
+  const firstResumed = firstResumedIds[0];
+  const firstView = await readScrollback(firstResumed);
+  expect(firstView).toContain('routes file');
+
+  // A fixed wait, not a poll: the divergence a wrong re-derivation would introduce grows with REAL
+  // wall-clock time since the ORIGINAL session's own start, so the gap between cycles has to be an
+  // actual span of elapsed time, not a condition to poll for.
+  await page.waitForTimeout(4000);
+
+  // Second cycle, on the resumed session.
+  await toggle.click();
+  await expect.poll(async () => (await monitorFields(page, firstResumed))?.status).toBe('suspended');
+  await page.locator(`[data-task-id="${TASK_MIDDLEWARE}"]`).click();
+  await expect(toggle).toHaveAttribute('title', 'Resume session');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('title', 'Pause session');
+
+  const secondResumedIds = await sessionIdsForTask(page, TASK_MIDDLEWARE);
+  expect(secondResumedIds).toHaveLength(1);
+  const secondResumed = secondResumedIds[0];
+  expect(secondResumed).not.toBe(firstResumed);
+  const secondView = await readScrollback(secondResumed);
+  expect(secondView).toBe(firstView);
+
+  // No recorded resume boot was fetched at either cycle: the session paused before its recording
+  // reached its own end, so both resumes carried the frozen frame over instead.
+  expect(getRecordingRequests().filter((url) => url.includes('/recordings/resume-'))).toEqual([]);
+  expect(getUnexpectedErrors()).toEqual([]);
+});
+
+test('a state= blob patching a session the sample install does not seed throws rather than silently no-op-ing', async ({ page }) => {
+  // Unlike the refusals above, this is NOT a validateState() check: `sessions` is validated up
+  // front for its shape and its fields, not its ids, so a bad id sails through that gate with
+  // nothing pushed to `errors`. The "is this id one the sample install seeds" check
+  // happens later, inside applyScene()'s __mockPreConfigure callback, called from the generated
+  // seed script's bare top-level `window.__demoBoot.afterSeed();` (demo/vite.config.mts) with no
+  // try/catch anywhere above it. So the throw is an UNCAUGHT exception, not a caught error: it
+  // never reaches the [data-testid="demo-error"] card path at all, and surfaces only as a
+  // Playwright pageerror.
+  const pageErrors: string[] = [];
+  page.on('pageerror', (error) => { pageErrors.push(error.message); });
+
+  const unknownSessionBlob = encodeState({ sessions: { 'sess-does-not-exist': { status: 'queued' } } });
+  await page.goto(demoUrl({ state: unknownSessionBlob, embed: '1', still: '1' }));
+  await expect
+    .poll(() => pageErrors.some((message) => message.includes('Scene patches session "sess-does-not-exist", which the sample install does not contain')))
+    .toBe(true);
+
+  // Positive control, same plumbing: patching a session id the sample install DOES seed throws
+  // nothing and boots clean.
+  pageErrors.length = 0;
+  const knownSessionBlob = encodeState({ sessions: { [DEMO_SESSIONS[0].id]: { status: 'queued' } } });
+  await gotoScene(page, { state: knownSessionBlob, embed: '1', still: '1' });
+  expect(pageErrors).toEqual([]);
 });
 
 test('the live task scene fetches its session recording from the serving origin', async ({ page }) => {
@@ -1049,15 +2139,17 @@ test('opened directly, the page hosts the frame at the site size and scales it t
   expect(getUnexpectedErrors()).toEqual([]);
 });
 
-test('the site\'s take-control dialog at a 1440 by 900 display holds the task window at the recording\'s grid', async ({ browser }) => {
+test('the site\'s take-control dialog at a 1440 by 900 display fills the task window', async ({ browser }) => {
   // kangentic.com gives the dialog's frame a 1233 by 771 box there, where the task window fits
   // well under the recording's columns and 26 rows: the case in which every wrapped row used to
-  // spill (task #673). The pane can show the recording's grid at about 70 percent of the type,
-  // above the hold's floor, so the terminal conforms and the bytes replay. Which recording that
-  // is follows the width the page measured: a pane narrower than the single recording takes the
-  // session's tiled one (the seed's layoutFor), played from the moment the session's clock
-  // began; either has a stretch left when the page opens, so its bytes stream, and the session's
-  // own clock keeps it working.
+  // spill (task #673). The scene's window is fitted against the 1600px frame the recordings were
+  // measured at, so in this smaller frame it keeps the stage's proportions, about 118 columns on
+  // Windows. The session's tiled recording is laid out for 115, so the pane shows it at the
+  // configured type (layoutFor), widened to the pane, where the single recording held at its own
+  // grid left the width beside it empty. A face that measures the pane narrower than 113 holds
+  // the tiled recording at a smaller type instead; either way the terminal fills the pane and the
+  // emulator plays the recording into it from the moment the session's clock began, which keeps
+  // the session working.
   const context = await browser.newContext({ viewport: { width: 1233, height: 771 }, deviceScaleFactor: 1 });
   const page = await context.newPage();
   const getUnexpectedErrors = collectUnexpectedErrors(page);
@@ -1066,9 +2158,10 @@ test('the site\'s take-control dialog at a 1440 by 900 display holds the task wi
   await SCENE_MARKERS.task(page);
   await expect.poll(() => sentGrids(page, 'sess-cw-middleware'), { timeout: 10_000 }).not.toHaveLength(0);
   const natural = (await sentGrids(page, 'sess-cw-middleware'))[0];
-  const heldGrid = natural.cols < MIDDLEWARE_RECORDED_GRID.cols ? MIDDLEWARE_TILED_GRID : MIDDLEWARE_RECORDED_GRID;
-  await expect.poll(() => sentGrids(page, 'sess-cw-middleware'), { timeout: 10_000 }).toContainEqual(heldGrid);
-  expect(natural.rows).toBeLessThan(heldGrid.rows);
+  expect(natural.cols).toBeLessThan(MIDDLEWARE_RECORDED_GRID.cols * 0.9);
+  const state = await expectFaithfulReplay(page, 'sess-cw-middleware');
+  expect(state.mode).toBe('frames');
+  await expectPanesFilled(page, 'the take-control dialog');
   expect(await firstStreamedSession(page, 10_000, 'sess-cw-middleware')).toBe('sess-cw-middleware');
   expect((await monitorRow(page, 'sess-cw-middleware'))?.activity).toBe('thinking');
   expect(getUnexpectedErrors()).toEqual([]);

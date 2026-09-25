@@ -12,12 +12,21 @@ import { browserPartitionForTask } from '../../src/shared/browser-partition';
  * Electron 41.1.1 build and the results are recorded in the plan.
  */
 
+/** A fresh partition's default user agent: Electron's, token included. */
+const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Kangentic/0.43.0 Chrome/146.0.7680.216 Electron/41.10.7 Safari/537.36';
+
 interface FakeWindow {
   id: number;
   destroyed: boolean;
   webContents: {
     id: number;
     setFrameRate: (fps: number) => void;
+    setUserAgent: (userAgent: string) => void;
+    session: {
+      getUserAgent: () => string;
+      setUserAgent: (userAgent: string) => void;
+    };
     loadURL: (url: string) => Promise<void>;
     once: (event: string, handler: () => void) => void;
     isDestroyed: () => boolean;
@@ -45,6 +54,11 @@ vi.mock('electron', () => ({
         webContents: {
           id,
           setFrameRate: vi.fn(),
+          setUserAgent: vi.fn(),
+          session: {
+            getUserAgent: () => DEFAULT_USER_AGENT,
+            setUserAgent: vi.fn(),
+          },
           loadURL: vi.fn(async () => {
             if (loadGate) await loadGate();
             if (loadShouldFail) throw new Error('ERR_CONNECTION_REFUSED');
@@ -59,8 +73,9 @@ vi.mock('electron', () => ({
         },
       };
       created.push({ options, window: win });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the fake stands in for a BrowserWindow
-      return win as any;
+      // The fake stands in for a BrowserWindow. A constructor may return any
+      // object assignable to its instance type, and this class declares none.
+      return win;
     }
   },
   // openLane now syncs the task jar with the project identity jar before creating
@@ -98,18 +113,21 @@ const {
   destroyLane,
   destroyLanesForSession,
   destroyIdleLanes,
-  destroyHandoffLanesForTask,
-  hasHandoffLaneForTask,
+  destroyLanesForTask,
+  hasLaneForTask,
   touchLane,
   LANE_IDLE_RECLAIM_MS,
   destroyAllLanes,
-  laneCountForTask,
-  laneIdsForTask,
+  laneIdForTask,
+  laneTaskIds,
+  setLaneChangeListener,
   isLaneId,
   resetLanesForTests,
-  MAX_LANES_PER_TASK,
   LANE_FRAME_RATE,
 } = await import('../../src/main/browser/browser-lane-manager');
+
+/** How many surfaces a task holds. One, always - see `laneIdForTask`. */
+const laneCountForTask = (taskId: string) => (laneIdForTask(taskId) ? 1 : 0);
 
 const input = (overrides: Record<string, unknown> = {}) => ({
   taskId: 'task-1',
@@ -149,15 +167,8 @@ describe('openLane', () => {
       // The registry keys the lane by this pre-minted handle; the agent session
       // that asked for it is recorded as the owner, never as the key.
       ownerSessionId: 'session-1',
-      handoff: false,
     });
     expect(isLaneId(registered[0].handle as string)).toBe(true);
-  });
-
-  it('registers a hand-off lane as one, so the resolver can rank it behind the visible pane', async () => {
-    const result = await openLane(input({ handoff: true }));
-    expect(result.ok).toBe(true);
-    expect(registered[0]).toMatchObject({ kind: 'lane', handoff: true });
   });
 
   /**
@@ -252,6 +263,24 @@ describe('openLane', () => {
     expect(created[0].window.webContents.setFrameRate).toHaveBeenCalledWith(LANE_FRAME_RATE);
   });
 
+  it('presents without the Electron token, set before its first load', async () => {
+    // A lane is not a <webview>, so the guest hook in web-contents-created never
+    // sees it, and it can open before any pane has set this task's jar. A
+    // firewall that rejects `Electron/` would otherwise block it (decision 41).
+    await openLane(input());
+    const guest = created[0].window.webContents;
+    const setUserAgent = vi.mocked(guest.setUserAgent);
+    expect(setUserAgent).toHaveBeenCalledTimes(1);
+    const laneUserAgent = setUserAgent.mock.calls[0][0];
+    expect(laneUserAgent).toContain('Kangentic/0.43.0');
+    expect(laneUserAgent).not.toContain('Electron/');
+    expect(guest.session.setUserAgent).toHaveBeenCalledWith(laneUserAgent);
+    expect(
+      setUserAgent.mock.invocationCallOrder[0],
+      'the user agent must be set before loadURL, or the first request still carries the token',
+    ).toBeLessThan(vi.mocked(guest.loadURL).mock.invocationCallOrder[0]);
+  });
+
   it('shares the task cookie jar (keyed by task identity) rather than minting a fresh one', async () => {
     // A private jar would land every worker on a sign-in wall for an app the
     // user is already authenticated into. The jar is keyed by project + task.
@@ -260,18 +289,22 @@ describe('openLane', () => {
     expect(options.webPreferences.partition).toBe('persist:kng-project1-task1');
   });
 
-  it('refuses past the per-task cap and names the lanes to reuse', async () => {
-    for (let index = 0; index < MAX_LANES_PER_TASK; index += 1) {
-      const created = await openLane(input());
-      expect(created.ok).toBe(true);
-    }
-    const overflow = await openLane(input());
-    expect(overflow).toMatchObject({ ok: false, kind: 'lane-limit' });
-    if (overflow.ok) throw new Error('expected a refusal');
-    // Actionable rather than a bare "no": a retrying agent needs to be told to
-    // reuse the handle it already holds.
-    expect(overflow.detail).toContain('reuse it by passing its sessionId');
-    for (const laneId of laneIdsForTask('task-1')) expect(overflow.detail).toContain(laneId);
+  it('refuses a SECOND surface for the same task and names the one that exists', async () => {
+    // One surface per task is the invariant the whole reclaim rests on: with
+    // two offscreen surfaces there is no answer to which one the Browser pill
+    // turns into a pane. Both callers check first, so this refusal is a
+    // structural guarantee rather than a path anything reaches.
+    const first = await openLane(input());
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error('expected a lane');
+
+    const second = await openLane(input());
+    expect(second).toMatchObject({ ok: false, kind: 'surface-exists' });
+    if (second.ok) throw new Error('expected a refusal');
+    // Actionable rather than a bare "no": a retrying agent needs the handle it
+    // already holds, by name.
+    expect(second.detail).toContain(first.laneId);
+    expect(laneCountForTask('task-1')).toBe(1);
   });
 
   it('counts lanes per task, not globally', async () => {
@@ -307,22 +340,41 @@ describe('lane cleanup backstops', () => {
 
   it('destroys only the owning session"s lanes', async () => {
     // Session end is the GUARANTEE, because only one of the ten supported agent
-    // CLIs has a SubagentStop hook to fire a faster signal.
+    // CLIs has a SubagentStop hook to fire a faster signal. Two SESSIONS, two
+    // TASKS: one surface per task means two sessions cannot share one.
     await openLane(input({ ownerSessionId: 'session-a' }));
-    await openLane(input({ ownerSessionId: 'session-b' }));
+    await openLane(input({ taskId: 'task-2', ownerSessionId: 'session-b' }));
     expect(destroyLanesForSession('session-a')).toBe(1);
-    expect(laneCountForTask('task-1')).toBe(1);
+    expect(laneCountForTask('task-1')).toBe(0);
+    expect(laneCountForTask('task-2')).toBe(1);
   });
 
-  it('closes only the AUTO hand-off lanes, never one the agent asked for', async () => {
-    // Closing an agent's deliberately-requested lane because a human opened an
-    // unrelated pane would be the same class of bug this whole task is about.
-    const requested = await openLane(input());
-    const handedOff = await openLane(input({ handoff: true }));
-    if (!requested.ok || !handedOff.ok) throw new Error('expected two lanes');
+  it('reclaims the task"s offscreen surface when its visible pane comes back', async () => {
+    // The RECLAIM. A task has one surface, so a pane registering for this task
+    // means the offscreen form of it has stopped being the answer. Scoped to
+    // the task: another task's surface is not the returning pane's business.
+    const reclaimed = await openLane(input());
+    const other = await openLane(input({ taskId: 'task-2' }));
+    if (!reclaimed.ok || !other.ok) throw new Error('expected two lanes');
 
-    expect(destroyHandoffLanesForTask('task-1')).toBe(1);
-    expect(laneIdsForTask('task-1')).toEqual([requested.laneId]);
+    expect(destroyLanesForTask('task-1')).toBe(1);
+    expect(hasLaneForTask('task-1')).toBe(false);
+    expect(laneIdForTask('task-2')).toBe(other.laneId);
+  });
+
+  it('announces every change to the offscreen set, so the renderer can light the card globe', async () => {
+    // Without this push a lane is invisible: the card globe and the Browser
+    // pill read `browserGuestTasks`, which only a real <webview> writes. An
+    // agent ran a whole verification in one with nothing on screen saying so.
+    const seen: string[][] = [];
+    setLaneChangeListener(() => { seen.push(laneTaskIds()); });
+
+    const lane = await openLane(input());
+    if (!lane.ok) throw new Error('expected a lane');
+    expect(seen.at(-1), 'the open announces the task').toEqual(['task-1']);
+
+    destroyLane(lane.laneId);
+    expect(seen.at(-1), 'and the close announces it going away').toEqual([]);
   });
 
   it('reclaims only lanes idle past the threshold', async () => {
@@ -358,19 +410,19 @@ describe('lane cleanup backstops', () => {
     expect(() => touchLane('session-that-is-not-a-lane')).not.toThrow();
   });
 
-  it('reclaims abandoned lanes before refusing at the cap', async () => {
-    // A long-lived session that opened and forgot lanes must not be refused a
-    // new one over renderer processes nothing is using.
-    for (let index = 0; index < MAX_LANES_PER_TASK; index += 1) {
-      await openLane(input());
-    }
-    expect(laneCountForTask('task-1')).toBe(MAX_LANES_PER_TASK);
+  it('reclaims an abandoned surface rather than refusing the task a new one', async () => {
+    // A long-lived session that opened a surface an hour ago and forgot it must
+    // not leave the task unable to open another. The sweep runs on the way in,
+    // so the stale one is gone before the one-per-task check.
+    const stale = await openLane(input());
+    if (!stale.ok) throw new Error('expected a lane');
 
-    // Age every existing lane past the reclaim threshold.
     vi.setSystemTime(Date.now() + LANE_IDLE_RECLAIM_MS + 1_000);
 
     const fresh = await openLane(input());
-    expect(fresh.ok).toBe(true);
+    expect(fresh.ok, 'a surface nothing has touched for an hour must not block a new one').toBe(true);
+    if (!fresh.ok) throw new Error('expected a lane');
+    expect(fresh.laneId).not.toBe(stale.laneId);
     expect(laneCountForTask('task-1')).toBe(1);
   });
 

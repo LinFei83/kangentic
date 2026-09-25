@@ -211,7 +211,7 @@ boot script (`demo/boot.js`: the URL contract, config overrides, still and embed
 hand-over to `demo/stage.html` that hosts a direct visit at the site's 1600 by 1000, the
 pre-reveal step runner, and a silent microphone in place of `getUserMedia`), the webview shim
 (`demo/webview-shim.js`: an iframe standing in for Electron's `<webview>` in the Browser pane,
-onto a bundled copy of what the project renders at its dev URL), `tests/ui/mock-electron-api.js`
+onto a bundled page with the project's own data at its dev URL), `tests/ui/mock-electron-api.js`
 verbatim, and the generated seed (the sample install from `tests/captures/helpers/demo-dataset.ts`
 plus, per recording under `tests/captures/fixtures/demo/`, its opening and final terminal frames,
 its working-tree diff split into the three scopes, the last output peek its Monitor row shows and,
@@ -222,9 +222,10 @@ per-commit diffs from `tests/captures/fixtures/demo/history/`, captured by
 out of the scaffold's `commits.json`). The
 plugin also emits every
 recording's timed byte stream under `recordings/`, which the live frame fetches when a terminal
-mounts to replay the session as it happened, and the agent boots a drag or a new Command
+mounts to replay the session as it happened, the agent boots a drag or a new Command
 Terminal starts (recorded per task and per project by `scripts/capture-demo-sessions.mjs` from
-the dataset), plus the agent transcript behind a session under `transcripts/` (from
+the dataset), and the `claude --resume` boot a Resume replays for a session paused at its
+recording's end (recorded by the same script as `resume-<sessionId>.json`), plus the agent transcript behind a session under `transcripts/` (from
 `tests/captures/fixtures/demo/transcripts/`, derived by main's own parsers), which the
 conversation viewer fetches when it opens. The five scripts, the recordings, the transcripts, and the guest pages carry a content hash in their
 names, as Vite's own chunks do, so a copy GitHub Pages cached from an earlier release is never
@@ -241,7 +242,16 @@ The scene registry (`tests/captures/scenes.ts`) has a second consumer: `npm run 
 the demo, then `tests/captures/features/scenes.capture.ts` opens every scene in it by URL and
 screenshots it per theme into the gitignored `captures/<timestamp>/scenes/`, playing the gesture
 a `driver` scene needs (a held drag, a right-click) with Playwright. The rig has no scene applier
-of its own; `demo/boot.js` is the applier for both consumers.
+of its own; `demo/boot.js` is the applier for both consumers. `npm run demo:posters`
+(`demo/posters.mjs`) drives that same rig for the site's docs figures: every scene in the `clay`
+and `rust` themes at the frame's 2x (`CAPTURE_THEMES`, `CAPTURE_RESOLUTIONS`, and
+`CAPTURE_OUTPUT_ROOT` into `dist/demo-posters/`), checked against the build's own `scenes.json`
+(every scene at every theme, every PNG 3200 by 2000, the build's version equal to
+`package.json`'s) and zipped with a `manifest.json` as `dist/demo-posters-<version>.zip`. The
+manifest also carries each poster's `focus` rect, which the rig measures on the still and writes
+beside it as a `.focus.json` sidecar. `release.yml`'s `demo-posters` job installs Roboto, runs it
+after `publish-release`, and attaches the zip to the release; `demo/README.md` ("The poster set")
+carries the manifest shape and the reasons.
 
 ### Worktree Dev
 
@@ -328,9 +338,13 @@ npm run test:demo
   loop iterates `SCENES`, so a new entry is covered with no test change) and, where it names a
   `focus`, that element is a real region rather than nothing, an empty box, or the whole frame; a
   `driver` scene is refused by name, `scenes.json` is served and matches the registry, the ready
-  message carries a dialog scene's focus rect, `embed=1` hides the window controls, `theme=`
-  applies, an unknown
-  scene shows the error card, the console stays clean, and boot makes no request off the serving
+  message carries a dialog scene's focus rect, Escape posts `kangentic-demo-escape` when the app
+  has nothing of its own to close and stays silent when it does, a task window takes the first
+  Escape even with its terminal under the pointer, Escape posts from a Command Terminal, from the
+  bottom panel's terminal, and after a window parks, `embed=1` hides the window
+  controls, `theme=` applies, an unknown
+  scene shows the error card, a `state=` blob naming only part of a nested config block is
+  refused, the console stays clean, and boot makes no request off the serving
   origin
 - **Build required** before running; the `demo` CI job and the Pages deploy both run it on the
   exact bytes they ship
@@ -450,7 +464,7 @@ electron-builder handles platform-specific packaging via `electron-builder.yml`:
 
 Native modules:
 - `better-sqlite3` - rebuilt against Electron headers via `scripts/rebuild-native.js`
-- `node-pty` - uses prebuilt NAPI binaries, no rebuild needed
+- `node-pty` - uses prebuilt NAPI binaries, no rebuild needed. The one exception is its macOS `spawn-helper`: `build/afterPack.js` compiles Kangentic's own (`build/spawn-helper/spawn-helper.c`, via `build/install-spawn-helper.js`) over the prebuilt one. It clears the inherited mach exception ports before exec, and the afterPack and afterSign gates prove that on the built binary. A macOS package build therefore needs Xcode or the Command Line Tools installed
 - `sherpa-onnx-node` - prebuilt platform-specific binaries, no rebuild needed (voice dictation, running in its own `kangentic-dictation` utilityProcess worker - see DESKTOP-X in `.claude/rules/dictation-out-of-process.md`; unpacked from asar via the `sherpa-onnx-*` glob in `asarUnpack`)
 - `font-list` - shells out to `fc-list` / a PowerShell script / a bundled macOS binary, no rebuild needed (Terminal Font Family picker; unpacked from asar via `asarUnpack` since the macOS binary is spawned via `child_process`)
 - `sqlite-vec` - a loadable SQLite extension shipped as per-platform binary packages, no rebuild needed (conversation-memory retrieval; unpacked via the `sqlite-vec-*` glob in `asarUnpack`, since dlopen cannot read an extension inside asar)

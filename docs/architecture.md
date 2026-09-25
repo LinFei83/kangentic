@@ -244,7 +244,7 @@ Replaced the `action:*` and `transition:*` channels, which had no renderer calle
 ### Usage Stats (1 channel)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `usage:getDashboardStats` | invoke | Composite usage-statistics payload for the dashboard (KPIs, bucketed token/cost time series, by-model / by-agent / by-effort / by-subagent-type breakdowns, plus `subagentBlindAgents`, the agents present in the range whose adapter cannot report subagent usage at all - so an empty subagent breakdown is distinguishable from an unmeasured one), for one project or rolled up across every registered project, over the Live/Today/Week/Month/All Time ranges. Sources from the append-only `usage_history` + `conversation_turn_usage` ledgers so totals survive task deletion, bulk-archive, and revert-to-backlog; also merges in-flight sessions from the live `SessionManager` on top (skipped for a day drill or custom window, which are pure ledger accounting) so the SESSIONS KPI and Live view are not undercounted. Read-only; the explicit scope argument carries the project id. |
+| `usage:getDashboardStats` | invoke | Composite usage-statistics payload for the dashboard (KPIs, bucketed token/cost time series, by-model / by-agent / by-effort / by-subagent-type breakdowns, plus `subagentBlindAgents`, the agents present in the range whose adapter cannot report subagent usage at all - so an empty subagent breakdown is distinguishable from an unmeasured one), for one project or rolled up across every registered project, over the Live/Today/Week/Month/All Time ranges. Sources from the append-only `usage_history` + `conversation_turn_usage` + `session_activity_intervals` ledgers (per-leg session cost, per-turn tokens, and agent-working time respectively) so totals survive task deletion, bulk-archive, and revert-to-backlog; also merges in-flight sessions from the live `SessionManager` on top (skipped for a day drill or custom window, which are pure ledger accounting) so the SESSIONS KPI and Live view are not undercounted. Read-only; the explicit scope argument carries the project id. |
 
 ### Agent Monitor (8 channels)
 Machine-global, like the Mobile Bridge channels: the monitor aggregates live sessions across
@@ -281,15 +281,15 @@ from a host's complete mounted set, never accumulated from claim/release - see
 |---------|---------|---------|
 | `config:get` | invoke | Fetch effective AppConfig (global merged with project overrides) |
 | `config:getGlobal` | invoke | Fetch global-only AppConfig (no project overrides) |
-| `config:set` | invoke | Update global config (partial merge) |
-| `config:setSync` | sendSync | Update global config synchronously (blocks the renderer until the fs write completes); used on window close to persist the workspace layout before the renderer tears down |
+| `config:set` | invoke | Update global config (partial merge). Resolves `ConfigSetResult` (`{ persisted }`), which says whether the write reached disk. Only the settings panel acts on it: this channel also carries window layouts, model caches and announcement dismissals, so a failure here is not necessarily something a user asked for (Sentry DESKTOP-1C) |
+| `config:setSync` | sendSync | Update global config synchronously (blocks the renderer until the fs write completes); used on window close to persist the workspace layout before the renderer tears down. Puts the same boolean on `event.returnValue`, which the preload bridge discards: there is no renderer left to tell |
 | `config:getProject` | invoke | Fetch project-level config overrides |
-| `config:setProject` | invoke | Update project-level overrides |
+| `config:setProject` | invoke | Update project-level overrides; resolves `ConfigSetResult` |
 | `config:getProjectByPath` | invoke | Fetch project overrides by filesystem path |
-| `config:setProjectByPath` | invoke | Update project overrides by filesystem path |
-| `config:syncDefaultToProjects` | invoke | Sync default config values to all project configs |
+| `config:setProjectByPath` | invoke | Update project overrides by filesystem path; resolves `ConfigSetResult` for a background project as well as the current one |
+| `config:syncDefaultToProjects` | invoke | Sync default config values to all project configs. Returns a bare count rather than `ConfigSetResult`: one click writes one file per project, and the count already excludes the ones that failed |
 | `config:changed` | on | Bare-signal event fanned to every window (main + open pop-outs) after any `config:set` is applied; subscribers re-fetch via `config:get` so theme/settings sync live across windows |
-| `config:writeFailed` | on | Push to the main window only, not broadcast to pop-outs (`ToastContainer` mounts in `AppLayout` alone, so a pop-out has no toast host): a synchronous write to the data directory failed, so the change applies to this session but will not persist. Carries the user-facing message. Latched per failing source in `src/main/config/write-failure-notice.ts`, so it fires at most once until a later write to that source succeeds (Sentry DESKTOP-14/DESKTOP-13) |
+| `config:writeFailed` | on | Push to the main window only, not broadcast to pop-outs (`ToastContainer` mounts in `AppLayout` alone, so a pop-out has no toast host): a synchronous write to the data directory failed, so the change applies to this session but will not persist. Carries the user-facing message, which names the cause when the errno gives one (disk full, no permission, read-only volume, drive unavailable). Latched per failing source in `src/main/config/write-failure-notice.ts`, so it fires at most once until a later write to that source succeeds (Sentry DESKTOP-14/DESKTOP-13, DESKTOP-1C) |
 
 ### Keybindings (1 channel)
 | Channel | Pattern | Purpose |
@@ -429,7 +429,7 @@ Detach a registered UI surface (usage stats, git changes, a single changed file'
 | `clipboard:saveImage` | invoke | Save PNG bytes the renderer decoded from a dropped image (a format the agent CLI cannot attach from a path, such as bmp) into the same temp directory under the same cap and prune; returns the file path, or null when the bytes are not a decodable image or the write failed |
 | `clipboard:writeText` | invoke | Write text to the native clipboard (focus-independent; used by terminal copy and the OSC 52 handler) |
 
-### Browser pane (17 channels)
+### Browser pane (24 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `browser:captureSend` | invoke | Composite the embedded webview frame + draw overlay + picked element into a PNG, write it to the session captures dir, and submit a structured prompt to the agent's PTY via PasteEngine |
@@ -446,21 +446,35 @@ Detach a registered UI surface (usage stats, git changes, a single changed file'
 | `browser:paneOpenRequest` | push | Main asking the renderer to open a task's Browser pane, behind `kangentic_browser_open_pane`. Pane open state is renderer-owned (`browserOpenTasks`), so main cannot set it directly. Fire-and-forget: main validates every precondition itself (the open project, the per-project `browser.enabled` gate, the task row, the URL it seeds first) and then awaits the pane REGISTRY rather than a reply, because only a registered live guest proves the pane is driveable |
 | `browser:paneCloseRequest` | push | Main asking the renderer to close Browser panes, behind `kangentic_browser_close_pane`. Carries the taskIds main computed from the pane registry: the renderer must not re-derive them, since `browserOpenTasks` is not project-keyed and the board store holds only the open project's tasks, so a retained backgrounded pane would be invisible to a board lookup |
 | `browser:agentInput` | push | An agent has started or stopped driving a guest, carrying the guest's `webContentsId` (one window hosts several panes). Debounced to the whole BURST rather than each tool call: announcing every call made the pane hand focus back between consecutive calls, measured at 810 focus events in one drive against 11 debounced. Drives the visible state - the terminal dims and the pane is marked - and arms the focus guard. See `.claude/rules/agent-driven-focus.md` |
+| `browser:viewportOverride` | push | Main to renderer: the emulated viewport a guest is now laying out against. The pane cannot see this for itself, because an override is a CDP-session property main owns and the guest's own widget size never changes, so without the push the page silently renders at a width nothing on screen accounts for. Drawn as a chip with a reset control, which is also the user's escape hatch once the agent that set it is gone |
+| `browser:viewportClear` | invoke | The user clearing a pane's viewport override from that chip. Separate from the agent's own `reset`, so the user is never waiting on an agent to give their pane back |
+| `browser:paneWidgetSize` | invoke | Renderer to main: the `<webview>` element's own size in CSS pixels. Main cannot measure it (its window is the whole app, several times the pane) and it is what a requested viewport is fitted against, so without this report a fit computes a zoom of 1 and leaves the page cropped |
+| `browser:viewportGet` | invoke | Which override, if any, this guest is already under. A pane that mounts AFTER the override was set, a pop-out or a re-register, missed the push, so it asks once on registration rather than showing nothing |
+| `browser:offscreenSurfaces` | push | Main to renderer: which tasks currently hold their one browser surface in its OFFSCREEN form. The whole set on every change, never a delta, because a renderer that missed one push would stay wrong forever. This is what makes an offscreen surface visible at all: the card globe and the task-detail Browser pill both read `browserGuestTasks`, written in exactly one place (`BrowserPane.tsx`, on the guest's `dom-ready`), so a main-process offscreen window set nothing and the user had no way to know one existed, let alone close it |
+| `browser:offscreenSurfacesGet` | invoke | The same set, asked for once on mount and after an HMR update. A push-only channel leaves a reloaded renderer blank until the next change, and an offscreen surface can sit unchanged for a whole session |
+| `browser:offscreenClose` | invoke | The user's "Close browser" on a task whose surface is offscreen. There is no guest in `browserGuestTasks` to retire and no pane to unmount, so the ordinary close path is a silent no-op for it, which would leave a control that says Close and does nothing. Main destroys the offscreen window directly |
 | `browser:userKeyDuringDrive` | push | A keystroke the user made while an agent held the guest's focus, already encoded as terminal bytes (`src/shared/terminal-key-encoding.ts`). Main intercepts it at `before-input-event` so it never reaches the page, and the pane writes it to the terminal the user was typing in. CDP input does not travel that path, so an event arriving mid-drive is the user's |
 | `browser:downloadDone` | push | A download from a guest finished, carrying `{ fileName, filePath, state }` for the toast and its "Show in folder" action (which reuses the existing `shell:showItemInFolder`). Sent to the INITIATING guest's host window, resolved per download rather than captured at install time, since one `Session` serves every pane in a worktree |
 | `browser:guestMouseButton` | push | A guest page's mouse BACK / FORWARD button went down or up, carrying the guest's `webContentsId` and a MAIN-stamped `at`. A guest consumes the mouse outright - measured, one real back press produced 31 events inside the page and ZERO on the host window - so no renderer listener can see the button that push-to-talk and back-navigation both live on. `webContents.on('input-event')` does see it, and reports a true down/up PAIR, which is what makes push-to-HOLD possible rather than a one-shot toggle. The timestamp is stamped in main because the renderer's own clock is congested by the work a press starts (mic permission, engine start, AudioWorklet load: an 80ms timer measured 414ms), which would misfile a tap as a hold |
 
-### Updater (3 channels)
+### Updater (4 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `updater:check` | invoke | Check for application updates |
 | `updater:install` | invoke | Install downloaded update (quit and install) |
 | `updater:downloaded` | on | Event: update has been downloaded and is ready to install |
+| `updater:blocked` | push | This install cannot update itself until the user acts, today only the macOS read-only-volume case (Sentry DESKTOP-1A). Carries the whole user-facing sentence, composed and latched in main so the renderer toasts it verbatim and a condition every 4-hour check rediscovers still toasts once per run. Every OTHER updater failure stays silent by design; see the "counted, not reported" family in `docs/analytics.md` |
 
-### Host memory pressure (1 channel)
+### Host memory pressure (2 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `hostMemory:pressure` | on | Event: host commit headroom crossed below the warning threshold (edge-triggered, not a per-tick heartbeat). Carries `{ sample, activeAgentCount }`. See `src/main/diagnostics/host-memory.ts` (Sentry DESKTOP-16) |
+| `hostMemory:recovered` | on | Event: host commit headroom recovered past the hysteresis line after a warning was latched (fires once per recovery, not on every healthy tick). Carries `{ sample }`. Clears the persistent toast `hostMemory:pressure` raised. See `src/main/diagnostics/host-memory.ts` (Sentry DESKTOP-16) |
+
+### GPU health (1 channel)
+| Channel | Pattern | Purpose |
+|---------|---------|---------|
+| `gpuHealth:status` | invoke | How this launch is rendering, and whether the user still needs telling. Returns `GpuGraphicsStatus` (`{ softwareRendering, noticePending }`) via `ElectronAPI.gpuHealth.readStatus()`. A PULL, unlike its neighbour above: both facts are decided during boot, before the renderer can have registered a listener, and the escalation record behind them is already cleared by then, so a dropped push would lose the notice for good. Reading consumes `noticePending`, so a renderer reload cannot re-toast. See `src/main/diagnostics/gpu-health.ts` (Sentry DESKTOP-18 / DESKTOP-W) |
 
 ### Announcements (4 channels)
 | Channel | Pattern | Purpose |
@@ -482,11 +496,12 @@ Read-only structured-transcript access for the conversation viewer. Prefer the e
 | `transcript:get` | invoke | Return the structured (tool_use / tool_result) transcript for a session. Powers the conversation viewer. |
 | `transcript:listSessions` | invoke | List the sessions that have a readable transcript, for the viewer's session picker. |
 
-### Memory (2 channels)
+### Memory (3 channels)
 Conversation-memory semantic layer (Smart-mode search). See the Memory settings tab.
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `memory:status` | invoke | Report the conversation-memory index status for the Smart-mode palette UI. |
+| `memory:prewarm` | on | Spawn + init the embedding worker ahead of the first Smart query (fire-and-forget, embeds nothing). Sent on a Smart-mode Quick Find open: the worker is released once it has gone long enough without a query or pending index work (see `memory.semanticEnabled` in `docs/configuration.md` for the windows), and the typing that follows the open is the window its cold start needs. A no-op when semantic is off, the model is absent, or the worker has crashed past its cap. |
 | `memory:rebuildIndex` | invoke | Purge the current project's conversation index and re-run the backfill sweep (recovery from a corrupt/stale index; Memory settings "Rebuild index"). |
 
 ### Diagnostics (2 channels)
@@ -512,7 +527,7 @@ By-session-id, not task-scoped (no `projectId`), in the same category as `sessio
 | `transcribe:modelProgress` | on | Push: first-use model download progress |
 | `transcribe:downloadModel` | invoke | Pre-download the selected model from settings |
 | `transcribe:liveWrite` | on | Live experience: write raw bytes (text + backspaces) straight into the focused terminal as the user speaks (fire-and-forget) |
-| `transcribe:prewarm` | on | Pre-load the selected engine so the next press is instant; `null` releases the warm engines (fire-and-forget) |
+| `transcribe:prewarm` | on | Pre-load the selected engine's live (streaming) model so the next press streams partials at once; the accurate model loads on the first press itself, overlapped with the utterance. `null` (dictation disabled) releases the worker outright (fire-and-forget) |
 
 ## Database
 
@@ -529,20 +544,20 @@ Overridable via `KANGENTIC_DATA_DIR` env var.
 
 Stores the project list. Tables:
 
-- **projects** -- id, name, path, github_url, default_agent, last_opened, created_at
+- **projects** -- id, name, path, github_url, default_agent, default_model, default_effort, group_id, position, last_opened, created_at
 - **global_config** -- key/value store for app-wide settings
-- **project_groups** -- sidebar grouping for projects. Fields: id, name, position, collapsed
+- **project_groups** -- sidebar grouping for projects. Fields: id, name, position, is_collapsed
 
 ### Per-Project DB (`<configDir>/projects/<projectId>.db`)
 
 Created on project open. Stored in the global config directory (not inside the project). Tables:
 
-- **swimlanes** -- Kanban columns. Fields: id, name, role (`todo`/`done`/null, set only at create, narrowed on read via `normalizeSwimlaneRole` and normalized when applied from `kangentic.json`, with an unconditional migration repairing any stray value already on disk. See [database.md](database.md)), position, color, icon, is_archived, permission_mode, auto_spawn, agent_override, model_override, effort_override, handoff_context, plan_exit_target_id, session_target, session_spawn_strategy, is_ghost, created_at (plus the retired `auto_command` / `auto_command_mode`, which the column's message automation replaced)
+- **swimlanes** -- Kanban columns. Fields: id, name, role (`todo`/`done`/null, set only at create, narrowed on read via `normalizeSwimlaneRole` and normalized when applied from `kangentic.json`, with an unconditional migration repairing any stray value already on disk. See [database.md](database.md)), position, color, icon, is_archived, permission_mode, auto_spawn, agent_override, model_override, effort_override, handoff_context, plan_exit_target_id, session_target, session_spawn_strategy, is_ghost, created_at, description (plus the retired `auto_command` / `auto_command_mode`, which the column's message automation replaced)
 - **tasks** -- Kanban cards. Fields: id, display_id, title, description, swimlane_id, position, agent, agent_override, model_override, effort_override, permission_mode, auto_command, auto_command_state, auto_command_text, auto_command_error, auto_command_at, profile_id, run_mode, session_id, worktree_path, worktree_folder, worktree_skip_reason, branch_name, pushed_branch, pr_number, pr_url, pr_state, pr_merge_readiness, head_sha, base_branch, resolved_base_branch, use_worktree, labels, priority, external_id, external_source, external_url, detail_view_state, archived_at, created_at, updated_at (the canonical column table lives in [database.md](database.md); this list is a pointer, not a second source of truth)
 - **column_automations** -- What runs when a task enters or leaves a column. Fields: id, swimlane_id, name, type (`send_message`, `run_script`, `webhook`, `notify`, plus the legacy `spawn_agent`), trigger (`enter`/`exit`), position, enabled, config_json, created_at, updated_at. One list per column, numbered per trigger, with names unique per column
 - **automation_runs** -- One row per execution, so an outcome survives a restart and a rename. Fields: id, automation_id, automation_name, type, task_id, swimlane_id, trigger, status (`running`/`succeeded`/`failed`/`skipped`/`interrupted`), detail, attempts, started_at, finished_at. Swept on project open: stale `running` rows become `interrupted`, then the newest 200 are kept
 - **actions**, **swimlane_transitions** -- Retired by the migration that created `column_automations`. Left on disk only so an older build can still read the file; nothing reads them after the migration. See [database.md](database.md)
-- **sessions** -- Session persistence for recovery/resume. Fields: id, task_id, session_type, agent_session_id, command, cwd, permission_mode, prompt, status (`running`/`queued`/`suspended`/`exited`/`orphaned`), exit_code, timestamps
+- **sessions** -- Session persistence for recovery/resume. Fields: id, task_id, session_type, agent_session_id, isolated_swimlane_id, command, cwd, permission_mode, prompt, status (`running`/`queued`/`suspended`/`exited`/`orphaned`), exit_code, started_at, suspended_at, exited_at, suspended_by, total_cost_usd, total_input_tokens, total_output_tokens, model_id, model_display_name, applied_model, applied_effort, total_duration_ms, tool_call_count, lines_added, lines_removed, files_changed, tool_breakdown, compaction_count (the canonical column table lives in [database.md](database.md); this list is a pointer, not a second source of truth)
 - **task_attachments** -- File attachments (images, etc.) stored on disk, metadata in DB
 - **backlog_tasks** -- Staging area tasks (Backlog View). Pre-board tasks with priority, labels, and optional external source tracking.
 - **backlog_attachments** -- File attachments for backlog tasks, mirroring `task_attachments`. Copied to `task_attachments` on promote.
@@ -626,9 +641,17 @@ folder and one manifest entry. See `.claude/rules/automation-adapters.md` for th
 | `notify` | Notify me | none | none | Raise one desktop notification through the same path `DesktopNotifier` uses |
 | `spawn_agent` | Start agent | none | none | Legacy. Kept so a row carrying a custom `promptTemplate` still runs; never offered for a new automation |
 
-The retired `send_command`, `kill_session`, `create_worktree`, `cleanup_worktree` and `create_pr`
-types are gone, rows and all: each was a no-op or a duplicate of the move path. A hand-written
-`kangentic.json` naming one is warned and skipped rather than rejected.
+The retired types are `kill_session`, `create_worktree` and `cleanup_worktree`
+(`RETIRED_ACTION_TYPES`). They are gone, rows and all: each was a no-op or a duplicate of the move
+path. A hand-written `kangentic.json` naming one is warned and skipped rather than rejected.
+`create_pr` survives only in the `ActionType` union and has no adapter and no migration case, so it
+takes the same warn-and-skip path without being named in that list.
+
+`send_command` is NOT retired. It is read as an alias for `send_message`, and its `command` field as
+an alias for `message`, by the board-config reader (`apply-automations.ts`), the MCP and command
+paths, and the legacy-action migration alike, so a hand-written file that predates the rename still
+opens. Neither alias is written back. See
+[Configuration](configuration.md#column-automations).
 
 Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{{taskId}}`, `{{taskNumber}}`, `{{projectPath}}`, `{{projectName}}`, `{{worktreePath}}`, `{{branchName}}`, `{{baseBranch}}`, `{{prUrl}}`, `{{prNumber}}`, `{{prState}}`, `{{issueKey}}`, `{{issueUrl}}`, `{{labels}}`, `{{attachments}}`, `{{port}}`, plus `{{column}}`, `{{fromColumn}}`, `{{toColumn}}` and `{{trigger}}` in a column automation, where there is a move to read them from. One declaration (`src/shared/task-template-vars.ts`) drives the `auto_command` field, the `spawn_agent` promptTemplate, and the Automation section's "Template variable" picker, which lists each variable with its description - see [Transition Engine](transition-engine.md#template-variables).
 

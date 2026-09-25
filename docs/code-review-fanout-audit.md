@@ -792,6 +792,17 @@ with the hunk-section count is the signal that `HUNK_CONTEXT_LINES` (3) is too n
 |---|---|---|---|---|---|---|---|---|
 | #650 (this change) | 6f +1450 | 219KB, 3175 lines | 4 (1) | 2 | 0 | 7 | 0 of 6 pack-carrying | 11 / 6 |
 | #686 | 39f +2367 | 214KB, 3610 lines | 14 (5) | 25 | 0 | 8 | 21 of 7 pack-carrying | 11 / 10 |
+| #710 | 4f +116 | 31KB, 513 lines | 4 (4) | 0 | 0 | 7 | 17 of 6 pack-carrying | 5 / 4 |
+| #711 | 12f +344 | 81KB, 1325 lines | 7 (6) | 5 | 0 | 7 | 4 of 6 pack-carrying | 9 / 5 |
+| #715 | 10f +270 | 63KB, 973 lines | 4 (4) | 6 | 0 | 7 | 30 of 6 pack-carrying | 9 / 5 |
+| #713 | 22f +2290 | 285KB, 3870 lines | 2 (1) | 20 | 0 | 7 | 17 of 6 pack-carrying | 19 / 13 |
+| #717 | 14f +859 plus 2 new files | 180KB, 3263 lines | 8 (4) | 6 | 0 | 7 | 11 of 6 pack-carrying | 24 / 18 |
+| #718 | 11f +312 | 72KB, 1010 lines | 7 (4) | 4 | 0 | 6 | 28 of 5 pack-carrying | 13 / 10 |
+| #720 | 9f +284 plus 4 new files | 116KB, 1782 lines | 8 (4) | 5 | 0 | 7 | 12 of 6 pack-carrying | 15 / 13 |
+| #724 | 7f +218 | 48KB, 873 lines | 7 (6) | 0 | 0 | 6 | 2 of 5 pack-carrying | 7 / 5 |
+| task 727, pre-PR | 13f +964 | 133KB, 1859 lines | 3 (3) | 10 | 0 | 7 | 1 of 6 pack-carrying | 10 / 7 |
+| #723 | 9f +210 | 32KB, 459 lines | 3 (2) | 6 | 0 | 8 | 28 of 7 pack-carrying | 12 / 9 |
+| #728 | 15f +576 plus 8 new files | 176KB, 3359 lines | 16 (7) | 7 | 0 | 8 | 10 of 7 pack-carrying | 11 / 7 |
 
 Row one is the format's own review, and it is weak evidence for the hunk tier: four of its six
 files were body tier, so the finders were mostly reading whole bodies. The integration finder is
@@ -809,3 +820,101 @@ it to answer a question about a changed guard,
 `docs/mobile-bridge.md` once for an unchanged line, and `session-resume-controllers.ts` once as a
 full body the pack already carried. So the hunk tier cost 3 gap reads on this diff, and one
 finder re-read a body it had; that is the number to watch, not the 21.
+
+Row three is small and all partial tier, with no hunk sections, so it says nothing about
+`HUNK_CONTEXT_LINES`. Of the 17 reads beyond the pack, 12 were outside the changed set: adapter
+greps to check a `probeAuth` regex, the UI mock's agent list, and a rule file. The other 5 were gap
+reads inside windowed bodies. Two finders read `WelcomeScreen.tsx`'s `DetectionRow` render (roughly
+lines 78-142), which sat just past the 20-line window of the prop the change added. One grepped the
+same file for the panel width, one read the spec's launch helper, and one read the `seeds` type in
+`scenes.ts`. So the partial tier's 20 lines stopped short of the component a changed prop feeds
+twice on this diff.
+
+Row four is the first sample where the body budget, not the file, decided the tier. The pack
+counted 198KB of full-body cost against the 200KB cap but wrote 69KB, because 6 of its 7 bodies
+were windowed. That left no room for `demo/posters.mjs`, a 110-line file, so it went in as hunks.
+Three of the 4 reads beyond the pack were re-reads of hunk-tier files: `demo/posters.mjs` in full
+by two finders that needed its call order, and the gap above a changed assertion in
+`tests/demo/static-demo.spec.ts` once. The fourth was `.gitattributes`, outside the changed set,
+for a line-ending question. A small file squeezed out by windowed bodies that were billed at full
+cost is the case to watch here.
+
+Row five is hunk-heavy on a small diff. Six of its 10 files were hunk tier, including the two
+largest, the UI mock (5041 lines) and `BoardManagerDialog.tsx` (2627 lines). Of the 30 reads beyond
+the pack, 23 were outside the changed set: the Codex adapter behind the mock's KEEP IN SYNC comment
+(three finders), the capability hooks the column form reads, `format-tokens.ts`, `model-id.ts`, and
+rule files. Four of the other 7 went into hunk-tier files, and they split two ways. Two finders read
+`BoardManagerDialog.tsx` for how the column form resolves its own agent (`effectiveAgent`, its
+display names, and its permissions, lines 1173-1182). That code sits 4 to 13 lines past the overview
+hunk's 3-line window, so a 20-line window would have carried it. This is the first row where
+`HUNK_CONTEXT_LINES` was too narrow for a finder's question. The other two read the mock past its
+Codex hunk for the other agents' entries, which run about 140 lines, so no context width covers
+them. The last 3 were a render-branch read in the windowed `DataTable.tsx`, a grep of the UI spec
+outside its window, and one finder's dash scan over files the pack already carried.
+
+Row six is the first pack past the Read tool's output cap. The skill sizes the load at one call
+per 2000 lines, but the first 2000 lines of this 285KB pack came back as 58,377 tokens against the
+tool's 25,000, so the call failed and the finders were told to read it in six 650-line calls. The
+pack is still read once per finder; only the call count changed, and a pack this wide will need
+the same until the skill sizes calls by bytes. Of the 17 reads beyond the pack, 4 were files
+outside the changed set (the capture rig, to learn whether it runs the seed without a recordings
+index) and 13 were the conventions finder's, 9 of them re-reads of pack-carried files to check a
+comment against the code around its hunk.
+
+Row eight has a 2050-line file in the hunk tier (`demo-dataset.ts`) and ran 6 finders, because no
+domain auditor's glob matched. Of the 28 reads beyond the pack, 22 were outside the changed set:
+the renderer files behind the new scene's selectors, the UI mock's dictation methods, rule files,
+and the tests around the moved `selectTier`. Of the other 6, one is a second case for a wider
+`HUNK_CONTEXT_LINES`. The correctness finder read `demo/boot.js` for the line that sets the boot
+veil (523), which a changed helper tests for. It sits 14 lines above the 3-line window of the
+hunk that routes click steps through that helper, so a 20-line window would have carried it. The rest are not about
+width. Two finders read the gap in the partial-tier `transcription-service.ts` to learn whether
+an import the diff left in place was still used, and the use sits over 100 lines from either
+window. One read a whole rule file for its contract, one grepped every `click:` step in
+`scenes.ts`, and one re-read `detect-hardware.ts` for an import line the pack's window already
+showed.
+
+Row ten is small and all partial tier, like row three, so it says nothing about
+`HUNK_CONTEXT_LINES`. Both reads beyond the pack were the correctness finder's and fell outside
+the changed set: `electron-builder.yml`, to learn how the macOS bundle and executable names are
+derived, and a repo-wide grep for a renamed constant. No finder re-read a file the pack carried.
+Three of the seven candidates were one issue, raised by three dimensions, so the kept count is
+the dedup, not a refutation.
+
+The task 727 row reviewed uncommitted work before any PR existed, so it is keyed by task. Its
+pack was 133KB, past the Read tool's output cap at 2000 lines, so the finders loaded it in three
+620-line calls. Five of the six pack-carrying finders read nothing else. The sixth,
+`platform-guard`, read two gaps in the hunk-tier `gh-client.ts`: the `execFileAsync` binding near
+the top of the file and the sibling `gh` methods, to compare the new call's argv against them.
+Both sit far outside any hunk, so this is not a case for a wider `HUNK_CONTEXT_LINES`. The driver
+refuted 3 of the 10 findings: a `Promise.all` that would have broken the `gh` queue's concurrency
+cap, and two coverage holes, one already pinned by an existing test and one that changed no
+output. It also found one that no finder raised. A timer-driven re-poll inherits the arming
+caller's `force` flag, and a comment claimed otherwise.
+
+The #723 row has one behavioral file, `demo/boot.js`, and it keys on DOM markers the renderer
+stamps. So 22 of its 28 reads beyond the pack went outside the changed set: the files that stamp
+each marker, xterm's own source for whether it stops an Escape, the keybinding registry, the scene
+registry, and rule files. Of the other 6, one is a third case for a wider `HUNK_CONTEXT_LINES`.
+The correctness finder read `CommandTerminalLayer.tsx` for its `panel.close` binding (309), 6
+lines past the 3-line window of the comment hunk that describes it. Two were gap reads no width
+closes. The spec's `hostFrame` and `focusAcrossFrame` helpers sit 67 to 93 lines above the
+partial tier's window, and `enableTerminalClipboard`'s signature sits 29 lines above its hunk's.
+The rest were a rule file read whole for its contract, a grep of the spec for an unchanged test,
+and a dash scan over the changed files. It ran 8 finders because a comment-only edit under
+`src/renderer/utils/` gated `hmr-parity` and a `path.join` context line gated `platform-guard`.
+Neither found anything.
+
+The #728 row hit the Read tool's output cap again, like row six, but for one finder only. The
+IPC auditor's first 2000-line call failed on the 25,000-token limit, so it read three targeted
+windows and skipped the analytics sections as off its checklist. The other finders reported
+loading the pack in the two calls the skill sizes. Of the 10 reads beyond the pack, 5 were outside
+the changed set: the correctness finder's removed-surface greps and a failed Glob for node-pty's
+helper source, and the conventions finder's pass over the `trackEvent` call sites and the installed
+Sentry minidump integration. Four were the conventions finder re-reading pack-carried files to
+quote exact lines. The last is a `HUNK_CONTEXT_LINES` case. The IPC auditor read `system.ts` lines
+575-629 for the `SHELL_EXEC` input guard, which sits just above the 3-line window of the changed
+spawn. The driver refuted four of the 11 candidates, each for a stated reason:
+- A fail-open ordering case had no SDK-shaped trigger.
+- Two platform nits changed no behavior.
+- One coverage hole was on code the diff moved without changing.

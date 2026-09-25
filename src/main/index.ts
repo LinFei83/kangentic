@@ -1,7 +1,8 @@
 const PROCESS_START = performance.now();
 
-import { app, BrowserWindow, clipboard, dialog, Menu, nativeImage, powerMonitor, session, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, powerMonitor, session, shell } from 'electron';
 import type { Event as ElectronEvent } from 'electron';
+import type { GpuGraphicsStatus } from '../shared/types';
 import path from 'node:path';
 import fs from 'node:fs';
 import { registerAllIpc, getSessionManager, getTerminalSubmitScheduler, getBoardConfigManager, getCurrentProjectId, getOptionalIpcContext, openProjectByPath, deleteProjectFromIndex, pruneStaleWorktreeProjects, activateAllProjects, getLastOpenedProject } from './ipc/register-all';
@@ -21,6 +22,7 @@ import { startMcpHttpServer, type McpHttpServerHandle } from './agent/mcp-http-s
 import { readBrowserAutomationConfig } from './browser/browser-automation-config';
 import { browserPaneRegistry } from './browser/browser-pane-registry';
 import { setAgentInputSender, isAgentDriving } from './browser/agent-input-signal';
+import { setViewportOverrideSender } from './browser/viewport-override-store';
 import { encodeTerminalKey } from '../shared/terminal-key-encoding';
 import { createRequestResolver } from './agent/mcp-project-context';
 import { IPC, PROJECT_PATH_MISSING_PREFIX } from '../shared/ipc-channels';
@@ -32,8 +34,8 @@ const windowConfigManager = new ConfigManager();
 import { initAnalytics, trackEvent, sanitizeErrorMessage, shouldEmitHeartbeat, setAnalyticsClientId, HEARTBEAT_INTERVAL_MS } from './analytics/analytics';
 import { initErrorReporting, isErrorReportingActive, reportHandledError, setErrorReportingUser, setHostMemoryContext } from './analytics/error-reporting';
 import { initUsageAnalytics, trackUpdateOutcome } from './analytics/usage';
-import { initRunUptimeTracking, checkpointRunUptime, recordRunExit, previousRunLaunchProps, RUN_UPTIME_CHECKPOINT_INTERVAL_MS } from './analytics/run-uptime';
-import { readPendingGpuEscalation, clearGpuEscalation } from './diagnostics/gpu-health';
+import { initRunUptimeTracking, checkpointRunUptime, recordRunExit, previousRunLaunchProps, previousRunLastAliveAt, peekPreviousRun, RUN_UPTIME_CHECKPOINT_INTERVAL_MS } from './analytics/run-uptime';
+import { readPendingGpuEscalation, clearGpuEscalation, isEscalationFromCurrentRun, isDeathNearRunEnd, shouldReportEscalation, summarizeGpuInfo } from './diagnostics/gpu-health';
 import { trackSettingsSnapshot } from './analytics/settings-snapshot';
 import { resolveClientId } from './analytics/client-id';
 import { PATHS } from './config/paths';
@@ -95,6 +97,7 @@ import { installWebviewDownloadPolicy } from './browser/webview-download-policy'
 // Fork addition: resolves the main process's locale before anything can render a
 // window title or a startup dialog in the wrong language. See docs/i18n-guide.md.
 import { installMainLocale, languageArgument, translate } from './i18n';
+import { applyBrowserUserAgent } from './browser/browser-user-agent';
 
 // Before every other module-scope statement, so no translated string main owns
 // can be produced in the default locale first.
@@ -114,6 +117,33 @@ if (__KANGENTIC_DEV__) startEventLoopLagMonitor();
 // test failure to catch it.
 const GPU_HEALTH_FILE_PATH = path.join(PATHS.configDir, 'gpu-health.json');
 
+// The run-uptime record. Hoisted for the same reason as the constant above:
+// the module-scope graphics decision below PEEKS it and initRunUptimeTracking
+// in whenReady OWNS it, so two path.join calls could diverge silently.
+const RUN_UPTIME_FILE_PATH = path.join(PATHS.configDir, 'analytics-run.json');
+
+/** How long the escalation report waits on app.getGPUInfo('complete') before
+ *  giving up on it. Enrichment only: nothing downstream needs it, and the
+ *  report is worth more on time without it than late with it. */
+const GPU_INFO_TIMEOUT_MS = 2_000;
+
+// When this run started, in wall clock. Compared against a pending GPU
+// record's own timestamp so the report block far below can tell a record the
+// PREVIOUS run wrote from one THIS run just wrote (gpu-health.ts's
+// isEscalationFromCurrentRun).
+const PROCESS_START_ISO = new Date().toISOString();
+
+/**
+ * True when THIS launch came up on software rendering because the previous
+ * one was killed by its GPU. The renderer PULLS this (IPC.GPU_HEALTH_STATUS)
+ * rather than main pushing it: the notice is decided exactly once, during
+ * boot, when a webContents.send can land before the renderer has registered
+ * any listener and be dropped silently - and the escalation record is already
+ * cleared by then, so a dropped push would lose the notice for good. Cleared
+ * on read, so a renderer reload does not re-toast.
+ */
+let pendingGpuNotice = false;
+
 // Install product diagnostics (log mirror, crash capture, IPC recorder,
 // debug-dump path resolver) BEFORE any IPC handler registers. The recorder
 // patches `ipcMain.handle` once and every subsequent registration flows
@@ -132,6 +162,7 @@ installDiagnostics({
     safeReadDeveloperFlag('recordIpcTraffic'),
   gpuHealthFilePath: GPU_HEALTH_FILE_PATH,
 });
+
 
 function safeReadDeveloperFlag(key: DeveloperFlagKey): boolean {
   try {
@@ -244,8 +275,16 @@ initAnalytics();
 // Initialize Sentry error reporting beside it (also pre-ready: the SDK wires
 // its renderer IPC/protocol transport during init). Gated by the same
 // KANGENTIC_TELEMETRY superset kill switch plus KANGENTIC_ERROR_REPORTING;
-// scrubbing and event hygiene are the SDK's and Sentry's job, not ours
-// (see analytics/error-reporting.ts).
+// scrubbing and event hygiene are the SDK's and Sentry's job, not ours, except
+// for breadcrumbs (see analytics/error-reporting.ts).
+//
+// It must stay AFTER installDiagnostics() above. The SDK wraps whatever
+// console.* is at init, so running second makes it the outer wrapper, which
+// sees each caller's own arguments. The log mirror hands the function it wraps
+// a `[HH:MM:SS] [projectName]`-prefixed first argument, so in the other order
+// no console line would start with an allowlisted breadcrumb tag, and every
+// console breadcrumb would silently drop. tests/unit/sentry-breadcrumbs.test.ts
+// pins the order.
 initErrorReporting();
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
@@ -258,6 +297,106 @@ for (const arg of process.argv) {
     break;
   }
 }
+
+/**
+ * Decide whether this launch runs on software rendering, and engage it if so.
+ *
+ * Placed HERE on purpose, and the position is load-bearing in two directions.
+ * It must come before `app.whenReady()`, because
+ * `app.disableHardwareAcceleration()` THROWS once the app is ready. And it
+ * must come after `initErrorReporting()` above, because it is the first thing
+ * in the process to call `windowConfigManager.load()`: if that load hits an
+ * unwritable config dir, `reportSyncWriteFailure` LATCHES the source before it
+ * calls `reportHandledError`, so running it while Sentry is still inactive
+ * would silently drop that failure and then suppress it for the whole run.
+ *
+ * Two independent triggers, in order:
+ *
+ *   1. The stored setting is off. That covers every launch after the first
+ *      recovered one, and a user who chose it themselves.
+ *   2. No setting yet, but the PREVIOUS run died with a GPU death at its end
+ *      (gpu-health.ts's isDeathNearRunEnd). This is the launch that rescues an
+ *      install which cannot otherwise start: DESKTOP-18's seven launches each
+ *      died 8 to 12 seconds in, so waiting for a setting written by a later
+ *      run would never have helped. whenReady persists the setting, so trigger
+ *      1 takes over from there.
+ *
+ * Both, not one. `--in-process-gpu` removes the GPU child process, so
+ * Chromium's IntentionallyCrashBrowserForUnusableGpuProcess (the LOG(FATAL)
+ * this whole path exists for) is unreachable. `disableHardwareAcceleration()`
+ * then keeps the display driver out of the browser process, which
+ * `--in-process-gpu` alone would pull in, turning a contained GPU-child crash
+ * into a browser crash with no fallback ladder at all. Calling the API rather
+ * than appending `--disable-gpu` ourselves is not a distinction: Electron's
+ * `App::DisableHardwareAcceleration` appends that exact switch AND disables
+ * the GpuDataManager, and it throws if called once the app is ready, which is
+ * the other half of why this sits at module scope.
+ *
+ * Verified in Electron 41 on Windows and on Linux (Ubuntu 24.04 under WSLg,
+ * whose GL is Mesa's d3d12 driver rather than a native one): with both set,
+ * getAppMetrics() reports no GPU process at all, and the window still paints.
+ * NOT verified on macOS, and no test tier reaches this branch on any platform
+ * (see the NODE_ENV note below), so CI being green is not evidence about the
+ * switches themselves.
+ *
+ * Cost on a launch that will never need any of this: one `readFileSync` that
+ * ENOENTs. `windowConfigManager.load()` caches, and every launch loads config
+ * anyway.
+ *
+ * Never in tests: an E2E or preview run must not inherit a downgrade from
+ * whatever ran before it, matching how `isE2ETest` gates the modal dialogs.
+ */
+function resolveGraphicsMode(): { software: boolean; engagedNow: boolean } {
+  if (process.env.NODE_ENV === 'test') return { software: false, engagedNow: false };
+  try {
+    if (windowConfigManager.load().graphicsAccelerationEnabled === false) {
+      return { software: true, engagedNow: false };
+    }
+    const pending = readPendingGpuEscalation(GPU_HEALTH_FILE_PATH);
+    if (!pending) return { software: false, engagedNow: false };
+    const previousRun = peekPreviousRun(RUN_UPTIME_FILE_PATH);
+    const killedTheLastRun = isDeathNearRunEnd(pending, {
+      previousRunExit: previousRun?.exit ?? null,
+      lastKnownAliveAt: previousRun?.lastAliveAt ?? null,
+    });
+    return { software: killedTheLastRun, engagedNow: killedTheLastRun };
+  } catch (error) {
+    // A decision this early must never be able to stop the app booting. An
+    // unreadable config or record simply means hardware, exactly as today.
+    console.error('[GPU-HEALTH] Failed to resolve the graphics mode:', error);
+    return { software: false, engagedNow: false };
+  }
+}
+
+const graphicsMode = resolveGraphicsMode();
+if (graphicsMode.software) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('in-process-gpu');
+  console.warn('[GPU-HEALTH] Starting without graphics acceleration.');
+}
+
+// Armed HERE, at module scope, and not only in the whenReady report block far
+// below. The renderer can invoke as soon as the synchronous createWindow()
+// span ends, and the block that would otherwise be the first to arm this sits
+// behind `await resolveClientId` after that span - so a renderer that got its
+// pull in first would read `noticePending: false`, consume it, and never ask
+// again, while the record behind it is cleared moments later. The user would
+// then be on software rendering with no explanation at all. This is the same
+// decision the whenReady block re-derives; arming it before any renderer can
+// exist is what makes the answer independent of who wins that race. The later
+// arm stays: it is idempotent, and it still covers the case where software
+// mode was already on from a previous launch, so this line cannot reach it.
+if (graphicsMode.engagedNow) pendingGpuNotice = true;
+
+// Registered here rather than in an ipc/handlers module because the answer is
+// a module-scope fact of THIS file: the graphics decision runs before
+// whenReady and the notice it produces has no other owner. Cleared on read, so
+// a renderer reload during the same launch does not re-toast.
+ipcMain.handle(IPC.GPU_HEALTH_STATUS, (): GpuGraphicsStatus => {
+  const noticePending = pendingGpuNotice;
+  pendingGpuNotice = false;
+  return { softwareRendering: graphicsMode.software, noticePending };
+});
 
 // Set Windows AppUserModelID so the taskbar resolves the correct icon.
 // In packaged builds, this must match the appId in electron-builder.yml so
@@ -319,6 +458,18 @@ app.on('web-contents-created', (_event, contents) => {
     webPreferences.contextIsolation = true;
     webPreferences.sandbox = true;
     webPreferences.webSecurity = true;
+    // Electron must not draw its own JavaScript dialog for a guest, because
+    // the CDP driver already answers them (`cdp.ts`, `Page.enable` +
+    // `Page.javascriptDialogOpening`). Measured on Electron 41: BOTH fire.
+    // The page got its answer from CDP and carried on, while Electron left a
+    // native "Really delete?" box on screen whose OK and Cancel then did
+    // nothing - the answer was already given. So the box was not merely
+    // redundant, it was a lie about what the page would do, and the user had
+    // to dismiss one per dialog.
+    //
+    // Suppressing it here rather than in the driver because this is Electron's
+    // own delegate, which the CDP interception does not sit in front of.
+    webPreferences.disableDialogs = true;
 
     let allowed: boolean;
     try {
@@ -342,6 +493,13 @@ app.on('web-contents-created', (_event, contents) => {
     contents.setWindowOpenHandler(createExternalWindowOpenHandler((url) => shell.openExternal(url)));
     return;
   }
+
+  // Drop the `Electron/` token from the guest's user agent, which some web
+  // application firewalls reject as a bot (decision 41). This runs at guest
+  // construction, before `did-attach` loads the first `src`, so the first
+  // request already carries it. It also sets the guest's Session, which is how
+  // the popups below inherit it.
+  applyBrowserUserAgent(contents);
 
   // Forward the guest's mouse BACK / FORWARD buttons to the host renderer.
   //
@@ -640,6 +798,30 @@ setAgentInputSender((guest, active) => {
   const hostWindow = BrowserWindow.fromWebContents(guest.hostWebContents ?? guest);
   if (!hostWindow || hostWindow.isDestroyed()) return;
   hostWindow.webContents.send(IPC.BROWSER_AGENT_INPUT, guest.id, active);
+});
+
+// Routed exactly as the two above are, and for the same reason: a detached
+// pane's chip lives in the pop-out window's renderer, not the main one. A LANE
+// has no host window at all and `fromWebContents` on its own offscreen guest
+// resolves the lane window, whose renderer has no pane to tell - the send is a
+// harmless no-op there, which is correct, since nobody is looking at a lane.
+setViewportOverrideSender((guest, override) => {
+  if (guest.isDestroyed()) return;
+  const hostWindow = BrowserWindow.fromWebContents(guest.hostWebContents ?? guest);
+  if (!hostWindow || hostWindow.isDestroyed()) return;
+  hostWindow.webContents.send(
+    IPC.BROWSER_VIEWPORT_OVERRIDE,
+    guest.id,
+    override
+      ? {
+          mechanism: override.mechanism,
+          requested: override.requested,
+          measured: override.measured,
+          deviceScaleFactor: override.deviceScaleFactor,
+          appliedAt: override.appliedAt,
+        }
+      : null,
+  );
 });
 
 // Enforce single instance -- prevents manual double-launches from spawning
@@ -1643,7 +1825,7 @@ app.whenReady().then(async () => {
   // holds the loop at quit, and cleared in clearPendingTimers regardless so no
   // tick fires mid-shutdown. Started before the awaited client-id resolution
   // below so a slow lookup cannot delay the first checkpoint.
-  initRunUptimeTracking(path.join(PATHS.configDir, 'analytics-run.json'), appLaunchTime);
+  initRunUptimeTracking(RUN_UPTIME_FILE_PATH, appLaunchTime);
   runUptimeCheckpointInterval = setInterval(() => checkpointRunUptime(), RUN_UPTIME_CHECKPOINT_INTERVAL_MS);
   runUptimeCheckpointInterval.unref();
 
@@ -1670,6 +1852,10 @@ app.whenReady().then(async () => {
     onPressure: (sample, activeAgentCount) => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
       mainWindow.webContents.send(IPC.HOST_MEMORY_PRESSURE, { sample, activeAgentCount });
+    },
+    onRecovery: (sample) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.webContents.send(IPC.HOST_MEMORY_RECOVERED, { sample });
     },
   });
 
@@ -1804,12 +1990,89 @@ app.whenReady().then(async () => {
   // gpu_process_gone count exist independent of this report.
   try {
     const pendingGpuEscalation = readPendingGpuEscalation(GPU_HEALTH_FILE_PATH);
-    if (pendingGpuEscalation) {
-      clearGpuEscalation(GPU_HEALTH_FILE_PATH);
-      reportHandledError(
-        new Error(
-          `GPU process exited repeatedly (reason ${pendingGpuEscalation.reason}, exit code ${pendingGpuEscalation.exitCode ?? 'unknown'})`
-        ),
+    // A record THIS run wrote is not the previous run's news. The writer is
+    // installed at module scope above; this block runs after createWindow and
+    // an await, so a GPU crash-looping from startup writes into that gap.
+    // Without this guard the same run reads it, clears it, and reports it,
+    // with the async Sentry POST racing the LOG(FATAL) about to kill the
+    // process - and the next launch then finds nothing pending. Leave it on
+    // disk for the launch that can actually deliver it.
+    if (pendingGpuEscalation && !isEscalationFromCurrentRun(pendingGpuEscalation, PROCESS_START_ISO)) {
+      const gpuReportContext = {
+        previousRunExit: (previousRunProps.lastRunExit as string | undefined) ?? null,
+        lastKnownAliveAt: previousRunLastAliveAt(),
+      };
+      const killedTheLastRun = isDeathNearRunEnd(pendingGpuEscalation, gpuReportContext);
+
+      // Persist what the module-scope decision already engaged, so every
+      // later launch reads the setting instead of re-deriving it from a
+      // record that is about to be cleared. Only ever sets 'off': the way
+      // back is the user's, and `graphicsAccelerationOffBy` is what stops a
+      // later failure rewriting a choice they made themselves.
+      if (graphicsMode.engagedNow) {
+        // Through the IPC context's manager, NOT windowConfigManager. By this
+        // point registerAllIpc has built a second ConfigManager that loaded
+        // and CACHED config.json, and every later write in the app goes
+        // through that one (window bounds, the settings panel). Saving here on
+        // the module-scope manager writes the key to disk and then loses it to
+        // the very next bounds save, which rewrites the file from the other
+        // manager's stale cache. Caught in /preview: safe mode engaged and
+        // toasted correctly, and the setting read 'on' afterwards - so the
+        // downgrade was a one-shot and the next launch would have gone
+        // straight back to hardware and died again.
+        const configManager = getOptionalIpcContext()?.configManager ?? windowConfigManager;
+        configManager.save({ graphicsAccelerationEnabled: false, graphicsAccelerationOffBy: 'app' });
+      }
+      // Independent of Sentry on purpose: reportHandledError is a no-op when
+      // reporting is off, and the user with telemetry disabled is exactly the
+      // one who would otherwise get no explanation at all.
+      if (killedTheLastRun) pendingGpuNotice = true;
+
+      // Compare-and-clear: a crash loop can write a FRESH record between the
+      // read above and this call, and an unconditional unlink would take it.
+      clearGpuEscalation(GPU_HEALTH_FILE_PATH, { onlyIfLastAt: pendingGpuEscalation.lastAt });
+
+      // The one getGPUInfo call in the whole path. It names the machine's
+      // actual graphics stack, which is the context every triage of this
+      // crash class has so far lacked.
+      //
+      // RACED AGAINST A TIMER, not just `.catch`ed. Electron only promises
+      // complete GPU info once `gpu-info-update` has fired, and this call
+      // happens on exactly the machines whose GPU is broken - including one
+      // just started in software mode with --in-process-gpu. A rejection is
+      // handled; a promise that never settles would strand the rest of this
+      // whenReady handler (app_launch, the settings snapshot, everything
+      // after) with the window already up and nothing visibly wrong. That
+      // failure would be invisible AND scoped to the users this feature
+      // exists for, which is the worst combination available.
+      // The loser's timer is cleared rather than left to fire into an
+      // already-settled promise. Resolving twice is harmless, but an
+      // uncleared handle keeps the event loop alive for up to the full
+      // timeout, and this block runs on the quit-sensitive startup path.
+      let gpuInfoTimer: NodeJS.Timeout | undefined;
+      const gpuInfoOnReport = await Promise.race([
+        app.getGPUInfo('complete').catch(() => null),
+        new Promise((resolve) => {
+          gpuInfoTimer = setTimeout(() => resolve(null), GPU_INFO_TIMEOUT_MS);
+        }),
+      ]).finally(() => {
+        if (gpuInfoTimer) clearTimeout(gpuInfoTimer);
+      });
+
+      // Not every pending record earns a Sentry issue. A lone recoverable
+      // death that the run then survived is DESKTOP-15's shape, and #665
+      // filtered it deliberately; it is still consumed above rather than
+      // left to accumulate.
+      //
+      // A record with no deaths at all is a fallback that no GPU exit ever
+      // announced: a launch-failure ladder (DESKTOP-W), which Electron never
+      // reports to JS. Its own message keeps it out of the crash-loop issue,
+      // because the two shapes need different triage.
+      const gpuReportMessage = pendingGpuEscalation.count > 0
+        ? `GPU process exited repeatedly (reason ${pendingGpuEscalation.reason}, exit code ${pendingGpuEscalation.exitCode ?? 'unknown'})`
+        : 'GPU left hardware acceleration with no GPU process exit reported';
+      if (shouldReportEscalation(pendingGpuEscalation, gpuReportContext)) reportHandledError(
+        new Error(gpuReportMessage),
         {
           source: 'gpu_process',
           reason: pendingGpuEscalation.reason,
@@ -1822,8 +2085,8 @@ app.whenReady().then(async () => {
         // (DESKTOP-W's shape); 'clean' or 'failsafe' means Chromium
         // recovered on its own (DESKTOP-15's). TWO feature-status reads,
         // deliberately not one: featureStatusAtEscalation is what Chromium's
-        // GPU mode was AT THE DEATH that produced this record (captured back
-        // when it was written); featureStatusOnReport is what it is on THIS
+        // GPU mode was at the record's latest write, a death or a fallback
+        // (captured back then); featureStatusOnReport is what it is on THIS
         // boot, which may already differ (a machine that recovers on its own,
         // or one still stuck) - reporting only the live read would silently
         // claim to describe the failure while actually describing whatever
@@ -1839,6 +2102,19 @@ app.whenReady().then(async () => {
             featureStatusAtEscalation: pendingGpuEscalation.featureStatus,
             featureStatusOnReport: app.getGPUFeatureStatus(),
             previousRunExit: previousRunProps.lastRunExit ?? 'unknown',
+            // The SEQUENCE, which is the thing a single end-state snapshot
+            // could never say: how Chromium walked its fallback ladder. Each
+            // entry names the rung its death left behind, so the death that
+            // triggered a fallback already reads the lower one. This is what
+            // the next occurrence needs for anyone to name a cause.
+            deaths: pendingGpuEscalation.deaths,
+            // Each step down the ladder that Chromium announced, which on a
+            // launch-failure ladder is the only trace of the incident. On
+            // Linux each step carries whether the GPU's zygote was alive.
+            modeChanges: pendingGpuEscalation.modeChanges,
+            gpuInfoOnReport: summarizeGpuInfo(gpuInfoOnReport),
+            killedTheLastRun,
+            softwareRenderingEngaged: graphicsMode.engagedNow,
           },
         },
       );

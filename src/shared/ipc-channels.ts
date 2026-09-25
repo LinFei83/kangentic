@@ -428,6 +428,49 @@ export const IPC = {
   // on the host. The pane restores the user's focus if it moved.
   // See `.claude/rules/agent-driven-focus.md`.
   BROWSER_AGENT_INPUT: 'browser:agentInput',
+  // Main -> renderer: an agent set (or cleared) the viewport a Browser pane
+  // lays out against. The pane cannot see this for itself - an override is a
+  // CDP-session property main owns, and the guest's own size never changes -
+  // so without the push the user's page silently renders at a width nothing on
+  // screen accounts for. The pane shows it as a chip with a reset control,
+  // which is also the user's escape hatch when the agent that set it is gone.
+  BROWSER_VIEWPORT_OVERRIDE: 'browser:viewportOverride',
+  // Renderer -> main: the user cleared a pane's viewport override from that
+  // chip. Separate from the agent's own reset so the user is never waiting on
+  // an agent to give their pane back.
+  BROWSER_VIEWPORT_CLEAR: 'browser:viewportClear',
+  // Renderer -> main: the `<webview>` element's own size in CSS pixels.
+  // Main cannot measure it (its window is the whole app, several times the
+  // pane), and it is what a requested viewport is fitted against, so without
+  // this report a fit computes a zoom of 1 and leaves the page cropped.
+  BROWSER_PANE_WIDGET_SIZE: 'browser:paneWidgetSize',
+  // Renderer -> main: what override (if any) this guest is already under.
+  // A pane that mounts AFTER the override was set - a pop-out, or a re-register
+  // - missed the push, so it asks once on registration rather than showing
+  // nothing.
+  BROWSER_VIEWPORT_GET: 'browser:viewportGet',
+  // Main -> renderer: which tasks currently hold their one browser surface in
+  // its OFFSCREEN form. The whole set on every change, not a delta, because a
+  // renderer that missed one push would otherwise stay wrong forever.
+  //
+  // This is what makes an offscreen surface visible at all. The card globe and
+  // the task-detail Browser pill both read `browserGuestTasks`, which is
+  // written in exactly one place - `BrowserPane.tsx`, on the `<webview>`'s
+  // `dom-ready` - so a main-process offscreen `BrowserWindow` set nothing and
+  // the user had no way to know one existed, let alone close it. An agent
+  // completed a whole verification run in one with no browser anywhere on
+  // screen, which is what ended agent-requested lanes entirely.
+  BROWSER_OFFSCREEN_SURFACES: 'browser:offscreenSurfaces',
+  // Renderer -> main: the same set, asked for once on mount and after an HMR
+  // update. A push-only channel leaves a reloaded renderer blank until the next
+  // change, and an offscreen surface can sit unchanged for the whole session.
+  BROWSER_OFFSCREEN_SURFACES_GET: 'browser:offscreenSurfacesGet',
+  // Renderer -> main: the user's "Close browser" on a task whose surface is
+  // OFFSCREEN. There is no guest in `browserGuestTasks` to retire and no pane
+  // to unmount, so the ordinary close path is a silent no-op for it - which
+  // would leave a control that says Close and does nothing. Main destroys the
+  // offscreen window directly.
+  BROWSER_OFFSCREEN_CLOSE: 'browser:offscreenClose',
   // Main -> renderer: a file download started from a Browser pane has finished.
   // The pane saves silently to the OS Downloads folder (Chrome's default), so
   // this is what stops an agent-triggered download being invisible.
@@ -460,9 +503,31 @@ export const IPC = {
   UPDATE_CHECK: 'updater:check',
   UPDATE_INSTALL: 'updater:install',
   UPDATE_DOWNLOADED: 'updater:downloaded',
+  // Push: this install cannot update itself and never will until the user acts
+  // on it - today that is only the macOS read-only-volume case, DESKTOP-1A.
+  // Carries the user-facing message to toast, composed in main and latched
+  // there for the app's lifetime (`notifyReadOnlyVolume` in src/main/updater.ts),
+  // so a condition every 4-hour check rediscovers still toasts once.
+  // Main window only (the updater's own window reference, not broadcast), for
+  // the reason CONFIG_WRITE_FAILED gives above: ToastContainer is mounted in
+  // AppLayout alone, so a pop-out window has no toast host to deliver this to.
+  // Every OTHER updater failure stays silent by design - see the error handler.
+  UPDATE_BLOCKED: 'updater:blocked',
 
   // Host memory pressure (Sentry DESKTOP-16; see src/main/diagnostics/host-memory.ts)
   HOST_MEMORY_PRESSURE: 'hostMemory:pressure',
+  HOST_MEMORY_RECOVERED: 'hostMemory:recovered',
+
+  // How this launch is rendering, and whether the user still needs telling
+  // (Sentry DESKTOP-18/DESKTOP-W; src/main/diagnostics/gpu-health.ts)
+  //
+  // An invoke, not a push, unlike HOST_MEMORY_PRESSURE above. That one is
+  // driven by a periodic sampler, so it never fires during boot and never has
+  // to prove the renderer is listening. This is decided once, while the
+  // renderer may still be parsing its bundle, and a send with no listener
+  // registered is dropped silently - with the escalation record already
+  // cleared, so nothing would ever resend it. The renderer pulls instead.
+  GPU_HEALTH_STATUS: 'gpuHealth:status',
 
   // Announcements (remote feed poll; see src/main/announcements.ts)
   ANNOUNCEMENTS_GET: 'announcements:get',
@@ -480,6 +545,9 @@ export const IPC = {
 
   // Conversation-memory semantic-layer status (Smart-mode palette UI).
   MEMORY_STATUS: 'memory:status',
+  // Spawn + init the embedding worker ahead of the first Smart query (Quick
+  // Find open); fire-and-forget, embeds nothing.
+  MEMORY_PREWARM: 'memory:prewarm',
   // Purge the current project's conversation index and re-run the backfill sweep
   // (recovery from a corrupt/stale index; Memory settings "Rebuild index").
   MEMORY_REBUILD_INDEX: 'memory:rebuildIndex',

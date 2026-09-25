@@ -28,8 +28,8 @@
  * A scene the registry does not know, a rig-only scene, or a malformed state= blob renders a
  * full-frame error card and boots nothing: a page must never caption a scene the visitor is not
  * looking at. The parent frame is told either way (kangentic-demo-ready / kangentic-demo-error).
- * Ready fires only once the scene's `ready` element exists, and carries the rect of its `focus`
- * element (fractions of the frame) so a host can crop a dialog scene to the dialog.
+ * Ready fires only once the scene's `ready` element exists, and carries the rect around its `focus`
+ * elements (fractions of the frame) so a host can crop a dialog scene to the dialog.
  */
 (function () {
   'use strict';
@@ -43,6 +43,14 @@
   // kangentic-light / kangentic-dark before being named clay / rust.
   var THEME_ALIASES = { night: 'dark', kangentic: 'clay', 'kangentic-light': 'clay', 'kangentic-dark': 'rust' };
   var STATE_KEYS = ['config', 'tasks', 'sessions', 'seeds', 'steps'];
+  // What a patch may say about a session the sample install seeds, and the values each takes. The
+  // seed folds a patch in before it derives anything from the session, so the row, the Monitor,
+  // the usage, and the clock all describe the same state (tests/captures/helpers/demo-dataset.ts).
+  // `resuming` is the moment after a relaunch: main has respawned the agent on its own
+  // conversation and it has not printed yet, which only a running session can be.
+  var SESSION_PATCH_KEYS = ['activity', 'status', 'resuming'];
+  var SESSION_ACTIVITIES = ['thinking', 'idle', 'permission'];
+  var SESSION_STATUSES = ['running', 'suspended', 'queued'];
   // A boot step clicks, types into a field, or presses a hotkey (a keyboard combo or a mouse
   // button, in the registry's own spelling, held for the frame); anything else (a hover, a
   // drag, a right-click) is the capture rig's and is refused here.
@@ -81,20 +89,53 @@
     return value !== null && typeof value === 'object' && !Array.isArray(value);
   }
 
+  /** Reject a session patch the seed would misread: an unknown field, a value outside its set, or a resume on a stopped session. */
+  function validateSessionPatch(patch, origin) {
+    if (!isPlainObject(patch)) throw new Error(origin + ' must be an object');
+    Object.keys(patch).forEach(function (key) {
+      if (SESSION_PATCH_KEYS.indexOf(key) === -1) throw new Error(origin + ' has an unknown key "' + key + '" (allowed: ' + SESSION_PATCH_KEYS.join(', ') + ')');
+    });
+    if (patch.activity !== undefined && SESSION_ACTIVITIES.indexOf(patch.activity) === -1) throw new Error(origin + '.activity must be one of ' + SESSION_ACTIVITIES.join(', '));
+    if (patch.status !== undefined && SESSION_STATUSES.indexOf(patch.status) === -1) throw new Error(origin + '.status must be one of ' + SESSION_STATUSES.join(', '));
+    if (patch.resuming !== undefined && patch.resuming !== true) throw new Error(origin + '.resuming can only be true');
+    if (patch.resuming && patch.status !== undefined && patch.status !== 'running') throw new Error(origin + ' resumes a session it also stops; a resuming session is running');
+  }
+
   /** Reject anything a DemoState blob is not allowed to carry. Data only, never code. */
   function validateState(state, origin) {
     if (!isPlainObject(state)) throw new Error(origin + ' must be a JSON object');
     Object.keys(state).forEach(function (key) {
       if (STATE_KEYS.indexOf(key) === -1) throw new Error(origin + ' has an unknown key "' + key + '" (allowed: ' + STATE_KEYS.join(', ') + ')');
     });
-    if (state.config !== undefined && !isPlainObject(state.config)) throw new Error(origin + '.config must be an object');
+    if (state.config !== undefined) {
+      if (!isPlainObject(state.config)) throw new Error(origin + '.config must be an object');
+      // A nested block REPLACES the default rather than merging into it: the merge is a shallow
+      // Object.assign here and again in the mock. Naming some of a block's fields therefore leaves
+      // the rest undefined, on settings the frame never shows, which is a figure that is quietly
+      // wrong rather than one that fails. Refuse it instead, and say which fields are missing.
+      var shape = window.__demoConfigShape || {};
+      Object.keys(state.config).forEach(function (key) {
+        var fields = shape[key];
+        var block = state.config[key];
+        if (!fields || !isPlainObject(block)) return;
+        var missing = fields.filter(function (field) { return !Object.prototype.hasOwnProperty.call(block, field); });
+        if (missing.length > 0) {
+          throw new Error(origin + '.config.' + key + ' replaces the whole block, so it must name every field; missing: ' + missing.join(', '));
+        }
+      });
+    }
     if (state.tasks !== undefined) {
       if (!Array.isArray(state.tasks)) throw new Error(origin + '.tasks must be an array');
       state.tasks.forEach(function (task) {
         if (!isPlainObject(task) || typeof task.id !== 'string') throw new Error(origin + '.tasks entries need a string id');
       });
     }
-    if (state.sessions !== undefined && !isPlainObject(state.sessions)) throw new Error(origin + '.sessions must be an object keyed by session id');
+    if (state.sessions !== undefined) {
+      if (!isPlainObject(state.sessions)) throw new Error(origin + '.sessions must be an object keyed by session id');
+      Object.keys(state.sessions).forEach(function (sessionId) {
+        validateSessionPatch(state.sessions[sessionId], origin + '.sessions.' + sessionId);
+      });
+    }
     if (state.seeds !== undefined) {
       if (!isPlainObject(state.seeds)) throw new Error(origin + '.seeds must be an object');
       Object.keys(state.seeds).forEach(function (key) {
@@ -153,6 +194,41 @@
     var descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
     if (descriptor && descriptor.set) descriptor.set.call(target, text); else target.value = text;
     target.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  /**
+   * Click the way a visitor would. A pointer click on a text field puts the caret in it, and
+   * `element.click()` alone does not, so a text field is focused first. Dictation reads its target
+   * from that focus. Only a field is focused this way. A button a pointer clicks takes focus too,
+   * but focusing one from a script can paint a focus ring no visitor's click would. The selector
+   * is the renderer's own test for a typing surface (`focusIsInTypingSurface`), minus `select`,
+   * which a click opens.
+   *
+   * The boot veil hides the app with `visibility: hidden`, and Chromium will not focus anything
+   * under a hidden ancestor, so a field click swaps the veil for opacity in the same task (nothing
+   * paints in between) before it focuses. The swap happens only here, because under the opacity
+   * veil an arriving terminal could take focus too, and every other scene keeps the veil it was
+   * shot under. Once a field holds focus, a terminal that arrives later is refused it (arrival
+   * focus reads it as occupied).
+   */
+  function clickTarget(target) {
+    if (target.matches('input, textarea, [contenteditable="true"]')) {
+      var root = document.getElementById('root');
+      if (root && root.style.visibility === 'hidden') {
+        root.style.visibility = '';
+        root.style.opacity = '0';
+        root.style.pointerEvents = 'none';
+      }
+      target.focus();
+    }
+    target.click();
+  }
+
+  /** Lift the boot veil, in whichever of its two forms the steps left it. */
+  function unveil(root) {
+    root.style.visibility = '';
+    root.style.opacity = '';
+    root.style.pointerEvents = '';
   }
 
   /** Later sources win per key; arrays concatenate; nested config objects are replaced whole. */
@@ -286,8 +362,10 @@
 
   if (still) {
     // Zero durations, never `animation: none`, on the general rules: the overlay-* classes
-    // unmount on animationend, which still fires at 0s and never at none. The activity marks
-    // are infinite loops with no listener, so those can stop outright.
+    // unmount on animationend, which fires at 0s on nearly every close and never at none.
+    // useOverlayPhase's fallback timer covers the few it drops, but at none every close would
+    // wait on it. The activity marks are infinite loops with no listener, so those can stop
+    // outright.
     injectStyle(
       '*, *::before, *::after {' +
       ' animation-duration: 0s !important; animation-delay: 0s !important;' +
@@ -312,6 +390,13 @@
     // open the What's New dialog behind the error card.
     window.electronAPI.app.getVersion = function () { return Promise.resolve(version); };
     if (errors.length > 0) return;
+    // Session patches are the SEED's input, not a pass over its output: the seed derives the
+    // Monitor rows, the usage, the activity stats, and each working session's clock from the
+    // session as it builds it, so a patch applied to the rows afterwards left all of those
+    // describing the unpatched session (a paused card whose Monitor row still read working).
+    // A queued, paused, or resuming card is a patch rather than a dataset row because adding one
+    // to the sample install would change every docs figure already placed.
+    window.__demoSessionPatches = effective.sessions;
     if (typeof window.__demoApplyFixture === 'function') window.__demoApplyFixture();
 
     if (effective.tasks.length > 0 || Object.keys(effective.sessions).length > 0) {
@@ -322,9 +407,10 @@
           if (!row) throw new Error('Scene patches task "' + patch.id + '", which the sample install does not contain');
           Object.assign(row, patch);
         });
+        // The seed applied these; an id it does not seed would otherwise be a silent no-op.
         Object.keys(effective.sessions).forEach(function (sessionId) {
-          var patch = effective.sessions[sessionId];
-          if (patch && patch.activity) state.activityCache[sessionId] = patch.activity;
+          var row = state.sessions.find(function (session) { return session.id === sessionId; });
+          if (!row) throw new Error('Scene patches session "' + sessionId + '", which the sample install does not contain');
         });
       });
     }
@@ -380,21 +466,166 @@
   }
 
   /**
-   * The rect of the scene's `focus` element as fractions of the frame, so a host can crop a
-   * dialog scene to the dialog without knowing the layout. Null when the scene names none or the
-   * element is not on screen; a host crops nothing on null.
+   * The rect of the elements a selector names, as fractions of the frame, so a host can crop a
+   * dialog scene to the dialog without knowing the layout. A selector list (`a, b`) names several,
+   * and the rect is the box around all of them: two cards a figure is about, say. Elements with no
+   * size are left out. Null when nothing on screen matches; a host crops nothing on null. Exposed
+   * as `__demoBoot.focusRectOf` for the capture rig, which measures the same rect for each poster
+   * (after its gesture, on a driver scene that booted from `state=` and so has no `scene` here).
    */
-  function focusRect() {
-    if (!scene || !scene.focus) return null;
-    var element = document.querySelector(scene.focus);
-    if (!element) return null;
-    var rect = element.getBoundingClientRect();
+  function rectOf(selector) {
     var width = window.innerWidth;
     var height = window.innerHeight;
-    if (!width || !height || !rect.width || !rect.height) return null;
+    if (!width || !height) return null;
+    var left = Infinity;
+    var top = Infinity;
+    var right = -Infinity;
+    var bottom = -Infinity;
+    Array.prototype.forEach.call(document.querySelectorAll(selector), function (element) {
+      var rect = element.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      left = Math.min(left, rect.left);
+      top = Math.min(top, rect.top);
+      right = Math.max(right, rect.right);
+      bottom = Math.max(bottom, rect.bottom);
+    });
+    if (left === Infinity) return null;
     var round = function (value) { return Math.round(value * 10000) / 10000; };
-    return { x: round(rect.left / width), y: round(rect.top / height), w: round(rect.width / width), h: round(rect.height / height) };
+    return { x: round(left / width), y: round(top / height), w: round((right - left) / width), h: round((bottom - top) / height) };
   }
+
+  /** The rect around the scene's `focus` elements, which the ready message carries; null without one. */
+  function focusRect() {
+    return scene && scene.focus ? rectOf(scene.focus) : null;
+  }
+
+  /**
+   * Tell a host page that Escape reached this frame and the app had nothing of its own to close,
+   * so it can close whatever it is showing the frame in.
+   *
+   * A host cannot do this itself. The frame is cross-origin, and once keyboard focus is inside it
+   * (the renderer's arrival-focus arbiter focuses a mounted terminal, exactly as it does on the
+   * desktop) every keystroke goes to the terminal's textarea; only a real click back on the host
+   * page moves focus out. Nothing in `demo/` takes that focus and nothing here can decline it:
+   * the renderer never branches on being embedded, which is the whole point of the web build.
+   *
+   * The guard ladder is NOT invented here. `src/renderer/pop-out/PopOutWindowFrame.tsx` already
+   * decides "is this Escape mine, or does something in the app own it" for a pop-out window, and
+   * this mirrors it so the frame agrees with the app it is showing. Two deliberate differences:
+   *
+   *  - CAPTURE phase, where the pop-out uses bubble. xterm can consume Escape inside its own key
+   *    pipeline (`enableTerminalClipboard`), so a bubble listener would never see the one case
+   *    that matters. Capture also means the guards below are read while any overlay about to be
+   *    dismissed is still in the DOM, which is the same property the pop-out's comment relies on.
+   *    `event.defaultPrevented` is therefore dropped: nothing has run yet, so it is always false.
+   *  - The xterm helper textarea is EXEMPTED from the focused-text-field guard. It is a textarea,
+   *    so the pop-out's rule would return on it, and it is precisely the case that must post.
+   *
+   * A window owns the first Escape, as it does on the desktop: on a scene with one open the
+   * visitor presses Escape twice, once to close the window and once to close the host's dialog.
+   * An open window frame is not always a window that will act on the key, though. Each case below
+   * is handled here rather than in the renderer:
+   *
+   *  - A task window's terminal keeps Escape for the agent while the POINTER is over it
+   *    (`releaseEscapeWhenPointerOutside` in `terminal-clipboard.ts`), so the window never sees
+   *    the key. A card click leaves the pointer exactly there once the window opens. Here the
+   *    terminal replays a recording with no agent to interrupt, so the key would do nothing and
+   *    the visitor could not leave. `closeHoveredTerminalWindow` does what the desktop does with
+   *    the pointer outside: the terminal never gets the key, and the window closes through its
+   *    own guarded close.
+   *  - Any OTHER terminal (the bottom panel's, a Command Terminal's) keeps Escape outright. xterm
+   *    stops propagation of every key it handles (`cancel(event, true)` at the end of its
+   *    `_keyDown`), so the document listener a window closes on never sees it. Measured with a
+   *    task window open and the panel's terminal focused, 0 of 3 presses reached `document`. No
+   *    frame is claimed for that key, so it is posted and the window stays open, as on the
+   *    desktop. A visitor gets there by clicking the panel's terminal, which light dismiss
+   *    deliberately does not treat as a click outside the window.
+   *  - A Command Terminal renders through `WindowFrame` too, but its layer hides on the
+   *    panel-close combo, the toggle, or a backdrop click, never on Escape. Its frame is never
+   *    claimed.
+   *  - A task window closed with a live Browser guest is PARKED, and one kept for a backgrounded
+   *    project is RETAINED. Both stay mounted at zero opacity so the guest survives, and
+   *    `WindowFrame` marks them `inert`. Neither has anything left to close, so neither is claimed.
+   */
+  function isEscapeTheAppOwns(event) {
+    var activeElement = document.activeElement;
+    var isHelperTextarea = isTerminalTextarea(activeElement);
+    if (!isHelperTextarea && activeElement && (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA' || activeElement.isContentEditable)) return true;
+    if (isOverlayOpen()) return true;
+    // A window that closes on Escape owns it: a task-detail or conversation window, both of which
+    // render through `WindowFrame`, which stamps this id. The comment above says why a terminal
+    // outside a task window, an inert frame, and a Command Terminal frame are no sign of that. NOT
+    // the pop-out's "a [data-window-layer-root] with children" test: in the MAIN window that host
+    // always holds the overlay wrapper, so a child count is 1 with no window open and the guard
+    // would swallow every Escape (measured on the board scene: one child, zero windows).
+    var terminalKeepsKey = isHelperTextarea && !taskWindowOf(activeElement);
+    if (!terminalKeepsKey) {
+      var frames = document.querySelectorAll('[data-testid^="window-frame-"]');
+      for (var index = 0; index < frames.length; index++) {
+        if (frames[index].hasAttribute('inert')) continue;
+        if (frames[index].querySelector('[data-testid="command-terminal-window"]')) continue;
+        return true;
+      }
+    }
+    // Monaco's find widget, which preventDefaults the keys it handles.
+    var target = event.target instanceof HTMLElement ? event.target : null;
+    if (target && target.closest('.find-widget')) return true;
+    return false;
+  }
+
+  /** Whether an element is xterm's helper textarea, where every keystroke into a terminal lands. */
+  function isTerminalTextarea(element) {
+    return !!(element && element.classList && element.classList.contains('xterm-helper-textarea'));
+  }
+
+  /**
+   * Whether an open dialog, context menu, or popover is in the DOM. One owns any Escape before a
+   * window does, so both paths below ask this one question rather than each keeping a copy.
+   */
+  function isOverlayOpen() {
+    return !!document.querySelector('[data-dismissable-layer]');
+  }
+
+  /** The task window frame an element sits in, told apart by its X; null outside one. */
+  function taskWindowOf(element) {
+    var frame = element.closest('[data-testid^="window-frame-"]');
+    return frame && frame.querySelector('[data-testid="task-detail-close"]') ? frame : null;
+  }
+
+  /**
+   * Close the task window whose terminal is focused AND under the pointer, the one case where the
+   * renderer keeps Escape from the window. Returns true when it closed one and consumed the key.
+   *
+   * Every condition is load-bearing. The hover test is the terminal's own (`el.matches(':hover')`
+   * on the element passed to `terminal.open()`, the `.xterm` element's parent), so with the
+   * pointer anywhere else this steps aside and the desktop path closes the window unaided. That
+   * also keeps it clear of `useWindowDrag`'s Esc-cancels-drag, a later capture listener on this
+   * same `window`: during a title-bar drag the terminal is not hovered. An open overlay still owns
+   * the key first. The close is the frame's own X, which calls the same guarded close Escape does.
+   */
+  function closeHoveredTerminalWindow(event) {
+    var activeElement = document.activeElement;
+    if (!isTerminalTextarea(activeElement)) return false;
+    if (isOverlayOpen()) return false;
+    var xtermElement = activeElement.closest('.xterm');
+    var terminalHost = xtermElement && xtermElement.parentElement;
+    if (!terminalHost || !terminalHost.matches(':hover')) return false;
+    var taskWindow = taskWindowOf(activeElement);
+    if (!taskWindow) return false;
+    var closeButton = taskWindow.querySelector('[data-testid="task-detail-close"]');
+    // The replay must not receive the key, exactly as the agent does not with the pointer outside.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeButton.click();
+    return true;
+  }
+
+  window.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape') return;
+    if (closeHoveredTerminalWindow(event)) return;
+    if (isEscapeTheAppOwns(event)) return;
+    notifyParent({ type: 'kangentic-demo-escape', scene: sceneName });
+  }, true);
 
   function markReady() {
     document.documentElement.setAttribute('data-demo-ready', '1');
@@ -408,8 +639,11 @@
     var veiled = effective.steps.length > 0;
     if (veiled && root) root.style.visibility = 'hidden';
     // The board is the gate every step waits behind; an empty install never mounts one, so its
-    // gate is the scene's own ready element.
-    var chain = waitForSelector(emptyInstall && scene && scene.ready ? scene.ready : '[data-swimlane-name]', deadline);
+    // gate is the app having rendered at all. It must NOT be the scene's own ready element: on an
+    // empty-install scene whose steps are what REVEAL that element, the chain would wait for what
+    // the first step is there to produce and time out having clicked nothing. Nothing is lost by
+    // the weaker gate, because `scene.ready` is awaited after the steps below either way.
+    var chain = waitForSelector(emptyInstall ? '#root > *' : '[data-swimlane-name]', deadline);
     effective.steps.forEach(function (step) {
       chain = chain.then(function () {
         if (typeof step.press === 'string') {
@@ -420,7 +654,7 @@
         // chunk), so it is waited for like anything else, against the same deadline.
         var selector = typeof step.type === 'string' ? step.type : step.click;
         return waitForSelector(selector, deadline).then(function (target) {
-          if (typeof step.type === 'string') typeInto(target, step.text); else target.click();
+          if (typeof step.type === 'string') typeInto(target, step.text); else clickTarget(target);
         });
       }).then(function () {
         return step.waitFor ? waitForSelector(step.waitFor, deadline) : null;
@@ -433,10 +667,10 @@
       chain = chain.then(function () { return waitForSelector(scene.ready, deadline); });
     }
     chain.then(function () {
-      if (veiled && root) root.style.visibility = '';
+      if (veiled && root) unveil(root);
       markReady();
     }).catch(function (error) {
-      if (veiled && root) root.style.visibility = '';
+      if (veiled && root) unveil(root);
       errors.push('Boot step failed: ' + (error && error.message ? error.message : String(error)));
       console.error('[kangentic-demo]', errors[errors.length - 1]);
       renderErrorCard();
@@ -461,5 +695,6 @@
     params: { theme: theme, embed: embed, still: still, loop: loop, fontSize: fontSize },
     errors: errors,
     afterSeed: applyScene,
+    focusRectOf: rectOf,
   };
 })();
