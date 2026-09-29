@@ -308,7 +308,7 @@ export class SessionManager extends EventEmitter {
         // terminal mounting onto a just-spawned session samples exactly
         // across that chunk - the replay hold window keeps those bytes out
         // of onFlush, so skipping them here would strand the shimmer
-        // overlay and the resuming label until the marker happens to recur.
+        // overlay until the marker happens to recur.
         // consume() is a one-shot latch, so feeding both the flushed and
         // the drained stream can never double-fire 'first-output'.
         this.consumeFirstOutput(sessionId, data);
@@ -544,7 +544,7 @@ export class SessionManager extends EventEmitter {
 
   /**
    * Feed a chunk to the first-output latch; on the first qualifying chunk,
-   * emit 'first-output' and clear the resuming flag. Fed from BOTH buffer
+   * emit 'first-output'. Fed from BOTH buffer
    * streams - the 16ms flush (onFlush) and the replay-drain report
    * (onDrain) - because a replay can consume the chunk carrying the
    * adapter's one-time marker before it ever flushes. The tracker is a
@@ -570,13 +570,13 @@ export class SessionManager extends EventEmitter {
         trigger: 'first-output',
         disarm: tuiComposedThisOutput,
       });
-      // Clear the resuming flag once the resumed CLI has actually
-      // produced output. This unblocks card / overlay labels for
-      // adapters (Codex, Gemini) that don't emit a usage statusline.
-      if (session && session.resuming) {
-        session.resuming = false;
-        this.emit('session-changed', sessionId, toSession(session));
-      }
+      // `resuming` is NOT cleared here. It means "spawned as a resume of a
+      // previous session" (the Session type's own doc), and the card and the
+      // context bar read it for their spinner label until the model name
+      // lands. Clearing it at first output flipped a resumed card from
+      // "Resuming agent..." to "Starting agent..." for that gap, which reads
+      // as the resume having failed and a fresh agent starting. The overlay
+      // this latch lifts is gone by then, so nothing else consumed the flip.
     }
   }
 

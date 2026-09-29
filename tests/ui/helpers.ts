@@ -30,6 +30,33 @@ export function collectPageErrors(page: Page): () => string[] {
 }
 
 /**
+ * Count the toasts on screen RIGHT NOW, with no assertion retry.
+ *
+ * This is the only correct way to assert "no toast appeared", and the reason is
+ * not obvious: `expect(locator).toHaveCount(0)` AUTO-RETRIES for up to the expect
+ * timeout (~5s by default), while a toast auto-dismisses after
+ * `notifications.toasts.durationSeconds` (4s in the mock config). So a wrongly
+ * raised toast disappears on its own INSIDE the retry window and the assertion
+ * reports a false pass. The test goes green against the bug it exists to catch.
+ *
+ * That has been rediscovered three times in this suite (add-project-flow,
+ * agent-driven-invalidation, idle-toast), each time as a local helper. It lives
+ * here now, and `tests/unit/toast-negative-assertion.test.ts` fails any new
+ * `toHaveCount(0)` against a toast locator.
+ *
+ * A fake clock (`page.clock.install()`) also masks the problem, because page
+ * timers freeze while Playwright retries in real time. Do not rely on that: the
+ * protection is invisible at the call site and vanishes if the clock is dropped.
+ *
+ * Pair it with a POSITIVE assertion that the path under test actually ran, or
+ * "no toast" is indistinguishable from "nothing happened yet".
+ */
+export async function toastCountRightNow(page: Page, hasText?: string | RegExp): Promise<number> {
+  const toasts = page.getByTestId('toast');
+  return hasText === undefined ? toasts.count() : toasts.filter({ hasText }).count();
+}
+
+/**
  * Poll the Vite dev server until it responds with HTTP 200.
  * Prevents thundering-herd timeouts when multiple workers launch simultaneously
  * before Vite finishes its initial compilation.
@@ -44,6 +71,30 @@ export async function waitForViteReady(url: string = VITE_URL, timeoutMs = 30000
     await new Promise(resolve => setTimeout(resolve, 200));
   }
   throw new Error(`Vite dev server at ${url} not ready after ${timeoutMs}ms`);
+}
+
+const VITE_GOTO_ATTEMPTS = 3;
+
+/**
+ * `page.goto` against the Vite dev server, retrying only a refused TCP connect.
+ *
+ * Seen in a full 3-worker UI run: waitForViteReady's fetch probe got its 200, then Chromium's
+ * navigation a moment later failed with `net::ERR_CONNECTION_REFUSED`, while the same server went
+ * on serving every other test with no restart or reload in its log. A refused connect is what
+ * waitForViteReady already exists to absorb, so it gets the same treatment here. No assertion is
+ * ever retried: any other navigation error, and a refusal on the last attempt, is rethrown.
+ */
+export async function gotoVite(page: Page, url: string = VITE_URL): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await page.goto(url);
+      return;
+    } catch (error) {
+      const refused = error instanceof Error && error.message.includes('net::ERR_CONNECTION_REFUSED');
+      if (!refused || attempt >= VITE_GOTO_ATTEMPTS) throw error;
+      await waitForViteReady(url);
+    }
+  }
 }
 
 /**
@@ -263,7 +314,7 @@ export async function launchPage(): Promise<{ browser: Browser; page: Page }> {
   // Inject the mock before any page scripts run
   await page.addInitScript({ path: MOCK_SCRIPT });
 
-  await page.goto(VITE_URL);
+  await gotoVite(page);
   await page.waitForLoadState('load');
   // Wait for React to render the app shell
   await page.waitForSelector('text=Kangentic', { timeout: 15000 });

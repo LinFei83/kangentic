@@ -113,7 +113,15 @@ function sliceBalancedBlock(source: string, searchFromIndex: number): string {
  * scanning.
  */
 function escalationReportTryBlock(): string {
-  const readIndex = INDEX_SOURCE.indexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
+  // lastIndexOf, not indexOf: there are TWO reads on purpose. The first is
+  // the module-scope graphics decision (resolveGraphicsMode), which only
+  // peeks at the record to decide whether to start Chromium in software
+  // rendering and never clears anything - it has to run before whenReady
+  // because app.disableHardwareAcceleration() throws after. The REPORT
+  // path, which owns the clear, is the later one. `reportPathIsTheLaterRead`
+  // below pins that ordering so this anchor cannot silently pick the wrong
+  // block if the two are ever reordered.
+  const readIndex = INDEX_SOURCE.lastIndexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
   if (readIndex === -1) {
     throw new Error('src/main/index.ts no longer calls readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
   }
@@ -145,10 +153,16 @@ describe('the GPU-health escalation report is wired into src/main/index.ts', () 
     const tryBlock = escalationReportTryBlock();
 
     expect(tryBlock, 'the try block must read the pending escalation').toContain('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
-    expect(tryBlock, 'the try block must clear the pending escalation').toContain('clearGpuEscalation(GPU_HEALTH_FILE_PATH)');
+    // Prefix match, no closing paren: the clear now takes an `onlyIfLastAt`
+    // option (compare-and-clear, so a crash loop writing a fresh record
+    // between the read and the clear does not lose it). The invariant this
+    // pins is "clears, via the one shared constant, before reporting" - the
+    // argument list is not part of that, and freezing it only breaks the
+    // test on changes it does not care about.
+    expect(tryBlock, 'the try block must clear the pending escalation').toContain('clearGpuEscalation(GPU_HEALTH_FILE_PATH');
     expect(tryBlock, 'the try block must report the escalation').toContain('reportHandledError(');
 
-    const clearIndex = tryBlock.indexOf('clearGpuEscalation(GPU_HEALTH_FILE_PATH)');
+    const clearIndex = tryBlock.indexOf('clearGpuEscalation(GPU_HEALTH_FILE_PATH');
     const reportIndex = tryBlock.indexOf('reportHandledError(');
     expect(
       clearIndex,
@@ -158,7 +172,7 @@ describe('the GPU-health escalation report is wired into src/main/index.ts', () 
     // The try block alone does not prove startup is protected - it has to be
     // followed by a catch, not left to propagate. Whatever immediately
     // follows the try block's own closing brace must open a catch.
-    const readIndex = INDEX_SOURCE.indexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
+    const readIndex = INDEX_SOURCE.lastIndexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
     const tryIndex = INDEX_SOURCE.lastIndexOf('try {', readIndex);
     const afterTry = INDEX_SOURCE.slice(tryIndex + tryBlock.length, tryIndex + tryBlock.length + 40);
     expect(
@@ -185,6 +199,244 @@ describe('the GPU-health escalation report is wired into src/main/index.ts', () 
     ).toContain('featureStatusOnReport: app.getGPUFeatureStatus()');
   });
 
+  it('reportPathIsTheLaterRead: the module-scope graphics peek comes first and never clears', () => {
+    // Every anchor in this file uses lastIndexOf to find the REPORT path,
+    // which is only correct while the peek precedes it. If the two are ever
+    // reordered, the slicer would silently scan the wrong block and most of
+    // this file would pass vacuously.
+    const reads = INDEX_CODE.split('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)').length - 1;
+    expect(
+      reads,
+      'src/main/index.ts should hold exactly two reads of the escalation record: the module-scope graphics decision (peek only) and the whenReady report (which owns the clear)',
+    ).toBe(2);
+
+    const firstRead = INDEX_CODE.indexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
+    const clearIndex = INDEX_CODE.indexOf('clearGpuEscalation(GPU_HEALTH_FILE_PATH');
+    expect(
+      clearIndex,
+      'the clear must belong to the LATER read. The module-scope peek runs before app.whenReady() and before the window exists; clearing there would consume a record nothing has reported yet',
+    ).toBeGreaterThan(firstRead);
+  });
+
+  it(
+    'arms pendingGpuNotice at MODULE SCOPE, before the whenReady createWindow() call, not only later inside the report block (source-anchor guard against the render race - not a runtime test, index.ts cannot be imported)',
+    () => {
+      // The renderer can pull IPC.GPU_HEALTH_STATUS as soon as the synchronous
+      // createWindow() span below ends, and that handler CONSUMES
+      // pendingGpuNotice on read (see the 'registers the graphics-status
+      // handler' test above, which pins the consume-on-read clear). The
+      // report block that would otherwise be the first to arm this notice
+      // sits behind createWindow() and an await (resolveClientId) further
+      // down in whenReady, so a renderer that got its GPU_HEALTH_STATUS pull
+      // in first would read noticePending: false, consume it, and never ask
+      // again, while the escalation record behind it is cleared moments
+      // later - leaving the user on software rendering with no explanation.
+      // The fix arms the flag at module scope, before any renderer can exist,
+      // independent of who wins that race. This is a static source-position
+      // check, the same constraint as every other test in this file (index.ts
+      // makes top-level electron calls and cannot be imported into vitest).
+      const armingIndex = INDEX_CODE.indexOf('if (graphicsMode.engagedNow) pendingGpuNotice = true;');
+      expect(
+        armingIndex,
+        'src/main/index.ts must arm pendingGpuNotice at module scope with `if (graphicsMode.engagedNow) pendingGpuNotice = true;`, independent of the later whenReady report block',
+      ).toBeGreaterThan(-1);
+
+      // Anchored on the LAST createWindow() call before the report block's
+      // own escalation read (the later of the two reads - see
+      // reportPathIsTheLaterRead above), which is the whenReady createWindow()
+      // call the module's own comment discusses, not the unrelated
+      // rebuildMainWindow() call used only by the macOS 'activate' /
+      // 'second-instance' paths.
+      const reportReadIndex = INDEX_CODE.lastIndexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
+      const createWindowIndex = INDEX_CODE.lastIndexOf('createWindow()', reportReadIndex);
+      expect(
+        createWindowIndex,
+        'src/main/index.ts must still call createWindow() in whenReady before reading the escalation record for the report',
+      ).toBeGreaterThan(-1);
+
+      expect(
+        armingIndex,
+        'pendingGpuNotice must be armed BEFORE this createWindow() call. If the arming line is removed from module scope, or moved back to sit after createWindow() (inside the report block further down, where it used to live), a renderer that pulls GPU_HEALTH_STATUS before the report block runs consumes noticePending: false and never asks again, silently losing the notice',
+      ).toBeLessThan(createWindowIndex);
+    },
+  );
+
+  it("guards against consuming a record THIS run wrote, between the read and the clear", () => {
+    const tryBlock = escalationReportTryBlock();
+    const guardIndex = tryBlock.indexOf('isEscalationFromCurrentRun');
+    const clearIndex = tryBlock.indexOf('clearGpuEscalation(GPU_HEALTH_FILE_PATH');
+
+    expect(
+      guardIndex,
+      'the report block must call isEscalationFromCurrentRun. The writer is installed at module scope and this block runs after createWindow and an await, so a GPU crash-looping from startup writes into that gap; without the guard the same run reads, clears and reports it while the async Sentry POST races the LOG(FATAL) about to kill the process, and the next launch finds nothing pending',
+    ).toBeGreaterThan(-1);
+    expect(
+      guardIndex,
+      'the same-run guard must run BEFORE the clear, or the record is already gone by the time we decide not to consume it',
+    ).toBeLessThan(clearIndex);
+
+    expect(
+      tryBlock,
+      'the clear must be a compare-and-clear against the lastAt that was actually reported: a crash loop can write a fresh record between the read and the clear, and an unconditional unlink would take it',
+    ).toContain('onlyIfLastAt');
+  });
+
+  it('registers the graphics-status handler in index.ts, where its state lives', () => {
+    // Every handler under ipc/handlers/ reaches CI through a call site in
+    // registerAllIpc(), so deleting one breaks a visible import chain. This
+    // one is a bare top-level statement with no call site pointing at it, and
+    // the UI spec that covers its behaviour runs entirely against the mock -
+    // so a deleted real handler would surface only as a swallowed rejection in
+    // production, logged as a console warning, with nothing going red.
+    expect(
+      INDEX_CODE,
+      'src/main/index.ts must register the GPU_HEALTH_STATUS handler. It cannot move to ipc/handlers/: it returns index.ts module-scope state (the pre-whenReady graphics decision and the one-shot notice flag), and resolveGraphicsMode must run before app.whenReady() because app.disableHardwareAcceleration() throws after it',
+    ).toContain('ipcMain.handle(IPC.GPU_HEALTH_STATUS');
+
+    // Consume-on-read is the property the "fires exactly once" UI assertion
+    // rests on, and the mock reproduces it. If main stopped clearing the flag,
+    // the mock would still pass while the real app re-toasted on every reload.
+    const handlerStart = INDEX_CODE.indexOf('ipcMain.handle(IPC.GPU_HEALTH_STATUS');
+    const handlerBody = INDEX_CODE.slice(handlerStart, handlerStart + 400);
+    expect(
+      handlerBody,
+      'the handler must clear pendingGpuNotice as it reads it, or a renderer reload re-toasts the same incident',
+    ).toContain('pendingGpuNotice = false');
+  });
+
+  it('persists the downgrade through the IPC context config manager, not the module-scope one', () => {
+    const tryBlock = escalationReportTryBlock();
+    expect(
+      tryBlock,
+      'the report block must persist graphicsAccelerationEnabled once it engages software rendering',
+    ).toContain('graphicsAccelerationEnabled: false');
+    // Caught in /preview, and invisible to every other tier: safe mode
+    // engaged and toasted correctly, then the setting read 'on' again,
+    // because registerAllIpc has already built a SECOND ConfigManager that
+    // loaded and cached config.json. Every later write in the app goes
+    // through that one, so a save here on windowConfigManager is dropped by
+    // the next window-bounds save rewriting the file from the stale cache.
+    // The downgrade became a one-shot and the next launch would have gone
+    // straight back to hardware and died again.
+    expect(
+      tryBlock,
+      'the save must resolve getOptionalIpcContext()?.configManager first - windowConfigManager alone writes a key the IPC context manager then clobbers',
+    ).toContain('getOptionalIpcContext()?.configManager');
+  });
+
+  it('decides the downgrade and the notice with the same fault-only predicate at both call sites', () => {
+    // The module-scope decision engages software rendering and the whenReady
+    // block persists it and arms the notice. If either one fell back to a rule
+    // that counts every GPU exit, a Windows shutdown with the app open (five
+    // session-teardown exits in 126 ms) would again turn a healthy GPU's
+    // acceleration off, or toast about a failure that never happened.
+    // Sliced up to the call rather than brace-matched: the function's return
+    // type is itself a `{ ... }` literal, which a balanced-block scan would
+    // take for the body.
+    const resolveStart = INDEX_CODE.indexOf('function resolveGraphicsMode()');
+    const resolveBody = INDEX_CODE.slice(resolveStart, INDEX_CODE.indexOf('const graphicsMode = resolveGraphicsMode();'));
+    expect(resolveStart).toBeGreaterThan(-1);
+    expect(resolveBody, 'resolveGraphicsMode must decide with gpuEndedPreviousRun').toContain('gpuEndedPreviousRun(pending,');
+    expect(
+      escalationReportTryBlock(),
+      'the whenReady block must re-derive killedTheLastRun with gpuEndedPreviousRun',
+    ).toContain('const killedTheLastRun = gpuEndedPreviousRun(pendingGpuEscalation, gpuReportContext);');
+    expect(INDEX_CODE, 'the old any-exit predicate must not come back').not.toContain('isDeathNearRunEnd');
+  });
+
+  it("titles and tags the report with the latest FAULT death, not the record's latest death", () => {
+    // A crash loop cut short by a Windows shutdown ends in session-teardown
+    // exits. Titling the issue with the record's own latest reason and code
+    // would group and triage it under STATUS_DLL_INIT_FAILED_LOGOFF instead of
+    // the crash.
+    const tryBlock = escalationReportTryBlock();
+    expect(tryBlock).toContain('const reportedDeath = gpuFaultSummary.lastFaultDeath ?? pendingGpuEscalation;');
+    expect(tryBlock).toContain('`GPU process exited repeatedly (reason ${reportedDeath.reason}, exit code ${reportedDeath.exitCode ?? \'unknown\'})`');
+    expect(tryBlock).toContain('reason: reportedDeath.reason,');
+    expect(tryBlock).toContain("exitCode: String(reportedDeath.exitCode ?? 'unknown'),");
+  });
+
+  it('saves the Graphics acceleration toggle through the IPC context config manager and restarts in the same handler', () => {
+    // Like the status handler above, this is a bare top-level registration the
+    // UI tier only ever reaches through the mock, so its body is pinned here.
+    const handlerStart = INDEX_CODE.indexOf('ipcMain.handle(IPC.GPU_HEALTH_SET_ACCELERATION');
+    expect(handlerStart, 'src/main/index.ts must register the GPU_HEALTH_SET_ACCELERATION handler').toBeGreaterThan(-1);
+    const handlerBody = sliceBalancedBlock(INDEX_CODE, INDEX_CODE.indexOf('{', handlerStart));
+    expect(
+      handlerBody,
+      'the save must resolve getOptionalIpcContext()?.configManager first, for the same stale-cache reason as the persist arm',
+    ).toContain('getOptionalIpcContext()?.configManager');
+    expect(handlerBody).toContain("graphicsAccelerationOffBy: enabled ? null : 'user'");
+    // The restart is what keeps the saved value matching the running mode.
+    // A save alone is the silent toggle this replaced.
+    const saveIndex = handlerBody.indexOf('configManager.save(');
+    const relaunchIndex = handlerBody.indexOf('relaunchApp(');
+    expect(saveIndex, 'the handler must save the setting').toBeGreaterThan(-1);
+    expect(relaunchIndex, 'the handler must restart after saving').toBeGreaterThan(saveIndex);
+    expect(handlerBody, 'the dev restart file is read only in dev builds').toContain('__KANGENTIC_DEV__ ? devRestartFileFrom(process.argv) : null');
+    // A plain relaunch with a downloaded update pending runs the installer on
+    // quit without relaunching, and the installer closes the relaunched app.
+    expect(handlerBody).toContain('installPendingUpdateAndRelaunch: quitAndInstallIfUpdatePending');
+    expect(handlerBody, 'app.exit() would skip before-quit, so the run would read as abrupt').not.toContain('app.exit(');
+  });
+
+  it('rejects a non-boolean enabled argument by throwing, not by coercing or silently no-opping', () => {
+    const handlerStart = INDEX_CODE.indexOf('ipcMain.handle(IPC.GPU_HEALTH_SET_ACCELERATION');
+    expect(handlerStart, 'src/main/index.ts must register the GPU_HEALTH_SET_ACCELERATION handler').toBeGreaterThan(-1);
+    const handlerBody = sliceBalancedBlock(INDEX_CODE, INDEX_CODE.indexOf('{', handlerStart));
+
+    const typeGuardIndex = handlerBody.indexOf("typeof enabled !== 'boolean'");
+    expect(
+      typeGuardIndex,
+      "the handler must validate its argument with typeof enabled !== 'boolean' before touching configManager or relaunchApp, so a malformed IPC payload is rejected instead of being coerced into a truthy or falsy acceleration setting",
+    ).toBeGreaterThan(-1);
+
+    const throwIndex = handlerBody.indexOf('throw', typeGuardIndex);
+    expect(
+      throwIndex,
+      'the type check must be followed by a throw',
+    ).toBeGreaterThan(typeGuardIndex);
+
+    // Guards against the check finding a throw belonging to a LATER, unrelated
+    // statement (the save-failure throw further down this same handler) once
+    // the type guard's own throw is weakened to a warn-and-return. No
+    // semicolon can sit between the condition and its own throw, since they
+    // share one if-statement.
+    expect(
+      handlerBody.slice(typeGuardIndex, throwIndex),
+      'the throw must belong to the SAME if-check as the type guard, not a later throw the guard merely happens to precede once its own throw is removed',
+    ).not.toContain(';');
+  });
+
+  it('throws before relaunching when configManager.save() reports a failed write, instead of restarting into the old mode with the failure toast lost in the quit', () => {
+    const handlerStart = INDEX_CODE.indexOf('ipcMain.handle(IPC.GPU_HEALTH_SET_ACCELERATION');
+    expect(handlerStart, 'src/main/index.ts must register the GPU_HEALTH_SET_ACCELERATION handler').toBeGreaterThan(-1);
+    const handlerBody = sliceBalancedBlock(INDEX_CODE, INDEX_CODE.indexOf('{', handlerStart));
+
+    // configManager.save() reports a failed write by RETURNING false, not by
+    // throwing, so the handler has to check the return value itself. A
+    // restart that goes ahead after a failed save would suspend every running
+    // agent and relaunch straight back into the OLD mode, with the
+    // write-failure toast lost in the quit before the user ever sees it.
+    const saveGuardIndex = handlerBody.indexOf('if (!configManager.save(');
+    expect(
+      saveGuardIndex,
+      'the handler must check the return value of configManager.save(...) with if (!configManager.save(...)), since a failed write reports itself by returning false rather than throwing',
+    ).toBeGreaterThan(-1);
+
+    const saveFailureThrowIndex = handlerBody.indexOf("throw new Error('Graphics acceleration could not be saved')");
+    expect(
+      saveFailureThrowIndex,
+      "a failed save must throw new Error('Graphics acceleration could not be saved'), so the invoke call rejects and the settings tab can surface the failure",
+    ).toBeGreaterThan(saveGuardIndex);
+
+    const relaunchIndex = handlerBody.indexOf('relaunchApp(');
+    expect(
+      relaunchIndex,
+      'relaunchApp( must run only AFTER the save-failure throw. A restart on a failed save would suspend every agent and come back in the old mode, and the write-failure toast would be lost in the quit',
+    ).toBeGreaterThan(saveFailureThrowIndex);
+  });
+
   it('reports the escalation only after setErrorReportingUser(clientId) has run, so the install id correlates it with a minidump of the same crash', () => {
     // Uses INDEX_CODE (comment-stripped), not tryBlock/INDEX_SOURCE: the
     // block's own comment narrates "Must run AFTER setErrorReportingUser
@@ -192,7 +444,10 @@ describe('the GPU-health escalation report is wired into src/main/index.ts', () 
     // the real call and the comparison would pass regardless of the actual
     // call order.
     const setUserIndex = INDEX_CODE.indexOf('setErrorReportingUser(clientId)');
-    const readIndex = INDEX_CODE.indexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
+    // lastIndexOf for the same reason as the slicer: the earlier read is the
+    // module-scope graphics decision, which reports nothing and legitimately
+    // runs long before any Sentry user is set.
+    const readIndex = INDEX_CODE.lastIndexOf('readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)');
     expect(setUserIndex, 'src/main/index.ts must still call setErrorReportingUser(clientId)').toBeGreaterThan(-1);
     expect(readIndex, 'src/main/index.ts must still call readPendingGpuEscalation(GPU_HEALTH_FILE_PATH)').toBeGreaterThan(-1);
     expect(
@@ -214,6 +469,76 @@ describe('the GPU-health escalation report is wired into src/main/index.ts', () 
     ).not.toContain('escalatedInVersion: app.getVersion()');
   });
 
+  it('reports a fallback-only record (no GPU death at all, the DESKTOP-W launch-failure shape) under its own message, with its mode changes', () => {
+    const tryBlock = escalationReportTryBlock();
+
+    expect(
+      tryBlock,
+      'the report must branch on pendingGpuEscalation.count > 0. A launch-failure ladder records a fallback with count 0, and "GPU process exited repeatedly (reason hardware-fallback, exit code unknown)" would both misdescribe it and group it into the crash-loop issue, which needs different triage',
+    ).toContain('pendingGpuEscalation.count > 0');
+    expect(
+      tryBlock,
+      'the count-0 branch must carry its own message, so Sentry groups the launch-failure shape as a separate issue',
+    ).toContain("'GPU left hardware acceleration with no GPU process exit reported'");
+    expect(
+      tryBlock,
+      'the reported Error must be built from the branched message, not a second inline literal that could ignore the branch',
+    ).toContain('new Error(gpuReportMessage)');
+    expect(
+      tryBlock,
+      'the gpu_process context must carry modeChanges: on a launch-failure ladder it is the only trace of the incident',
+    ).toContain('modeChanges: pendingGpuEscalation.modeChanges');
+  });
+
+  it('binds each report message to its OWN arm of the count > 0 ternary, not the other one', () => {
+    // The test above checks that both message strings and `count > 0` exist
+    // somewhere in the block, independently. That stays green even if the two
+    // ternary arms are swapped: a crash loop would then report under the
+    // fallback-only message and a launch-failure fallback under the
+    // crash-loop message, which is the exact misgrouping this branch exists
+    // to prevent (a crash-loop issue and a launch-failure issue need
+    // different triage). This test pins the ORDER instead: the crash-loop
+    // template must sit between the ternary's `?` and `:`, and the
+    // fallback-only string after the `:`.
+    const tryBlock = escalationReportTryBlock();
+
+    const conditionIndex = tryBlock.indexOf('pendingGpuEscalation.count > 0');
+    expect(conditionIndex, 'the branch must still test pendingGpuEscalation.count > 0').toBeGreaterThan(-1);
+
+    const questionMarkIndex = tryBlock.indexOf('?', conditionIndex);
+    expect(questionMarkIndex, 'the count > 0 test must be the condition of a ternary').toBeGreaterThan(-1);
+
+    const colonIndex = tryBlock.indexOf(':', questionMarkIndex);
+    expect(colonIndex, 'the ternary must have an else arm').toBeGreaterThan(-1);
+
+    const crashLoopMessageIndex = tryBlock.indexOf('`GPU process exited repeatedly');
+    const fallbackMessageIndex = tryBlock.indexOf("'GPU left hardware acceleration with no GPU process exit reported'");
+    expect(crashLoopMessageIndex, 'the crash-loop template literal must still exist').toBeGreaterThan(-1);
+    expect(fallbackMessageIndex, 'the fallback-only string literal must still exist').toBeGreaterThan(-1);
+
+    expect(
+      crashLoopMessageIndex,
+      "the crash-loop template ('GPU process exited repeatedly...') must be the THEN arm: it has to sit after the ternary's own ?, not before it",
+    ).toBeGreaterThan(questionMarkIndex);
+    expect(
+      crashLoopMessageIndex,
+      "the crash-loop template must sit before the ternary's :, i.e. it is the THEN arm, not the ELSE arm",
+    ).toBeLessThan(colonIndex);
+    expect(
+      fallbackMessageIndex,
+      "the fallback-only string ('GPU left hardware acceleration...') must be the ELSE arm: it has to sit after the ternary's :, not before it",
+    ).toBeGreaterThan(colonIndex);
+  });
+
+  it('carries faultDeathCount from gpuFaultSummary.faultCount, so a report can tell how much of the record was real GPU faults versus kills and teardown exits', () => {
+    const tryBlock = escalationReportTryBlock();
+
+    expect(
+      tryBlock,
+      "the gpu_process context must carry faultDeathCount: gpuFaultSummary.faultCount. pendingGpuEscalation.count also collects kills and session-teardown exits alongside real GPU faults, so without this field a report cannot show how much of the record's count was noise rather than an actual fault",
+    ).toContain('faultDeathCount: gpuFaultSummary.faultCount');
+  });
+
   it("sources previousRunExit from previousRunProps.lastRunExit with an 'unknown' fallback, the exact field name and sentinel that already drifted once (commit cf620796)", () => {
     const tryBlock = escalationReportTryBlock();
 
@@ -221,5 +546,47 @@ describe('the GPU-health escalation report is wired into src/main/index.ts', () 
       tryBlock,
       "previousRunExit must read previousRunProps.lastRunExit ?? 'unknown' - this is what lets a report distinguish the DESKTOP-W shape (the escalating run ended in an abrupt process kill) from the DESKTOP-15 shape (Chromium recovered on its own); a wrong field name or a different sentinel silently breaks that distinction without any type error, since previousRunProps is a loosely-typed Record",
     ).toContain("previousRunExit: previousRunProps.lastRunExit ?? 'unknown'");
+  });
+});
+
+/**
+ * resolveGraphicsMode() (the module-scope function that decides, before
+ * app.whenReady(), whether this launch runs on software rendering) opens with
+ * `if (process.env.NODE_ENV === 'test') return ...`. Every E2E test and
+ * /preview run sets NODE_ENV=test, and without this bypass a launch under
+ * test would still load config, peek a leftover gpu-health.json escalation
+ * record, and peek the previous run's uptime record - inheriting a downgrade
+ * from whatever ran before it, matching how `isE2ETest` gates the modal
+ * dialogs elsewhere in this file (the function's own doc comment says so).
+ * Nothing else in the tree can prove this: resolveGraphicsMode is not
+ * exported and index.ts cannot be imported (see the file header), so this is
+ * a static source-position check, same constraint as every other test here.
+ */
+describe('resolveGraphicsMode bypasses its whole decision under NODE_ENV=test', () => {
+  it('checks process.env.NODE_ENV === \'test\' inside resolveGraphicsMode\'s own preamble, as an early return before the try block that does the real work', () => {
+    const signatureIndex = INDEX_CODE.indexOf('function resolveGraphicsMode()');
+    expect(signatureIndex, 'src/main/index.ts must still declare function resolveGraphicsMode()').toBeGreaterThan(-1);
+
+    const tryIndex = INDEX_CODE.indexOf('try {', signatureIndex);
+    expect(tryIndex, 'resolveGraphicsMode must still open a try block for its real (non-test) decision path').toBeGreaterThan(-1);
+
+    // Bounded to the PREAMBLE (signature through the function's own try {),
+    // not searched from the signature to end of file: process.env.NODE_ENV
+    // === 'test' also gates isE2ETest and an unrelated isTest constant
+    // further down in this file, and an unbounded indexOf could bind to
+    // either of those instead of a check actually inside this function -
+    // which is exactly what happened when this test was first written
+    // (removing the real check still let it find isE2ETest's declaration).
+    const preamble = INDEX_CODE.slice(signatureIndex, tryIndex);
+    const bypassIndex = preamble.indexOf("process.env.NODE_ENV === 'test'");
+    expect(
+      bypassIndex,
+      "resolveGraphicsMode must check process.env.NODE_ENV === 'test' before its own try block. Every E2E test (helpers.ts's launchApp()) and /preview run sets NODE_ENV=test; without this check inside the function's own preamble, a test launch would run the real graphics decision and could inherit a downgrade from a leftover gpu-health.json record or a graphicsAccelerationEnabled: false setting written by an earlier run or session",
+    ).toBeGreaterThan(-1);
+
+    expect(
+      preamble.slice(bypassIndex).indexOf('return'),
+      'the NODE_ENV check must be followed by a return - an early-return guard, not merely a condition referenced elsewhere in the function',
+    ).toBeGreaterThan(-1);
   });
 });

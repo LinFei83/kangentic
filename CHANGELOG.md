@@ -6,6 +6,141 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 <!-- releases -->
 
+## [v0.43.2] - 2026-09-24
+
+### Fixes
+- Keep breadcrumbs from carrying paths, commands, and task titles to Sentry (e27f5eb6)
+- Track foreign crashes in Sentry and reset exception ports for shell launches (5a2a0853)
+- Close an overlay whose exit animationend never arrives (8c52d869)
+- Let Escape leave the embedded demo from a task window terminal (d691fa10)
+- Re-poll a PR while its checks are in flight so the pill settles in seconds (ab5959eb)
+- Reset mach exception ports for PTY children on macOS (f402aae6)
+- Record the GPU fallback a launch-failure ladder leaves behind (216216b2)
+- Drop foreign Electron crashes the minidump filter kept (30409171)
+- Find the focused frame's root by walking parent, not top (16a87d89)
+- Refuse agent keys the pane would not receive, and put typed text on the keyDown (55c65dab)
+
+### Other
+- Align the foreign-crash and triage notes with the breadcrumb policy (53e43c3e)
+- Pin that the spawn-helper warn passes its error as its own argument (3a5530f2)
+- Say a foreign crash with an unreadable dump still arrives as a fatal (b8302dc2)
+- Pin the --child-process-check CLI branch's exit code (8f5aa430)
+- Prove a child_process shell launch through the spawn-helper on macOS (6c0c13c4)
+- Record the #728 review pack in the fan-out audit (e93099c0)
+- Wait for the collapsed pane to detach before re-expanding (8f07a646)
+- Cover Escape in a hovered Command Terminal (1a788bf7)
+- Record the demo Escape review in the per-review ledger (bebd7729)
+- Correct what a not-yet-reported required check reads and costs (df1627e5)
+- Pin three unguarded paths of the in-flight re-poll and queued rule (161416df)
+- Record the task 727 review in the fan-out audit log (3482da05)
+- Name the dev-run case the native crash filter still backstops (8dc1164f)
+- Pin the self-test's hardened-runtime signature and failure exit (5842ab53)
+- Pin the unavailable compositing branch and the report message arms (87b1fa28)
+- Pin the packaged arm of the crash filter's executable name (797c09dd)
+- Record the #724 review pack in the fan-out audit (f3ec3c2e)
+- Record the #720 review in the fan-out audit log (d3c0797b)
+- Stop naming char events in the focus-guard comment (900af07a)
+
+## [v0.43.1] - 2026-09-23
+
+### Features
+- Show dictation switched on in Settings and listening in a text field (f89b90ec)
+- Replay the recorded resume boot and hold a paused session's view (0e802fb1)
+- Add a session-resume scene and resume paused sessions in place (2af5ad63)
+- Shoot the posters in Roboto and carry each poster's focus rect (5bc28859)
+- Make the Browser scene's guest page read as a website (517de769)
+
+### Fixes
+- Stop pane screenshots tiling under a viewport override (48f16042)
+- Keep a resumed session marked resuming after its first output (4ca7490d)
+- Fill every terminal pane at any grid instead of letterboxing (f64f9629)
+- Give All columns its widths, and seed the column scenes with a real ladder (b55f25a8)
+- Drop the Electron token from the Browser pane user agent (7c94e67a)
+- Give a signed-out agent a full-width row (b57fb385)
+
+### Other
+- Give every in-test app boot in the dashboard spec a 30s budget (9b7830aa)
+- Keep the turn-group fixture inside today after midnight (3e79b84d)
+- Pin buildDictationInfo and primaryModel directly (9a538769)
+- Name the right hunk in the #718 ledger row (e3d74dde)
+- Pin the demo's boot veil and silent push-to-talk release (6328570e)
+- Correct viewport screenshot claims found at merge (67204ed8)
+- Pin the pane surface the screenshot and click paths pass (a5826232)
+- Drop the resuming label from the drained-bytes comment (f8853031)
+- Pin the demo boot contracts and name the mock's project rule (ac8665d9)
+- Cover emulator disposal and the conform decline timer (c257c830)
+- Record this review pack in the fan-out audit (41d73011)
+- Scan demo/ for xterm Unicode 11 activation (82245fda)
+- Pin the colgroup and the default-agent permission label (0ae5234f)
+- Correct the #715 ledger row's read count and context finding (cd58a971)
+- Record the column-seed review in the per-review ledger (16862825)
+- Drop the any cast from the lane manager's fake window (d93ad94a)
+- Say the poster verify refuses a stray PNG, not any stray file (623088ae)
+- Cover an extra-key focus sidecar and a pre-read focus map (bc26e5db)
+- Record the poster focus review in the per-review ledger (a5a6822a)
+- Hold every guest page to the README's three constraints (480a317a)
+- Record the welcome-screen review in the per-review ledger (421e6c8c)
+- Point Planning and Code Review at Opus 5.5 (2dccf278)
+
+## [v0.43.0] - 2026-09-22
+
+### Features
+- Agent viewport control, one surface per task, and seven new browser tools (6a779291)
+- Recover from a GPU process that kills the app, and record what failed (fb05224a)
+- Implement the Agent Idle toast (55d195ae)
+- Seven scenes for the docs figures, and an escape message for the host (b052fc86)
+- Ship the scene poster set as a versioned release asset (d0a0c0f2)
+
+### Fixes
+- Stop counting a resumed conversation once per resume (032060b1)
+- Clear the low-memory toast when host commit headroom recovers (07e068d8)
+- Name why a config write failed, and report a settings write that did not land (4c503a22)
+- Stop filing three un-actionable updater conditions (0e182bcd)
+- Pin each reporting file's own role address, and correct the boundary funnel claim (389b1928)
+- Make a truncated Sentry stack visible, and forward diff-boundary errors (4298f8c8)
+- Stop toast cards swallowing clicks on the UI beneath them (fd903ee1)
+- Send the Escape cases through the frame's own keyboard (9ee4fc4e)
+- Reap Qwen worktree trust entries on worktree removal (7208cf13)
+- The Send tooltip named Ctrl/Cmd+Enter, but Enter is what sends (06935fa7)
+- Note the heartbeat-forced budget in the stability-window bypass (df39a7d9)
+
+### Other
+- Cover the new reader methods and the token-coverage notice (4558e3a3)
+- Also pin the duration half of the lineage delta (e69bd583)
+- Cover the usage_history lineage backfill and fill the demo fixture (28d0d170)
+- Pin that a failed createSession releases its session id (e9308a19)
+- Load and release the model workers on demand (739cb02f)
+- Pin the commit-ceiling reader and the main memory block (8f790db4)
+- Split the Command Terminal and activity-mark essays out of CLAUDE.md (7eda6982)
+- Finish the no-op to throws correction (cdbc0945)
+- Say what disableHardwareAcceleration actually does (99623390)
+- Follow the Animations row to the Performance tab (71448044)
+- Cover the run-uptime, config and WebGL edges of the GPU recovery path (8714a48e)
+- Poll cross-frame focus before Escape in the dialog-close smoke test (cfb259fb)
+- Cover SettingTextInput's unfocused resync and its committedRef update (b00d19c1)
+- Count toasts right now, and pin the prototype-shaped errno fallback (dad51871)
+- Pin the settings commit boundary and the per-setting toast bucket (e07696b3)
+- Name both of initUpdater's platform branches (5650e91f)
+- Count the dismissed toast without a retrying matcher (9025ae76)
+- Pin the read-only latch across a window rebuild (f878f8dc)
+- Pin DiffErrorBoundary's Sentry forwarding (420bc8b4)
+- Let auto mode make the Sentry calls /sentry and /release already do (45ef6efe)
+- Use security@kangentic.com as the vulnerability fallback contact (5ac07c51)
+- The notification-toast scene no longer calls the idle toast unimplemented (a256f248)
+- Cover the two shared values the idle toast introduced (c667808a)
+- Cover the notification-click branches openTaskFromNotification split (016b8ef1)
+- Pin handleSave to its single wrapped call site (1059fb53)
+- Pin the saveBoardProfiles boolean contract and the toast exit fallback (e3afc853)
+- Assert the two new scenes show what their alts claim (272e90ce)
+- Drive the two unexercised opt-out markers from source fixtures (2b142f9b)
+- Build every docs link from one base URL (aa300ef7)
+- Qualify the never-a-user-decision claim for Grok (189efa93)
+- Pin removeWorktreeTrust's never-throws contract on a corrupt read (b5104766)
+- Note the heartbeat-forced budget in the watchdog section body (636e50a3)
+- Name timing constants instead of restating their values (f7fde955)
+- Cover the rig's CAPTURE_THEMES guard by importing it (f5085bff)
+- List npm run demo:posters beside the other demo commands (b9e15fe4)
+
 ## [v0.42.0] - 2026-09-19
 
 ### Features

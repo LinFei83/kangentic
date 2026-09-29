@@ -1,4 +1,4 @@
-import { Bot, MessageSquare, Zap } from 'lucide-react';
+import { Bot, CircleArrowUp, MessageSquare, Zap } from 'lucide-react';
 import { DataTable, type DataTableColumn, type DataTableColumnGroup } from '../../DataTable';
 import { Pill } from '../../Pill';
 import { ToggleSwitch } from '../../settings/shared';
@@ -41,6 +41,10 @@ export interface OverviewValue {
   applicable: boolean;
   /** Why it does not apply. Required when `applicable` is false; becomes the cell's `title`. */
   reason?: string;
+  /** Hover text when it should say more than `label` (a floating model alias names the version it runs). */
+  title?: string;
+  /** A newer version of the value is known, e.g. "Sonnet 5.5" for a column pinned to Sonnet 5. */
+  newer?: string;
 }
 
 /** One boolean cell, rendered as the read-only control that sets it. */
@@ -77,36 +81,13 @@ interface ColumnsOverviewProps {
 }
 
 /**
- * Humanize a model id for display (e.g. `claude-fable-5` -> "Fable 5",
- * `claude-opus-4-8` -> "Opus 4.8"). A generic display formatter (not agent-name
- * branching): strips a vendor prefix, title-cases the name parts, and joins the
- * numeric version parts with dots. Mirrors the Claude adapter's
- * `humanizeClaudeModelId`; falls back to the raw id when nothing is derivable.
- */
-export function formatModelName(modelId: string): string {
-  const trimmed = modelId.trim();
-  if (!trimmed) return trimmed;
-  const bracketMatch = trimmed.match(/\[([^\]]+)\]/);
-  const base = trimmed.replace(/\[[^\]]*\]/, '');
-  const segments = base.replace(/^claude-/i, '').split('-').filter(Boolean);
-  if (segments.length === 0) return trimmed;
-  const nameParts: string[] = [];
-  const versionParts: string[] = [];
-  for (const segment of segments) {
-    if (/^\d+$/.test(segment)) {
-      if (segment.length < 6) versionParts.push(segment); // drop date stamps
-    } else {
-      nameParts.push(segment.charAt(0).toUpperCase() + segment.slice(1));
-    }
-  }
-  const label = [nameParts.join(' '), versionParts.join('.')].filter(Boolean).join(' ');
-  if (!label) return trimmed;
-  return bracketMatch ? `${label} (${bracketMatch[1].toUpperCase()})` : label;
-}
-
-/**
  * The one renderer for every value cell, so the three states cannot drift column
  * by column. `data-state` is what a spec asserts against.
+ *
+ * A value that does not fit its column ends in an ellipsis and keeps its whole
+ * text in `title`. The cell is `overflow-hidden`, so without the truncate a long
+ * value (a permission label, an agent name) was cut mid-glyph with nothing to
+ * say anything was missing.
  */
 function OverviewCell({ value }: { value: OverviewValue }) {
   if (!value.applicable) {
@@ -122,15 +103,42 @@ function OverviewCell({ value }: { value: OverviewValue }) {
     return (
       <span
         data-state="changed"
-        className="inline-flex h-[22px] items-center whitespace-nowrap rounded bg-surface-hover/50 px-2 font-medium text-fg"
+        title={value.title ?? value.label}
+        className="inline-flex h-[22px] max-w-full min-w-0 items-center whitespace-nowrap rounded bg-surface-hover/50 px-2 font-medium text-fg"
       >
-        {value.label}
+        <span className="truncate">{value.label}</span>
+        <NewerMark newer={value.newer} />
       </span>
     );
   }
   return (
-    <span data-state="unchanged" className="whitespace-nowrap text-fg-faint">
+    <span
+      data-state="unchanged"
+      title={value.title ?? value.label}
+      className="inline-block max-w-full truncate align-middle text-fg-faint"
+    >
       {value.label}
+      <NewerMark newer={value.newer} />
+    </span>
+  );
+}
+
+/**
+ * A small upgrade mark after a value a newer version has superseded. It is a
+ * fixed part of the cell, never a button: the update itself is picking the
+ * newer model in the column's own Model field.
+ */
+function NewerMark({ newer }: { newer?: string }) {
+  if (!newer) return null;
+  return (
+    <span
+      data-overview-newer
+      role="img"
+      title={`${newer} available`}
+      aria-label={`${newer} available`}
+      className="ml-1 inline-flex flex-shrink-0 align-middle text-fg-faint"
+    >
+      <CircleArrowUp size={12} />
     </span>
   );
 }
@@ -176,11 +184,17 @@ export function ColumnsOverview({ rows, onSelect }: ColumnsOverviewProps) {
     { label: 'Automations', span: 2, icon: <Zap size={12} strokeWidth={1.75} /> },
   ];
 
+  // The widths reach the table through DataTable's <colgroup>; a grouped
+  // table's first row is the band row, which carries none. They are sized so a
+  // realistic per-column setup reads whole at the site's 1600px frame: an agent
+  // as long as "GitHub Copilot CLI", a label as long as "Plan (Read-Only)",
+  // with room left for a font wider than Segoe UI (the posters are shot on
+  // Linux). Anything longer ellipsizes in OverviewCell.
   const columns: DataTableColumn<OverviewRow>[] = [
     {
       key: 'name',
       label: 'Column',
-      width: 'w-[17%]',
+      width: 'w-[13%]',
       render: (row) => {
         const Icon = row.icon ? ICON_REGISTRY.get(row.icon) : (row.role ? ROLE_DEFAULTS[row.role] : null);
         return (
@@ -203,17 +217,17 @@ export function ColumnsOverview({ rows, onSelect }: ColumnsOverviewProps) {
         );
       },
     },
-    { key: 'autoSpawn', label: 'Start', width: 'w-[7%]', render: (row) => <OverviewToggle flag={row.autoSpawn} /> },
-    { key: 'agent', label: 'Agent', width: 'w-[12%]', render: (row) => <OverviewCell value={row.agent} /> },
-    { key: 'model', label: 'Model', width: 'w-[10%]', render: (row) => <OverviewCell value={row.model} /> },
-    { key: 'effort', label: 'Effort', width: 'w-[8%]', render: (row) => <OverviewCell value={row.effort} /> },
+    { key: 'autoSpawn', label: 'Start', width: 'w-[6%]', render: (row) => <OverviewToggle flag={row.autoSpawn} /> },
+    { key: 'agent', label: 'Agent', width: 'w-[15%]', render: (row) => <OverviewCell value={row.agent} /> },
+    { key: 'model', label: 'Model', width: 'w-[12%]', render: (row) => <OverviewCell value={row.model} /> },
+    { key: 'effort', label: 'Effort', width: 'w-[7%]', render: (row) => <OverviewCell value={row.effort} /> },
     { key: 'permission', label: 'Permissions', width: 'w-[14%]', render: (row) => <OverviewCell value={row.permission} /> },
     { key: 'handoff', label: 'Handoff', width: 'w-[8%]', render: (row) => <OverviewToggle flag={row.handoff} /> },
     { key: 'session', label: 'Session', width: 'w-[9%]', render: (row) => <OverviewCell value={row.session} /> },
     {
       key: 'onEnter',
       label: 'On enter',
-      width: 'w-[7%]',
+      width: 'w-[8%]',
       render: (row) => <span data-enter={row.onEnter.label}><OverviewCell value={row.onEnter} /></span>,
     },
     {

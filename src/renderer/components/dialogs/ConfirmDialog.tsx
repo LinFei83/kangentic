@@ -10,6 +10,12 @@ interface ConfirmDialogProps {
   variant?: 'danger' | 'warning' | 'default';
   showDontAskAgain?: boolean;
   dontAskAgainLabel?: string;
+  /** `data-testid` for the dialog, forwarded to BaseDialog, so one confirm among several open
+   *  dialogs is addressable by name rather than by its title text. */
+  testId?: string;
+  /** Replaces the variant's warning triangle, for a confirmation that is not a warning (a
+   *  restart). Color it the way the variant would, e.g. `text-accent-fg` for `default`. */
+  icon?: React.ReactNode;
   onConfirm: (dontAskAgain: boolean) => void;
   onCancel: () => void;
 }
@@ -22,6 +28,8 @@ export function ConfirmDialog({
   variant = 'default',
   showDontAskAgain = false,
   dontAskAgainLabel = "Don't ask again",
+  testId,
+  icon,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -58,8 +66,9 @@ export function ConfirmDialog({
     <BaseDialog
       onClose={onCancel}
       title={title}
-      icon={<AlertTriangle size={16} className={iconStyles[variant]} />}
+      icon={icon ?? <AlertTriangle size={16} className={iconStyles[variant]} />}
       zIndex="z-[60]"
+      testId={testId}
       trapFocus
       footer={
         <div className="flex items-center">

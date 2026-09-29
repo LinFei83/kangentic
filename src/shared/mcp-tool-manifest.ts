@@ -26,6 +26,8 @@
  * from `name` with no per-tool hardcoding.
  */
 
+import { DOCS_URLS } from './docs-links';
+
 export type McpToolCategoryId = 'tasks' | 'board' | 'sessions' | 'browser' | 'diagnostics';
 
 export interface McpToolManifestEntry {
@@ -117,6 +119,16 @@ export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
   { name: 'kangentic_browser_type', label: 'Type', blurb: 'type text into the Browser pane', category: 'browser' },
   { name: 'kangentic_browser_keypress', label: 'Keypress', blurb: 'send a key or chord to the pane', category: 'browser' },
   { name: 'kangentic_browser_drag', label: 'Drag', blurb: 'drag from one element to another', category: 'browser' },
+  { name: 'kangentic_browser_hover', label: 'Hover', blurb: 'move the pointer over an element without clicking', category: 'browser' },
+  { name: 'kangentic_browser_scroll', label: 'Scroll', blurb: 'scroll the page or an element by a wheel delta', category: 'browser' },
+  { name: 'kangentic_browser_select_option', label: 'Select Option', blurb: 'choose a value in a native dropdown', category: 'browser' },
+  { name: 'kangentic_browser_drop_files', label: 'Drop Files', blurb: 'drop real files onto a drop zone or file input', category: 'browser' },
+  { name: 'kangentic_browser_history', label: 'History', blurb: 'go back or forward in the pane history', category: 'browser' },
+  { name: 'kangentic_browser_network', label: 'Network Requests', blurb: 'list the requests the page made, with status and timing', category: 'browser' },
+  { name: 'kangentic_browser_handle_dialog', label: 'Handle Dialog', blurb: 'decide how alert / confirm / prompt are answered', category: 'browser' },
+  { name: 'kangentic_browser_set_viewport', label: 'Set Viewport', blurb: 'render the pane at a chosen width and height', category: 'browser' },
+  { name: 'kangentic_browser_pop_out', label: 'Pop Out Browser', blurb: 'detach the Browser pane into its own window', category: 'browser' },
+  { name: 'kangentic_browser_dock', label: 'Dock Browser', blurb: 'put a detached Browser window back in the task', category: 'browser' },
   { name: 'kangentic_browser_eval', label: 'Eval', blurb: 'evaluate JavaScript in the page (off by default)', category: 'browser' },
 
   // ── Diagnostics (diagnostics-tools.ts; query_db from session-tools.ts) - dev-leaning, rendered last ──
@@ -129,7 +141,7 @@ export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
 ];
 
 /** Live docs reference for the MCP server. Each tool's heading anchor is its registered name. */
-export const MCP_SERVER_DOCS_URL = 'https://kangentic.com/mcp-server/';
+export const MCP_SERVER_DOCS_URL = DOCS_URLS.mcpServer;
 
 /** Deep link to a tool's entry on the docs page. Anchor = manifest/registered tool name. */
 export function mcpToolDocsUrl(toolName: string): string {

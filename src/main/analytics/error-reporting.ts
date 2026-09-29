@@ -5,12 +5,12 @@ import type { ErrorEvent, EventHint } from '@sentry/electron/main';
 import { isUserConfigurationError } from '../../shared/user-configuration-error';
 import { BENIGN_RENDERER_ERRORS } from '../../shared/benign-renderer-errors';
 import type { HostMemorySample } from '../../shared/types';
-import { trackEvent } from './analytics';
 import {
   correctNativeCrashEvent,
   readMinidumpIdentity,
   type NativeCrashContext,
 } from './native-crash-event';
+import { filterBreadcrumb } from '../../shared/sentry-breadcrumbs';
 
 /**
  * Sentry DSN for the Kangentic desktop project (kangentic.sentry.io, project
@@ -120,7 +120,7 @@ export function reportHandledError(
  * Attach the latest host memory sample (Sentry DESKTOP-16) to the persisted
  * Sentry scope, so whatever event fires next - including a native crash,
  * which has no other route into `contexts` - carries it. Deliberately not a
- * `beforeSend` hook: `beforeSend` is already `filterNativeCrashEvent`
+ * `beforeSend` hook: `beforeSend` is already `beforeSendEvent`
  * (below), and tracing/replay are off (see `initErrorReporting`'s doc
  * comment), so there is no transaction for `setMeasurement` to hang on.
  * `setContext` on the ambient scope is the plain route. Composes with
@@ -157,24 +157,39 @@ function resolveNativeCrashContext(): NativeCrashContext {
       process.platform === 'darwin'
         ? path.resolve(path.dirname(executablePath), '..')
         : path.dirname(executablePath),
-    appExecutableName: path.basename(executablePath),
+    // Unpackaged, the executable is `Electron` inside `Electron.app`. Every dev
+    // Electron app shares both names, so matching on them would keep any dev
+    // Electron app's crash (DESKTOP-1D's class). Blank, it switches off both
+    // relocation fallbacks and leaves the install root, which covers the
+    // checkout's own dev Electron, as the only test.
+    appExecutableName: app.isPackaged ? path.basename(executablePath) : '',
     appVersion: app.getVersion(),
     caseInsensitivePaths: process.platform === 'win32',
   };
 }
 
 /**
- * The `beforeSend` body, for native crash events only: it drops a crash that
- * happened in a process that is not ours, and corrects the release tag and scope
- * of one that is. Everything else passes through untouched, including renderer
- * events (the SDK re-captures those through main's client, so they reach this
- * hook too).
+ * The `beforeSend` body, for native crash events only. A crash in a process that
+ * is not ours becomes one grouped warning with its dump removed; a crash that is
+ * ours gets its release tag and scope corrected. Everything else passes through
+ * untouched, including renderer events (the SDK re-captures those through
+ * main's client, so they reach this hook too).
+ *
+ * A foreign crash still reaches Sentry because it is still our defect: our
+ * Crashpad port leaked into a process we started (see native-crash-event.ts).
+ * Its dump never does. It holds another program's memory, and the SDK builds
+ * the envelope from `hint.attachments` only after this hook returns, reading the
+ * same hint object (`sendEvent` in @sentry/core's client), so removing the dump
+ * here is what keeps it on the machine.
+ * tests/unit/foreign-crash-real-client.test.ts pins that against the real client.
  *
  * The whole thing fails OPEN. A `beforeSend` that throws makes the SDK drop the
  * event, so a bug in the minidump reader would silently delete every native
  * crash rather than one. Any doubt at all and the event goes through unchanged.
+ * Failing open keeps the dump, so the foreign rewrite and the removal below must
+ * never throw: they are plain property writes and an array filter.
  */
-export function filterNativeCrashEvent(event: ErrorEvent, hint: EventHint): ErrorEvent | null {
+export function filterNativeCrashEvent(event: ErrorEvent, hint: EventHint): ErrorEvent {
   try {
     const minidump = hint.attachments?.find(
       (attachment) => attachment.attachmentType === MINIDUMP_ATTACHMENT_TYPE
@@ -183,19 +198,71 @@ export function filterNativeCrashEvent(event: ErrorEvent, hint: EventHint): Erro
 
     const identity = readMinidumpIdentity(minidump.data);
     const decision = correctNativeCrashEvent(event, identity, resolveNativeCrashContext());
-    if (decision.action === 'keep') return decision.event;
-
-    // Counted, not reported, the same split as a transient updater failure or a
-    // recoverable utility crash. Once this filter ships, DESKTOP-K stops growing
-    // and this counter is the only fleet-wide evidence left that foreign
-    // processes are still writing into our crash database, which is what the
-    // mach-exception-port follow-up needs a before and after number for. The
-    // module name is a basename, so it carries no path and no home directory.
-    trackEvent('foreign_minidump_dropped', { module: decision.mainModule });
-    return null;
+    if (decision.action === 'foreign') {
+      // Every dump, not only the one read above, and nothing else: a renderer's
+      // scope attachments ride in the same array.
+      hint.attachments = hint.attachments?.filter(
+        (attachment) => attachment.attachmentType !== MINIDUMP_ATTACHMENT_TYPE
+      );
+    }
+    return decision.event;
   } catch {
     return event;
   }
+}
+
+/**
+ * The number of stack frames the Sentry SDK keeps. Both halves of the cap are
+ * this number: `@sentry/browser`'s globalHandlers integration sets
+ * `Error.stackTraceLimit = 50` when it installs, and `@sentry/core`'s
+ * `createStackParser` stops parsing at 50 frames and slices to 50 again.
+ */
+export const SENTRY_STACK_FRAME_LIMIT = 50;
+
+/**
+ * Tag an event whose stack hit the SDK's frame cap.
+ *
+ * The parser reads a V8 stack INNERMOST-first and stops at the limit, so the
+ * frames it discards are the OUTER ones: the app code that called into the
+ * library, and the timer or handler the whole thing ran under. An event capped
+ * at exactly 50 therefore reads as a self-contained third-party failure with
+ * `in_app: false` on every frame, when in fact the app frames were cut off.
+ *
+ * That is not hypothetical. Every event on DESKTOP-19 ("Illegal value for
+ * lineNumber") carried exactly 50 monaco-editor frames and no in-app frame,
+ * which is what made it look like a pure upstream bug; the app frame that
+ * actually armed the call had been truncated away. This tag makes the
+ * difference between "no app frames" and "no app frames survived" visible in
+ * the issue stream instead of leaving it to be rediscovered by hand.
+ *
+ * Mutates and returns the event; never drops one.
+ */
+export function tagTruncatedStack(event: ErrorEvent): ErrorEvent {
+  const exceptionValues = event.exception?.values;
+  if (!exceptionValues) return event;
+  const hitFrameCap = exceptionValues.some(
+    (exceptionValue) => exceptionValue.stacktrace?.frames?.length === SENTRY_STACK_FRAME_LIMIT
+  );
+  if (!hitFrameCap) return event;
+  event.tags = { ...event.tags, stack_truncated: 'true' };
+  return event;
+}
+
+/**
+ * The actual `beforeSend`. Tags a frame-capped stack, then runs the native
+ * crash split. Neither ever drops an event.
+ *
+ * Fails OPEN for the same reason `filterNativeCrashEvent` does: a throwing
+ * `beforeSend` makes the SDK drop the event, so a bug in the tagging must never
+ * be able to delete telemetry.
+ */
+export function beforeSendEvent(event: ErrorEvent, hint: EventHint): ErrorEvent {
+  try {
+    tagTruncatedStack(event);
+  } catch {
+    // Tagging is diagnostic only; never let it cost us the event.
+  }
+  return filterNativeCrashEvent(event, hint);
 }
 
 /**
@@ -205,27 +272,37 @@ export function filterNativeCrashEvent(event: ErrorEvent, hint: EventHint): Erro
  *
  * SCRUBBING is deliberately Sentry's job, not ours: the SDK's default
  * normalizePathsIntegration rewrites stack-frame paths and URLs relative to
- * the app root (so the user's home directory never reaches Sentry for app
- * code), sendDefaultPii stays false, and Sentry's server-side data scrubbing
- * is on by default. Any further scrubbing rule belongs in the Sentry UI
- * (Advanced Data Scrubbing), not in a custom beforeSend here.
+ * the app root (so the user's home directory never reaches Sentry through an
+ * app stack frame), sendDefaultPii stays false, and Sentry's server-side data
+ * scrubbing is on by default. Any further scrubbing rule belongs in the Sentry
+ * UI (Advanced Data Scrubbing), not in a custom beforeSend here.
+ *
+ * BREADCRUMBS are an exception to that stance, filtered on the machine by
+ * `beforeBreadcrumb` (src/shared/sentry-breadcrumbs.ts). normalizePathsIntegration never touches
+ * them, and no server-side rule can recognize a task title or a column prompt
+ * inside a console line, so the policy runs before a crumb enters the ring.
  *
  * FILTERING is a separate concern and does live here, in `ignoreErrors`:
  * deciding that a whole class of event is un-actionable and should never become
  * an issue is a product judgement about our own code, not a data-privacy rule.
  * See the annotated entries below.
  *
- * NATIVE CRASH EVENTS are the one exception to "filtering lives in
- * `ignoreErrors`", and to the no-beforeSend stance above. `ignoreErrors` is the
- * `eventFiltersIntegration`, which matches only an event's message and its
- * exception type and value. A minidump event has none of those, so the matcher
- * sees an empty candidate list and the filter is a no-op on it. The thing that
- * says whether the crash was even ours lives in the attached dump, not on the
- * event, and Sentry derives the stack and the image list from that dump only
- * AFTER upload. So this one class is filtered in `beforeSend`
- * (filterNativeCrashEvent, above), which is the only hook that can see the
- * attachment. It is still filtering, not scrubbing: the scrubbing stance is
- * unchanged.
+ * NATIVE CRASH EVENTS are the one exception to the no-beforeSend stance above.
+ * `ignoreErrors` is the `eventFiltersIntegration`, which matches only an event's
+ * message and its exception type and value. A minidump event has none of those,
+ * so the matcher sees an empty candidate list and the filter is a no-op on it.
+ * The thing that says whether the crash was even ours lives in the attached
+ * dump, not on the event, and Sentry derives the stack and the image list from
+ * that dump only AFTER upload. So this one class is split in `beforeSend`
+ * (filterNativeCrashEvent, reached through beforeSendEvent, above), which is the
+ * only hook that can see the attachment. A foreign crash becomes one grouped
+ * warning, and its dump is removed from the upload. That removal is an exception
+ * to the scrubbing stance, the same kind as the stderr tail's home directory
+ * becoming `~`: the dump is another program's memory, and no Sentry-side rule
+ * can scrub a file it has already received.
+ *
+ * `beforeSend` does one other thing: beforeSendEvent also TAGS a frame-capped
+ * stack (tagTruncatedStack, above). That is annotation on an event we keep.
  *
  * Errors only: release-health session tracking (the MainProcessSession
  * integration, on by default) is filtered out, and tracing/replay are never
@@ -252,9 +329,10 @@ export function initErrorReporting(): void {
         defaultIntegrations.filter(
           (integration) => integration.name !== 'MainProcessSession'
         ),
-      // Native crash events only; see the NATIVE CRASH EVENTS note above for why
-      // this one class cannot go in ignoreErrors below.
-      beforeSend: filterNativeCrashEvent,
+      // Tags a frame-capped stack, then splits native crash events into ours
+      // and foreign ones; see the NATIVE CRASH EVENTS note above for why that
+      // one class cannot go in ignoreErrors below.
+      beforeSend: beforeSendEvent,
       // Noise filtering, which is a different concern from the scrubbing above:
       // these are real events we deliberately do not want as issues, not data
       // we need removed from events we do keep.
@@ -311,6 +389,10 @@ export function initErrorReporting(): void {
         // so main's event processors run on them.
         ...BENIGN_RENDERER_ERRORS,
       ],
+      // Drops or rewrites every breadcrumb main records, before it takes a
+      // slot in the ring (src/shared/sentry-breadcrumbs.ts). Renderer crumbs
+      // skip this hook, so the renderer installs the same policy itself.
+      beforeBreadcrumb: filterBreadcrumb,
     });
     active = true;
   } catch (error) {

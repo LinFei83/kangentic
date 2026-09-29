@@ -43,7 +43,7 @@ import { ModelCombobox } from './ModelCombobox';
 import { Combobox } from './Combobox';
 import { maximizedDialogLayout, MaximizeToggleButton } from './dialog-maximize';
 import { ColumnRail, ALL_COLUMNS_ID, type RailRow } from './board-manager/ColumnRail';
-import { ColumnsOverview, formatModelName, type OverviewRow, type OverviewValue } from './board-manager/ColumnsOverview';
+import { ColumnsOverview, type OverviewRow, type OverviewValue } from './board-manager/ColumnsOverview';
 import { Pill } from '../Pill';
 import { RegistryIcon, getSwimlaneIconName, getUsedIcons } from '../../utils/swimlane-icons';
 import { Select } from '../settings/shared';
@@ -53,9 +53,10 @@ import { SETTING_LABEL_CLASS, SETTING_DESCRIPTION_CLASS } from '../SettingText';
 import { OverlayPopover } from '../OverlayPopover';
 import { usePopoverPosition } from '../../hooks/usePopoverPosition';
 import { useAgentCapabilityResolution } from '../../hooks/useAgentCapabilityResolution';
-import { useModelContextWindows, useModelDisplayNames } from '../../hooks/useKnownModels';
+import { unionKnownModels, useModelAliases, useModelContextWindows, useModelDisplayNames } from '../../hooks/useKnownModels';
 import { useKeybinding } from '../../hooks/useKeybinding';
-import { modelRowLabel } from '../../utils/format-tokens';
+import { buildOfferedIdsByDisplayName, modelAliasTitle, modelRowLabel } from '../../utils/format-tokens';
+import { newerModelFor } from '../../../shared/model-id';
 import {
   getPermissionLabel,
   DEFAULT_PERMISSIONS,
@@ -728,6 +729,9 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   // implicitly updates this subscription too.
   const agentList = useConfigStore((state) => state.agentList);
   const loadAgentList = useConfigStore((state) => state.loadAgentList);
+  // The overview's "newer version available" mark reads the same model union
+  // the Model combobox lists (useKnownModels), so the two never disagree.
+  const discoveredModelsByAgent = useConfigStore((state) => state.config.discoveredModelsByAgent);
 
   // Snapshot originals + drafts at mount. If the dialog was opened with
   // `seedNewDraft=true`, also seed a fresh new draft inline so the dialog
@@ -1102,7 +1106,20 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
       const agentLabel = overrideName
         ? (agentList.find((agent) => agent.name === overrideName)?.displayName ?? overrideName)
         : projectDefaultAgentLabel;
+      // Model and Permissions are worded by the column's OWN agent, from the
+      // same sources its form fields read, so a row never names a value the
+      // column page spells differently (a Codex column's acceptEdits is "Auto
+      // (Preset)", not Claude's "Accept Edits").
+      const laneAgentName = overrideName ?? projectDefaultAgent;
+      const laneAgentInfo = agentList.find((agent) => agent.name === laneAgentName);
       const modelOverride = laneDraft.model_override?.trim();
+      const laneDisplayNames = laneAgentInfo?.capabilities?.modelDisplayNames ?? {};
+      const laneAliases = laneAgentInfo?.capabilities?.modelAliases ?? [];
+      const laneKnownModels = unionKnownModels(
+        laneAgentInfo?.capabilities?.models,
+        laneAgentName ? discoveredModelsByAgent?.[laneAgentName] : undefined,
+      );
+      const newerModel = modelOverride ? newerModelFor(modelOverride, laneKnownModels) : null;
 
       const rows = automationDrafts[id] ?? [];
       const counts = runnableAutomationCounts(rows, laneDraft);
@@ -1127,10 +1144,20 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
           ? { on: false, applicable: false, reason: agentReason, ariaLabel: 'Start an agent here' }
           : { on: laneDraft.auto_spawn, applicable: true, ariaLabel: 'Start an agent here' },
         agent: value(agentLabel, !!overrideName),
-        model: value(modelOverride ? formatModelName(modelOverride) : 'Default', !!modelOverride),
+        model: {
+          ...value(modelOverride ? modelRowLabel(modelOverride, laneDisplayNames) : 'Default', !!modelOverride),
+          ...(agentApplies && modelOverride
+            ? {
+                title: modelAliasTitle(modelOverride, laneAliases, laneDisplayNames) ?? undefined,
+                newer: newerModel ? modelRowLabel(newerModel, laneDisplayNames) : undefined,
+              }
+            : {}),
+        },
         effort: value(laneDraft.effort_override || 'Default', !!laneDraft.effort_override),
         permission: value(
-          laneDraft.permission_mode ? getPermissionLabel(DEFAULT_PERMISSIONS, laneDraft.permission_mode) : 'Default',
+          laneDraft.permission_mode
+            ? getPermissionLabel(laneAgentInfo?.permissions ?? DEFAULT_PERMISSIONS, laneDraft.permission_mode)
+            : 'Default',
           !!laneDraft.permission_mode,
         ),
         handoff: agentApplies
@@ -1153,8 +1180,8 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
       }];
     });
   }, [
-    laneOrder, drafts, originals, newDraftIds, agentList, projectDefaultAgentLabel,
-    automationDrafts, automationOriginals,
+    laneOrder, drafts, originals, newDraftIds, agentList, projectDefaultAgent, projectDefaultAgentLabel,
+    automationDrafts, automationOriginals, discoveredModelsByAgent,
   ]);
 
   // Effective-agent resolution for the column manager: column draft's
@@ -1169,6 +1196,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   } = useAgentCapabilityResolution(effectiveAgent);
   const modelContextWindows = useModelContextWindows(effectiveAgent);
   const modelDisplayNames = useModelDisplayNames(effectiveAgent);
+  const modelAliases = useModelAliases(effectiveAgent);
   const agentPermissions = effectiveAgentInfo?.permissions ?? DEFAULT_PERMISSIONS;
 
   // Project-level model/effort defaults (mirrors projectDefaultAgent above).
@@ -1185,14 +1213,23 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   // local-only context.
   const discoveredModels = useMemo(() => {
     const merged = new Set(knownModels);
+    // A value written the way the app displays it ("Opus", from a hand-edited
+    // kangentic.json or an MCP call) names a row the picker already lists, so
+    // it is not added as a version of its own. Only values nothing offered
+    // recognizes (another column's custom model) get a row.
+    const offeredIdsByName = buildOfferedIdsByDisplayName(
+      [...knownModels, ...modelAliases.map((alias) => alias.id)],
+      modelDisplayNames,
+    );
     for (const lane of Object.values(drafts)) {
       if (!lane.model_override) continue;
       const laneAgent = lane.agent_override ?? projectDefaultAgent;
       if (laneAgent !== effectiveAgent) continue;
+      if (offeredIdsByName.has(lane.model_override.trim().toLowerCase())) continue;
       merged.add(lane.model_override);
     }
     return Array.from(merged).sort((a, b) => a.localeCompare(b));
-  }, [knownModels, drafts, projectDefaultAgent, effectiveAgent]);
+  }, [knownModels, drafts, projectDefaultAgent, effectiveAgent, modelAliases, modelDisplayNames]);
 
   const usedIcons = useMemo(() => {
     return getUsedIcons(
@@ -1504,6 +1541,36 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
       }
     }
 
+    // Profiles persist AFTER the column creates above, so an entry can reference
+    // a newly-created column's real uuid (the create path assigns it server-side).
+    // Written whole rather than diffed: profiles live in kangentic.json with no
+    // DB representation, so this array IS the source of truth. A hand-written
+    // profile the user never touched round-trips unchanged, and one keyed to a
+    // column this machine does not have is preserved rather than dropped.
+    // `profilesToSave` rather than `profileDrafts`: a staged column delete prunes
+    // that column out of the list above, and this whole-array write would
+    // otherwise restore it. When nothing here is dirty we do not write at all,
+    // which is correct - the delete path already pruned the on-disk copy.
+    //
+    // Guarded and folded into `firstError` like the five steps above it, and
+    // placed BEFORE the error check rather than after so that branch owns the
+    // toast, the setSaving(false) and the return. `saveBoardProfiles` reports a
+    // failed write as `false` (it raises its own toast and reloads); before
+    // that, a failed profile write fell through to the success toast below, so
+    // the user got "saved profiles" next to "Failed to save profiles" and the
+    // dialog closed on the lie. The try/catch also covers the structuredClone.
+    if (!firstError && profilesDirty) {
+      try {
+        if (await saveBoardProfiles(profilesToSave)) {
+          setProfileOriginals(structuredClone(profilesToSave) as BoardProfile[]);
+        } else {
+          firstError = new Error('Could not save profiles');
+        }
+      } catch (error) {
+        firstError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+
     if (firstError) {
       const savedTotal = savedUpdates + savedCreates + savedDeletes;
       const partialParts: string[] = [];
@@ -1518,21 +1585,6 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
       return;
     }
 
-    // Profiles persist AFTER the column creates above, so an entry can reference
-    // a newly-created column's real uuid (the create path assigns it server-side).
-    // Written whole rather than diffed: profiles live in kangentic.json with no
-    // DB representation, so this array IS the source of truth. A hand-written
-    // profile the user never touched round-trips unchanged, and one keyed to a
-    // column this machine does not have is preserved rather than dropped.
-    // `profilesToSave` rather than `profileDrafts`: a staged column delete prunes
-    // that column out of the list above, and this whole-array write would
-    // otherwise restore it. When nothing here is dirty we do not write at all,
-    // which is correct - the delete path already pruned the on-disk copy.
-    if (profilesDirty) {
-      await saveBoardProfiles(profilesToSave);
-      setProfileOriginals(structuredClone(profilesToSave) as BoardProfile[]);
-    }
-
     const parts: string[] = [];
     if (savedUpdates > 0) parts.push(`Saved ${savedUpdates} column${savedUpdates > 1 ? 's' : ''}`);
     if (savedCreates > 0) parts.push(`created ${savedCreates} column${savedCreates > 1 ? 's' : ''}`);
@@ -1544,13 +1596,42 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
       message: parts.length > 0 ? parts.join(' and ') : 'No changes to save',
       variant: 'info',
     });
+    // Defensive, not a fix for a reachable path: every failure above returns
+    // through the firstError branch, so reaching here means the save landed and
+    // onClose() unmounts us. See requestSave below for what a stranded
+    // `saving === true` costs, which is why the line is worth keeping.
+    setSaving(false);
     onClose();
   }, [saving, laneOrder, drafts, originals, newDraftIds, pendingDeleteIds, orderDirty, profilesDirty, profileDrafts, saveBoardProfiles, updateSwimlane, createSwimlane, deleteSwimlane, reorderSwimlanes, onClose,
     automationsDirty, automationOriginals, automationDrafts, replaceAutomationsForColumn]);
 
+  /**
+   * The only way handleSave is invoked, so a throw escaping it cannot strand
+   * `saving === true`.
+   *
+   * Every failure INSIDE handleSave returns through its firstError branch, so
+   * this is a backstop rather than a live path. It is worth having because the
+   * consequence is out of all proportion to the cause: `requestCancel` bails
+   * while `saving`, so a stranded flag deadens Cancel, Escape, the header X and
+   * the backdrop as well as Save, and handleSave's own re-entrancy guard means
+   * Ctrl+S is no escape hatch either. The dialog would need a reload to close.
+   *
+   * A bare `void handleSave()` turned that into an unhandled rejection the user
+   * never saw. Catching releases the flag AND says what happened.
+   */
+  const requestSave = useCallback(() => {
+    handleSave().catch((error) => {
+      setSaving(false);
+      useToastStore.getState().addToast({
+        message: `Could not save: ${error instanceof Error ? error.message : String(error)}`,
+        variant: 'error',
+      });
+    });
+  }, [handleSave]);
+
   // Cmd/Ctrl+S to save, via the central keybinding registry. Document-level,
   // bubble phase, preventDefault only - matching the original listener.
-  useKeybinding('boardManager.save', () => void handleSave(), {
+  useKeybinding('boardManager.save', requestSave, {
     target: 'document',
     stopPropagation: false,
   });
@@ -1821,9 +1902,10 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
         // matches Cancel and Save so the footer keeps its height.
         <DialogFooterActions
           onCancel={requestCancel}
-          onConfirm={() => void handleSave()}
+          onConfirm={requestSave}
           confirmLabel="Save"
           confirmDisabled={saving || !hasDirty}
+          cancelTestId="board-manager-cancel"
           confirmTestId="board-manager-save"
           leading={!isOverview && draft && !isTodoOrDone && !activeProfileId ? (
             <button
@@ -1953,7 +2035,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                     value={draft.name}
                     placeholder="Column name"
                     onChange={(event) => updateDraft((current) => ({ ...current, name: event.target.value }))}
-                    onKeyDown={(event) => { if (event.key === 'Enter') void handleSave(); }}
+                    onKeyDown={(event) => { if (event.key === 'Enter') requestSave(); }}
                     data-testid="board-manager-name"
                     className="w-full bg-surface-control border border-edge-input rounded px-3 py-1.5 text-sm text-fg-tertiary placeholder-fg-muted focus:outline-none focus:border-accent"
                   />
@@ -2164,6 +2246,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                           onOpen={() => useConfigStore.getState().rescanModels()}
                           contextWindows={modelContextWindows}
                           modelDisplayNames={modelDisplayNames}
+                          modelAliases={modelAliases}
                         />
                       </div>
                     </SettingField>

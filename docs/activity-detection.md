@@ -1,6 +1,6 @@
 # Activity Detection
 
-Kangentic tracks whether each agent session is **thinking** (working on a turn), **idle** (waiting for input or done), or in a **permission** state (paused awaiting user approval). This drives the task card spinner, the desktop "task done" notification, idle-timeout suspend, and auto-focus behavior.
+Kangentic tracks whether each agent session is **thinking** (working on a turn), **idle** (waiting for input or done), or in a **permission** state (paused awaiting user approval). This drives the task card spinner, the desktop "task done" notification, the in-app idle toast, idle-timeout suspend, and auto-focus behavior.
 
 ## Why this matters
 
@@ -98,8 +98,12 @@ Three top-level states:
 - **`idle`** - agent is truly done. Notification fires. Auto-focus / auto-suspend can act. The
   desktop notify decision (cooldown, focus gate, active-project gate, title assembly) is owned by
   `src/main/notifications/desktop-notifier.ts`, which listens to `SessionManager`'s own `activity`
-  event directly rather than a renderer round-trip.
-- **`permission`** - agent paused awaiting user approval. Distinct from `idle` so the UI can render a different affordance (lock icon vs idle dot).
+  event directly rather than a renderer round-trip. The in-app toast half lives in the renderer
+  (`src/renderer/utils/idle-toast.ts`) and fires on the opposite condition: the user is on this
+  project but is not already looking at that session's terminal. It is edge-triggered off the
+  previous state, because `session:activity` also carries reason-only refreshes that must not
+  retrigger it.
+- **`permission`** - agent paused awaiting user approval. Distinct from `idle` so the UI can render a different affordance (lock icon vs idle dot). Both notification channels bucket it WITH `idle` through `requiresUserInteraction`; only the alert text differs.
 
 ## ActivityReason (discriminated union)
 
@@ -164,9 +168,14 @@ genuine human reply (`event:prompt`) from the agent resuming itself
 (`event:prompt:pty-activity`, `force-thinking`). `started_ms`/`ended_ms` (epoch integers, used by
 the `duration_ms` arithmetic and the `started_ms` index) are mirrored by `started_at`/`ended_at`
 (TEXT UTC ISO 8601, per `.claude/rules/utc-timestamps.md`) - the store derives the mirror from the
-same value it writes to the `_ms` column, so the two can never drift. Read via the
-`kangentic_get_activity_intervals` MCP tool (see `docs/mcp-server.md`) or `kangentic_query_db`. No
-desktop-facing IPC endpoint exists yet.
+same value it writes to the `_ms` column, so the two can never drift. Read directly via the
+`kangentic_get_activity_intervals` MCP tool (see `docs/mcp-server.md`) or `kangentic_query_db`, and
+indirectly by the usage dashboard: `ActivityIntervalStore.getActiveTotals(sinceMs, untilMs)` sums
+the CLOSED `'active'` intervals in a window behind `usage:getDashboardStats`, backing the
+`activeMs` / `activeSessionsCovered` KPI pair (the Avg Active tile) and the per-project Avg Active
+column. Those two travel together because this ledger covers FEWER sessions than `usage_history`
+does - per-interval recording shipped later - so the average is over the sessions with coverage,
+never over the Sessions count.
 
 Priority ladder: `permission > tool > subagent > background-shell > turn-active > idle`. Anchored to `state.activity` for consistency - when forced paths (Interrupted, forceIdle) commit a transition that diverges from the bare predicate (e.g. clearing all counters on Esc), the reason follows the committed state.
 
@@ -369,7 +378,7 @@ When the predicate flips from `thinking` to `idle` due to a Stop event or a coun
 Bypassed by:
 - `Interrupted` (Esc - instant, no flicker concern)
 - `forceIdle` (PTY-driven; already debounced 3s in PtyActivityTracker)
-- Stale-thinking watchdog (already 180s)
+- Stale-thinking watchdog (already 180s, or 30s on a heartbeat-forced turn)
 
 Configurable via `ActivityEngineOptions.idleStabilityWindowMs`. Tests set this to 0 for deterministic timing.
 
@@ -389,7 +398,7 @@ When only ANONYMOUS bg shells (`anonymousBackgroundShellCount`, no shell_id) hol
 
 ### 3. Stale-thinking watchdog (180s)
 
-Held by `turnActive` alone (no tools, no subagent, no bg shells) for 180 seconds. The matching Idle/Stop hook never arrived. Emits synthetic `Idle/Timeout`, clears `turnActive`. Bypasses the stability window (the 180s already debounced any flicker). Anchored to the FRESHER of `lastSignalAt` and `lastPtyOutputAt` (`anchor: 'signal-or-pty-output'`, resolved in `watchdogBaseTime`). `lastSignalAt` is refreshed by every non-log-only event - including `tool_end` (a `PostToolUse` hook is proof of liveness), so a foreground tool longer than 180s that ends while the turn continues gets a fresh window instead of being force-idled the instant it ends (task #229; pinned by `session-016-false-idle-after-long-foreground-tool`). `lastPtyOutputAt` is refreshed by `markPtyOutput` (called unconditionally on every PTY chunk by the spawn flow), so a single heavy generation turn that streams output for >180s with no nested hook event and a silent status heartbeat is not force-idled either (task #246; pinned by `session-019-false-idle-tool-less-streaming-gap`). A genuinely-finished turn sits at a quiet prompt with no PTY data (a blinking cursor is xterm-rendered terminal state, not a PTY chunk), so the anchor freezes and the safety net still fires at the threshold.
+Held by `turnActive` alone (no tools, no subagent, no bg shells) for 180 seconds. The matching Idle/Stop hook never arrived. Emits synthetic `Idle/Timeout`, clears `turnActive`. Bypasses the stability window (180s already debounced any flicker, or 30s on a heartbeat-forced turn). Anchored to the FRESHER of `lastSignalAt` and `lastPtyOutputAt` (`anchor: 'signal-or-pty-output'`, resolved in `watchdogBaseTime`). `lastSignalAt` is refreshed by every non-log-only event - including `tool_end` (a `PostToolUse` hook is proof of liveness), so a foreground tool longer than 180s that ends while the turn continues gets a fresh window instead of being force-idled the instant it ends (task #229; pinned by `session-016-false-idle-after-long-foreground-tool`). `lastPtyOutputAt` is refreshed by `markPtyOutput` (called unconditionally on every PTY chunk by the spawn flow), so a single heavy generation turn that streams output for >180s with no nested hook event and a silent status heartbeat is not force-idled either (task #246; pinned by `session-019-false-idle-tool-less-streaming-gap`). A genuinely-finished turn sits at a quiet prompt with no PTY data (a blinking cursor is xterm-rendered terminal state, not a PTY chunk), so the anchor freezes and the safety net still fires at the threshold.
 
 **Exception while the agent is BELIEVED parked (`parkedAnchor: 'signal'`).** A parked Claude TUI keeps repainting its statusline (rate-limit / context meter, spinner) = real PTY bytes, so the `signal-or-pty-output` anchor stays fresh forever and the net never fires - the safety net is blinded by the same parked-TUI behavior. The hold narrows its anchor to `signal` (`lastSignalAt` only, ignoring `lastPtyOutputAt`) while ANY of three "believed parked" signals holds:
 
@@ -557,7 +566,7 @@ The activity icon on each task card is wrapped in a tooltip rendering `ActivityR
 
 ### Activity Engine Debug Overlay (Developer settings tab)
 
-A per-project setting under **Developer → Activity Engine Debug Overlay** enables a floating panel showing live engine state:
+A global setting under **Developer → Activity Engine Debug Overlay** enables a floating panel showing live engine state. Global, not per-project: Developer is a system tab, and the overlay reads `globalConfig` precisely so a project override cannot toggle it. It shows:
 - Current activity + reason for each running session
 - Raw counters (tools, subagents, bg shells)
 - **Compensation counters** (`staleThinking`, `bgShellHatch`, `stuckPendingTools`, `forceThinking`, `forceIdle`, `unmatchedBgShellEnd`, `ignoredInnerSubagentStop`, `stuckSubagent`) - monotonic tallies of silent recovery events. In a clean session all eight read 0; any non-zero value flags a watchdog / forced transition / unattributable or discarded event that did not visibly flip the activity pill. (`ignoredInnerSubagentStop` is the benign exception: non-zero is normal on any session that ran subagents - it is the count of spurious empty-detail inner stops the engine correctly discarded.)
@@ -647,9 +656,9 @@ interface ActivityEngineOptions {
 
 Plumbed through `SessionManagerOptions.activityEngineOptions` for tests.
 
-### Per-project setting
+### Global setting
 
-`developer.activityDebugOverlay: boolean` - enables the debug overlay for the current project. Default false.
+`developer.activityDebugOverlay: boolean` - enables the debug overlay for every project on this install. Global-only, with no per-project override. Default false.
 
 ### Environment variables
 

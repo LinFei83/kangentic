@@ -1,4 +1,5 @@
 import type { ErrorEvent } from '@sentry/electron/main';
+import { moduleBasename, reportableModuleName } from './reportable-module-name';
 
 /**
  * Reads the two facts a native crash event needs but cannot carry, straight out
@@ -15,7 +16,17 @@ import type { ErrorEvent } from '@sentry/electron/main';
  *    and we report them as ours. DESKTOP-K is Homebrew ffmpeg's `ffprobe`
  *    failing to start; DESKTOP-N is a Puppeteer `chrome-headless-shell`;
  *    DESKTOP-Q is `/usr/local/share/dotnet/dotnet`. None loaded a single
- *    Kangentic image.
+ *    Kangentic image. DESKTOP-1D is another project's dev Electron Helper,
+ *    whose Electron images all sat under that project's own
+ *    `node_modules/electron/dist/Electron.app`. The packaged app now clears
+ *    those ports in node-pty's spawn-helper before exec
+ *    (build/spawn-helper/spawn-helper.c), for PTY children and for the shell
+ *    launches that go through pty/spawn/shell-launch.ts, so this check is the
+ *    backstop for older builds, for an unpackaged run with error reporting
+ *    switched on (`npm start` keeps node-pty's stock helper), and for anything
+ *    else started outside those paths. Such a crash is still a Kangentic
+ *    defect, since it is our port that leaked, so it becomes one grouped Sentry
+ *    warning rather than a fatal, and its dump never uploads.
  * 2. A dump uploaded after an upgrade wears the UPLOADING build's release tag and
  *    scope. DESKTOP-M crashed on 0.38.0 and is filed under 0.39.0, with
  *    breadcrumbs from a launch 21 minutes after the crash.
@@ -35,7 +46,8 @@ import type { ErrorEvent } from '@sentry/electron/main';
  *
  * Everything here fails OPEN. A parse this module does not fully trust returns
  * `ok: false`, and the caller then keeps the event untouched: a foreign crash
- * that slips through is noise, a real crash dropped by a parser bug is gone.
+ * that slips through is noise, while a real crash a parser bug misread as
+ * foreign loses its dump, and with it the stack.
  */
 
 const MINIDUMP_SIGNATURE = 'MDMP';
@@ -101,10 +113,11 @@ const MAX_STRING_LENGTH = 1024 * 100;
 const CRASHED_VERSION_ANNOTATION = '_version';
 
 /**
- * The macOS framework bundle. Present in every real Kangentic dump on that
- * platform and in no foreign process's image list.
+ * Where the macOS framework sits inside an app bundle. Every Electron app loads
+ * it, so on its own it identifies nobody (DESKTOP-1D). It is ours only under
+ * our own `<name>.app/`.
  */
-const ELECTRON_FRAMEWORK_MODULE = 'Electron Framework';
+const ELECTRON_FRAMEWORK_IN_BUNDLE = '/Contents/Frameworks/Electron Framework.framework/';
 
 /**
  * The header's `time_date_stamp` has one-second resolution and truncates down,
@@ -137,7 +150,10 @@ export type MinidumpIdentity =
 export interface NativeCrashContext {
   /** The directory every image of a healthy install sits under. */
   installRoot: string;
-  /** The app executable's file name, with extension. */
+  /**
+   * The app executable's file name, with extension. Empty switches off both
+   * relocation fallbacks in isOurModule, which is what an unpackaged run passes.
+   */
   appExecutableName: string;
   /** The version of the build doing the uploading, which is not the crashed one. */
   appVersion: string;
@@ -145,9 +161,23 @@ export interface NativeCrashContext {
   caseInsensitivePaths: boolean;
 }
 
+/**
+ * `foreign` carries the event already rewritten into the grouped warning. The
+ * caller must still keep that event's minidump from uploading: the dump holds
+ * another program's memory, and only the caller can reach the attachment.
+ */
 export type NativeCrashDecision =
-  | { action: 'drop'; mainModule: string }
+  | { action: 'foreign'; event: ErrorEvent }
   | { action: 'keep'; event: ErrorEvent };
+
+/** The title of the one Sentry issue every foreign crash groups into. */
+export const FOREIGN_CRASH_MESSAGE = "Foreign process crash reached Kangentic's crash database";
+
+/** Fixed, so every foreign crash lands in that one issue whatever program it was. */
+export const FOREIGN_CRASH_FINGERPRINT = ['foreign-process-crash'];
+
+/** The prefix the SDK gives the dump's own Crashpad annotation objects in `contexts.electron`. */
+const CRASHPAD_ANNOTATION_KEY_PREFIX = 'crashpad.';
 
 function requireRange(totalBytes: number, offset: number, length: number, what: string): void {
   if (offset < 0 || length < 0 || offset + length > totalBytes) {
@@ -342,16 +372,6 @@ export function readMinidumpIdentity(data: Uint8Array): MinidumpIdentity {
 }
 
 /**
- * The last path segment, splitting on either separator. `path.basename` splits
- * on the HOST's separator, and these paths come from the crashed machine, so a
- * Windows dump read on a Linux CI runner would come back whole.
- */
-function moduleBasename(modulePath: string): string {
-  const separator = Math.max(modulePath.lastIndexOf('/'), modulePath.lastIndexOf('\\'));
-  return separator === -1 ? modulePath : modulePath.slice(separator + 1);
-}
-
-/**
  * A prefix match that stops at a path-segment boundary. A bare `startsWith`
  * would read a sibling install as ours: `...\Programs\Kangentic` is a string
  * prefix of `...\Programs\KangenticBeta\injected.dll`, which shares no
@@ -383,7 +403,22 @@ function isOurModule(modulePath: string, context: NativeCrashContext): boolean {
     return true;
   }
 
-  return modulePath.includes(ELECTRON_FRAMEWORK_MODULE);
+  // The same relocation case for a helper process, whose basename is
+  // `Kangentic Helper (GPU)` and never the main executable's. electron-builder
+  // names the bundle and the executable from one `productName`, so our bundle
+  // is `<executable>.app`. The leading `/` keeps the match on a segment
+  // boundary, the same way isUnderPathRoot does. On Windows and Linux the
+  // derived name (`Kangentic.exe.app`, `kangentic.app`) never appears in a
+  // real path, so this needs no platform branch. It reads the raw path, not
+  // comparablePath, for the same reason. A bundle only exists on macOS, where
+  // caseInsensitivePaths is false. An unpackaged run passes an empty
+  // executable name, because `Electron.app` would match every dev Electron
+  // app; see resolveNativeCrashContext. The cost is a bundle the user renamed
+  // and then moved between the crash and the upload. Its helper crashes now
+  // read as foreign. A bundle renamed in place still keeps them through the
+  // install root.
+  if (context.appExecutableName.length === 0) return false;
+  return modulePath.includes(`/${context.appExecutableName}.app${ELECTRON_FRAMEWORK_IN_BUNDLE}`);
 }
 
 /**
@@ -408,11 +443,71 @@ function startedAfterCrash(appStartTime: unknown, crashTime: Date | undefined): 
 }
 
 /**
+ * Rewrite a foreign crash's event, in place, into the one grouped warning.
+ *
+ * What stays is Kangentic's own scope context, which is no more than any other
+ * event carries. What goes is everything that describes the foreign process or
+ * could name it: the SDK's fatal-crash shape, the `event.process` and
+ * `exit.reason` tags (the SDK sends every dump in the folder with the tags of
+ * whichever of our own processes triggered the scan, so on a foreign dump both
+ * describe the wrong process), the dump's own Crashpad annotations, which the
+ * SDK read out of that process's memory, and the breadcrumbs. The breadcrumb
+ * policy (src/shared/sentry-breadcrumbs.ts) keeps the `SHELL_EXEC` command line
+ * out of the trail, but Node's child_process breadcrumb still carries the
+ * spawned file's name, and a dump found at startup can carry an older build's
+ * unfiltered trail, so either can name exactly the program the `module` tag
+ * withholds. The module
+ * name itself goes through reportableModuleName, so a user's own binary is
+ * never named.
+ */
+function toForeignCrashWarning(
+  event: ErrorEvent,
+  identity: Extract<MinidumpIdentity, { ok: true }>,
+  context: NativeCrashContext,
+  foundAtStartup: boolean
+): ErrorEvent {
+  event.level = 'warning';
+  event.message = FOREIGN_CRASH_MESSAGE;
+  event.fingerprint = [...FOREIGN_CRASH_FINGERPRINT];
+  delete event.exception;
+  delete event.breadcrumbs;
+
+  const tags: NonNullable<ErrorEvent['tags']> = {
+    ...event.tags,
+    module: reportableModuleName(identity.mainModule),
+  };
+  delete tags['event.process'];
+  delete tags['exit.reason'];
+  event.tags = tags;
+
+  const electronContext = event.contexts?.electron;
+  if (electronContext) {
+    for (const key of Object.keys(electronContext)) {
+      if (key.startsWith(CRASHPAD_ANNOTATION_KEY_PREFIX)) delete electronContext[key];
+    }
+  }
+
+  // Enough to tell the one-time tail of dumps written before an upgrade from the
+  // residue that follows it. No `_version`: on a foreign dump that is the other
+  // program's version, which can be a user project's own.
+  event.contexts = {
+    ...event.contexts,
+    native_crash: {
+      crash_time: identity.crashTime?.toISOString(),
+      uploaded_by_version: context.appVersion,
+      found_at_startup: foundAtStartup,
+    },
+  };
+  return event;
+}
+
+/**
  * Decide what to do with a native crash event, given what its minidump says.
  *
- * Drops a crash that loaded none of our images. Otherwise corrects the event in
- * place: the breadcrumbs and, where they provably describe the uploading run
- * rather than the crashed one, the release tag and the app context.
+ * A crash that loaded none of our images becomes the grouped foreign-crash
+ * warning. Otherwise the event is corrected in place: the breadcrumbs and, where
+ * they provably describe the uploading run rather than the crashed one, the
+ * release tag and the app context.
  */
 export function correctNativeCrashEvent(
   event: ErrorEvent,
@@ -422,14 +517,23 @@ export function correctNativeCrashEvent(
   // An unreadable dump is not evidence of anything. Keep the event.
   if (!identity.ok) return { action: 'keep', event };
 
+  // Only a dump FOUND AT STARTUP describes a process this one did not watch die.
+  // The SDK's other two native paths fire from `render-process-gone` and
+  // `child-process-gone` in the running session: they build the event fresh, so
+  // its scope really is the crashed session's, and they are the only paths that
+  // stamp `exit.reason`. The startup scan is the one that replays a stored
+  // previous-run scope, and the one whose scope can therefore belong to a
+  // different run entirely. Correcting the other two would delete a good trail.
+  // Read before the foreign branch, which deletes that tag.
+  const foundAtStartup = event.tags?.['exit.reason'] === undefined;
+
   if (
     identity.moduleNames.length > 0 &&
     !identity.moduleNames.some((moduleName) => isOurModule(moduleName, context))
   ) {
     return {
-      action: 'drop',
-      // The basename only: a full path carries the crashing user's home directory.
-      mainModule: moduleBasename(identity.mainModule ?? '') || 'unknown',
+      action: 'foreign',
+      event: toForeignCrashWarning(event, identity, context, foundAtStartup),
     };
   }
 
@@ -439,15 +543,6 @@ export function correctNativeCrashEvent(
   // and start-time fields and reporting `scope_corrected` while leaving the
   // version it was supposed to correct untouched.
   const crashedVersion = identity.annotations[CRASHED_VERSION_ANNOTATION] || undefined;
-
-  // Only a dump FOUND AT STARTUP describes a process this one did not watch die.
-  // The SDK's other two native paths fire from `render-process-gone` and
-  // `child-process-gone` in the running session: they build the event fresh, so
-  // its scope really is the crashed session's, and they are the only paths that
-  // stamp `exit.reason`. The startup scan is the one that replays a stored
-  // previous-run scope, and the one whose scope can therefore belong to a
-  // different run entirely. Correcting the other two would delete a good trail.
-  const foundAtStartup = event.tags?.['exit.reason'] === undefined;
 
   let releaseCorrected = false;
   let scopeCorrected = false;

@@ -39,17 +39,27 @@ Any step in the release path that exists to guarantee something must fail when i
   replaces it, so a `needs:` entry missing from the condition lets the job run when its dependency
   FAILED. This is the specific shape that let three matrix legs race past a broken barrier. It is
   not only `always()`: `!cancelled()` reads like a cancellation guard and does the same thing, and
-  both publish jobs and the demo deploy use it.
+  both publish jobs, the demo deploy, and the poster job (`demo-posters`) use it.
 
 ## Enforcement (self-maintaining)
 
 - **Test (mechanical, CI):** `tests/unit/release-workflow-gates.test.ts` parses
   `.github/workflows/release.yml` and fails when any job whose `if:` carries a status-check
   function (`always()`, `cancelled()`, `failure()`) has a `needs:` entry its `if:` does not
-  reference, when the set of such jobs stops matching the five that exist (an empty filter would
+  reference, when the set of such jobs stops matching the six that exist (an empty filter would
   otherwise reduce that check to zero test cases and pass), when the draft release stops depending
   on `preflight-symbols`, when that preflight stops being able to fail (`exit 1`) or acquires an
   `environment:` approval gate, or when `release` loses the clause it inherits the gate through.
+  It also pins the poster job (`demo-posters`): that it checks out the same ref `publish-release`
+  did, that its version gate can fail, that it uploads with `--clobber` and says whether it
+  attached or replaced, and that the file still carries the decision keeping the zip out of
+  `scripts/release-assets.js` (a twelfth expected asset would fail the verify that runs before
+  the job). Its font step is pinned too: it runs before the shoot, it can fail when `fc-match`
+  resolves another family, and the family it installs is still in Tailwind's default
+  `--font-sans`, with no renderer stylesheet overriding the stack. The families ahead of it are
+  pinned as well, since a runner can resolve a generic like `system-ui` placed first. A Tailwind
+  bump that dropped the family or put one of those ahead of it would otherwise put the posters
+  back in the runner's fallback face with every step green.
   It also pins the two shapes v0.39.0 and v0.40.0 broke:
   `create-draft-release` must be able to FAIL on a release that is already published and
   incomplete (rather than reusing it, which lets electron-builder skip every upload while the
