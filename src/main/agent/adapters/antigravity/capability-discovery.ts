@@ -13,12 +13,10 @@
  *   `gemini-3.1-pro-high\tGemini 3.1 Pro (High)`.
  */
 
-import { exec, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execAsync, execFileAsync } from '../../../utility-process/off-main-exec';
+import { quoteCmdExecutable } from '../../../../shared/shell-quote';
 import type { AgentCapabilities } from '../../../../shared/types';
 
-const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
 
 const HELP_TIMEOUT_MS = 5000;
 const MODELS_TIMEOUT_MS = 10000;
@@ -32,7 +30,7 @@ export function resetAntigravityCapabilityCacheForTests(): void {
 
 async function runCli(cliPath: string, args: string[], timeoutMs: number): Promise<string> {
   if (process.platform === 'win32') {
-    const { stdout } = await execAsync(`"${cliPath}" ${args.join(' ')}`, {
+    const { stdout } = await execAsync(`${quoteCmdExecutable(cliPath)} ${args.join(' ')}`, {
       timeout: timeoutMs,
       windowsHide: true,
       maxBuffer: 1024 * 1024,

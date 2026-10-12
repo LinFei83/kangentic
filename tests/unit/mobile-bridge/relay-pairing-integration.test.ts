@@ -25,22 +25,16 @@ import {
 } from '@kangentic/protocol';
 import { startRelayDouble, type RelayDouble } from './relay-double';
 
-vi.mock('electron', () => ({
-  app: {
-    isReady: () => true,
-    whenReady: () => Promise.resolve(),
-  },
-  safeStorage: {
-    isEncryptionAvailable: () => true,
-    encryptString: (plaintext: string) => Buffer.from(`encrypted:${plaintext}`, 'utf8'),
-    decryptString: (buffer: Buffer) => {
-      const raw = buffer.toString('utf8');
-      if (raw.startsWith('encrypted:')) return raw.slice('encrypted:'.length);
-      throw new Error('safeStorage.decryptString: invalid ciphertext');
+vi.mock('electron', async () => {
+  const { createFakeSafeStorage } = await import('../helpers/fake-safe-storage');
+  return {
+    app: {
+      isReady: () => true,
+      whenReady: () => Promise.resolve(),
     },
-    getSelectedStorageBackend: () => 'keychain',
-  },
-}));
+    safeStorage: createFakeSafeStorage(),
+  };
+});
 
 const existsSyncSpy = vi.hoisted(() => vi.fn<(filePath: string) => boolean>());
 const readFileSyncSpy = vi.hoisted(() => vi.fn<(filePath: string, encoding: BufferEncoding) => string>());
@@ -76,7 +70,7 @@ const { PairingService } = await import('../../../src/main/mobile-bridge/pairing
 const { RelayClient } = await import('../../../src/main/mobile-bridge/transport/relay-client');
 const { generateEd25519KeyPair } = await import('@kangentic/protocol');
 type BridgeIdentityModule = typeof import('../../../src/main/mobile-bridge/identity');
-type BridgeIdentity = ReturnType<BridgeIdentityModule['loadOrCreateBridgeIdentity']>;
+type BridgeIdentity = Awaited<ReturnType<BridgeIdentityModule['loadOrCreateBridgeIdentity']>>;
 
 function testIdentity(): BridgeIdentity {
   return {

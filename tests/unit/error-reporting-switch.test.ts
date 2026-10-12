@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ErrorEvent } from '@sentry/electron/main';
 import { createRequire } from 'node:module';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 const mocks = vi.hoisted(() => {
@@ -310,6 +311,7 @@ describe('error reporting runtime behavior (module-state gated)', () => {
       commitRemainingBytes: 2_256_896,
       physicalTotalBytes: 34_060_931_072,
       physicalFreeBytes: 5_005_045_760,
+      physicalAvailableBytes: null,
     };
 
     it('forwards the sample to Sentry.setContext("host_memory", ...) only when active', async () => {
@@ -513,6 +515,180 @@ describe('error reporting runtime behavior (module-state gated)', () => {
       expect(minidumpCount(hint)).toBe(1);
     });
 
+    // A Browser pane page runs as Kangentic.exe, so its dump reads as ours, but its content is the
+    // user's page. The SDK stamps it through getRendererName (renderer-classification.ts).
+    it('reduces a Browser pane page crash to a warning without the page, and keeps its dump off the upload', async () => {
+      const beforeSend = await initAndGetBeforeSend();
+      const hint = minidumpHint(OUR_APP_MODULES, { _version: '0.39.0' });
+      const guestCrash = {
+        level: 'fatal',
+        platform: 'native',
+        release: 'Kangentic@0.39.0',
+        tags: { 'event.process': 'browser-guest', 'exit.reason': 'oom' },
+        exception: {
+          values: [{ type: 'OutOfMemoryError', value: 'Renderer reached heap limit', stacktrace: { frames: [{ function: 'leakyDevAppLoop' }] } }],
+        },
+        contexts: {
+          electron: {
+            crashed_url: 'https://intranet.example/private/report?id=42',
+            details: { reason: 'oom', exitCode: -536870904 },
+            'crashpad.url-chunk': 'https://intranet.example/private/report?id=42',
+            'crashpad.process_type': 'renderer',
+          },
+        },
+      };
+
+      const result = beforeSend(guestCrash, hint);
+
+      expect(result).toMatchObject({
+        level: 'warning',
+        message: 'A Browser pane page crashed',
+        fingerprint: ['browser-guest-crash', 'oom'],
+        tags: { 'event.process': 'browser-guest', 'exit.reason': 'oom' },
+      });
+      expect(result?.exception).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain('intranet.example');
+      expect(JSON.stringify(result)).not.toContain('leakyDevAppLoop');
+      // The exit reason and code survive, so the warning still says how the page died.
+      expect((result?.contexts as { electron: { details: unknown } }).electron.details).toEqual({
+        reason: 'oom',
+        exitCode: -536870904,
+      });
+      expect(minidumpCount(hint)).toBe(0);
+    });
+
+    it('leaves our own renderer crash, its stack, and its dump alone', async () => {
+      const beforeSend = await initAndGetBeforeSend();
+      const hint = minidumpHint(OUR_APP_MODULES, { _version: '0.39.0' });
+      const ownRendererCrash = {
+        level: 'fatal',
+        platform: 'native',
+        release: 'Kangentic@0.39.0',
+        tags: { 'event.process': 'renderer', 'exit.reason': 'oom' },
+        exception: { values: [{ type: 'OutOfMemoryError', value: 'Renderer reached heap limit' }] },
+      };
+
+      const result = beforeSend(ownRendererCrash, hint);
+
+      expect(result?.level).toBe('fatal');
+      expect(result?.exception).toBeDefined();
+      expect(minidumpCount(hint)).toBe(1);
+    });
+
+    // initErrorReporting sets getRendererName, which our own windows answer with undefined. The SDK's
+    // live renderer-crash path turns that into 'unknown' (not 'renderer'), so a crash of our own UI
+    // would otherwise land in the issue stream under event.process 'unknown', the tag a dump with
+    // unreadable annotations gets. The dump's process_type annotation (copied into contexts.electron
+    // under 'crashpad.') still says renderer, and beforeSend puts the tag back. This is the SDK's
+    // own event shape, not one derived from the code under test; sentry-guest-crash-contract.test.ts
+    // pins each SDK fact it rests on.
+    it('tags our own window renderer crash renderer again when the SDK stamped it unknown, and keeps the event and its dump', async () => {
+      const beforeSend = await initAndGetBeforeSend();
+      const hint = minidumpHint(OUR_APP_MODULES, { _version: '0.39.0' });
+      const ownWindowCrash = {
+        level: 'fatal',
+        platform: 'native',
+        release: 'Kangentic@0.39.0',
+        tags: { 'event.environment': 'native', 'event.process': 'unknown', 'exit.reason': 'crashed' },
+        contexts: {
+          electron: {
+            details: { reason: 'crashed', exitCode: -1073741819 },
+            'crashpad.process_type': 'renderer',
+          },
+        },
+      };
+
+      const result = beforeSend(ownWindowCrash, hint);
+
+      expect(result).toMatchObject({
+        level: 'fatal',
+        tags: { 'event.environment': 'native', 'event.process': 'renderer', 'exit.reason': 'crashed' },
+      });
+      expect(result?.message).toBeUndefined();
+      expect(minidumpCount(hint)).toBe(1);
+    });
+
+    it('tags it renderer again even when no dump rode along to read, since the tag does not depend on one', async () => {
+      const beforeSend = await initAndGetBeforeSend();
+      const ownWindowCrash = {
+        level: 'fatal',
+        platform: 'native',
+        tags: { 'event.environment': 'native', 'event.process': 'unknown', 'exit.reason': 'crashed' },
+        contexts: { electron: { 'crashpad.process_type': 'renderer' } },
+      };
+
+      const result = beforeSend(ownWindowCrash, {});
+
+      expect((result?.tags as Record<string, string>)['event.process']).toBe('renderer');
+    });
+
+    it('leaves a crash tagged unknown alone when the dump does not say renderer, as for DESKTOP-E', async () => {
+      const beforeSend = await initAndGetBeforeSend();
+      const hint = minidumpHint(OUR_APP_MODULES, { _version: '0.39.0' });
+      const unreadableAnnotationsCrash = {
+        level: 'fatal',
+        platform: 'native',
+        release: 'Kangentic@0.39.0',
+        tags: { 'event.environment': 'native', 'event.process': 'unknown', 'exit.reason': 'crashed' },
+      };
+
+      const result = beforeSend(unreadableAnnotationsCrash, hint);
+
+      expect((result?.tags as Record<string, string>)['event.process']).toBe('unknown');
+      expect(minidumpCount(hint)).toBe(1);
+    });
+
+    // The same event shape as the own-window case above, down to the native environment tag and a
+    // renderer process_type annotation (a guest is a renderer too), changing only the name the SDK
+    // got from getRendererName. A guest is a user's page: it is reduced, never put back as our own.
+    it('still reduces a Browser pane page crash to its warning and never tags it renderer, though its dump says renderer', async () => {
+      const beforeSend = await initAndGetBeforeSend();
+      const hint = minidumpHint(OUR_APP_MODULES, { _version: '0.39.0' });
+      const guestCrash = {
+        level: 'fatal',
+        platform: 'native',
+        release: 'Kangentic@0.39.0',
+        tags: { 'event.environment': 'native', 'event.process': 'browser-guest', 'exit.reason': 'crashed' },
+        contexts: {
+          electron: {
+            crashed_url: 'https://intranet.example/private/report?id=42',
+            details: { reason: 'crashed', exitCode: -1073741819 },
+            'crashpad.process_type': 'renderer',
+          },
+        },
+      };
+
+      const result = beforeSend(guestCrash, hint);
+
+      expect(result).toMatchObject({
+        level: 'warning',
+        message: 'A Browser pane page crashed',
+        fingerprint: ['browser-guest-crash', 'crashed'],
+        tags: { 'event.process': 'browser-guest' },
+      });
+      expect(JSON.stringify(result)).not.toContain('intranet.example');
+      // The scrub took the annotation the restore would have read, along with the rest.
+      expect((result?.contexts as { electron: Record<string, unknown> }).electron['crashpad.process_type']).toBeUndefined();
+      expect(minidumpCount(hint)).toBe(0);
+    });
+
+    it('names Browser pane renderers for the SDK, and drops their un-attributable exit messages', async () => {
+      const errorReporting = await importFreshErrorReporting();
+      errorReporting.initErrorReporting();
+      const options = mocks.sentryMock.init.mock.calls[0][0] as {
+        getRendererName: (contents: { id: number; getType: () => string }) => string | undefined;
+        ignoreErrors: Array<string | RegExp>;
+      };
+      expect(options.getRendererName({ id: 1, getType: () => 'webview' })).toBe('browser-guest');
+      expect(options.getRendererName({ id: 2, getType: () => 'window' })).toBeUndefined();
+
+      const matches = (message: string) =>
+        options.ignoreErrors.some((pattern) => (typeof pattern === 'string' ? message.includes(pattern) : pattern.test(message)));
+      expect(matches("'browser-guest' process exited with 'abnormal-exit'")).toBe(true);
+      // Our own renderer's exit keeps reporting, as before.
+      expect(matches("'renderer' process exited with 'crashed'")).toBe(false);
+    });
+
     it('leaves a live-reported error alone: it carries no minidump', async () => {
       const beforeSend = await initAndGetBeforeSend();
       const liveError = {
@@ -617,6 +793,82 @@ describe('error reporting runtime behavior (module-state gated)', () => {
       const tags = (result as { tags?: Record<string, string> } | null)?.tags;
 
       expect(tags?.stack_truncated).toBe('true');
+    });
+
+    it('rewrites this machine\'s home directory through the REAL Sentry.init() wiring, not only via a direct import of beforeSendEvent', async () => {
+      // The direct-import cases at the end of this file stay green if
+      // initErrorReporting() were pointed at a hand-rolled chain that tags and
+      // splits but forgets the redaction. Only the function Sentry.init actually
+      // received can catch that. The path comes from the real os.homedir(), which
+      // is exactly what the rewrite matches, so no personal path is hardcoded.
+      const beforeSend = await initAndGetBeforeSend();
+      const homePath = path.join(os.homedir(), 'project', 'file.js');
+
+      const result = beforeSend(
+        {
+          exception: { values: [{ type: 'Error', value: `Illegal value in ${homePath}` }] },
+          tags: { source: 'diff_viewer' },
+        },
+        {}
+      ) as ErrorEvent | null;
+
+      const exceptionValue = result?.exception?.values?.[0].value;
+      expect(exceptionValue).not.toContain(os.homedir());
+      expect(exceptionValue).toContain('~');
+      expect(result?.tags?.source).toBe('diff_viewer');
+    });
+
+    it('scrubs a home path in a field the foreign-crash rewrite KEEPS, and still removes the dump', async () => {
+      // toForeignCrashWarning keeps the tags (minus event.process and exit.reason)
+      // and the non-crashpad contexts. A home path in either survives the split
+      // and must be rewritten after it. Removing the dump stays the split's job:
+      // the redaction pass must not disturb the hint.
+      const beforeSend = await initAndGetBeforeSend();
+      const hint = minidumpHint(FFPROBE_MODULES);
+      const homePath = path.join(os.homedir(), 'project');
+
+      const result = beforeSend(
+        {
+          level: 'fatal',
+          platform: 'native',
+          release: 'Kangentic@0.39.0',
+          tags: { working_directory: homePath },
+          contexts: { app: { app_path: homePath } },
+        },
+        hint
+      ) as ErrorEvent | null;
+
+      expect(result).toMatchObject({
+        level: 'warning',
+        fingerprint: ['foreign-process-crash'],
+        tags: { module: 'ffprobe' },
+      });
+      expect(result?.tags?.working_directory).not.toContain(os.homedir());
+      expect(result?.tags?.working_directory).toContain('~');
+      expect((result?.contexts?.app as { app_path: string }).app_path).not.toContain(os.homedir());
+      expect(minidumpCount(hint)).toBe(0);
+    });
+
+    it('still returns the event when a value inside it throws on read, with the fields before it already scrubbed', async () => {
+      // A throwing beforeSend makes the SDK drop the event, so the redaction
+      // pass failing must surface as a half-scrubbed event, never as a lost one.
+      const beforeSend = await initAndGetBeforeSend();
+      const hostile = {};
+      Object.defineProperty(hostile, 'boom', {
+        enumerable: true,
+        get() {
+          throw new Error('getter exploded');
+        },
+      });
+      const event = { message: `failed in ${os.homedir()}`, extra: hostile };
+
+      let result: Record<string, unknown> | null = null;
+      expect(() => {
+        result = beforeSend(event, {});
+      }).not.toThrow();
+
+      expect(result).toBe(event);
+      expect(event.message).toBe('failed in ~');
     });
   });
 });
@@ -776,5 +1028,32 @@ describe('tagTruncatedStack', () => {
     const returned = beforeSendEvent(eventWithFrameCount(3), {});
     expect(returned).not.toBeNull();
     expect(returned?.tags?.stack_truncated).toBeUndefined();
+  });
+});
+
+/**
+ * An OS username is often a real name, and an exception message is free text that the SDK's path
+ * normalization never rewrites. DESKTOP-19's Monaco rethrow put about 48 home paths in the exception
+ * value. `beforeSendEvent` is the one hook every main and renderer event passes, so the rewrite
+ * lives there. The path is built from this machine's real home directory at run time, which is
+ * exactly what the rewrite matches, so the case holds on every platform without a hardcoded path.
+ */
+describe('beforeSendEvent: home directory in an event', () => {
+  it('rewrites this machine\'s home directory in the exception value and still returns the event', () => {
+    const homePath = path.join(os.homedir(), 'AppData', 'x.js');
+    const event: ErrorEvent = {
+      exception: { values: [{ type: 'Error', value: `Illegal value in ${homePath}` }] },
+      tags: { source: 'diff_viewer' },
+    };
+    const returned = beforeSendEvent(event, {});
+    expect(returned).not.toBeNull();
+    expect(returned?.exception?.values?.[0].value).not.toContain(os.homedir());
+    expect(returned?.exception?.values?.[0].value).toContain('~');
+    expect(returned?.tags?.source).toBe('diff_viewer');
+  });
+
+  it('rewrites after the native crash split, so a foreign-crash rewrite is scrubbed too', () => {
+    const event: ErrorEvent = { message: `crashed under ${os.homedir()}` };
+    expect(beforeSendEvent(event, {})?.message).toBe('crashed under ~');
   });
 });

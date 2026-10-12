@@ -23,7 +23,7 @@ import { McpServerTab } from './tabs/McpServerTab';
 import { BrowserAutomationTab } from './tabs/BrowserAutomationTab';
 import { NotificationsTab } from './tabs/NotificationsTab';
 import { MobileDevicesTab } from './tabs/MobileDevicesTab';
-import { MemoryTab } from './tabs/MemoryTab';
+import { KnowledgeGraphTab } from './tabs/KnowledgeGraphTab';
 import { PrivacyTab } from './tabs/PrivacyTab';
 import { DeveloperTab } from './tabs/DeveloperTab';
 import { HotkeysTab } from './tabs/HotkeysTab';
@@ -77,7 +77,8 @@ const TAB_ICONS: Record<string, ElementType> = {
   behavior: SlidersHorizontal,
   performance: Gauge,
   dictation: Mic,
-  memory: Brain,
+  // The title bar's Knowledge Graph icon, so the two read as one feature.
+  knowledgeGraph: Brain,
   hotkeys: Keyboard,
   mcpServer: Plug,
   browserAutomation: MousePointerClick,
@@ -150,7 +151,7 @@ export function SettingsContent({ activeTab, isSearching, searchQuery, matchingT
    *  This is the only caller that knows a write represents a deliberate user gesture -
    *  `config.set` also carries window layouts, model caches and announcement
    *  dismissals - which is why the check lives here and not in the IPC handler. */
-  const updateSetting = useCallback((partial: DeepPartial<AppConfig>, scope: SettingScope) => {
+  const updateSetting = useCallback((partial: DeepPartial<AppConfig>, scope: SettingScope, projectPath?: string) => {
     const reportFailure = (message: string) => {
       // One user gesture can still be many writes: NUMBER fields commit on every
       // keystroke (typing "120" writes 1, then 12, then 120), the Theme tab commits on
@@ -165,7 +166,7 @@ export function SettingsContent({ activeTab, isSearching, searchQuery, matchingT
       useToastStore.getState().addToast({ message, variant: 'error', duration: 12000 });
     };
 
-    const write = scope === 'project' ? updateProjectOverride(partial) : updateConfig(partial);
+    const write = scope === 'project' ? updateProjectOverride(partial, projectPath) : updateConfig(partial);
     void write.then(
       ({ persisted }) => {
         if (persisted) return;
@@ -210,7 +211,7 @@ export function SettingsContent({ activeTab, isSearching, searchQuery, matchingT
       case 'browserAutomation': return <BrowserAutomationTab globalConfig={globalConfig} />;
       case 'notifications': return <NotificationsTab globalConfig={globalConfig} />;
       case 'mobile': return <MobileDevicesTab globalConfig={globalConfig} />;
-      case 'memory': return <MemoryTab globalConfig={globalConfig} />;
+      case 'knowledgeGraph': return <KnowledgeGraphTab globalConfig={globalConfig} />;
       case 'privacy': return <PrivacyTab />;
       default: return null;
     }

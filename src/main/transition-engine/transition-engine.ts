@@ -511,6 +511,7 @@ export class TransitionEngine {
       effort: spawnOverrides?.effort ?? undefined,
       executionTarget,
       launchOptions,
+      taskProcessTag: task.id,
     };
     const command = adapter.buildCommand(commandOptions);
     const extraEnv = adapter.buildEnv?.(commandOptions) ?? null;
@@ -535,7 +536,11 @@ export class TransitionEngine {
       agentName: adapter.name,
       agentSessionId,
       isolatedSwimlaneId,
+      permissionMode,
       exitSequence: adapter.getExitSequence?.() ?? ['\x03'],
+      // The grid recorded on the record this spawn retires. Only used when no
+      // in-memory predecessor speaks for it (a resume after a desktop restart).
+      ...(intent.restoredGrid ? { restoredGrid: intent.restoredGrid } : {}),
     });
 
     console.log(`[spawnAgent] PTY session created: id=${session.id.slice(0, 8)} status=${session.status}`);
@@ -576,8 +581,8 @@ export class TransitionEngine {
       // Record the model/effort this spawn/resume actually applied via the CLI
       // flags (the same `spawnOverrides` that fed `commandOptions`). This is the
       // ground truth a later column transition diffs against, so a move into a
-      // same-valued column never re-injects `/model` / `/effort`. null = agent
-      // default (no flag).
+      // same-valued column never restarts the session. null = agent default
+      // (no flag).
       this.sessionRepo.updateAppliedSettings(ptySessionId, {
         model: spawnOverrides?.model ?? null,
         effort: spawnOverrides?.effort ?? null,

@@ -203,6 +203,15 @@ describe('release.yml job graph', () => {
     expect(preflight?.body).not.toMatch(/^ {4}environment:/m);
   });
 
+  it('authorizes the release build\'s symbol upload explicitly, not through the runner\'s ambient CI', () => {
+    // isSentryUploadAuthorized (scripts/build.js) needs CI or KANGENTIC_SENTRY_UPLOAD=1 beside the
+    // token. Without the flag a runner that stopped setting CI would skip every upload while the
+    // build went green, the v0.37.0 failure this rule exists for.
+    const build = stepBody('release', 'Build and publish');
+    expect(build).toContain('KANGENTIC_SENTRY_TOKEN: ${{ secrets.KANGENTIC_SENTRY_TOKEN }}');
+    expect(build).toMatch(/^ {10}KANGENTIC_SENTRY_UPLOAD: '1'$/m);
+  });
+
   it('reaches the build matrix from the preflight, transitively', () => {
     const releaseJob = jobs.find((job) => job.name === 'release');
     // `release` does not name preflight-symbols directly; it inherits the gate through
@@ -271,6 +280,48 @@ describe('release.yml job graph', () => {
     // The comment carrying the "not an expected asset" decision is pinned against the whole file
     // because parseJobs files a job's header comment under the PRECEDING job's body.
     expect(workflowSource).toContain('It is NOT in scripts/release-assets.js');
+  });
+
+  // electron-updater skips an update only when latest-mac.yml carries minimumSystemVersion, and
+  // electron-builder never writes it there, so without this step a Mac below the floor installs a
+  // build macOS refuses to open. It belongs in publish-release, which runs after every platform
+  // leg, so a re-run of the mac leg alone cannot put the unpatched file back. It runs before the
+  // verify and the --draft=false, so a failure leaves the release a draft. The script itself
+  // (value, Darwin mapping, feed shape) is pinned in patch-mac-update-info.test.ts.
+  it('patches latest-mac.yml with the minimum system version before verifying and publishing', () => {
+    const patch = stepBody('publish-release', 'Block macOS updates below the minimum system version');
+    expect(patch).toContain('node scripts/patch-mac-update-info.js "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"');
+    expect(patch).toContain('RELEASE_TAG: ${{ steps.version.outputs.tag }}');
+    expect(patch).toContain('GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}');
+    expect(patch).not.toContain('--dry-run');
+
+    const body = jobs.find((job) => job.name === 'publish-release')?.body ?? '';
+    const patchAt = body.indexOf('      - name: Block macOS updates below the minimum system version');
+    const verifyAt = body.indexOf('      - name: Verify the release carries every expected asset');
+    const publishAt = body.indexOf('      - name: Publish release with notes (remove draft status)');
+    expect(patchAt).toBeGreaterThan(-1);
+    expect(patchAt).toBeLessThan(verifyAt);
+    expect(verifyAt).toBeLessThan(publishAt);
+    expect(fs.existsSync(path.join(REPO_ROOT, 'scripts', 'patch-mac-update-info.js'))).toBe(true);
+  });
+
+  // A git ref name may contain `"`, `$` and a backtick, a dispatch's version input is free text,
+  // and a `${{ }}` expression is pasted into the script text before the shell parses it, so either
+  // value spliced into a `run:` line can run whatever it carries. Both only ever reach a step
+  // through an env assignment. The one other place the input appears is the create-tag job's
+  // `outputs:` value, which no shell reads.
+  it('never splices the release tag or the version input into a run script', () => {
+    const lines = workflowSource.split(/\r?\n/);
+    for (const expression of ['${{ steps.version.outputs.tag }}', '${{ inputs.version }}']) {
+      const uses = lines.filter((line) => line.includes(expression));
+      expect(uses.length, `${expression} is no longer read at all; update this pin`).toBeGreaterThan(0);
+      for (const line of uses) {
+        const isEnvAssignment = line.trim() === `${line.trim().split(':')[0]}: ${expression}`
+          && /^[A-Z_]+$/.test(line.trim().split(':')[0]);
+        const isJobOutput = line.trim() === `tag: v${expression}`;
+        expect(isEnvAssignment || isJobOutput, `${expression} is spliced into script text: ${line.trim()}`).toBe(true);
+      }
+    }
   });
 
   // The landing page shows the posters with no live frame beside them, so the job installs a face

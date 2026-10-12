@@ -3,19 +3,13 @@
  * `getSubagentTotalsByType`'s depth aggregates and `getTaskFanOuts`' recursive
  * resolution of `parent_tool_use_id` through `turn_spawn_links`.
  *
- * These cannot live in `conversation-usage-store.test.ts`. That suite models the
- * ledger with a hand-rolled fake `Database` whose `prepare` matches on SQL
- * substrings, which is right for the upsert and filter decisions it covers but
- * cannot EXECUTE anything - and the whole risk here is in the SQL itself: a
- * recursive CTE, a `COUNT(DISTINCT CASE WHEN ...)`, and a `GROUP BY` over a LEFT
- * JOIN that must keep unresolved rows rather than drop them.
- *
- * node:sqlite rather than better-sqlite3, for the reason task-ordering-sql.test.ts
- * records: better-sqlite3 is compiled for Electron's Node ABI, so a suite gated on
- * it skips everywhere, CI included, and a skipped test is not coverage.
+ * The whole risk here is in the SQL itself: a recursive CTE, a
+ * `COUNT(DISTINCT CASE WHEN ...)`, and a `GROUP BY` over a LEFT JOIN that must
+ * keep unresolved rows rather than drop them. Real better-sqlite3, the driver
+ * production uses, runs it.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { runProjectMigrations } from '../../src/main/db/migrations/project-schema';
 import {
   ConversationUsageStore,
@@ -23,44 +17,20 @@ import {
 } from '../../src/main/retrieval/conversation/conversation-usage-store';
 import type { TranscriptEntry } from '../../src/shared/types';
 import type DatabaseType from 'better-sqlite3';
-
-type SqliteModule = typeof import('node:sqlite');
-let sqlite: SqliteModule | null = null;
-try {
-  sqlite = await import('node:sqlite');
-} catch {
-  sqlite = null;
-}
-
-const describeWithSqlite = sqlite ? describe : describe.skip;
-
-/** See task-ordering-sql.test.ts - same adapter, same non-nesting caveat. */
-function adaptDatabase(database: InstanceType<SqliteModule['DatabaseSync']>): DatabaseType.Database {
-  const adapter = {
-    exec: (sql: string) => database.exec(sql),
-    prepare: (sql: string) => database.prepare(sql),
-    pragma: (statement: string) => database.prepare(`PRAGMA ${statement}`).all(),
-    transaction: <Args extends unknown[], Result>(body: (...args: Args) => Result) =>
-      (...args: Args): Result => {
-        database.exec('BEGIN');
-        try {
-          const result = body(...args);
-          database.exec('COMMIT');
-          return result;
-        } catch (error) {
-          database.exec('ROLLBACK');
-          throw error;
-        }
-      },
-  };
-  return adapter as unknown as DatabaseType.Database;
-}
+import { openTestDatabase } from './helpers/test-database';
 
 const TASK_ID = 'task-1';
 const NOW = '2026-09-15T00:00:00.000Z';
 
+const openDatabases: DatabaseType.Database[] = [];
+
+afterEach(() => {
+  for (const database of openDatabases.splice(0)) database.close();
+});
+
 function makeStore(): { store: ConversationUsageStore; db: DatabaseType.Database } {
-  const db = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
+  const db = openTestDatabase();
+  openDatabases.push(db);
   runProjectMigrations(db);
   return { store: new ConversationUsageStore(db), db };
 }
@@ -208,7 +178,7 @@ describe('extractTurnSpawnLinks', () => {
   });
 });
 
-describeWithSqlite('getSubagentTotalsByType depth aggregates', () => {
+describe('getSubagentTotalsByType depth aggregates', () => {
   it('counts nested turns and agents as a SUBSET of the totals, not an addend', () => {
     const { store, db } = makeStore();
     // Two agents of one type at depth 1, one at depth 2.
@@ -241,7 +211,7 @@ describeWithSqlite('getSubagentTotalsByType depth aggregates', () => {
   });
 });
 
-describeWithSqlite('getTaskFanOuts', () => {
+describe('getTaskFanOuts', () => {
   it('groups depth-1 subagents under the driver turn that spawned them', () => {
     const { store, db } = makeStore();
     insertDriverTurn(db, 'driver-1', 1000);
@@ -403,18 +373,21 @@ describeWithSqlite('getTaskFanOuts', () => {
   });
 });
 
-describeWithSqlite('recordSpawnLinks', () => {
-  it('is idempotent across a re-walk', () => {
+describe('recordSpawnLinks', () => {
+  it('is idempotent across a re-walk: an unchanged link writes nothing, a changed one is rewritten', () => {
     const { store, db } = makeStore();
+    const readLinks = () => db.prepare('SELECT tool_use_id, turn_uuid, recorded_at FROM turn_spawn_links').all() as Array<{
+      tool_use_id: string; turn_uuid: string; recorded_at: string;
+    }>;
     store.recordSpawnLinks([{ toolUseId: 'toolu_1', turnUuid: 'driver-1' }], NOW);
     store.recordSpawnLinks([{ toolUseId: 'toolu_1', turnUuid: 'driver-1' }], '2026-09-16T00:00:00.000Z');
 
-    const rows = db.prepare('SELECT tool_use_id, turn_uuid, recorded_at FROM turn_spawn_links').all() as Array<{
-      tool_use_id: string; turn_uuid: string; recorded_at: string;
-    }>;
-    expect(rows).toHaveLength(1);
-    expect(rows[0].turn_uuid).toBe('driver-1');
-    expect(rows[0].recorded_at).toBe('2026-09-16T00:00:00.000Z');
+    // The same pair again leaves the row as it was: a re-walk of a long
+    // conversation must not rewrite every link it already holds.
+    expect(readLinks()).toEqual([{ tool_use_id: 'toolu_1', turn_uuid: 'driver-1', recorded_at: NOW }]);
+
+    store.recordSpawnLinks([{ toolUseId: 'toolu_1', turnUuid: 'driver-2' }], '2026-09-17T00:00:00.000Z');
+    expect(readLinks()).toEqual([{ tool_use_id: 'toolu_1', turn_uuid: 'driver-2', recorded_at: '2026-09-17T00:00:00.000Z' }]);
   });
 
   it('writes nothing on an empty batch', () => {

@@ -1,6 +1,6 @@
 /**
  * UI tests for the launch-option toggles inside the Agent settings tab
- * (`agent-launch-option-fields.tsx`): one `SettingToggleRow` per
+ * (`agent-launch-option-fields.tsx`): one `CardToggleRow` per
  * `AgentDetectionInfo.launchOptions` entry declared by the currently-selected
  * agent's adapter (e.g. Codex's "Disable ChatGPT Apps"), stored at the global
  * `AppConfig.agent.launchOptions[agentName][optionId]`.
@@ -30,7 +30,7 @@
  */
 import { test, expect, chromium, type Browser, type Page } from '@playwright/test';
 import path from 'node:path';
-import { waitForViteReady, dismissOnboardingChecklist } from './helpers';
+import { waitForViteReady, dismissOnboardingChecklist, gotoVite } from './helpers';
 
 test.describe.configure({ mode: 'parallel' });
 
@@ -53,7 +53,7 @@ async function launch(): Promise<{ browser: Browser; page: Page }> {
   const context = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
   const page = await context.newPage();
   await page.addInitScript({ path: MOCK_SCRIPT });
-  await page.goto(VITE_URL);
+  await gotoVite(page, VITE_URL);
   await page.waitForLoadState('load');
   await page.waitForSelector('text=Kangentic', { timeout: 15000 });
   return { browser, page };
@@ -154,7 +154,8 @@ test.describe('AgentTab - Launch Option fields', () => {
 
     const toggle = page.getByRole('switch', { name: LAUNCH_OPTION_LABEL, exact: true });
     await expect(toggle).toBeVisible();
-    await expect(page.getByText(LAUNCH_OPTION_DESCRIPTION)).toBeVisible();
+    // The description sits behind the row's info icon, which names it.
+    await expect(page.getByRole('button', { name: `About ${LAUNCH_OPTION_LABEL}: ${LAUNCH_OPTION_DESCRIPTION}` })).toBeVisible();
 
     await closeSettings(page);
   });
@@ -164,7 +165,7 @@ test.describe('AgentTab - Launch Option fields', () => {
     await openAgentSettingsTabAs(page, 'claude');
 
     await expect(page.getByRole('switch', { name: LAUNCH_OPTION_LABEL, exact: true })).toHaveCount(0);
-    await expect(page.getByText(LAUNCH_OPTION_DESCRIPTION)).toHaveCount(0);
+    await expect(page.getByRole('button', { name: `About ${LAUNCH_OPTION_LABEL}: ${LAUNCH_OPTION_DESCRIPTION}` })).toHaveCount(0);
 
     await closeSettings(page);
   });

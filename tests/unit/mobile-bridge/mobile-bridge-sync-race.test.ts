@@ -15,16 +15,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { CAPABILITY_VERBS } from '@kangentic/protocol';
 
-vi.mock('electron', () => ({
-  app: { isReady: () => true, whenReady: () => Promise.resolve() },
-  safeStorage: {
-    isEncryptionAvailable: () => true,
-    encryptString: (plaintext: string) => Buffer.from(`encrypted:${plaintext}`, 'utf8'),
-    decryptString: (buffer: Buffer) => buffer.toString('utf8').replace(/^encrypted:/, ''),
-    getSelectedStorageBackend: () => 'keychain',
-  },
-  ipcMain: { handle: vi.fn(), on: vi.fn(), removeHandler: vi.fn() },
-}));
+vi.mock('electron', async () => {
+  const { createFakeSafeStorage } = await import('../helpers/fake-safe-storage');
+  return {
+    app: { isReady: () => true, whenReady: () => Promise.resolve() },
+    safeStorage: createFakeSafeStorage(),
+    ipcMain: { handle: vi.fn(), on: vi.fn(), removeHandler: vi.fn() },
+  };
+});
 
 vi.mock('../../../src/main/analytics/analytics', () => ({
   trackEvent: vi.fn(),
@@ -56,9 +54,17 @@ const fakeDevice = {
 
 vi.mock('../../../src/main/mobile-bridge/identity', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../src/main/mobile-bridge/identity')>()),
-  loadBridgeIdentity: () => fakeIdentity,
-  loadOrCreateBridgeIdentity: () => fakeIdentity,
+  loadBridgeIdentity: async () => fakeIdentity,
+  loadOrCreateBridgeIdentity: async () => fakeIdentity,
 }));
+
+/** runSyncSessions() first awaits the (already settled) secure-storage warm-up, so a session opens a few microtasks after reconcile(). */
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
 
 vi.mock('../../../src/main/mobile-bridge/roster-store', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../src/main/mobile-bridge/roster-store')>()),
@@ -119,21 +125,21 @@ describe('MobileBridgeService.syncSessions() reentrancy', () => {
     // subscribes to sessionManager and pushes onto boardEvents - a real
     // EventEmitter and a stub bus keep that wiring inert here.
     service.attachContext({ sessionManager: Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() }), boardEvents: { emitBoardChanged: vi.fn() } } as never);
+    await service.whenStorageReady();
 
     // Fire two reconciles with the SAME config while the first is still
     // suspended on transport.connect(). Without the guard, both would each
     // create a BridgeSession for the same device.
     service.reconcile({ enabled: true, relayUrl: 'wss://relay.example.com' });
     service.reconcile({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    await flushMicrotasks();
 
     // The dial is still pending: exactly one open attempt is in flight.
     expect(bridgeSessionInstances).toBe(1);
 
     // Release the dial and let the coalesced follow-up run settle.
     releaseConnect?.();
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushMicrotasks();
 
     // Still exactly one session; the second reconcile coalesced instead of
     // opening a duplicate, orphaned session.
@@ -152,9 +158,9 @@ describe('MobileBridgeService.syncSessions() reentrancy', () => {
 
     const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
     service.attachContext({ sessionManager: Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() }), boardEvents: { emitBoardChanged: vi.fn() } } as never);
+    await service.whenStorageReady();
     service.reconcile({ enabled: true, relayUrl: 'wss://relay.example.com' });
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushMicrotasks();
 
     expect(bridgeSessionInstances).toBe(1);
     expect(createdBridgeSessions[0].dispose).not.toHaveBeenCalled();
@@ -162,8 +168,7 @@ describe('MobileBridgeService.syncSessions() reentrancy', () => {
 
     // A later sync still sees the session in the map - no duplicate opens.
     service.reconcile({ enabled: true, relayUrl: 'wss://relay.example.com' });
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushMicrotasks();
     expect(bridgeSessionInstances).toBe(1);
 
     service.dispose();

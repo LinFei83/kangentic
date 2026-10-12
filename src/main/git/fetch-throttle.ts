@@ -179,12 +179,18 @@ function fetchCacheKey(projectPath: string, branch: string): string {
  * bare `<branch>` says nothing about why. Callers that surface staleness
  * (spawn-progress notes, warning toasts) key off the outcome, never the
  * return value.
+ *
+ * `options.nonInteractive` runs the fetch with `nonInteractiveGitEnv()`, for a
+ * fetch with nobody at the desk to answer a prompt (a Command Terminal a phone
+ * starts): a credential dialog then fails the fetch, which falls back to the
+ * local branch like every other failure, instead of waiting on a window no one
+ * will click.
  */
 export async function fetchIfStale(
   _git: SimpleGit,
   projectPath: string,
   branch: string,
-  options?: { signal?: AbortSignal; onOutcome?: (outcome: FetchIfStaleOutcome) => void },
+  options?: { signal?: AbortSignal; onOutcome?: (outcome: FetchIfStaleOutcome) => void; nonInteractive?: boolean },
 ): Promise<string> {
   const key = fetchCacheKey(projectPath, branch);
   const lastFetch = fetchCache.get(key);
@@ -194,9 +200,17 @@ export async function fetchIfStale(
   }
 
   try {
-    await runGitWithTimeout(projectPath, ['fetch', 'origin', branch], {
+    // --no-auto-gc: skip the `git maintenance run --auto` a fetch ends with.
+    // Windows cannot detach it, so when loose objects (every agent commit adds
+    // some) pass gc.auto, the gc runs inside this fetch: measured 1.7 s against
+    // 0.12 s without, on a small repo. A gc that outlasts FETCH_TIMEOUT_MS would
+    // even turn a successful fetch into a timeout and a stale start point.
+    // Every Kangentic fetch skips it, so maintenance runs on the next commit,
+    // or on a fetch the developer runs themselves.
+    await runGitWithTimeout(projectPath, ['fetch', '--no-auto-gc', 'origin', branch], {
       timeoutMs: FETCH_TIMEOUT_MS,
       signal: options?.signal,
+      ...(options?.nonInteractive ? { env: nonInteractiveGitEnv() } : {}),
     });
     fetchCache.set(key, Date.now());
     reportOutcome(options?.onOutcome, { kind: 'fetched' });
@@ -247,23 +261,7 @@ export async function fetchIfStale(
  */
 export async function fetchAllRemotesIfStale(checkPath: string, options?: FetchAllRemotesOptions): Promise<void> {
   const env = options?.nonInteractive ? nonInteractiveGitEnv() : undefined;
-  let repoIdentityPath = checkPath;
-  try {
-    const commonDirOutput = (
-      await runGitWithTimeout(checkPath, ['rev-parse', '--git-common-dir'], {
-        timeoutMs: PROBE_FETCH_TIMEOUT_MS,
-        env,
-      })
-    ).stdout.trim();
-    if (commonDirOutput) {
-      // `--git-common-dir` can be relative (e.g. ".git"); resolve against the
-      // probed path so worktrees of the same repo share one identity.
-      repoIdentityPath = path.resolve(checkPath, commonDirOutput);
-    }
-  } catch {
-    // Fall back to checkPath: the throttle degrades to per-worktree, still correct.
-  }
-
+  const repoIdentityPath = await resolveRepoIdentity(checkPath, env);
   const cacheKey = fetchCacheKey(repoIdentityPath, ALL_REMOTES_SENTINEL);
   const lastFetch = fetchCache.get(cacheKey);
   if (lastFetch && Date.now() - lastFetch < FETCH_THROTTLE_MS) {
@@ -277,7 +275,13 @@ export async function fetchAllRemotesIfStale(checkPath: string, options?: FetchA
 
   const fetchPromise = (async () => {
     try {
-      await runGitWithTimeout(checkPath, ['fetch', '--all', '--prune', '--quiet'], {
+      // --no-auto-gc for the same reason as fetchIfStale, plus two of this
+      // fetch's own. It is capped at 5 s, so on Windows a due gc running inside
+      // it gets killed and the fetch counts as failed (stale counts, a slower
+      // Done check). And the background scheduler runs it while holding the
+      // project's git queue, where that gc would hold up worktree creation.
+      // Commits, the agents' and the user's, still run git's maintenance.
+      await runGitWithTimeout(checkPath, ['fetch', '--all', '--prune', '--quiet', '--no-auto-gc'], {
         timeoutMs: PROBE_FETCH_TIMEOUT_MS,
         env,
       });
@@ -295,4 +299,37 @@ export async function fetchAllRemotesIfStale(checkPath: string, options?: FetchA
 
   inFlightAllRemoteFetches.set(cacheKey, fetchPromise);
   return fetchPromise;
+}
+
+/**
+ * The repo identity every worktree of one repository shares: its git common
+ * dir, falling back to `checkPath` when git cannot say. `--git-common-dir` can
+ * be relative (e.g. ".git"), so it resolves against the probed path.
+ */
+async function resolveRepoIdentity(checkPath: string, env: NodeJS.ProcessEnv | undefined): Promise<string> {
+  try {
+    const commonDirOutput = (
+      await runGitWithTimeout(checkPath, ['rev-parse', '--git-common-dir'], {
+        timeoutMs: PROBE_FETCH_TIMEOUT_MS,
+        env,
+      })
+    ).stdout.trim();
+    if (commonDirOutput) return path.resolve(checkPath, commonDirOutput);
+  } catch {
+    // Fall back to checkPath: the throttle degrades to per-worktree, still correct.
+  }
+  return checkPath;
+}
+
+/**
+ * When the repo that owns `checkPath` last completed a fetch of all remotes,
+ * or null if it has not this session. Every caller of `fetchAllRemotesIfStale`
+ * stamps the same entry whichever worktree it passed (opening the Changes
+ * panel, the Done check, the drag prefetch, the scheduler itself), because the
+ * key is the shared git common dir. The auto-fetch scheduler reads this to
+ * count its 5 minutes from the last fetch anyone made, not from its own.
+ */
+export async function lastAllRemotesFetchAt(checkPath: string): Promise<number | null> {
+  const repoIdentityPath = await resolveRepoIdentity(checkPath, nonInteractiveGitEnv());
+  return fetchCache.get(fetchCacheKey(repoIdentityPath, ALL_REMOTES_SENTINEL)) ?? null;
 }

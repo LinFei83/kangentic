@@ -3,19 +3,17 @@
  * and for the `updateMetrics` -> `getSummaryForTask` round-trip with
  * `tool_breakdown`.
  *
- * Both helpers are module-private. They are exercised indirectly through
- * `getSummaryForTask`, which is the sole caller of `parseToolBreakdown`.
- * This approach is preferred over exporting the helpers because:
- *   - it tests the actual integration path (DB column -> deserialized PerToolStat[])
- *   - it avoids exposing implementation details in the public module surface
- *   - it gives the same branch coverage as direct tests
+ * They are exercised through `getSummaryForTask`, because that tests the
+ * actual integration path (DB column -> deserialized PerToolStat[]) and gives
+ * the same branch coverage as direct tests.
  *
- * better-sqlite3 is compiled for Electron's Node ABI and cannot load under
- * vitest's system Node. All tests use a queue-based mock DB that returns
- * pre-programmed values per `prepare()` call, matching the exact call order
- * inside `getSummaryForTask`.
+ * All tests use a queue-based mock DB that returns pre-programmed values per
+ * `prepare()` call, matching the exact call order inside `getSummaryForTask`.
+ * `tests/unit/helpers/test-database.ts` opens a real better-sqlite3 database
+ * if one is wanted.
  */
 
+import { passThroughTransaction } from './helpers/transaction-double';
 import { describe, it, expect, vi } from 'vitest';
 import type Database from 'better-sqlite3';
 import { SessionRepository } from '../../src/main/db/repositories/session-repository';
@@ -32,9 +30,12 @@ import type { SessionRecord } from '../../src/shared/types';
  *   call 0 - the latestRecord query (returns a SessionRecord row)
  *   call 1 - the aggregated query (SUM cost/duration/compactions/tool calls/lines)
  *   call 2 - the tokens query (latest row per lineage, SUMmed)
+ * and then `prepare().all()` once, for every costed record's `tool_breakdown`.
  *
  * Pass `latestRecordReturn` for call 0, `aggregateReturn` for call 1, and
  * `tokensReturn` for call 2. Additional `prepare()` calls fall back to undefined.
+ * The breakdown query answers with the latest record's own `tool_breakdown`
+ * under the tests' task id, as a task with a single costed record would.
  */
 function createGetSummaryMockDb(options: {
   latestRecordReturn: unknown;
@@ -46,6 +47,8 @@ function createGetSummaryMockDb(options: {
     options.aggregateReturn,
     options.tokensReturn ?? { total_input_tokens: 0, total_output_tokens: 0 },
   ];
+  const latestBreakdown = (options.latestRecordReturn as { tool_breakdown?: string | null } | undefined)?.tool_breakdown ?? null;
+  const breakdownRows = latestBreakdown === null ? [] : [{ task_id: 'task-1', tool_breakdown: latestBreakdown }];
   let callIndex = 0;
 
   const mockDb = {
@@ -55,7 +58,7 @@ function createGetSummaryMockDb(options: {
       return {
         run: vi.fn(() => ({ changes: 0 })),
         get: vi.fn((..._params: unknown[]) => getReturns[index]),
-        all: vi.fn(() => []),
+        all: vi.fn(() => breakdownRows),
       };
     }),
   } as unknown as Database.Database;
@@ -166,6 +169,28 @@ describe('parseToolBreakdown (via getSummaryForTask)', () => {
     expect(summary).not.toBeNull();
     expect(summary!.toolBreakdown).toEqual([
       { toolName: 'Bash', callCount: 3, totalDurationMs: 1500, interruptedCount: 1, costUsd: 0.01, inputTokens: 200, outputTokens: 50 },
+    ]);
+  });
+
+  it('keeps resultTokens through the parse, and drops an entry whose resultTokens is not a number', () => {
+    const row = JSON.stringify([
+      { toolName: 'Read', callCount: 2, totalDurationMs: 200, interruptedCount: 0, resultTokens: 1500 },
+      { toolName: 'Bash', callCount: 1, totalDurationMs: 50, interruptedCount: 0, resultTokens: 'lots' },
+    ]);
+    const summary = getSummaryWithBreakdown(row);
+    expect(summary!.toolBreakdown).toEqual([
+      { toolName: 'Read', callCount: 2, totalDurationMs: 200, interruptedCount: 0, resultTokens: 1500 },
+    ]);
+  });
+
+  it('keeps waitedCount through the parse, and drops an entry whose waitedCount is not a number', () => {
+    const row = JSON.stringify([
+      { toolName: 'ExitPlanMode', callCount: 1, totalDurationMs: 0, interruptedCount: 0, waitedCount: 1 },
+      { toolName: 'Bash', callCount: 1, totalDurationMs: 50, interruptedCount: 0, waitedCount: 'yes' },
+    ]);
+    const summary = getSummaryWithBreakdown(row);
+    expect(summary!.toolBreakdown).toEqual([
+      { toolName: 'ExitPlanMode', callCount: 1, totalDurationMs: 0, interruptedCount: 0, waitedCount: 1 },
     ]);
   });
 
@@ -339,7 +364,7 @@ describe('updateMetrics tool_breakdown round-trip', () => {
 // (cost / duration / compactions) and the latest-per-lineage token row onto the
 // summary, instead of taking cost/tokens/duration from the latest record.
 // (The SQL aggregation itself - SUM across rows, window-function token dedup -
-// runs only against real better-sqlite3, which can't load under vitest; it is
+// needs a real database, which this mock-based suite does not use; it is
 // validated empirically and by the transcript-usage test below. This locks the
 // field mapping so a future refactor can't silently revert to "latest record".)
 // ---------------------------------------------------------------------------
@@ -519,6 +544,88 @@ describe('SessionRepository.updateTranscriptToolCounts', () => {
     const { sql } = capturedCalls[0];
     expect(sql).toMatch(/WHERE\s+id\s*=\s*\?\s*AND\s*\(\s*tool_call_count\s+IS\s+NULL\s+OR\s+tool_call_count\s*=\s*0\s*\)/i);
   });
+
+  /**
+   * A DB whose guarded fill matches no row (the live count is healthy), and
+   * whose SELECT returns `liveBreakdown`. Captures every `run`.
+   */
+  function createHealthyLiveCountMockDb(liveBreakdown: string | null): {
+    db: Database.Database;
+    capturedCalls: Array<{ sql: string; params: unknown[] }>;
+  } {
+    const capturedCalls: Array<{ sql: string; params: unknown[] }> = [];
+    const db = {
+      prepare: vi.fn((sql: string) => ({
+        run: vi.fn((...params: unknown[]) => {
+          capturedCalls.push({ sql, params });
+          return { changes: /tool_call_count IS NULL/i.test(sql) ? 0 : 1 };
+        }),
+        get: vi.fn(() => ({ tool_breakdown: liveBreakdown })),
+        all: vi.fn(() => []),
+      })),
+    } as unknown as Database.Database;
+    return { db, capturedCalls };
+  }
+
+  it('merges resultTokens onto a healthy live breakdown by tool name, keeping live counts and durations', () => {
+    const live = [
+      { toolName: 'Read', callCount: 40, totalDurationMs: 12_000, interruptedCount: 1 },
+      { toolName: 'Bash', callCount: 9, totalDurationMs: 30_000, interruptedCount: 0 },
+    ];
+    const { db, capturedCalls } = createHealthyLiveCountMockDb(JSON.stringify(live));
+    const repo = new SessionRepository(db);
+
+    repo.updateTranscriptToolCounts('session-abc', {
+      toolCallCount: 35,
+      toolBreakdown: [
+        { toolName: 'Read', callCount: 35, totalDurationMs: 0, interruptedCount: 0, resultTokens: 41_000 },
+        { toolName: 'Glob', callCount: 2, totalDurationMs: 0, interruptedCount: 0, resultTokens: 300 },
+      ],
+    });
+
+    expect(capturedCalls).toHaveLength(2);
+    expect(capturedCalls[1].sql).toMatch(/UPDATE\s+sessions\s+SET\s+tool_breakdown\s*=\s*\?\s+WHERE\s+id\s*=\s*\?/i);
+    expect(capturedCalls[1].sql).not.toMatch(/tool_call_count/i);
+    expect(JSON.parse(capturedCalls[1].params[0] as string)).toEqual([
+      { toolName: 'Read', callCount: 40, totalDurationMs: 12_000, interruptedCount: 1, resultTokens: 41_000 },
+      { toolName: 'Bash', callCount: 9, totalDurationMs: 30_000, interruptedCount: 0 },
+    ]);
+    expect(capturedCalls[1].params[1]).toBe('session-abc');
+  });
+
+  it('issues no write when the stored breakdown holds an entry the shape guard rejects', () => {
+    // The merge branch used to read through the filtering parser and save the
+    // filtered array back, which deleted the bad entry. It must leave the row whole.
+    // The byte-for-byte check against a real database is in tool-breakdown-repair.test.ts.
+    const live = [
+      { toolName: 'Read', callCount: 40, totalDurationMs: 12_000, interruptedCount: 1 },
+      { toolName: 'X', callCount: 'bad', totalDurationMs: 0, interruptedCount: 0 },
+    ];
+    const { db, capturedCalls } = createHealthyLiveCountMockDb(JSON.stringify(live));
+    const repo = new SessionRepository(db);
+
+    repo.updateTranscriptToolCounts('session-abc', {
+      toolCallCount: 35,
+      toolBreakdown: [{ toolName: 'Read', callCount: 35, totalDurationMs: 0, interruptedCount: 0, resultTokens: 41_000 }],
+    });
+
+    // Only the guarded fill ran (it matched no row); no second UPDATE followed.
+    expect(capturedCalls).toHaveLength(1);
+    expect(capturedCalls[0].sql).toMatch(/tool_call_count IS NULL/i);
+  });
+
+  it('writes nothing more when the transcript carries no resultTokens', () => {
+    const live = [{ toolName: 'Read', callCount: 4, totalDurationMs: 100, interruptedCount: 0 }];
+    const { db, capturedCalls } = createHealthyLiveCountMockDb(JSON.stringify(live));
+    const repo = new SessionRepository(db);
+
+    repo.updateTranscriptToolCounts('session-abc', {
+      toolCallCount: 4,
+      toolBreakdown: [{ toolName: 'Read', callCount: 4, totalDurationMs: 0, interruptedCount: 0 }],
+    });
+
+    expect(capturedCalls).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -560,13 +667,19 @@ function createListAllSummariesMockDb(rows: ListAllSummariesAggregateRow[]): {
   capturedSql: string[];
 } {
   const capturedSql: string[] = [];
+  // The fixture's `tool_breakdown` stands for its task's one costed record, and
+  // answers the separate breakdown query (every costed row's breakdown).
+  const breakdownRows = rows
+    .filter((row) => row.tool_breakdown !== null)
+    .map((row) => ({ task_id: row.task_id, tool_breakdown: row.tool_breakdown }));
   const db = {
     prepare: vi.fn((sql: string) => {
       capturedSql.push(sql);
+      const isBreakdownQuery = /SELECT\s+task_id\s*,\s*tool_breakdown\s+FROM\s+sessions/i.test(sql);
       return {
         run: vi.fn(() => ({ changes: 0 })),
         get: vi.fn(),
-        all: vi.fn(() => rows),
+        all: vi.fn(() => (isBreakdownQuery ? breakdownRows : rows)),
       };
     }),
   } as unknown as Database.Database;
@@ -642,12 +755,14 @@ describe('listAllSummaries lifetime rollup (SQL-aggregated)', () => {
     expect(summary.toolBreakdown).toEqual([]);
   });
 
-  it('issues ONE query whose SQL carries the load-bearing aggregation clauses', () => {
+  it('issues one aggregate query plus one breakdown query, whose SQL carries the load-bearing clauses', () => {
     const { db, capturedSql } = createListAllSummariesMockDb([]);
     const repo = new SessionRepository(db);
     repo.listAllSummaries();
 
-    expect(capturedSql).toHaveLength(1);
+    expect(capturedSql).toHaveLength(2);
+    // The breakdown merges over exactly the costed rows the count sums.
+    expect(capturedSql[1]).toMatch(/WHERE\s+total_cost_usd\s+IS\s+NOT\s+NULL\s+AND\s+tool_breakdown\s+IS\s+NOT\s+NULL/i);
     const sql = capturedSql[0];
     // Costed rows only, grouped per task.
     expect(sql).toMatch(/WHERE\s+total_cost_usd\s+IS\s+NOT\s+NULL/i);
@@ -675,7 +790,7 @@ describe('SessionRepository.setTaskGitStats', () => {
           return { changes: 1 };
         }),
       })),
-      transaction: vi.fn((fn: (...args: unknown[]) => unknown) => (...args: unknown[]) => fn(...args)),
+      transaction: vi.fn(passThroughTransaction),
     } as unknown as Database.Database;
     return { db, runCalls };
   }

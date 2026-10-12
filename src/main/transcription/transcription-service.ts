@@ -8,7 +8,7 @@ import type {
   DictationStartResult,
 } from '../../shared/types';
 import { detectHardware, selectTier } from './hardware/detect-hardware';
-import { computeEngineKey, selectEngine, type EngineSelection } from './engines/engine-selection';
+import { computeEngineKey, finalNeedsSentenceCase, selectEngine, type EngineSelection } from './engines/engine-selection';
 import { ensureModel, isModelInstalled, listInstalledModels } from './models/model-manager';
 import type { ModelDef } from './models/model-registry';
 import { buildDictationInfo, primaryModel } from './dictation-info';
@@ -34,6 +34,24 @@ interface PreparedModels {
   needsDownload: boolean;
 }
 
+/** A model whose download failed, named so the error event can say which: the
+ *  Dictation tab marks only that model's line failed. It keeps the cause's
+ *  message, so the text the user reads is the same. */
+class ModelDownloadError extends Error {
+  readonly modelId: string;
+
+  constructor(modelId: string, cause: unknown) {
+    super(cause instanceof Error ? cause.message : 'Model download failed', { cause });
+    this.modelId = modelId;
+  }
+}
+
+/** The model a failure names: the one whose download failed, else the first of
+ *  the selection (a failed worker load has no single model to blame). */
+function failedModelId(selected: EngineSelection, error: unknown): string {
+  return error instanceof ModelDownloadError ? error.modelId : selected.models[0].id;
+}
+
 /**
  * The single transcription funnel and choke point. The renderer's local PCM
  * stream and a future mobile/network source both reach the active engine
@@ -54,9 +72,9 @@ interface PreparedModels {
  *
  * Engines are kept WARM (in the worker), but only as far as they are cheap.
  * The renderer pre-warms the selected engine the moment dictation is enabled
- * (and on every model change), which loads the small streaming live model so
- * the first press streams partials at once. The 631 MB accurate model loads
- * on the first press itself, overlapped with the utterance (see
+ * (and on every model change), which loads the live model so the first press
+ * streams partials at once. The refinement model loads on the first press
+ * itself, overlapped with the utterance (see
  * engines/hybrid-engine.ts), and is then REUSED across presses - until the
  * worker has gone IDLE_SHUTDOWN_MS without a request, when DictationClient
  * recycles it (a process exit is the only thing that gives onnxruntime's
@@ -131,7 +149,7 @@ export class TranscriptionService extends EventEmitter {
         models: prepared.resolved,
         remote: config.remote,
         warmCap: this.warmCap(profile),
-        sessionOptions: { language: config.language ?? 'en', punctuation: config.punctuation ?? true },
+        sessionOptions: { language: config.language ?? 'en' },
       });
     } catch (error) {
       this.active.delete(dictationSessionId);
@@ -152,6 +170,7 @@ export class TranscriptionService extends EventEmitter {
       engineId: selected.id,
       modelId: primaryModel(selected.models)?.id ?? null,
       needsDownload: prepared.needsDownload,
+      sentenceCaseFinal: finalNeedsSentenceCase(selected),
     };
   }
 
@@ -237,7 +256,7 @@ export class TranscriptionService extends EventEmitter {
   private reportPrepareFailure(selected: EngineSelection, error: unknown): Error {
     const message = error instanceof Error ? error.message : 'Failed to prepare the dictation engine';
     if (selected.models.length > 0) {
-      this.emitModelProgress({ modelId: selected.models[0].id, status: 'error', downloadedBytes: 0, totalBytes: 0, error: message });
+      this.emitModelProgress({ modelId: failedModelId(selected, error), status: 'error', downloadedBytes: 0, totalBytes: 0, error: message });
     }
     return new Error(message);
   }
@@ -248,6 +267,12 @@ export class TranscriptionService extends EventEmitter {
    * two large models on a weak machine). Computed here (the profile comes from
    * detectHardware, which needs the `app` module) and passed to the worker
    * rather than re-derived there.
+   *
+   * Two stays right for 600 MB live models too. onnxruntime keeps a disposed
+   * engine's arena reserved in-process, so a cap of 1 frees nothing: a switch
+   * away and back with a cap of 1 grew the worker by an engine at each step,
+   * where a cap of 2 serves the switch back from the warm engine (figures in
+   * DictationClient's IDLE_SHUTDOWN_MS note).
    */
   private warmCap(profile: DictationHardwareProfile): number {
     return selectTier(profile) === 'streaming-tiny' ? 1 : 2;
@@ -270,13 +295,27 @@ export class TranscriptionService extends EventEmitter {
     // smoothly without flooding IPC, but always emit the final byte so it hits 100%.
     let lastEmitMs = 0;
     for (const model of models) {
-      const resolvedPaths = await ensureModel(model, (progress) => {
-        const downloadedBytes = priorBytes + progress.downloadedBytes;
-        const now = Date.now();
-        if (now - lastEmitMs < 150 && downloadedBytes < totalBytes) return;
-        lastEmitMs = now;
-        this.emitModelProgress({ modelId: model.id, status: 'downloading', downloadedBytes, totalBytes });
-      });
+      let resolvedPaths: Awaited<ReturnType<typeof ensureModel>>;
+      try {
+        resolvedPaths = await ensureModel(model, (progress) => {
+          const downloadedBytes = priorBytes + progress.downloadedBytes;
+          const now = Date.now();
+          if (now - lastEmitMs < 150 && downloadedBytes < totalBytes) return;
+          lastEmitMs = now;
+          // The aggregate drives the popup's one bar; the per-model pair drives
+          // the Dictation tab's line for this model.
+          this.emitModelProgress({
+            modelId: model.id,
+            status: 'downloading',
+            downloadedBytes,
+            totalBytes,
+            modelDownloadedBytes: progress.downloadedBytes,
+            modelTotalBytes: progress.totalBytes,
+          });
+        });
+      } catch (error) {
+        throw new ModelDownloadError(model.id, error);
+      }
       priorBytes += Math.round(model.approxSizeMb * 1024 * 1024);
       resolved.push({ id: model.id, engineId, kind: resolvedPaths.kind, paths: resolvedPaths.paths });
     }
@@ -298,7 +337,7 @@ export class TranscriptionService extends EventEmitter {
       this.emitModelProgress({ modelId: selected.models[0].id, status: 'done', downloadedBytes: totalBytes, totalBytes });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Model download failed';
-      this.emitModelProgress({ modelId: selected.models[0].id, status: 'error', downloadedBytes: 0, totalBytes: 0, error: message });
+      this.emitModelProgress({ modelId: failedModelId(selected, error), status: 'error', downloadedBytes: 0, totalBytes: 0, error: message });
       throw new Error(message, { cause: error });
     }
   }
@@ -402,7 +441,7 @@ export class TranscriptionService extends EventEmitter {
       ...buildDictationInfo(await detectHardware(), config, listInstalledModels()),
       // The dictation worker gave up after repeated crashes: name why, so the
       // settings panel can say so instead of leaving push-to-talk a silent
-      // dead end. Mirrors EmbedClient.crashReason surfaced in the Memory tab.
+      // dead end. Mirrors EmbedClient.crashReason surfaced in the Knowledge Graph tab.
       workerUnavailable: this.client.crashed,
       workerError: this.client.crashReason ?? undefined,
     };
@@ -423,9 +462,9 @@ function normalizeConfig(options: DictationStartOptions): DictationConfig {
   return {
     enabled: true,
     engineMode: options.engineMode,
+    mode: options.mode,
     modelId: options.modelId ?? null,
     liveModelId: options.liveModelId ?? null,
-    punctuation: options.punctuation,
     language: options.language,
   };
 }

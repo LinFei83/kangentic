@@ -9,7 +9,7 @@
  * fresh empty session.
  *
  * Deterministic simulation of the hard kill: after a real session spawns, close
- * the app, then directly edit the project DB (node:sqlite, app closed) into the
+ * the app, then directly edit the project DB (better-sqlite3, app closed) into the
  * exact post-kill state (status='exited', exit_code=1073807364) - overriding
  * what the clean shutdown wrote. Relaunch and assert recovery resumes via
  * `--resume <original-agent-session-id>` (MOCK_CLAUDE_RESUMED marker), not a
@@ -32,15 +32,16 @@ import {
   mockAgentPath,
   moveTaskIpc,
   waitForRunningSession,
+  waitForTaskSession,
   waitForScrollback,
   getTaskIdByTitle,
   getSwimlaneIds,
   closeApp,
+  closeAppAndWaitForExit,
 } from './helpers';
-import type { Session } from '../../src/shared/types';
 import path from 'node:path';
 import fs from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import Database from 'better-sqlite3';
 
 const TEST_NAME = 'session-resume-os-killed';
 const runId = Date.now();
@@ -115,14 +116,15 @@ test.describe('Claude Agent -- OS-killed session recovery on startup', () => {
     });
     expect(projectId).toBeTruthy();
 
-    await closeApp(app);
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    // The DB surgery below opens the project database directly, so the old
+    // process must be gone first. Wait for that, not a guessed pause.
+    await closeAppAndWaitForExit(app);
 
     // === Phase 2: simulate the hard kill via DB surgery (app closed) ===
     // The clean close marked the record 'suspended'; force the exact OS-killed
     // state the old recovery could not see: exited + abnormal code.
     const dbPath = path.join(dataDir, 'projects', `${projectId}.db`);
-    const db = new DatabaseSync(dbPath);
+    const db = new Database(dbPath);
     db.prepare(
       `UPDATE sessions SET status = 'exited', exit_code = ?, suspended_at = NULL, suspended_by = NULL WHERE task_id = ?`,
     ).run(HARD_KILL_EXIT_CODE, taskId);
@@ -158,14 +160,7 @@ test.describe('Claude Agent -- OS-killed session recovery on startup', () => {
     expect(scrollback2).toContain(expectedMarker);
 
     // And the task is wired to a live running session again.
-    await page.waitForFunction(
-      async (expectedTaskId) => {
-        const sessions: Session[] = await window.electronAPI.sessions.list();
-        return sessions.some((session) => session.taskId === expectedTaskId && session.status === 'running');
-      },
-      taskId,
-      { timeout: 20_000 },
-    );
+    await waitForTaskSession(page, taskId, 20_000);
 
     await closeApp(app);
   });

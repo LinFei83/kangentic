@@ -364,6 +364,20 @@ describe('TransitionEngine - raw/sanitized description split', () => {
     });
   });
 
+  it('executeAction (spawn_agent): hands the builder the task id as taskProcessTag', async () => {
+    const task = makeTask();
+    let capturedTag: string | undefined;
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string; taskProcessTag?: string }) => {
+      capturedTag = options.taskProcessTag;
+      return `claude ${options.prompt ?? ''}`;
+    });
+
+    const { runSpawn } = makeEngine({});
+    await runSpawn(task);
+
+    expect(capturedTag).toBe(task.id);
+  });
+
   it('executeAction (spawn_agent): task_xml contains raw multi-line description', async () => {
     const rawDescription = 'Step 1: check OAuth.\n\nStep 2: refresh token.';
     const task = makeTask({ description: rawDescription });
@@ -627,6 +641,68 @@ describe('TransitionEngine - migrateResumeCwdIfRenamed wiring', () => {
         agentSessionId: 'agent-sess-uuid',
       }),
     );
+  });
+});
+
+describe('TransitionEngine - recorded grid on a resume (executeSpawnAgent chokepoint)', () => {
+  // A Resume or a move after a desktop restart has no in-memory predecessor
+  // with a grid, so the spawn takes the one recorded on the record it retires.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => `claude ${options.prompt ?? ''}`);
+  });
+
+  function resumableRecord(grid: { last_pty_cols: number | null; last_pty_rows: number | null }) {
+    return {
+      id: 'session-record-grid',
+      agent_session_id: 'agent-sess-uuid',
+      session_type: 'claude_agent',
+      status: 'suspended',
+      cwd: '/some/project',
+      ...grid,
+    };
+  }
+
+  it('hands the retired record grid to the spawn', async () => {
+    const sessionRepo = makeSessionRepo();
+    sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue(resumableRecord({ last_pty_cols: 210, last_pty_rows: 48 }));
+
+    const { runSpawn, sessionManager } = makeEngine({ sessionRepo });
+    await runSpawn(makeTask());
+
+    expect(sessionManager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({ restoredGrid: { cols: 210, rows: 48 } }),
+    );
+  });
+
+  it('passes no grid when the retired record has none', async () => {
+    const sessionRepo = makeSessionRepo();
+    sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue(resumableRecord({ last_pty_cols: null, last_pty_rows: null }));
+
+    const { runSpawn, sessionManager } = makeEngine({ sessionRepo });
+    await runSpawn(makeTask());
+
+    expect(sessionManager.spawn.mock.calls[0][0]).not.toHaveProperty('restoredGrid');
+  });
+});
+
+describe('TransitionEngine - the spawn carries the permission mode its record gets', () => {
+  // The spawn analytics event fires inside spawn(), before this record is
+  // inserted, so it reads the mode off the session. The two must agree.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => `claude ${options.prompt ?? ''}`);
+  });
+
+  it('hands spawn() the same resolved mode it writes to the record', async () => {
+    const sessionRepo = makeSessionRepo();
+    const { runSpawn, sessionManager } = makeEngine({ sessionRepo });
+    await runSpawn(makeTask());
+
+    const spawned = sessionManager.spawn.mock.calls[0][0] as unknown as { permissionMode?: string | null };
+    const inserted = sessionRepo.insert.mock.calls[0][0] as { permission_mode?: string | null };
+    expect(spawned.permissionMode).toBeTruthy();
+    expect(spawned.permissionMode).toBe(inserted.permission_mode);
   });
 });
 

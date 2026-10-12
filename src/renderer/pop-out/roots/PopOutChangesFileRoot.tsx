@@ -2,7 +2,9 @@ import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useSta
 import { Loader2 } from 'lucide-react';
 import { PanelErrorBoundary } from '../../components/PanelErrorBoundary';
 import type { PopOutChangesFileParams } from '../../../shared/pop-out';
-import type { GitDiffFileEntry, GitFileContentResult } from '../../../shared/types';
+import type { GitDiffFileEntry } from '../../../shared/types';
+// No Monaco in this module's graph, so the root chunk stays light.
+import { fetchDiffContent, type DiffContent } from '../../components/dialogs/task-detail/changes/diff-content';
 
 const ChangesFileDiffPane = lazy(() =>
   import('./ChangesFileDiffPane').then((module) => ({ default: module.ChangesFileDiffPane })),
@@ -11,7 +13,7 @@ const ChangesFileDiffPane = lazy(() =>
 /** Displayed file content paired with the path it was fetched for, mirroring
  *  ChangesPanel's DisplayedFileContent (DiffViewer's stale-content contract). */
 export interface DisplayedFileDiffContent {
-  result: GitFileContentResult;
+  result: DiffContent;
   filePath: string;
 }
 
@@ -61,10 +63,14 @@ export function PopOutChangesFileRoot({ params }: { params: PopOutChangesFilePar
 
   // Guard out-of-order resolutions: only the newest fetch may commit state.
   const fetchGenerationRef = useRef(0);
+  // The last content shown. This window shows one file at one scope, so it is
+  // always the same file the next fetch asks for, and its image fingerprints
+  // let main skip resending an image that did not change.
+  const lastResultRef = useRef<DiffContent | null>(null);
   const runFetch = useCallback(async (seedEntry: GitDiffFileEntry | null) => {
     const generation = ++fetchGenerationRef.current;
     const applyContent = async (fileEntry: GitDiffFileEntry) => {
-      const result = await window.electronAPI.git.fileContent({
+      const result = await fetchDiffContent({
         worktreePath,
         projectPath,
         baseBranch,
@@ -73,8 +79,9 @@ export function PopOutChangesFileRoot({ params }: { params: PopOutChangesFilePar
         oldPath: fileEntry.oldPath,
         scope,
         commitOid,
-      });
+      }, fileEntry.binary, lastResultRef.current);
       if (generation !== fetchGenerationRef.current) return;
+      lastResultRef.current = result;
       setContent({ result, filePath });
       setLoadError(null);
     };
@@ -95,6 +102,7 @@ export function PopOutChangesFileRoot({ params }: { params: PopOutChangesFilePar
       setEntry(matched);
       if (!matched) {
         // Reverted / no longer changed: the empty state below. Window stays open.
+        lastResultRef.current = null;
         setContent(null);
         setLoadError(null);
         return;

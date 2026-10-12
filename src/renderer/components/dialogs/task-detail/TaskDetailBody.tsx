@@ -13,6 +13,7 @@ import { taskDetailSurfaceFor } from '../../../utils/task-progress';
 import { scheduleWindowTerminalResize } from '../../../window-manager/terminal/resize-coalescer';
 import { QueuedPlaceholder } from './QueuedPlaceholder';
 import { taskHasDescriptionContent } from './description-content';
+import { TaskPriorWork } from '../../knowledge-graph/TaskPriorWork';
 import { AttachmentChipStrip } from '../AttachmentChipStrip';
 import { isImageMediaType } from '../attachment-utils';
 import type { AttachmentWithPreview } from './useAttachments';
@@ -51,7 +52,7 @@ function ChangesPanelSkeleton() {
     <div className="flex h-full" data-testid="changes-panel-skeleton">
       {/* Mirrors ChangesPanel's RAIL_DEFAULT_WIDTH_CLAMP (kept literal here so
           the skeleton never imports the lazy chunk it stands in for). */}
-      <div className="flex-shrink-0 border-r border-edge p-2 space-y-1.5" style={{ width: 'clamp(220px, 25%, 420px)' }}>
+      <div className="flex-shrink-0 border-r border-edge p-2 space-y-1.5" style={{ width: 'clamp(160px, clamp(220px, 25%, 420px), calc(100% - 244px))' }}>
         {Array.from({ length: 6 }, (_, index) => (
           <div key={index} className="h-4 rounded bg-surface-hover animate-pulse" style={{ opacity: 1 - index * 0.1 }} />
         ))}
@@ -293,6 +294,15 @@ export function TaskDetailBody({
       )}
       {labelsAndPriorityRow}
       {attachmentStrip}
+      {/* Proactive recall, deliberately placed INSIDE the description subtree
+          rather than as a new child of the split row below: React matches that
+          row's children by index, and a shifted index silently remounts a
+          retained Browser pane's <webview>, killing the agent's CDP session.
+          See .claude/rules/retained-pane-never-remounts.md. This subtree is a
+          sibling of that row, and the description peek is mutually exclusive
+          with the Browser pane, so nothing here can shift it. Renders null
+          when there is no prior work, so it costs nothing on most tasks. */}
+      <TaskPriorWork taskId={task.id} projectId={paneProjectId ?? null} />
     </>
   );
 

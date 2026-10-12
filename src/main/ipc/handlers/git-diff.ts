@@ -10,7 +10,7 @@ import { getFileHistory } from '../../git/file-history';
 import { getBlame } from '../../git/blame';
 import { fetchAllRemotesIfStale } from '../../git/fetch-throttle';
 import { countLocalOnlyCommits } from '../../git/local-only-commits';
-import type { GitBlameInput, GitBranchSummaryInput, GitCommitGraphInput, GitDiffFilesInput, GitFileContentInput, GitFileHistoryInput, GitPendingChangesInput, GitPendingChangesResult, GitWorktreeHeadInput, GitWorktreeHeadResult, PRState } from '../../../shared/types';
+import type { GitBlameInput, GitBranchSummaryInput, GitCommitGraphInput, GitDiffFilesInput, GitFileContentInput, GitFileHistoryInput, GitFileImageInput, GitPendingChangesInput, GitPendingChangesResult, GitWorktreeHeadInput, GitWorktreeHeadResult, PRState } from '../../../shared/types';
 import type { IpcContext } from '../ipc-context';
 import { broadcast } from '../../pop-out/window-broadcast';
 
@@ -137,6 +137,11 @@ export function registerGitDiffHandlers(context: IpcContext): void {
     return service.getFileContent(input);
   });
 
+  ipcMain.handle(IPC.GIT_FILE_IMAGE, async (_, input: GitFileImageInput) => {
+    const service = getOrCreateService(input.worktreePath ?? input.projectPath);
+    return service.getImageContent(input);
+  });
+
   // Per-sender refcounting so N windows watching one path (the in-app Changes
   // panel, the detached Changes window, per-file diff windows) each hold their
   // own subscription: one window unsubscribing (or being destroyed) never tears
@@ -192,19 +197,18 @@ export function registerGitDiffHandlers(context: IpcContext): void {
   // ran 640 to 1150ms on the dogfooding instance and the fetch was its dominant
   // step, while the FlyingCard flight it gates is 500ms.
   //
-  // Gated on the SAME per-project setting the background scheduler reads
-  // (`git.autoFetchIntervalMinutes`, null or <= 0 meaning off). A drag is a user
-  // gesture, but it is not a request to reach the network, and a card dragged
-  // between two working columns never goes near the Done probe at all. A user who
-  // turned background fetching off therefore sees no new fetches; their Done drop
-  // still fetches inside the probe exactly as it does today, so the setting costs
-  // them the speed-up and nothing else.
+  // Gated on the SAME per-project switch the background scheduler reads
+  // (`git.autoFetch`). A drag is a user gesture, but it is not a request to reach
+  // the network, and a card dragged between two working columns never goes near
+  // the Done probe at all. A user who turned background fetching off therefore
+  // sees no new fetches; their Done drop still fetches inside the probe exactly as
+  // it does today, so the setting costs them the speed-up and nothing else.
   ipcMain.handle(IPC.GIT_PREFETCH_REMOTES, async (_, checkPath: unknown): Promise<void> => {
     if (typeof checkPath !== 'string' || checkPath.length === 0) return;
-    const intervalMinutes = context.configManager
+    const autoFetch = context.configManager
       .getEffectiveConfig(context.currentProjectPath ?? undefined)
-      .git.autoFetchIntervalMinutes;
-    if (intervalMinutes === null || intervalMinutes <= 0) return;
+      .git.autoFetch;
+    if (autoFetch !== true) return;
     await fetchAllRemotesIfStale(checkPath, { nonInteractive: true });
   });
 

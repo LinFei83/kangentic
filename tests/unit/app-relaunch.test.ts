@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from 'vitest';
-import { relaunchApp, devRestartFileFrom, DEV_RESTART_FILE_FLAG, type RelaunchDependencies } from '../../src/main/app-relaunch';
+import {
+  relaunchApp,
+  devRestartFileFrom,
+  isRestartRequested,
+  resetRestartRequestedForTests,
+  DEV_RESTART_FILE_FLAG,
+  type RelaunchDependencies,
+} from '../../src/main/app-relaunch';
 
 /**
  * Mocks for the quitAndInstallIfUpdatePending describe block further below,
@@ -109,6 +116,70 @@ describe('relaunchApp', () => {
     });
     expect(() => relaunchApp(dependencies)).toThrow('EACCES');
     expect(calls).toEqual([]);
+  });
+});
+
+describe('isRestartRequested', () => {
+  // The quit a restart starts must be able to tell itself from one that ends
+  // the app: an ephemeral preview deletes its open project on the latter only.
+  beforeEach(() => {
+    resetRestartRequestedForTests();
+  });
+
+  it('is false until a restart is asked for', () => {
+    expect(isRestartRequested()).toBe(false);
+  });
+
+  it('is true once the dev restart request is written, before the quit runs', () => {
+    let requestedWhenQuitRan: boolean | null = null;
+    const { dependencies } = recordingDependencies({
+      devRestartFile: '/mock/restart',
+      quit: () => { requestedWhenQuitRan = isRestartRequested(); },
+    });
+    relaunchApp(dependencies);
+    expect(requestedWhenQuitRan).toBe(true);
+  });
+
+  it('is true for a packaged relaunch too', () => {
+    relaunchApp(recordingDependencies().dependencies);
+    expect(isRestartRequested()).toBe(true);
+  });
+
+  it('is already true when the packaged quit runs, since before-quit fires inside the quit call', () => {
+    let requestedWhenQuitRan: boolean | null = null;
+    const { dependencies } = recordingDependencies({
+      quit: () => { requestedWhenQuitRan = isRestartRequested(); },
+    });
+
+    relaunchApp(dependencies);
+
+    expect(requestedWhenQuitRan).toBe(true);
+  });
+
+  it('is already true when control passes to the update installer, which is the call that quits the app', () => {
+    let requestedWhenInstallRan: boolean | null = null;
+    const { dependencies } = recordingDependencies({
+      installPendingUpdateAndRelaunch: () => {
+        requestedWhenInstallRan = isRestartRequested();
+        return true;
+      },
+    });
+
+    expect(relaunchApp(dependencies)).toBe('update-install');
+
+    expect(requestedWhenInstallRan).toBe(true);
+    expect(isRestartRequested()).toBe(true);
+  });
+
+  it('stays false when the restart is skipped in a test run or its request cannot be written', () => {
+    relaunchApp(recordingDependencies({ isTest: true, devRestartFile: '/mock/restart' }).dependencies);
+    expect(isRestartRequested()).toBe(false);
+
+    expect(() => relaunchApp(recordingDependencies({
+      devRestartFile: '/mock/restart',
+      writeFile: () => { throw new Error('EACCES'); },
+    }).dependencies)).toThrow('EACCES');
+    expect(isRestartRequested()).toBe(false);
   });
 });
 

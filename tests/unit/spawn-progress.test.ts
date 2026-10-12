@@ -5,9 +5,12 @@
  * Contract:
  *  - emit/createProgressCallback set the in-flight map AND push IPC.
  *  - clear deletes from the map AND pushes a null label.
+ *  - a claim's release clears only while the claim still owns the label.
  *  - createProgressCallback resolves known phases to labels and passes
  *    unknown strings (raw git progress) through verbatim.
  *  - getInFlightSpawnProgress() prunes TTL-expired entries on read.
+ *  - onSpawnProgressChange hears every push (decorated label, null on clear);
+ *    a TTL prune is not a push.
  *  - The map is updated even when the window is destroyed (it is the
  *    authoritative source of truth); only the IPC send is skipped.
  */
@@ -17,9 +20,11 @@ import {
   emitSpawnProgress,
   emitSpawnWaiting,
   createProgressCallback,
+  claimSpawnProgress,
   clearSpawnProgress,
   getInFlightSpawnProgress,
   onSpawnProgressTransition,
+  onSpawnProgressChange,
   setSpawnStaleNote,
   beginSpawnStaleProbe,
   touchSpawnStaleProbe,
@@ -240,6 +245,77 @@ describe('spawn-progress queryable map', () => {
     expect(events).toEqual([]);
   });
 
+  it('onSpawnProgressChange fires on every push with the decorated label, and null on clear', () => {
+    const { window } = makeWindow();
+    const events: Array<[string, string | null]> = [];
+    const unsubscribe = onSpawnProgressChange((taskId, label) => events.push([taskId, label]));
+
+    emitSpawnProgress(window, 'task-1', 'fetching'); // first entry
+    emitSpawnProgress(window, 'task-1', 'starting-agent'); // label-only change
+    setSpawnStaleNote(window, 'task-1', 'base 3 behind'); // re-push with the note applied
+    emitSpawnWaiting(window, 'task-1', 2);
+    emitSpawnWaiting(window, 'task-1', 2); // an unchanged re-push still fires
+    clearSpawnProgress(window, 'task-1');
+
+    unsubscribe();
+    expect(events).toEqual([
+      ['task-1', 'Fetching latest...'],
+      ['task-1', 'Starting agent...'],
+      ['task-1', 'Starting agent... (base 3 behind)'],
+      ['task-1', 'Waiting (2 ahead) (base 3 behind)'],
+      ['task-1', 'Waiting (2 ahead) (base 3 behind)'],
+      ['task-1', null],
+    ]);
+  });
+
+  it('onSpawnProgressChange stops firing after unsubscribe, and a TTL expiry fires nothing', () => {
+    const nowSpy = vi.spyOn(Date, 'now');
+    const { window } = makeWindow();
+    const events: Array<[string, string | null]> = [];
+    const unsubscribe = onSpawnProgressChange((taskId, label) => events.push([taskId, label]));
+
+    nowSpy.mockReturnValue(0);
+    emitSpawnProgress(window, 'task-1', 'fetching');
+    // Past the TTL: the read prunes the entry without a push.
+    nowSpy.mockReturnValue(10 * 60_000);
+    expect(getInFlightSpawnProgress()).toEqual({});
+    expect(events).toEqual([['task-1', 'Fetching latest...']]);
+
+    unsubscribe();
+    emitSpawnProgress(window, 'task-1', 'fetching');
+    expect(events).toEqual([['task-1', 'Fetching latest...']]);
+  });
+
+  it('a throwing change listener neither throws into the push nor skips later listeners or the renderer send', () => {
+    // pushSpawnProgress runs on the spawn path itself, so a listener that
+    // throws (the mobile bridge feed, say) must be contained.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { window, send } = makeWindow();
+    const listenerError = new Error('listener blew up');
+    const laterListenerEvents: Array<[string, string | null]> = [];
+    const unsubscribeThrowing = onSpawnProgressChange(() => {
+      throw listenerError;
+    });
+    const unsubscribeLater = onSpawnProgressChange((taskId, label) => laterListenerEvents.push([taskId, label]));
+
+    try {
+      expect(() => emitSpawnProgress(window, 'task-1', 'starting-agent')).not.toThrow();
+
+      // The listener AFTER the throwing one still heard the push.
+      expect(laterListenerEvents).toEqual([['task-1', 'Starting agent...']]);
+      // The renderer push that follows the listener loop still happened.
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledWith('task:spawnProgress', 'task-1', 'Starting agent...');
+      // The map was updated and the failure was logged, not swallowed silently.
+      expect(getInFlightSpawnProgress()).toEqual({ 'task-1': 'Starting agent...' });
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith('[spawn-progress] change listener failed:', listenerError);
+    } finally {
+      unsubscribeThrowing();
+      unsubscribeLater();
+    }
+  });
+
   it('updates the map even when the window is destroyed, but skips the IPC send', () => {
     const { window, send } = makeWindow(true);
     emitSpawnProgress(window, 'task-1', 'starting-agent');
@@ -288,6 +364,110 @@ describe('spawn-progress queryable map', () => {
     // At 270_001ms: pruned (past TTL from the last push at 150s).
     nowSpy.mockReturnValue(150_000 + 120_001);
     expect(getInFlightSpawnProgress()['task-seq']).toBeUndefined();
+  });
+});
+
+describe('claimSpawnProgress: a region clears only its own label', () => {
+  beforeEach(() => {
+    __resetSpawnProgressForTest();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('release clears the claim\'s own label and pushes null', () => {
+    const { window, send } = makeWindow();
+    const claim = claimSpawnProgress(window, 'task-1');
+    claim.onProgress('resuming');
+    claim.onProgress('Receiving objects: 45%');
+    expect(getInFlightSpawnProgress()).toEqual({ 'task-1': 'Receiving objects: 45%' });
+
+    claim.release();
+
+    expect(getInFlightSpawnProgress()).toEqual({});
+    expect(send).toHaveBeenLastCalledWith('task:spawnProgress', 'task-1', null);
+  });
+
+  it.each([
+    ['a second claim', (window: BrowserWindow) => claimSpawnProgress(window, 'task-1').onProgress('resuming')],
+    ['createProgressCallback', (window: BrowserWindow) => createProgressCallback(window, 'task-1')('fetching')],
+    ['emitSpawnProgress', (window: BrowserWindow) => emitSpawnProgress(window, 'task-1', 'switching-model')],
+    ['emitSpawnWaiting', (window: BrowserWindow) => emitSpawnWaiting(window, 'task-1', 2)],
+  ])('release leaves the label alone once %s has labelled the task since', (_label, labelFromAnotherPath) => {
+    const { window, send } = makeWindow();
+    const claim = claimSpawnProgress(window, 'task-1');
+    claim.onProgress('resuming');
+    labelFromAnotherPath(window);
+    const otherLabel = getInFlightSpawnProgress()['task-1'];
+    send.mockClear();
+
+    claim.release();
+
+    expect(getInFlightSpawnProgress()['task-1']).toBe(otherLabel);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('the claim that labelled last still releases its own label after an older one stood aside', () => {
+    const { window } = makeWindow();
+    const olderClaim = claimSpawnProgress(window, 'task-1');
+    olderClaim.onProgress('resuming');
+    const newerClaim = claimSpawnProgress(window, 'task-1');
+    newerClaim.onProgress('resuming');
+
+    olderClaim.release();
+    expect(getInFlightSpawnProgress()['task-1']).toBe('Resuming session...');
+
+    newerClaim.release();
+    expect(getInFlightSpawnProgress()).toEqual({});
+  });
+
+  it('a stale-note decoration keeps the claim as owner, so release still clears', () => {
+    const { window } = makeWindow();
+    const claim = claimSpawnProgress(window, 'task-1');
+    claim.onProgress('starting-agent');
+    setSpawnStaleNote(window, 'task-1', 'base 3 behind');
+    expect(getInFlightSpawnProgress()['task-1']).toBe('Starting agent... (base 3 behind)');
+
+    claim.release();
+
+    expect(getInFlightSpawnProgress()).toEqual({});
+  });
+
+  it('with no label left, release still pushes null (a TTL sweep pushed nothing to the renderer)', () => {
+    const { window, send } = makeWindow();
+    const nowSpy = vi.spyOn(Date, 'now');
+    nowSpy.mockReturnValue(1_000);
+    const claim = claimSpawnProgress(window, 'task-1');
+    claim.onProgress('resuming');
+    nowSpy.mockReturnValue(1_000 + 120_001);
+    expect(getInFlightSpawnProgress()).toEqual({});
+    send.mockClear();
+
+    claim.release();
+
+    expect(send).toHaveBeenCalledWith('task:spawnProgress', 'task-1', null);
+  });
+
+  it('an unconditional clearSpawnProgress still clears a claim\'s label (ownership protects one direction only)', () => {
+    const { window } = makeWindow();
+    const claim = claimSpawnProgress(window, 'task-1');
+    claim.onProgress('resuming');
+
+    clearSpawnProgress(window, 'task-1');
+
+    expect(getInFlightSpawnProgress()).toEqual({});
+  });
+
+  it('a label on another task never blocks the release', () => {
+    const { window } = makeWindow();
+    const claim = claimSpawnProgress(window, 'task-1');
+    claim.onProgress('resuming');
+    emitSpawnProgress(window, 'task-2', 'fetching');
+
+    claim.release();
+
+    expect(getInFlightSpawnProgress()).toEqual({ 'task-2': 'Fetching latest...' });
   });
 });
 

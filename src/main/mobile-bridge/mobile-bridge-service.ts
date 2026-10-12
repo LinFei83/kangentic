@@ -8,6 +8,8 @@ import {
   encodePairingQrPayload,
   PROTOCOL_VERSION,
   rosterDeviceCapabilitySet,
+  type CapabilityRequestMessage,
+  type CapabilityResponseMessage,
   type CapabilityVerb,
   type PairingQrPayload,
   type RosterDeviceEntry,
@@ -17,6 +19,7 @@ import { isGenuineEncryptionAvailable } from '../boards/shared/auth';
 import { trackFeatureUsed } from '../analytics/usage';
 import { trackEvent } from '../analytics/analytics';
 import { validateRelayUrl } from '../../shared/relay';
+import { commandTerminalDisplayName } from '../../shared/command-terminal-name';
 import type { MobileBridgeStatus, MobileBridgeTransportState, MobileDeviceConnectionState } from '../../shared/types';
 import { DevQuickPair } from './dev-quick-pair';
 import { DiffWatcher } from '../git/diff-watcher';
@@ -29,7 +32,8 @@ import {
 } from './roster-store';
 import { PairingService, sanitizeDeviceName } from './pairing/pairing-service';
 import { createTransport } from './transport/transport-factory';
-import { BridgeSession } from './session/bridge-session';
+import { BridgeSession, MessageEncodeError, responseTooLargeRefusal, type RekeyHoldReleaseReason } from './session/bridge-session';
+import { startMainLoopBlockProbe, takeRequestSpans } from './request-spans';
 import { FORCED_REDIAL_DESCRIPTIONS, type ForcedRedialReason } from './session/forced-redial-reason';
 import { SubscriptionRegistry } from './session/subscription-registry';
 import { CapabilityRouter } from './capability-router';
@@ -37,6 +41,7 @@ import { registerCapabilityHandlers } from './handlers';
 import { terminalStreamKeyFor, TERMINAL_STREAM_KEY_PREFIX } from './handlers/read-stream';
 import { sizeGuardKeyFor } from './handlers/terminal-size-guard';
 import { SessionLifecycleBoardFeed } from './session-lifecycle-feed';
+import { SpawnProgressFeed } from './spawn-progress-feed';
 import { PushRegistrationStore } from './push/push-registration-store';
 import { collectConnectedDeviceIds, PushNotifier } from './push/push-notifier';
 import { SpawnStallWatcher } from './push/spawn-stall-watcher';
@@ -68,6 +73,16 @@ const RELAY_STATE_EMIT_WINDOW_MS = 500;
  */
 const FRAME_REJECTED_LOG_WINDOW_MS = 10_000;
 
+/**
+ * A phone request whose desktop share (handler plus encode, seal and hand-off
+ * to the socket) reaches this logs one `warn` line naming where the time went.
+ * `warn` because log-mirror.ts persists it on every build, so the line is in a
+ * user's report without Persist Console Logs. The phone measures the whole
+ * round trip; this line is the desktop's part of it, so the gap between the two
+ * is time on the wire or in the relay.
+ */
+const SLOW_REQUEST_WARN_MS = 750;
+
 /** The transition lines that persist on every build (log-mirror.ts keeps `warn` unconditionally). */
 const CONNECTION_STATES_LOGGED_AT_WARN: ReadonlySet<MobileDeviceConnectionState> = new Set(['offline', 'reconnecting', 'closed']);
 
@@ -94,6 +109,19 @@ export function resetForcedRedialTelemetryForTests(): void {
   forcedRedialReasonsTracked.clear();
 }
 
+/**
+ * `read-stream/subscribe <requestId> from 441c40f8`: the verb, the payload's
+ * `action` when it has one, the FULL requestId (the phone logs it whole, and a
+ * truncated one cannot be matched against the phone's own timing of the same
+ * request), and the short device id the bridge's other lines use.
+ */
+function describeRequest(session: BridgeSession, request: CapabilityRequestMessage): string {
+  const payload = request.payload;
+  const action =
+    payload !== null && typeof payload === 'object' && !Array.isArray(payload) && typeof payload.action === 'string' ? `/${payload.action}` : '';
+  return `${request.verb}${action} ${request.requestId} from ${session.deviceId.slice(0, 8)}`;
+}
+
 export interface PairedDeviceSummary {
   deviceId: string;
   displayName: string;
@@ -118,7 +146,7 @@ export interface PairedDeviceSummary {
  * Identity creation is deferred to the FIRST deliberate pairing attempt
  * (ensureIdentity(), called only from startPairing()), not the
  * constructor and not any read path (getStatus/listDevices/etc use
- * tryLoadIdentity(), which never creates one). Merely opening the
+ * loadedIdentity(), which never creates one). Merely opening the
  * settings tab or checking status must not have the side effect of
  * generating and persisting a device keypair. Constructing this service
  * never throws even when secure storage is unavailable - getStatus()
@@ -127,7 +155,17 @@ export interface PairedDeviceSummary {
 export class MobileBridgeService extends EventEmitter {
   readonly capabilityRouter = new CapabilityRouter();
   private config: MobileBridgeConfig;
+  /**
+   * The identity and the secure-storage verdict are read through safeStorage's
+   * ASYNC API (boards/shared/auth.ts), once per run, by whenStorageReady(). The
+   * synchronous readers (getStatus, listDevices, the push notifier's key
+   * lookup, the roster edits) serve these cached values; the IPC handlers await
+   * whenStorageReady() first so the settings tab never sees the pre-warm state.
+   */
   private identity: BridgeIdentity | null = null;
+  private secureStorageAvailable = false;
+  private storageWarmup: Promise<void> | null = null;
+  private capabilityMigrationDone = false;
   private activePairing: PairingService | null = null;
   private readonly sessions = new Map<string, BridgeSession>();
   private readonly subscriptionsByDevice = new Map<string, SubscriptionRegistry>();
@@ -157,6 +195,8 @@ export class MobileBridgeService extends EventEmitter {
   private ipcContext: IpcContext | null = null;
   /** Feeds session lifecycle edges onto the board-changed bus so phones' board views track spawn/queue/suspend/exit. */
   private sessionLifecycleFeed: SessionLifecycleBoardFeed | null = null;
+  /** Throttled spawn-progress label changes, which read-board forwards to phones as task-updated (kept off the board bus). */
+  private spawnProgressFeed: SpawnProgressFeed | null = null;
   /** Per-device push registrations (Expo token + envelope key), written by the register-push handler and read by the notifier. */
   readonly pushRegistrations = new PushRegistrationStore();
   /** Seals and sends E2E push notifications on permission/turn-complete/crash/plan/stall triggers. */
@@ -186,7 +226,12 @@ export class MobileBridgeService extends EventEmitter {
     this.config = config;
     this.devQuickPair = __KANGENTIC_DEV__
       ? new DevQuickPair({
-          getIdentity: () => this.ensureIdentity(),
+          // reconcileDevQuickPair() creates the identity before it enables the
+          // quick pair, so the cached one is always there when this is read.
+          getIdentity: () => {
+            if (!this.identity) throw new Error('Dev quick pair read the identity before it was loaded');
+            return this.identity;
+          },
           getRelayUrl: () => this.config.relayUrl,
           onRosterChanged: () => {
             void this.syncSessions();
@@ -223,11 +268,16 @@ export class MobileBridgeService extends EventEmitter {
       // reveals (observed live 2026-08-02).
       hasStreamSubscriber: (sessionId) => this.anyDeviceSubscriptionHas(terminalStreamKeyFor(sessionId)),
     });
+    this.spawnProgressFeed = new SpawnProgressFeed({
+      resolveProjectIdForTask: (taskId) => this.findTaskOwner(context, taskId)?.projectId ?? null,
+    });
+    this.spawnProgressFeed.start();
     registerCapabilityHandlers(this.capabilityRouter, {
       context,
       diffWatcher: this.diffWatcher,
       getSubscriptions: (deviceId) => this.getOrCreateSubscriptions(deviceId),
       pushRegistrations: this.pushRegistrations,
+      spawnProgressFeed: this.spawnProgressFeed,
     });
     this.sessionLifecycleFeed = new SessionLifecycleBoardFeed({
       sessionManager: context.sessionManager,
@@ -246,6 +296,17 @@ export class MobileBridgeService extends EventEmitter {
         const projectId = context.sessionManager.getSessionProjectId(sessionId);
         const taskId = context.sessionManager.getSessionTaskId(sessionId);
         if (!projectId || !taskId) return null;
+        // A Command Terminal has no task row: its name is the title, and the
+        // discriminator tells the phone to open the terminal, not a task.
+        const liveSession = context.sessionManager.getSession(sessionId);
+        if (liveSession?.transient) {
+          return {
+            projectId,
+            taskId,
+            taskTitle: commandTerminalDisplayName(liveSession.commandTerminalLabel, liveSession.commandTerminalSlot),
+            sessionKind: 'command-terminal',
+          };
+        }
         let taskTitle = '';
         try {
           taskTitle = getProjectRepos(context, projectId).tasks.getById(taskId)?.title ?? '';
@@ -255,22 +316,13 @@ export class MobileBridgeService extends EventEmitter {
         return { projectId, taskId, taskTitle };
       },
       // A spawn stall has no session yet, so there is no getSessionProjectId
-      // to consult - scan every known project's task repo instead. Rare
-      // (fires once per stalled spawn, 8s after it starts), so a linear
-      // scan over the project list is fine.
+      // to consult; findTaskOwner scans the project list instead.
       resolveTaskContextByTaskId: (taskId) => {
-        for (const project of context.projectRepo.list()) {
-          try {
-            const task = getProjectRepos(context, project.id).tasks.getById(taskId);
-            if (task) return { projectId: project.id, taskId, taskTitle: task.title };
-          } catch {
-            // This project's repos may not be initialized; try the next one.
-          }
-        }
-        return null;
+        const owner = this.findTaskOwner(context, taskId);
+        return owner ? { projectId: owner.projectId, taskId, taskTitle: owner.taskTitle } : null;
       },
       getDeviceStaticPublicKey: (deviceId) => {
-        const identity = this.tryLoadIdentity();
+        const identity = this.loadedIdentity();
         if (!identity) return null;
         return loadRoster(identity).devices.find((device) => device.deviceId === deviceId)?.staticPublicKey ?? null;
       },
@@ -280,15 +332,70 @@ export class MobileBridgeService extends EventEmitter {
       onStall: (taskId) => this.pushNotifier?.notifyTaskStalled(taskId),
     });
     this.spawnStallWatcher.start();
-    // Runs exactly once, before the first reconcile()'s syncSessions() opens
-    // any BridgeSession - see the method's own doc comment for why this
-    // cannot be a plain roster field mutation.
-    this.migrateDevicesToFullCapabilityGrant();
+    // Loads the identity and runs this launch's capability migration
+    // (migrateDevicesToFullCapabilityGrant) before any BridgeSession opens:
+    // runSyncSessions() awaits the same warm-up before it opens one.
+    void this.whenStorageReady();
   }
 
   /**
-   * One-shot upgrade for devices paired before pairing granted the full
-   * verb set: capabilities live inside the Ed25519-signed roster payload
+   * Which project owns a task, by scanning every known project's task repo: a
+   * task with no session yet has no getSessionProjectId to consult. One
+   * indexed lookup per project. Callers are rare by construction: the
+   * spawn-stall push (once per stalled spawn) and the spawn-progress feed (once
+   * per label, which it keeps until the label clears, and only while a phone
+   * watches a board).
+   */
+  private findTaskOwner(context: IpcContext, taskId: string): { projectId: string; taskTitle: string } | null {
+    for (const project of context.projectRepo.list()) {
+      try {
+        const task = getProjectRepos(context, project.id).tasks.getById(taskId);
+        if (task) return { projectId: project.id, taskTitle: task.title };
+      } catch {
+        // This project's repos may not be initialized; try the next one.
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Resolves the secure-storage verdict and loads the identity, once per run,
+   * then runs the capability migration. Every path that needs either awaits
+   * this; a failure (say, called before app ready) is logged and the next call
+   * tries again.
+   */
+  whenStorageReady(): Promise<void> {
+    if (!this.storageWarmup) {
+      this.storageWarmup = this.warmSecureStorage().catch((error: unknown) => {
+        console.warn('[mobile-bridge] could not read secure storage:', error);
+        this.storageWarmup = null;
+      });
+    }
+    return this.storageWarmup;
+  }
+
+  private async warmSecureStorage(): Promise<void> {
+    this.secureStorageAvailable = await isGenuineEncryptionAvailable();
+    if (!this.identity) this.identity = await loadBridgeIdentity();
+    if (this.identity && !this.capabilityMigrationDone) {
+      this.capabilityMigrationDone = true;
+      // See the method's own doc comment for why this cannot be a plain roster
+      // field mutation.
+      this.migrateDevicesToFullCapabilityGrant();
+    }
+    // A settings tab that rendered before the warm-up re-reads now.
+    this.emitStateChanged();
+  }
+
+  /**
+   * Re-grants the full verb set to every paired device missing any verb:
+   * devices paired before pairing granted everything, and every device once a
+   * new verb ships. Runs once per launch (`capabilityMigrationDone` is not
+   * persisted), so a narrower grant set through setDeviceCapabilities does
+   * not survive a restart; a future narrower preset must change this to grant
+   * only newly added verbs.
+   *
+   * Capabilities live inside the Ed25519-signed roster payload
    * (roster-store.ts), so mutating them without re-signing would fail
    * verifyRosterEntry and silently drop the device from the roster on the
    * next load. Routing through the public setDeviceCapabilities (which
@@ -298,7 +405,7 @@ export class MobileBridgeService extends EventEmitter {
    * only rewrites the on-disk roster before syncSessions() reads it.
    */
   private migrateDevicesToFullCapabilityGrant(): void {
-    const identity = this.tryLoadIdentity();
+    const identity = this.loadedIdentity();
     if (!identity) return;
     const fullGrant = new Set<CapabilityVerb>(CAPABILITY_VERBS);
     for (const device of loadRoster(identity).devices) {
@@ -371,7 +478,7 @@ export class MobileBridgeService extends EventEmitter {
       // config.relayUrl is always resolved (see src/shared/relay.ts's
       // resolveRelayUrl at both reconcile() call sites) and therefore never
       // '', so there is no longer a meaningful empty-URL case to gate on here.
-      this.devQuickPair?.reconcile(config.enabled && isGenuineEncryptionAvailable());
+      this.reconcileDevQuickPair();
     }
     if (!config.enabled && wasEnabled) {
       this.cancelPairing('Mobile bridge disabled');
@@ -425,11 +532,15 @@ export class MobileBridgeService extends EventEmitter {
    */
   private async runSyncSessions(): Promise<void> {
     if (!this.ipcContext) return;
-    if (!this.config.enabled || !isGenuineEncryptionAvailable()) {
+    await this.whenStorageReady();
+    // dispose() can run during the warm-up; a session opened after it would
+    // dial a relay transport that nothing will ever close.
+    if (this.disposed) return;
+    if (!this.config.enabled || !this.secureStorageAvailable) {
       this.disposeAllSessions();
       return;
     }
-    const identity = this.tryLoadIdentity();
+    const identity = this.loadedIdentity();
     if (!identity) {
       this.disposeAllSessions();
       return;
@@ -490,12 +601,12 @@ export class MobileBridgeService extends EventEmitter {
     const deviceId = session.deviceId;
     session.on('message', (message) => {
       if (message.type !== 'capability-request') return;
+      // Taken here, right after the session decrypted and decoded the frame,
+      // so the slow-request line starts at the desktop's first sight of it.
+      const receivedAtMs = performance.now();
+      const stopBlockProbe = startMainLoopBlockProbe();
       void this.capabilityRouter.dispatch(message, session).then((response) => {
-        try {
-          session.sendMessage(response);
-        } catch {
-          // The session may have dropped mid-dispatch; nothing to recover here.
-        }
+        this.sendCapabilityResponse(session, message, response, receivedAtMs, stopBlockProbe);
       });
     });
     // The session already answered the phone (see BridgeSession's
@@ -561,6 +672,16 @@ export class MobileBridgeService extends EventEmitter {
     session.on('established', () => {
       console.log(`[mobile-bridge] device ${label} handshake established`);
     });
+    // Frames a rekey held for the phone's reply (BridgeSession.rekeyHeldFrames).
+    // 'established' and 'dispose' are routine; 'deadline', 'overflow',
+    // 'read-failed' and 'send-failed' sealed them under the old keys after the
+    // phone may already have switched, so they are the lines to look for next
+    // to a phone request that timed out.
+    session.on('rekeyHoldReleased', ({ frames, heldMs, reason }: { frames: number; heldMs: number; reason: RekeyHoldReleaseReason }) => {
+      const line = `[mobile-bridge] device ${label} rekey held ${frames} frame(s) for ${heldMs} ms, released (${reason})`;
+      if (reason === 'established' || reason === 'dispose') console.log(line);
+      else console.warn(line);
+    });
     session.on('handshakeFailed', (error: unknown) => {
       console.warn(`[mobile-bridge] device ${label} handshake failed: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -587,6 +708,54 @@ export class MobileBridgeService extends EventEmitter {
       frameRejectedSuppressed = 0;
       console.warn(`[mobile-bridge] device ${label} rejected a frame: ${error instanceof Error ? error.message : String(error)}${suffix}`);
     });
+  }
+
+  /**
+   * Sends one capability response and writes the slow-request line when the
+   * desktop's share of the round trip reaches SLOW_REQUEST_WARN_MS.
+   *
+   * A response the protocol cannot encode (over its frame caps, which a big
+   * terminal seed can reach) is replaced with a short refusal and a `warn`
+   * line, so the phone fails fast instead of waiting out its own timeout. The
+   * encode runs before anything is sealed (MessageEncodeError), so the refusal
+   * goes out on the same stream without desyncing the phone's receive counter.
+   * Any other send failure is the session dropping mid-dispatch, which the
+   * transport's own lines cover.
+   */
+  private sendCapabilityResponse(
+    session: BridgeSession,
+    request: CapabilityRequestMessage,
+    response: CapabilityResponseMessage,
+    receivedAtMs: number,
+    stopBlockProbe: () => number,
+  ): void {
+    const handledAtMs = performance.now();
+    let frameBytes: number | undefined;
+    try {
+      frameBytes = session.sendMessage(response);
+    } catch (error) {
+      if (error instanceof MessageEncodeError) {
+        console.warn(`[mobile-bridge] response to ${describeRequest(session, request)} not sent: ${error.message}; answered with a refusal`);
+        try {
+          session.sendMessage(responseTooLargeRefusal(request.requestId));
+        } catch {
+          // The session dropped between the two sends; the phone's own timeout covers it.
+        }
+      }
+    }
+    const sentAtMs = performance.now();
+    // Taken on every request, slow or not, so the registry never holds a
+    // finished request's spans and no probe keeps ticking.
+    const spans = takeRequestSpans(session.deviceId, request.requestId);
+    const longestMainLoopBlockMs = stopBlockProbe();
+    if (sentAtMs - receivedAtMs < SLOW_REQUEST_WARN_MS) return;
+    const parts = [`handler ${Math.round(handledAtMs - receivedAtMs)} ms`, ...spans, `send ${Math.round(sentAtMs - handledAtMs)} ms`];
+    if (typeof frameBytes === 'number') parts.push(`${Math.round(frameBytes / 1024)} kB frame`);
+    const bufferedBytes = session.transportBufferedBytes;
+    // Rounded up, so a few stalled bytes never read as "0 kB still buffered".
+    if (typeof bufferedBytes === 'number' && bufferedBytes > 0) parts.push(`${Math.ceil(bufferedBytes / 1024)} kB still buffered`);
+    parts.push(`longest main-loop block ${longestMainLoopBlockMs} ms`);
+    console.warn(`[mobile-bridge] slow request ${describeRequest(session, request)}: ${parts.join(', ')}`);
   }
 
   /**
@@ -708,31 +877,80 @@ export class MobileBridgeService extends EventEmitter {
     this.connectionStateSinceByDevice.delete(deviceId);
   }
 
-  /** Creates a new identity if none exists. Only called from startPairing() - a deliberate user action - never from a read path. */
-  private ensureIdentity(): BridgeIdentity {
-    if (!this.identity) this.identity = loadOrCreateBridgeIdentity();
+  /** In-flight identity creation, shared by concurrent ensureIdentity() callers. */
+  private identityCreation: Promise<BridgeIdentity> | null = null;
+
+  /**
+   * Creates a new identity if none exists. Only called from startPairing() and
+   * the dev quick pair - deliberate user actions - never from a read path.
+   * Concurrent callers share ONE creation: creating is async now, and two
+   * first-ever "Pair a device" clicks each generating and saving a keypair left
+   * one ceremony signing the roster with a key that was not the one on disk, so
+   * after a restart the roster failed to verify and the phone was dropped.
+   */
+  private async ensureIdentity(): Promise<BridgeIdentity> {
+    await this.whenStorageReady();
+    if (this.identity) return this.identity;
+    if (!this.identityCreation) {
+      this.identityCreation = loadOrCreateBridgeIdentity()
+        .then((identity) => {
+          this.identity = identity;
+          return identity;
+        })
+        .finally(() => {
+          this.identityCreation = null;
+        });
+    }
+    return this.identityCreation;
+  }
+
+  /**
+   * The identity WITHOUT creating one: the one whenStorageReady() loaded, or
+   * null before it has. Merely checking status, listing devices, or opening the
+   * settings tab must never have the side effect of generating and persisting a
+   * new device keypair - only startPairing() (a deliberate "Pair a device"
+   * click) does that.
+   */
+  private loadedIdentity(): BridgeIdentity | null {
     return this.identity;
   }
 
   /**
-   * Reads the identity WITHOUT creating one. Merely checking status,
-   * listing devices, or opening the settings tab must never have the side
-   * effect of generating and persisting a new device keypair - only
-   * startPairing() (a deliberate "Pair a device" click) does that.
+   * Dev builds only. Enables the quick pair once secure storage is confirmed and
+   * the identity exists (creating it, which is as deliberate as "Pair a
+   * device"), because the quick pair reads that identity synchronously.
    */
-  private tryLoadIdentity(): BridgeIdentity | null {
-    if (this.identity) return this.identity;
-    const loaded = loadBridgeIdentity();
-    if (loaded) this.identity = loaded;
-    return loaded;
+  private reconcileDevQuickPair(): void {
+    // Lets esbuild strip this body from production, as it strips DevQuickPair.
+    if (!__KANGENTIC_DEV__) return;
+    const devQuickPair = this.devQuickPair;
+    if (!devQuickPair) return;
+    if (!this.config.enabled) {
+      devQuickPair.reconcile(false);
+      return;
+    }
+    void (async () => {
+      await this.whenStorageReady();
+      if (this.disposed) return;
+      if (!this.config.enabled || !this.secureStorageAvailable) {
+        devQuickPair.reconcile(false);
+        return;
+      }
+      await this.ensureIdentity();
+      // dispose() stopped the quick pair; do not restart it.
+      if (this.disposed) return;
+      devQuickPair.reconcile(true);
+    })().catch((error: unknown) => {
+      console.warn('[mobile-bridge] dev quick pair could not start:', error);
+    });
   }
 
   getStatus(): MobileBridgeStatus {
-    const secureStorageAvailable = isGenuineEncryptionAvailable();
+    const secureStorageAvailable = this.secureStorageAvailable;
     let identityFingerprint: string | null = null;
     let pairedDeviceCount = 0;
     if (secureStorageAvailable) {
-      const identity = this.tryLoadIdentity();
+      const identity = this.loadedIdentity();
       if (identity) {
         identityFingerprint = bytesToHex(identity.staticKeyPair.publicKey);
         pairedDeviceCount = loadRoster(identity).devices.length;
@@ -752,7 +970,7 @@ export class MobileBridgeService extends EventEmitter {
   }
 
   listDevices(): PairedDeviceSummary[] {
-    const identity = this.tryLoadIdentity();
+    const identity = this.loadedIdentity();
     if (!identity) return [];
     return loadRoster(identity).devices.map((device) => ({
       deviceId: device.deviceId,
@@ -765,7 +983,7 @@ export class MobileBridgeService extends EventEmitter {
   }
 
   renameDevice(deviceId: string, displayName: string): void {
-    const identity = this.tryLoadIdentity();
+    const identity = this.loadedIdentity();
     if (!identity) throw new Error(`No such paired device: ${deviceId}`);
     // Same clamp and control-character filter the pairing path applies to the
     // phone-supplied name: a rename lands in the same signed roster entry and
@@ -794,7 +1012,7 @@ export class MobileBridgeService extends EventEmitter {
     // before the identity guard, so a registration can never outlive its
     // device under any teardown ordering.
     this.pushRegistrations.remove(deviceId);
-    const identity = this.tryLoadIdentity();
+    const identity = this.loadedIdentity();
     if (!identity) return; // No identity means no roster, so nothing to revoke.
     revokeDeviceInRoster(identity, deviceId);
     this.disposeSession(deviceId);
@@ -810,7 +1028,7 @@ export class MobileBridgeService extends EventEmitter {
   }
 
   setDeviceCapabilities(deviceId: string, capabilities: CapabilityVerb[]): void {
-    const identity = this.tryLoadIdentity();
+    const identity = this.loadedIdentity();
     if (!identity) throw new Error(`No such paired device: ${deviceId}`);
     setDeviceCapabilitiesInRoster(identity, deviceId, capabilities);
     const session = this.sessions.get(deviceId);
@@ -834,7 +1052,16 @@ export class MobileBridgeService extends EventEmitter {
     const relayValidation = validateRelayUrl(this.config.relayUrl);
     if (!relayValidation.ok) throw new Error(`Cannot start pairing: ${relayValidation.reason}`);
 
-    const identity = this.ensureIdentity();
+    const identity = await this.ensureIdentity();
+    // The bridge can be disabled or shut down during that await. The checks at
+    // the top ran before it, so repeat them, or a ceremony and its relay
+    // transport start for a bridge that is off.
+    if (this.disposed) throw new Error('Mobile bridge service is shutting down');
+    if (!this.config.enabled) throw new Error('Mobile bridge is not enabled');
+    // ensureIdentity() awaits, so a second click can have started its own
+    // ceremony in the gap. Supersede it here as above, or the first one's
+    // transport would stay open with nothing left to close it.
+    if (this.activePairing) this.cancelPairing('Superseded by a new pairing attempt');
     const pairingService = new PairingService(identity);
     const token = pairingService.mintToken();
     this.activePairing = pairingService;
@@ -932,6 +1159,8 @@ export class MobileBridgeService extends EventEmitter {
     this.devQuickPair?.stop();
     this.sessionLifecycleFeed?.dispose();
     this.sessionLifecycleFeed = null;
+    this.spawnProgressFeed?.dispose();
+    this.spawnProgressFeed = null;
     this.pushNotifier?.dispose();
     this.pushNotifier = null;
     this.spawnStallWatcher?.dispose();

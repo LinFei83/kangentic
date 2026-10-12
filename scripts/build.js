@@ -35,8 +35,10 @@ process.env.NODE_ENV = 'production';
 const keepDevtools = process.env.KANGENTIC_BUILD_DEV === '1';
 
 // Sentry sourcemap upload for the main + preload bundles, release-only: it
-// activates only when an upload token is present (a CI/release secret; the
-// renderer half lives in vite.config.mts behind the same gate).
+// activates only when an upload token is present (a CI/release secret) AND the
+// build is authorized to upload (isSentryUploadAuthorized below: CI, or an
+// explicit KANGENTIC_SENTRY_UPLOAD=1). The renderer half lives in
+// vite.config.mts behind the same gate.
 // KANGENTIC_SENTRY_TOKEN is the scoped name; SENTRY_AUTH_TOKEN stays accepted
 // as the conventional CI fallback. Maps are generated as separate files
 // (esbuild 'external' = no sourceMappingURL comment), uploaded with debug
@@ -62,8 +64,29 @@ function resolveSentryAuthToken(env) {
   return undefined;
 }
 
+/**
+ * Whether this build may upload at all, separately from having a token.
+ *
+ * A token alone is not intent. The dogfooding machine carries
+ * KANGENTIC_SENTRY_TOKEN as a USER environment variable (the /sentry skill reads
+ * Sentry with it), so every local `npm run build` before an E2E run, a /test pass
+ * or a packaged smoke uploaded sourcemaps and node-pty debug files for an
+ * unreleased working tree, filed under the current release's name. Releases build
+ * in CI (release.yml), where GitHub Actions sets CI=true, so the upload is
+ * authorized there; a local build uploads only with an explicit
+ * KANGENTIC_SENTRY_UPLOAD=1. The skip is announced either way (see
+ * announceSentryUploadMode), so it can never be silent.
+ *
+ * Exported for test. Mirrored in vite.config.mts for the renderer half.
+ */
+function isSentryUploadAuthorized(env) {
+  const ci = typeof env.CI === 'string' ? env.CI.trim().toLowerCase() : '';
+  if (ci !== '' && ci !== 'false' && ci !== '0') return true;
+  return typeof env.KANGENTIC_SENTRY_UPLOAD === 'string' && env.KANGENTIC_SENTRY_UPLOAD.trim() === '1';
+}
+
 const sentryAuthToken = resolveSentryAuthToken(process.env);
-const uploadSourcemaps = Boolean(sentryAuthToken);
+const uploadSourcemaps = Boolean(sentryAuthToken) && isSentryUploadAuthorized(process.env);
 // One Sentry project receives both the sourcemaps and the native debug files.
 const SENTRY_ORG = 'kangentic';
 const SENTRY_PROJECT = 'desktop';
@@ -127,9 +150,14 @@ function assertUploadCanActuallyRun() {
  * trace of it in the release logs, so silence is the bug being fixed here.
  */
 function announceSentryUploadMode() {
-  console.log(uploadSourcemaps
-    ? `[build] Sentry symbol upload: enabled (release ${resolveSentryReleaseName()})`
-    : '[build] Sentry symbol upload: skipped (no KANGENTIC_SENTRY_TOKEN or SENTRY_AUTH_TOKEN)');
+  if (uploadSourcemaps) {
+    console.log(`[build] Sentry symbol upload: enabled (release ${resolveSentryReleaseName()})`);
+  } else if (sentryAuthToken) {
+    console.log('[build] Sentry symbol upload: skipped (a token is set, but this is a local build; '
+      + 'uploads run in CI, or set KANGENTIC_SENTRY_UPLOAD=1)');
+  } else {
+    console.log('[build] Sentry symbol upload: skipped (no KANGENTIC_SENTRY_TOKEN or SENTRY_AUTH_TOKEN)');
+  }
 }
 
 // The uploadSourcemaps guard gates the require below (the function itself runs
@@ -229,12 +257,13 @@ async function uploadNativeDebugFiles() {
 }
 
 /**
- * Fails the build unless the two heavy lazy-only vendors (recharts behind
- * LazyStatsDashboard, monaco behind the lazy ChangesPanel) stayed OUT of the
- * renderer entry's static import closure. Rolldown's chunking has silently
- * defeated both boundaries before (a manualChunks group absorbed react's CJS
- * interop and became a static import of the entry, parsing the whole vendor
- * at every cold start), so this is the build-time backstop. Invariants:
+ * Fails the build unless the heavy lazy-only vendors (recharts behind
+ * LazyStatsDashboard, monaco behind the lazy ChangesPanel, three behind
+ * LazyKnowledgeGraph) stayed OUT of the renderer entry's static import closure.
+ * Rolldown's chunking has silently defeated these boundaries before (a
+ * manualChunks group absorbed react's CJS interop and became a static import of
+ * the entry, parsing the whole vendor at every cold start), so this is the
+ * build-time backstop. Invariants:
  *   1. A `recharts-*.js` chunk EXISTS in assets/ (proves the manualChunks
  *      name in vite.config.mts did not silently rot on a future upgrade).
  *   2. Walking the Vite manifest's static `imports` closure from the entry
@@ -242,6 +271,12 @@ async function uploadNativeDebugFiles() {
  *   3. No chunk in that static closure CONTAINS monaco (marker-string scan;
  *      monaco has no named chunk by design - see vite.config.mts), and some
  *      lazy chunk does (proving the markers still detect monaco at all).
+ *   4. The same existence + closure pair for `three-*.js`. This one is the most
+ *      exposed of the three: `PopOutKnowledgeGraphRoot` IS statically reachable from the
+ *      entry through the pop-out surface registry, so the ONLY thing keeping
+ *      three lazy is that it imports the graph through `LazyKnowledgeGraph`. A
+ *      stray static import there would be invisible in dev and would parse all
+ *      of three at every cold start in production.
  * Falls back to asserting index.html carries no reference to the recharts
  * chunk if the manifest is ever unavailable.
  */
@@ -291,6 +326,24 @@ function assertVendorChunksLazy(rendererOutDir) {
     );
   }
 
+  const threeChunk = assetFiles.find((name) => name.startsWith('three-') && name.endsWith('.js'));
+  if (!threeChunk) {
+    throw new Error(
+      '[build] No three-*.js chunk in the renderer output. Either three became statically bundled '
+      + 'into another chunk (check the manualChunks entry in vite.config.mts) or the dependency '
+      + 'layout changed; the lazy Knowledge Graph bundle assertion cannot run.',
+    );
+  }
+  const threeFile = `assets/${threeChunk}`;
+  if (staticFiles.has(threeFile)) {
+    throw new Error(
+      `[build] ${threeChunk} is in the entry's STATIC import closure. Something imports three `
+      + '(or a Knowledge Graph module that pulls it) statically from the startup path. The usual cause '
+      + 'is PopOutKnowledgeGraphRoot, which IS statically reachable from the entry via the pop-out surface '
+      + 'registry - it must reach the scene through the LazyKnowledgeGraph boundary, never directly.',
+    );
+  }
+
   // Monaco: marker-string scan. These literals appear in monaco's editor
   // sources and nowhere in first-party code; web workers are separate
   // entries loaded inside worker contexts, not part of the startup path.
@@ -317,7 +370,7 @@ function assertVendorChunksLazy(rendererOutDir) {
       + 'blind (markers rotted on a monaco upgrade?). Update MONACO_MARKERS in scripts/build.js.',
     );
   }
-  console.log(`[build] Verified ${rechartsChunk} and all monaco chunks are reachable only via dynamic import`);
+  console.log(`[build] Verified ${rechartsChunk}, ${threeChunk} and all monaco chunks are reachable only via dynamic import`);
 }
 
 const esbuildCommon = {
@@ -325,7 +378,7 @@ const esbuildCommon = {
   platform: 'node',
   target: 'node24',
   format: 'cjs',
-  external: ['electron', 'better-sqlite3', 'node-pty', 'sherpa-onnx-node', 'sqlite-vec', '@huggingface/transformers', 'font-list'],
+  external: ['electron', 'better-sqlite3', 'node-pty', 'sherpa-onnx-node', 'sqlite-vec', '@huggingface/transformers', 'font-list', 'koffi'],
   conditions: ['require'],
   define: {
     'MAIN_WINDOW_VITE_DEV_SERVER_URL': JSON.stringify(''),
@@ -420,8 +473,25 @@ async function build() {
       entryPoints: [path.join(projectDir, 'src/main/transcription/dictation-worker.ts')],
       outfile: path.join(projectDir, '.vite/build/dictation-worker.js'),
     }),
+    // The retrieval index (search, the Knowledge Graph's map, indexing) runs
+    // in an Electron utilityProcess (see src/main/retrieval/retrieval-client.ts),
+    // so none of its database work blocks the main process. `better-sqlite3`
+    // stays external, resolved from the unpacked node_modules at runtime.
+    esbuild.build({
+      ...esbuildCommon,
+      entryPoints: [path.join(projectDir, 'src/main/retrieval/worker/retrieval-worker.ts')],
+      outfile: path.join(projectDir, '.vite/build/retrieval-worker.js'),
+    }),
+    // The pty host (`kangentic-pty-host` utility process): every node-pty
+    // instance and the per-chunk work on its output. node-pty and
+    // better-sqlite3 stay external, resolved from the unpacked node_modules.
+    esbuild.build({
+      ...esbuildCommon,
+      entryPoints: [path.join(projectDir, 'src/main/pty/host/pty-host-entry.ts')],
+      outfile: path.join(projectDir, '.vite/build/pty-host.js'),
+    }),
   ]);
-  console.log('[build] Main + preload + embed worker + line-count worker + dictation worker built');
+  console.log('[build] Main + preload + embed, line-count, dictation and retrieval workers and the pty host built');
 
   // Copy external scripts (bridges + adapter plugins) that run outside the
   // esbuild bundle as raw .js/.mjs and must sit next to the bundle. The copy
@@ -457,6 +527,7 @@ module.exports = {
   assertVendorChunksLazy,
   uploadNativeDebugFiles,
   resolveSentryAuthToken,
+  isSentryUploadAuthorized,
   announceSentryUploadMode,
   assertUploadCanActuallyRun,
   resolveSentryEsbuildPlugins,

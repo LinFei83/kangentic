@@ -43,7 +43,7 @@ import { useToastStore } from '../../stores/toast-store';
 import { resolveShortcutCommand } from '../../../shared/template-vars';
 import { ICON_REGISTRY } from '../../utils/swimlane-icons';
 import { resolveProjectRoot } from '../../../shared/git-utils';
-import { commandTerminalTitle } from '../../../shared/command-terminal-name';
+import { commandTerminalDisplayName } from '../../../shared/command-terminal-name';
 import { isActive, requiresUserInteraction } from '../../../shared/activity-state';
 import { useLayerStore } from '../../window-manager';
 import type { ManagedWindow } from '../../window-manager';
@@ -248,15 +248,18 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
   );
 
   const projectId = useProjectStore((s) => s.currentProject?.id ?? null);
-  const transientLabel = useSessionStore((state) =>
-    projectId ? state.transientSessions[transientKey(projectId, slot)]?.label ?? null : null,
-  );
-  // The auto-derived label (summarized from the first prompt) wins when it
-  // exists; until then the slot number is what makes two terminals tellable
-  // apart, since every other fact in this header (agent, model, branch, cwd) is
-  // identical across a project's terminals by construction. `commandTerminalTitle`
-  // is shared with the Agent Monitor so both surfaces print the same name.
-  const windowTitle = transientLabel ?? commandTerminalTitle(slot);
+  // Main derives the terminal's name from its first prompt and stamps it on the
+  // session row, so it is read from the replica, not from window state.
+  const transientLabel = useSessionStore((state) => {
+    if (!sessionId) return null;
+    return state.sessions.find((session) => session.id === sessionId)?.commandTerminalLabel ?? null;
+  });
+  // The derived name wins when it exists; until then the slot number is what
+  // makes two terminals tellable apart, since every other fact in this header
+  // (agent, model, branch, cwd) is identical across a project's terminals by
+  // construction. `commandTerminalDisplayName` is shared with the Agent Monitor,
+  // a phone's snapshot and the push alert, so all four print the same name.
+  const windowTitle = commandTerminalDisplayName(transientLabel, slot);
   // The branch is read from the pairing map, never held here: every path that
   // used to set it locally (spawn, adopt, a picker switch) already writes the
   // map entry, and the layer's HEAD tracker (`useTrackHeadBranch`) corrects
@@ -373,10 +376,11 @@ export function CommandTerminalWindow({ managedWindow, isMaximized, titleBarPoin
     const grid = gridGetterRef.current?.() ?? undefined;
     try {
       // Act on the outcome here too, not just in handleTerminate: this path scrubs the
-      // slot and immediately spawns a replacement on it, so a kill that failed leaves the
-      // old PTY running and unreachable while a new one starts under a fresh checkout.
-      // Warn rather than abort - the user asked for the branch switch, and the respawn is
-      // still the useful half of it.
+      // slot and immediately spawns a replacement on it, so a kill that failed may leave
+      // the old PTY running and unreachable. Warn, then still try the respawn: if the old
+      // row is gone it succeeds, and if it lives main refuses its slot (`slot-taken`) and
+      // the catch below says so. The kill handler's only refusal (a task's session)
+      // cannot reach this path, so 'failed' means the invoke itself failed.
       const killOutcome = await useSessionStore.getState().killTransientSessionBySlot(currentProjectId, slot);
       if (killOutcome === 'failed') {
         useToastStore.getState().addToast({

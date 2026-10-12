@@ -12,29 +12,29 @@ When a task moves from one column to another, the IPC handler (`task:move`) chec
 
 | Priority | Condition | Action |
 |----------|-----------|--------|
-| 1 | Target is **To Do** (role=`todo`) | Kill session, preserve worktree |
-| 2 | Target is **Done** (role=`done`) | Suspend session (resumable), archive task |
+| 1 | Target is **To Do** (role=`todo`) | Kill session, reap what the task left running, remove worktree (and branch when `git.autoCleanup` is on) |
+| 2 | Target is **Done** (role=`done`) | Suspend session (resumable), reap what the task left running, archive task |
 | 2.5 | Target has `auto_spawn=false` (non-todo, non-done) | Suspend session |
-| 3 | Task has **active session** | Permission-mode delta suspends and respawns with the destination's CLI flags. Live injection plan injects into the running session. Model/effort delta without live-swap suspends and respawns. Otherwise keep alive. |
+| 3 | Task has **active session** | A model or effort change suspends and respawns with the destination's CLI flags. A column message alone is injected into the running session. A permission-only change, or none, keeps it alive. |
 | 4 | Task has **no session** | Resume suspended session (with the column's message preloaded as resume prompt) OR create worktree (if enabled) + run the destination's On enter group |
 
 The SOURCE column's On exit group runs ahead of all five, in Phase 1. See [Triggers](#triggers).
 
-"Active session" is decided against the registry, not the raw `task.session_id`. Phase 1 runs `reconcileTaskSessionRef` (`session-reconcile.ts`, the same self-heal `SESSION_RESUME`, `SESSION_RECONCILE`, `SESSION_SUSPEND`, and `task:setRuntimeOverride` use) before the ladder: a pointer at a non-live registry row (an agent that exited on its own, a `--resume` that could not read its transcript) is cleared so the move takes Priority 4 and resumes the record, and a live PTY the pointer lost is re-linked so the move takes Priority 3 instead of spawning a second agent. Before #682 the raw pointer decided, and a task whose CLI had ended by itself was "kept alive" on every move with nothing running.
+"Active session" is decided against the registry, not the raw `task.session_id`. Phase 1 runs `reconcileTaskSessionRef` (`session-reconcile.ts`, the same self-heal `SESSION_RESUME`, `SESSION_RECONCILE`, `SESSION_SUSPEND`, `task:setRuntimeOverride`, and the auto_spawn-off suspend in `reconcileAutoSpawnChange` use) before the ladder: a pointer at a non-live registry row (an agent that exited on its own, a `--resume` that could not read its transcript) is cleared so the move takes Priority 4 and resumes the record, and a live PTY the pointer lost is re-linked so the move takes Priority 3 instead of spawning a second agent. Before #682 the raw pointer decided, and a task whose CLI had ended by itself was "kept alive" on every move with nothing running.
 
 ### Priority 3: Active Session Handling
 
-Priority 3 has five sub-cases, checked in order:
+Priority 3 has four sub-cases, checked in order:
 
-**a) Agent change (handoff):** If `resolveTargetAgent()` returns a different agent than the current session's agent, the session is suspended and the engine falls through to the `spawnAgent` path. The `agentOverride` parameter is set on the spawn request to prevent the new session from resuming the old agent's session. **Side effect:** per-task `model_override` and `effort_override` are cleared on handoff because override values are model-name-specific and don't carry across agents (Claude's `claude-sonnet-4-6` is meaningless to Codex). This clear is skipped when `task.agent_override` is set, since the user locked the agent at creation and the overrides remain valid for that agent. If the target column has `handoff_context` enabled, prior work context (transcript, git diff, metrics) is packaged and delivered to the new agent. If disabled (the default), the new agent starts fresh with just the task title/description. See [Cross-Agent Handoff](#cross-agent-handoff) below.
+**a) Agent change (handoff):** If `resolveTargetAgent()` returns a different agent than the current session's agent, the session is suspended and the engine falls through to the `spawnAgent` path. The `agentOverride` parameter is set on the spawn request to prevent the new session from resuming the old agent's session. **Side effect:** per-task `model_override` and `effort_override` are cleared on handoff because override values are model-name-specific and don't carry across agents (Claude's `claude-sonnet-4-6` is meaningless to Codex). This clear is skipped when `task.agent_override` is set, since the user locked the agent at creation and the overrides remain valid for that agent. If the target column has `handoff_context` enabled, prior work context (transcript, git diff, metrics) is packaged and delivered to the new agent. If disabled (the default), no history is packaged: the new agent gets only the task title/description, or resumes its own earlier conversation on this task when one is resumable. See [Cross-Agent Handoff](#cross-agent-handoff) below.
 
-**b) Same agent + permission-mode delta:** If the destination column's EFFECTIVE permission mode (`lane.permission_mode ?? config.agent.permissionMode`) differs from the mode the live session was spawned with (the session record's `permission_mode`, not the source lane), the session is suspended and respawned. No adapter exposes a non-interactive permission-mode switch for a live session (Claude's only mechanism is interactive shift+tab cycling), so this is checked before live injection. The respawn resumes the same agent session id, and the destination's `--permission-mode` / `--model` / `--effort` land as CLI flags. Legacy session records with a null `permission_mode` never trigger this case. A plan-exit auto-move additionally passes a continuation prompt ("Your plan was approved. Proceed with the implementation.") delivered as the resumed session's first message when the destination column has no `auto_command` (the `auto_command` wins when present).
+**b) Same agent + model or effort change:** If `prepareInjectionPlan` returns a `restartReason` (`'model'` or `'effort'`), the session is suspended and respawned so the destination's `--model` / `--effort` / `--permission-mode` land as launch flags. Nothing is typed into the PTY: a live `/model` left the agent paused after a Planning -> Executing handoff, and a mid-turn `/effort` writes no transcript entry, so it could not be confirmed on a plan-exit move, which always lands mid-turn. The respawn resumes the same agent session id and carries the column's message as its prompt. A plan-exit auto-move passes a continuation prompt that names the destination column ("The session restarted to apply the <column> column's settings. Proceed with implementing the approved plan.") delivered as the resumed session's first message only when neither the destination column's message (its first enabled `send_message` enter automation) nor the task's own `auto_command` is set; either one takes the prompt slot instead. No continuation is sent when the move switches session track (into or out of an isolated column), lands in an `always_spawn_new` column, or changes agent: each of those lands in a conversation that never saw the plan. The progress label is `switching-model` for a model change and `applying-settings` for an effort-only one.
 
-**c) Same agent + live injection plan:** If the destination adapter returns a non-null plan from `prepareInjectionPlan` (model/effort slash commands like `/model X` + optional auto_command), the writes are scheduled directly into the running session via `TerminalSubmitScheduler.scheduleKeystrokes`. No suspend/resume cycle occurs. The delta is computed against what the session is *actually running at*, not the leaving column, so a column whose value the session already has injects nothing. The two fields resolve that differently: **model** uses the session record's `applied_model`, while **effort** prefers the level the agent itself reports (`task.effort_override ?? <agent-reported effort> ?? record.applied_effort`), because `applied_effort` records only what Kangentic last asked for and an `/effort` typed straight into the terminal never reaches it. Model deliberately stays record-only - telemetry reports canonical ids while the configured values are flag strings, so comparing them would read a false change and restart the PTY. See [Command Injection](command-injection.md) for the full precedence. After scheduling, when `plan.appliedSettings` is present the handler persists it via `sessionRepo.updateAppliedSettings`, keeping the recorded value current so the next move diffs against the truth.
+The delta is computed against what the session is *actually running at*, not the leaving column, so a column whose value the session already has restarts nothing. The two fields resolve that differently: **model** uses the session record's `applied_model`, while **effort** prefers the level the agent itself reports (`task.effort_override ?? <agent-reported effort> ?? record.applied_effort`), because `applied_effort` records only what Kangentic last asked for and an `/effort` typed straight into the terminal never reaches it. A level the model silently downgraded counts as applied: when the target equals `applied_effort` and the reported level has not moved since the session's first report, nothing restarts. Model deliberately stays record-only - telemetry reports canonical ids while the configured values are flag strings, so comparing them would read a false change and restart the PTY on every move. Only a concrete target restarts: entering a "Default" column (null target) keeps the session, since `--resume <id>` preserves what it runs at. A per-task override wins on both sides, so a pinned field never restarts. See [Command Injection](command-injection.md) for the full precedence.
 
-**d) Same agent + concrete model/effort delta (no live-swap):** If the adapter has no live-swap slash for the target value AND the destination column overrides model or effort to a non-null value the session is not already running at (the delta is computed against what the session is actually running at, not the source lane: `applied_model` for model, and `task.effort_override ?? <agent-reported effort> ?? record.applied_effort` for effort, matching case (c) above), the session is suspended and respawned so the new flags land on the command line. The respawn is skipped when the target value is null (entering a "Default" column) because adapters have no `/model <agent-default>` slash and `--resume <id>` preserves the saved model regardless - the suspend/resume would just churn the PTY without changing anything. Matches the recovery contract in `task-runtime-override.ts`.
+**c) Same agent + column message only:** If the plan carries the column's message and no `restartReason`, the message is scheduled into the running session via `TerminalSubmitScheduler.scheduleKeystrokes`. No suspend/resume cycle occurs.
 
-**e) Same agent, no delta or no concrete target:** The session stays alive with no interruption.
+**d) Same agent, permission-only change or no change:** The session stays alive with no interruption. A permission-mode delta never restarts: in the canonical Planning -> Executing flow the user already approved the plan in the terminal and Claude left plan mode in-session, so the spawn-time permission mode recorded on the session is stale.
 
 ## Triggers
 
@@ -77,11 +77,11 @@ Runs a script as an ordinary child process, in the task's worktree when it has o
 | Field | Type | Description |
 |-------|------|-------------|
 | `script` | string | The script body, with `{{placeholders}}`. Escaping is `shell` |
-| `timeoutMinutes` | number | Give up after this long. Default 10. Set in `kangentic.json` only, not in the Column Manager: an exit group is capped at 60 seconds in aggregate whatever this says, so the control could not tell the truth on half the rows it appeared on. The bound itself is not optional, because enter automations hold the task lock and `withTaskLock` has no timeout of its own |
+| `timeoutMinutes` | number | Give up after this long. Default 10, range 1 to 120. Set in `kangentic.json` only, not in the Column Manager: an exit group is capped at 60 seconds in aggregate whatever this says, so the control could not tell the truth on half the rows it appeared on. The bound itself is not optional, because enter automations hold the task lock and `withTaskLock` has no timeout of its own |
 
 Not a PTY. An interactive shell runs the script and then returns to its prompt and lives forever, so completion is unobservable and the exit code unobtainable; this adapter awaits the exit and records the code. The timeout kills the process TREE, because a bare kill reaches the shell only and leaves whatever it spawned running. No retry: a half-run script is not safe to repeat.
 
-Every variable also arrives as a `KANGENTIC_*` environment variable, which is the lossless path: `"$KANGENTIC_TITLE"` gets the exact value on every shell, where substituted text is stripped of shell metacharacters.
+Every variable also arrives as a `KANGENTIC_*` environment variable, which is the lossless path: `"$KANGENTIC_TITLE"` gets the exact value on a POSIX shell or PowerShell, where substituted text is stripped of shell metacharacters (including the curly double quotes, which PowerShell ends a string at). Not on cmd.exe, which expands `%KANGENTIC_TITLE%` and then re-parses the value for metacharacters.
 
 ### `webhook` -- Call webhook
 
@@ -92,22 +92,22 @@ Every variable also arrives as a `KANGENTIC_*` environment variable, which is th
 | `body` | string | Request body. Escaping is `json`. Empty means the default JSON envelope |
 | `headers` | Record<string, string> | Extra headers, authored one per line as `Name: Value` |
 
-30 second timeout via `AbortSignal.timeout`, a `response.ok` check, and 3 attempts on a transport error, 429 or 5xx through the shared `withBackoff`, honoring `Retry-After`. Every attempt sends an `Idempotency-Key` built from the run id, so a retry cannot double-create downstream. `attempts` is written to the run row.
+30 second timeout via `AbortSignal.timeout`, a `response.ok` check, and 3 attempts on a transport error, 408, 429 or 5xx through the runner's retry loop (`delayBeforeRetry` in `src/main/automations/automation-runner.ts`), honoring `Retry-After`. Every attempt sends an `Idempotency-Key` built from the run id, so a retry cannot double-create downstream. `attempts` is written to the run row.
 
 ### `notify` -- Notify me
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `title` | string | Default `{{title}}` |
-| `body` | string | Default `{{toColumn}}` |
+| `title` | string | Default `{{title}}`. Escaping is `none` |
+| `body` | string | Default `{{toColumn}}`. Escaping is `none` |
 
 One desktop notification through the same `showNotification` path `DesktopNotifier` uses, so it inherits click-to-task. No timeout, no retry.
 
 ### `spawn_agent` -- Start agent (legacy)
 
-The one legacy adapter, kept because a row carrying a custom `promptTemplate` is not a duplicate of anything and has no other home. It is never offered for a new automation, appears as a disabled option in the dialog's Type select, and shows a lint on its row: "This is handled by the column's settings now. Remove it to use them."
+The one legacy adapter, kept because a row carrying a custom `promptTemplate` is not a duplicate of anything and has no other home. It is never offered for a new automation, appears as a disabled option in the dialog's Type select, and shows a lint on its row: "This is handled by the column's settings now. Remove it to use them." Its one field, `promptTemplate`, has escaping `none`.
 
-`send_command`, `kill_session`, `create_worktree`, `cleanup_worktree` and `create_pr` are GONE, rows and all. Each was a no-op or a duplicate of the move path: `kill_session` suspended a session the task no longer had at that point, `create_worktree` did what `ensureTaskWorktree` does, `cleanup_worktree` did what a To Do move does, and `create_pr` was never implemented. A hand-written `kangentic.json` naming one is warned and skipped, matching what the migration did to the same row in the DB.
+`kill_session`, `create_worktree` and `cleanup_worktree` (`RETIRED_ACTION_TYPES`) are GONE, rows and all. Each was a no-op or a duplicate of the move path: `kill_session` suspended a session the task no longer had at that point, `create_worktree` did what `ensureTaskWorktree` does, and `cleanup_worktree` did what a To Do move does. `create_pr` was never implemented, and the migration drops it with any other type it does not recognize. A hand-written `kangentic.json` naming one of these is warned and skipped, matching what the migration did to the same row in the DB. `send_command` is not retired. The migration converted its rows to `send_message`, and a file that still names it is read as an alias (see [configuration.md](configuration.md)).
 
 ## Every row is isolated, bounded and recorded
 
@@ -253,7 +253,7 @@ Each message declares WHEN it fires, via its own `mode` field: `immediate` (the 
 
 This enables workflows like moving a task from "Running" to "Code Review" to automatically send a review prompt to the agent.
 
-`resolveColumnMessage` picks the column's message: the FIRST enabled `send_message` row in its On enter group. First, not all of them, because the two callers that ask are asking a question with one answer -- a spawn has a single prompt slot, and the live injection bundles one command into the model/effort keystroke burst. Later message rows are the runner's to deliver. `resolveEffectiveAutoCommand` then puts a per-task `auto_command` (MCP-only, `kangentic_create_task`'s `autoCommand` param) ahead of it for that task.
+`resolveColumnMessage` picks the column's message: the FIRST enabled `send_message` row in its On enter group. First, not all of them, because the two callers that ask are asking a question with one answer. A spawn has a single prompt slot, and the live injection types exactly one command. Later message rows are the runner's to deliver. `resolveEffectiveAutoCommand` then puts a per-task `auto_command` (MCP-only, `kangentic_create_task`'s `autoCommand` param) ahead of it for that task.
 
 **A profile cannot re-point the message.** Automations are shared by every profile, which is why the Column Manager's whole list is read-only under one. `BoardProfileEntry.autoCommand` is the retired key that used to overlay it: nothing reads it, and nothing writes it. A column's own legacy `autoCommand` in `kangentic.json` IS still read, and converted into a `send_message` row on apply.
 
@@ -269,8 +269,8 @@ Two special roles affect behavior:
 
 | Role | Behavior |
 |------|----------|
-| `todo` | Task moves here → session killed (not suspended), worktree preserved |
-| `done` | Task moves here → session suspended (resumable), task archived |
+| `todo` | Task moves here → session killed (not suspended), leftover processes reaped, worktree removed |
+| `done` | Task moves here → session suspended (resumable), leftover processes reaped, task archived |
 
 Both roles still run their On EXIT group (in Phase 1, before the kill or the suspend), and neither runs an On enter group: the Column Manager offers only the exit group there, and `canColumnRun` blocks an enter row written by hand.
 
@@ -344,7 +344,7 @@ When a task moves to a column with a different agent (detected by `resolveTarget
 1. **Agent resolution** detects agent change: `resolveTargetAgent()` checks `task.agent_override` first (highest priority - the user's create-time lock), then column `agent_override`, then project `default_agent`, then global fallback (`'claude'`). If the resolved agent differs from the current session's agent, a handoff is triggered. Tasks with a non-null `task.agent_override` never trigger a handoff on column moves - the locked agent supersedes column settings.
 2. **Task-move Priority 3** suspends the current session.
 3. **spawnAgent handoff path** - the `agentOverride` parameter is passed to `executeSpawnAgent()`, which prevents resume of the wrong agent's session.
-4. **HandoffOrchestrator** packages context from the previous session: transcript (from `session_transcripts`), git diff, and session metrics.
+4. **HandoffOrchestrator** packages context from the previous session: transcript (from `session_transcript_chunks`), git diff, and session metrics.
 5. **Transition engine** spawns the new agent with a `handoffPromptPrefix` that summarizes the handoff context.
 6. **Post-spawn** - a `handoff-context.md` file is written to the session directory for the new agent to reference.
 

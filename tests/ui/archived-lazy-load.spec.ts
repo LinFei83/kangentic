@@ -13,11 +13,13 @@
  *      full list back to the preview.
  *   5. After the dialog closes, the next agent-driven reload downgrades back to
  *      the preview: no further full `tasks.listArchived`, only the preview fetch.
+ *   6. Opening a finished task older than the preview (Quick Find, the Knowledge
+ *      Graph) loads the full archive and opens its window, never nothing.
  */
 import { test, expect } from '@playwright/test';
 import { chromium, type Browser, type Page } from '@playwright/test';
 import path from 'node:path';
-import { waitForViteReady } from './helpers';
+import { waitForViteReady, gotoVite } from './helpers';
 
 // Each test launches its own page (separate context / goto reset), so the file
 // can fan out across the UI workers safely.
@@ -93,7 +95,7 @@ async function launchWithArchivedTasks(): Promise<{ browser: Browser; page: Page
     });
   `);
 
-  await page.goto(VITE_URL);
+  await gotoVite(page, VITE_URL);
   await page.waitForLoadState('load');
   await page.waitForSelector('text=Kangentic', { timeout: 15000 });
   // The Done column is always visible once the board hydrates.
@@ -212,6 +214,26 @@ test.describe('archive lazy-load', () => {
 
       const counts = await readCounts(page);
       expect(counts['tasks.listArchived'] ?? 0).toBe(0);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test('opening a finished task older than the preview loads it and opens its window', async () => {
+    // Quick Find and the Knowledge Graph open a task by id. arch-19 is the OLDEST
+    // of the twenty, outside the fifteen the board hydrates, which is where the
+    // detail window used to give up silently: the request was made and nothing
+    // ever opened.
+    const { browser, page } = await launchWithArchivedTasks();
+    try {
+      await page.evaluate(() => (window as unknown as {
+        __zustandStores: { session: { getState: () => { setDetailTaskId: (taskId: string) => void } } };
+      }).__zustandStores.session.getState().setDetailTaskId('arch-19'));
+
+      await expect.poll(async () => page.evaluate(() => Object.values((window as unknown as {
+        __zustandStores: { window: { getState: () => { windows: Record<string, { kind: string; anchor: string }> } } };
+      }).__zustandStores.window.getState().windows).map((entry) => `${entry.kind}:${entry.anchor}`))).toContain('task-detail:arch-19');
+      expect((await readCounts(page))['tasks.listArchived'] ?? 0).toBeGreaterThan(0);
     } finally {
       await browser.close();
     }

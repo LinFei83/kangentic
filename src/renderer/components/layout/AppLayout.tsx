@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { TitleBar } from './TitleBar';
 import { StatusBar } from './StatusBar';
 import { ProjectSidebar } from '../sidebar/ProjectSidebar';
@@ -9,7 +10,13 @@ import { BacklogView } from '../backlog/BacklogView';
 import { BacklogDialogs } from '../backlog/BacklogDialogs';
 import { TerminalPanel } from '../terminal/TerminalPanel';
 import { SettingsPanel } from '../settings/SettingsPanel';
-import { CommandTerminalLayer, MAX_COMMAND_TERMINALS, spawnAdditionalCommandTerminal } from '../command-bar/CommandTerminalLayer';
+import {
+  CommandTerminalLayer,
+  spawnAdditionalCommandTerminal,
+  useCloseCommandWindowOnRemoval,
+} from '../command-bar/CommandTerminalLayer';
+import { MAX_COMMAND_TERMINALS } from '../../../shared/command-terminal-name';
+import { selectLiveCommandTerminalSlots } from '../../stores/session-store/transient-session-slice';
 import { commandWindowManager } from '../../window-manager';
 import { SearchPalette } from '../search/SearchPalette';
 import { WelcomeScreen } from './WelcomeScreen';
@@ -19,6 +26,7 @@ import { WALKTHROUGH_STEPS, resolveNextStep } from '../onboarding/walkthrough-st
 import { useWalkthroughActivation } from '../onboarding/useWalkthroughActivation';
 import { useOnboardingProgress } from '../../hooks/useOnboardingProgress';
 import { ProjectPathMissingDialog } from '../dialogs/ProjectPathMissingDialog';
+import { LeftoverProcessesDialog } from '../dialogs/LeftoverProcessesDialog';
 import { ReleaseNotesDialog } from '../dialogs/ReleaseNotesDialog';
 import { WhatsNewDialog } from '../dialogs/WhatsNewDialog';
 import { AnnouncementBanner } from '../announcements/AnnouncementBanner';
@@ -46,9 +54,11 @@ import { DictationSurface } from '../dictation/DictationSurface';
 import { useKeybinding } from '../../hooks/useKeybinding';
 import { StatsPage } from '../stats/StatsPage';
 import { MonitorPage } from '../monitor/MonitorPage';
+import { KnowledgeGraphPage } from '../knowledge-graph/KnowledgeGraphPage';
 import { warmStatsDashboardOnIdle } from '../stats/LazyStatsDashboard';
 import { useUsageDashboardStore } from '../../stores/usage-dashboard-store';
 import { useMonitorStore } from '../../stores/monitor-store';
+import { useKnowledgeGraphStore } from '../../stores/knowledge-graph-store';
 import { usePopOut } from '../../pop-out/usePopOut';
 import type { OnboardingStepKey } from '../../../shared/types';
 
@@ -58,6 +68,8 @@ export function AppLayout() {
   const statsPopOut = usePopOut('stats', {});
   const monitorOpen = useMonitorStore((s) => s.monitorOpen);
   const monitorPopOut = usePopOut('monitor', {});
+  const knowledgeGraphOpen = useKnowledgeGraphStore((s) => s.graphOpen);
+  const knowledgeGraphPopOut = usePopOut('knowledge-graph', {});
   const setSettingsOpen = useConfigStore((s) => s.setSettingsOpen);
   const openProjectSettings = useConfigStore((s) => s.openProjectSettings);
   const config = useConfigStore((s) => s.config);
@@ -141,10 +153,22 @@ export function AppLayout() {
   // Destructured for the callback's dep list: `open`/`close` are stable, `isOpen` changes;
   // depending on the fresh `commandBar` object would rebuild the callback every render.
   const { isOpen: commandBarIsOpen, open: openCommandBar, close: closeCommandBar } = commandBar;
-  // Live count of Command Terminal windows (the store is a module singleton that
-  // outlives the layer's mount), so the title-bar "New terminal" button disables
-  // at the cap without needing the layer mounted.
-  const commandWindowCount = commandWindowManager.store((state) => Object.keys(state.windows).length);
+  // Slots in use for the current project: the Command Terminal windows (the store
+  // is a module singleton that outlives the layer's mount) plus the project's live
+  // terminals, which include any a phone started with the layer closed. The
+  // title-bar "New terminal" button disables at the cap main enforces. Both reads
+  // compare shallowly, so this root re-renders only when a slot changes.
+  const commandWindowSlots = commandWindowManager.store(useShallow((state) =>
+    Object.values(state.windows).map((managedWindow) => managedWindow.anchor)));
+  const liveCommandTerminalSlots = useSessionStore(useShallow((state) =>
+    [...selectLiveCommandTerminalSlots(state.sessions, currentProjectId)]));
+  const commandTerminalSlotsInUse = useMemo(
+    () => new Set([...commandWindowSlots, ...liveCommandTerminalSlots]).size,
+    [commandWindowSlots, liveCommandTerminalSlots],
+  );
+  // Closes a terminal's window when main ends it (a phone's Stop, the agent
+  // exiting), mounted here so it runs while the layer is hidden.
+  useCloseCommandWindowOnRemoval();
   // The title-bar terminal button is a plain open/close toggle, so there is always
   // a discoverable one-click way to hide the layer even when a window is maximized
   // over the backdrop. "Spawn another terminal" is a separate, adjacent title-bar
@@ -216,6 +240,23 @@ export function AppLayout() {
     if (statsOpen) useMonitorStore.getState().close();
   }, [statsOpen]);
 
+  // The knowledge graph is the third full-bleed overlay in the same z-slot, so it
+  // joins the same mutual-exclusion mesh: its own pop-out closes the overlay,
+  // and opening it closes the other two plus the Command Terminal layer (which
+  // sits ABOVE at 45 and would otherwise swallow every click).
+  useEffect(() => {
+    if (knowledgeGraphPopOut.isOpen) useKnowledgeGraphStore.getState().close();
+  }, [knowledgeGraphPopOut.isOpen]);
+  useEffect(() => {
+    if (!knowledgeGraphOpen) return;
+    useUsageDashboardStore.getState().close();
+    useMonitorStore.getState().close();
+    useSessionStore.getState().requestHideCommandBar();
+  }, [knowledgeGraphOpen]);
+  useEffect(() => {
+    if (statsOpen || monitorOpen) useKnowledgeGraphStore.getState().close();
+  }, [statsOpen, monitorOpen]);
+
   // App-level shortcuts wired here, where the layout owns the relevant state and
   // resize controllers. Combos come from the central keybinding registry.
   // Settings toggle mirrors the title-bar gear's behavior.
@@ -226,6 +267,11 @@ export function AppLayout() {
   });
   useKeybinding('stats.toggle', () => (statsPopOut.isOpen ? statsPopOut.focus() : useUsageDashboardStore.getState().toggle()));
   useKeybinding('monitor.toggle', () => (monitorPopOut.isOpen ? monitorPopOut.focus() : useMonitorStore.getState().toggle()));
+  useKeybinding('knowledgeGraph.toggle', () => (
+    knowledgeGraphPopOut.isOpen
+      ? knowledgeGraphPopOut.focus()
+      : useKnowledgeGraphStore.getState().toggle(currentProject?.id ?? null)
+  ));
   useKeybinding('view.toggleSidebar', () => sidebar.toggle());
   useKeybinding('view.toggleTerminalPanel', () => terminal.onToggleCollapse());
   useKeybinding('task.create', () => useBoardStore.getState().requestNewTask(), {
@@ -398,7 +444,7 @@ export function AppLayout() {
         onOpenSearch={searchPalette.open}
         commandBarOpen={commandBar.isOpen}
         onSpawnAdditionalTerminal={spawnAdditionalCommandTerminal}
-        canSpawnMoreTerminals={commandWindowCount < MAX_COMMAND_TERMINALS}
+        canSpawnMoreTerminals={commandTerminalSlotsInUse < MAX_COMMAND_TERMINALS}
       />
 
       {/* `data-dismiss-layer`: the board layer owns this whole subtree, so a clean click on
@@ -537,10 +583,12 @@ export function AppLayout() {
       {config.statusBarVisible !== false && <StatusBar />}
       {statsOpen && !statsPopOut.isOpen && <StatsPage />}
       {monitorOpen && !monitorPopOut.isOpen && <MonitorPage />}
+      {knowledgeGraphOpen && !knowledgeGraphPopOut.isOpen && <KnowledgeGraphPage />}
       {settingsOpen && <SettingsPanel />}
       {commandBar.isOpen && <CommandTerminalLayer onHide={commandBar.close} />}
       {searchPalette.isOpen && <SearchPalette onClose={searchPalette.close} />}
       <ProjectPathMissingDialog />
+      <LeftoverProcessesDialog />
       <ReleaseNotesDialog />
       <WhatsNewDialog />
       {/* History first, then the announcement dialog it can open on top. The

@@ -2,8 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 /**
  * UtilityRestartPolicy - the backoff / decay / reporting contract shared by the
- * two utility processes Kangentic owns (kangentic-embeddings,
- * kangentic-line-count).
+ * utility processes Kangentic owns (kangentic-embeddings, kangentic-line-count,
+ * kangentic-dictation, kangentic-retrieval, kangentic-pty-host).
  *
  * The bug this exists to prevent: both clients used to re-fork immediately on
  * the next request, bounded only by a crash cap, so a worker that died on
@@ -32,10 +32,13 @@ vi.mock('../../src/main/analytics/error-reporting', () => ({
   reportHandledError: mockReportHandledError,
 }));
 
+import { EventEmitter } from 'node:events';
 import {
+  STDERR_DRAIN_BOUND_MS,
   UtilityRestartPolicy,
   resetUtilityCrashTelemetryForTests,
 } from '../../src/main/utility-process/restart-policy';
+import { StderrTail, captureWorkerStderr } from '../../src/main/utility-process/stderr-tail';
 
 /** A controllable clock, so no test depends on wall time. */
 function makeClock(start = 1_000) {
@@ -226,6 +229,7 @@ describe('UtilityRestartPolicy', () => {
       expect(mockTrackEvent).toHaveBeenCalledWith('utility_worker_crashed', {
         service: 'kangentic-test-worker',
         exitCode: 9,
+        cause: 'exit',
         phase: 'first',
       });
     });
@@ -259,6 +263,7 @@ describe('UtilityRestartPolicy', () => {
         service: 'kangentic-test-worker',
         exitCode: '137',
         crashCount: '3',
+        cause: 'exit',
       });
 
       // The Aptabase side: `first` on crash one, `latched` on crash three, and
@@ -268,6 +273,7 @@ describe('UtilityRestartPolicy', () => {
       expect(mockTrackEvent).toHaveBeenLastCalledWith('utility_worker_crashed', {
         service: 'kangentic-test-worker',
         exitCode: 137,
+        cause: 'exit',
         phase: 'latched',
       });
     });
@@ -284,10 +290,11 @@ describe('UtilityRestartPolicy', () => {
 
     it('records a fork failure (no exit code) without throwing', () => {
       const { policy } = makePolicy();
-      policy.recordCrash(null);
+      policy.recordCrash(null, undefined, { cause: 'fork_failed' });
       expect(mockTrackEvent).toHaveBeenCalledWith('utility_worker_crashed', {
         service: 'kangentic-test-worker',
         exitCode: -1,
+        cause: 'fork_failed',
         phase: 'first',
       });
     });
@@ -327,8 +334,199 @@ describe('UtilityRestartPolicy', () => {
       expect(mockTrackEvent).toHaveBeenLastCalledWith('utility_worker_crashed', {
         service: 'kangentic-other-worker',
         exitCode: 1,
+        cause: 'exit',
         phase: 'first',
       });
+    });
+  });
+
+  // DESKTOP-1Q: `kangentic-retrieval worker exited repeatedly (exit code unknown)`, with no stderr.
+  // "Unknown" meant the worker never exited: the client killed it for not answering, and the
+  // report kept only the last exit code, so it could not say which method hung or what the first
+  // two crashes were. Each crash in the window now carries a fixed-value cause.
+  describe('crash causes - what a latch says when the worker hung rather than exited', () => {
+    it('lists every crash in the window with its cause and the method that did not answer, and tags the newest cause', () => {
+      const { policy, clock } = makePolicy();
+      policy.recordCrash(null, undefined, {
+        cause: 'request_timeout',
+        method: 'projects.summaries',
+        pendingMethods: ['transcript.usage', 'index.rebuild', 'transcript.usage'],
+      });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'search.conversations' });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, {
+        cause: 'request_timeout',
+        method: 'projects.summaries',
+        pendingMethods: ['summary.candidates'],
+      });
+
+      expect(mockReportHandledError).toHaveBeenCalledTimes(1);
+      const [error, tags, contexts] = mockReportHandledError.mock.calls[0];
+      // The message drives grouping, so it stays exactly what the issue already carries.
+      expect((error as Error).message).toBe('kangentic-test-worker worker exited repeatedly (exit code unknown)');
+      expect(tags.cause).toBe('request_timeout');
+      expect(contexts.utility_process.crashes).toEqual([
+        'request_timeout method=projects.summaries pending=transcript.usage(2),index.rebuild',
+        'request_timeout method=search.conversations',
+        'request_timeout method=projects.summaries pending=summary.candidates',
+      ]);
+    });
+
+    it('omits pending= when the timed-out call was the only one pending, and omits method= when none is named', () => {
+      // The retrieval client passes pendingMethods: [] in the common single-call case.
+      const { policy, clock } = makePolicy();
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'projects.summaries', pendingMethods: [] });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'projects.summaries', pendingMethods: [] });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'request_timeout' });
+
+      const [, , contexts] = mockReportHandledError.mock.calls[0];
+      expect(contexts.utility_process.crashes).toEqual([
+        'request_timeout method=projects.summaries',
+        'request_timeout method=projects.summaries',
+        'request_timeout',
+      ]);
+    });
+
+    it('keeps every context value a primitive or a list of primitives, which is all that survives Sentry\'s depth-3 normalization', () => {
+      // Sentry normalizes event.contexts to depth 3: contexts, utility_process, a list, and an
+      // object inside that list arrives as the string "[Object]". A crash record as an object
+      // would pass every other assertion here and still reach Sentry unreadable.
+      const { policy, clock } = makePolicy();
+      policy.recordCrash(1, makeStderrSource('boom'));
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'ready_timeout' });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'projects.summaries', pendingMethods: ['index.rebuild'] });
+
+      const [, , contexts] = mockReportHandledError.mock.calls[0];
+      const isPrimitive = (value: unknown): boolean => value === null || ['string', 'number', 'boolean'].includes(typeof value);
+      for (const value of Object.values(contexts.utility_process as Record<string, unknown>)) {
+        const survives = isPrimitive(value) || (Array.isArray(value) && value.every(isPrimitive));
+        expect(survives).toBe(true);
+      }
+    });
+
+    it('lists mixed causes oldest first and tags the latching one', () => {
+      const { policy, clock } = makePolicy();
+      policy.recordCrash(1);
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'ready_timeout' });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'projects.summaries' });
+
+      const [, tags, contexts] = mockReportHandledError.mock.calls[0];
+      expect(tags.cause).toBe('request_timeout');
+      expect(contexts.utility_process.crashes).toEqual([
+        'exit code=1',
+        'ready_timeout',
+        'request_timeout method=projects.summaries',
+      ]);
+    });
+
+    it('reads a crash with no cause as an exit, with or without a code, so an exit never passes for a fork that threw', () => {
+      const { policy, clock } = makePolicy();
+      policy.recordCrash(137);
+      clock.advance(4_000);
+      policy.recordCrash(null);
+      clock.advance(4_000);
+      policy.recordCrash(undefined);
+
+      const [, tags, contexts] = mockReportHandledError.mock.calls[0];
+      expect(tags.cause).toBe('exit');
+      expect(contexts.utility_process.crashes).toEqual(['exit code=137', 'exit', 'exit']);
+      expect(policy.lastCrashDescription).toBe('exited with code unknown');
+    });
+
+    it('sends the cause with the Aptabase event, so a hang no longer counts as a fork failure', () => {
+      // Both have no exit code, so both send -1. Before the cause rode along,
+      // every retrieval timeout read on the dashboard as a fork that threw.
+      const { policy, clock } = makePolicy();
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'projects.summaries' });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'fork_failed' });
+      clock.advance(4_000);
+      policy.recordCrash(null, undefined, { cause: 'ready_timeout' });
+
+      expect(mockTrackEvent).toHaveBeenCalledTimes(2);
+      expect(mockTrackEvent).toHaveBeenNthCalledWith(1, 'utility_worker_crashed', {
+        service: 'kangentic-test-worker',
+        exitCode: -1,
+        cause: 'request_timeout',
+        phase: 'first',
+      });
+      expect(mockTrackEvent).toHaveBeenNthCalledWith(2, 'utility_worker_crashed', {
+        service: 'kangentic-test-worker',
+        exitCode: -1,
+        cause: 'ready_timeout',
+        phase: 'latched',
+      });
+    });
+
+    it('logs a crash with no exit in the in-app words, keeping the suffix the package smoke matches', () => {
+      const { policy } = makePolicy({ maxCrashes: 10 });
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'projects.summaries' });
+      policy.recordCrash(null, undefined, { cause: 'ready_timeout' });
+      policy.recordCrash(null, undefined, { cause: 'fork_failed' });
+
+      const lines = warnSpy.mock.calls.map((call) => String(call[0]));
+      expect(lines).toEqual([
+        '[utility-process] kangentic-test-worker did not answer projects.summaries in time (crash 1 of 10)',
+        '[utility-process] kangentic-test-worker did not start in time (crash 2 of 10)',
+        '[utility-process] kangentic-test-worker failed to start (crash 3 of 10)',
+      ]);
+      for (const line of lines) expect(line).not.toContain('exited with code');
+    });
+
+    it('describes the newest crash in the in-app signal by what the worker failed to do, not by a code it never had', () => {
+      // The Knowledge Graph used to say "exited with code unknown" for a worker
+      // that was killed for hanging.
+      const { policy } = makePolicy({ maxCrashes: 10 });
+      policy.recordCrash(null, undefined, { cause: 'request_timeout', method: 'projects.summaries' });
+      expect(policy.lastCrashDescription).toBe('did not answer projects.summaries in time');
+
+      policy.recordCrash(null, undefined, { cause: 'request_timeout' });
+      expect(policy.lastCrashDescription).toBe('did not answer in time');
+
+      policy.recordCrash(null, makeStderrSource('Error: sqlite-vec failed to load'), { cause: 'ready_timeout' });
+      expect(policy.lastCrashDescription).toBe('did not start in time: Error: sqlite-vec failed to load');
+
+      policy.recordCrash(null, undefined, { cause: 'fork_failed' });
+      // The ready timeout's stderr is still the newest non-empty tail.
+      expect(policy.lastCrashDescription).toBe('failed to start: Error: sqlite-vec failed to load');
+
+      policy.reset();
+      policy.recordCrash(3);
+      expect(policy.lastCrashDescription).toBe('exited with code 3');
+    });
+
+    it('says an exit with no code exited with code unknown, since that cause is the only one that claims a code', () => {
+      const { policy } = makePolicy({ maxCrashes: 10 });
+      policy.recordCrash(null, undefined, { cause: 'exit' });
+      expect(policy.lastCrashDescription).toBe('exited with code unknown');
+
+      const lines = warnSpy.mock.calls.map((call) => String(call[0]));
+      expect(lines).toEqual([
+        '[utility-process] kangentic-test-worker exited with code unknown (crash 1 of 10)',
+      ]);
+    });
+
+    it('starts a fresh list after the window decays', () => {
+      const { policy, clock } = makePolicy({ decayMs: 300_000 });
+      for (let index = 0; index < 3; index++) {
+        policy.recordCrash(1);
+        clock.advance(4_000);
+      }
+      clock.advance(300_000);
+      for (let index = 0; index < 3; index++) {
+        policy.recordCrash(null, undefined, { cause: 'ready_timeout' });
+        clock.advance(4_000);
+      }
+
+      const [, , contexts] = mockReportHandledError.mock.calls[1];
+      expect(contexts.utility_process.crashes).toEqual(['ready_timeout', 'ready_timeout', 'ready_timeout']);
     });
   });
 
@@ -369,6 +567,7 @@ describe('UtilityRestartPolicy', () => {
         service: 'kangentic-test-worker',
         exitCode: '1',
         crashCount: '3',
+        cause: 'exit',
       });
       expect(contexts).toEqual({
         utility_process: {
@@ -376,6 +575,7 @@ describe('UtilityRestartPolicy', () => {
           exitCode: 1,
           crashCount: 3,
           stderrTail: "Error: Cannot find module 'sharp'",
+          crashes: ['exit code=1', 'exit code=1', 'exit code=1'],
         },
       });
     });
@@ -401,7 +601,7 @@ describe('UtilityRestartPolicy', () => {
     it('reports a placeholder when no tail was ever captured (the fork-failure path)', () => {
       const { policy, clock } = makePolicy();
       for (let index = 0; index < 3; index++) {
-        policy.recordCrash(null);
+        policy.recordCrash(null, undefined, { cause: 'fork_failed' });
         clock.advance(4_000);
       }
 
@@ -411,6 +611,7 @@ describe('UtilityRestartPolicy', () => {
         exitCode: null,
         crashCount: 3,
         stderrTail: '(no stderr captured)',
+        crashes: ['fork_failed', 'fork_failed', 'fork_failed'],
       });
     });
 
@@ -450,6 +651,251 @@ describe('UtilityRestartPolicy', () => {
       const { policy } = makePolicy();
       policy.recordCrash(137);
       expect(policy.lastCrashDescription).toBe('exited with code 137');
+    });
+  });
+
+  // Electron 44.5.0 drains a utility process's stderr after `exit` (electron/electron#54278), so
+  // the dying exception can land a few milliseconds after recordCrash ran. Logging at once printed
+  // "(no stderr captured)" for exactly the crash whose text was on its way.
+  describe('waiting for the dying worker\'s stderr to drain', () => {
+    function attachedTail(): { tail: StderrTail; stream: EventEmitter } {
+      const stream = new EventEmitter();
+      const tail = new StderrTail(8 * 1024, '/home/dev', false);
+      captureWorkerStderr({ stderr: stream as unknown as NodeJS.ReadableStream }, tail, false);
+      return { tail, stream };
+    }
+
+    async function flushMicrotasks(): Promise<void> {
+      for (let index = 0; index < 5; index++) await Promise.resolve();
+    }
+
+    it('logs the text that arrives after the exit, once the pipe ends', async () => {
+      const { policy } = makePolicy();
+      const { tail, stream } = attachedTail();
+
+      policy.recordCrash(1, tail);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      stream.emit('data', "Error: Cannot find module 'sharp'\n");
+      stream.emit('end');
+      await flushMicrotasks();
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('kangentic-test-worker exited with code 1 (crash 1 of 3)'),
+        expect.stringContaining("Cannot find module 'sharp'"),
+      );
+    });
+
+    it('keeps counting, backoff and telemetry synchronous while the log waits', async () => {
+      const { policy } = makePolicy();
+      const { tail, stream } = attachedTail();
+
+      policy.recordCrash(1, tail);
+
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(policy.maySpawn()).toBe(false);
+      expect(policy.lastCrashDescription).toBe('exited with code 1');
+      expect(mockTrackEvent).toHaveBeenCalledWith('utility_worker_crashed', {
+        service: 'kangentic-test-worker',
+        exitCode: 1,
+        cause: 'exit',
+        phase: 'first',
+      });
+
+      // End the pipe so the pending log does not outlive this test.
+      stream.emit('end');
+      await flushMicrotasks();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs at the bound when the pipe never ends', async () => {
+      vi.useFakeTimers();
+      try {
+        const { policy } = makePolicy();
+        const { tail } = attachedTail();
+
+        policy.recordCrash(1, tail);
+        await vi.advanceTimersByTimeAsync(STDERR_DRAIN_BOUND_MS - 1);
+        expect(warnSpy).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(expect.any(String), '(no stderr captured)');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('decides the latch at once, and sends the report with the late text once the pipe ends', async () => {
+      const { policy, clock } = makePolicy();
+      policy.recordCrash(1, makeStderrSource(''));
+      clock.advance(4_000);
+      policy.recordCrash(1, makeStderrSource(''));
+      clock.advance(4_000);
+      const { tail, stream } = attachedTail();
+      policy.recordCrash(137, tail);
+
+      // The latch is decided now: the subsystem is exhausted and Aptabase already has it.
+      expect(policy.exhausted).toBe(true);
+      expect(mockTrackEvent).toHaveBeenLastCalledWith('utility_worker_crashed', {
+        service: 'kangentic-test-worker',
+        exitCode: 137,
+        cause: 'exit',
+        phase: 'latched',
+      });
+      expect(mockReportHandledError).not.toHaveBeenCalled();
+
+      stream.emit('data', 'Fatal: out of memory in onnxruntime\n');
+      stream.emit('end');
+      await flushMicrotasks();
+
+      expect(mockReportHandledError).toHaveBeenCalledTimes(1);
+      const [, tags, contexts] = mockReportHandledError.mock.calls[0];
+      expect(tags.crashCount).toBe('3');
+      expect(contexts.utility_process.stderrTail).toBe('Fatal: out of memory in onnxruntime');
+
+      // A crash after the latch still waits, and still does not re-report.
+      const next = attachedTail();
+      policy.recordCrash(137, next.tail);
+      next.stream.emit('end');
+      await flushMicrotasks();
+      expect(mockReportHandledError).toHaveBeenCalledTimes(1);
+    });
+
+    it('labels each deferred log line with the crash number from when it was recorded, not the count at emit time', async () => {
+      // Fake timers, deliberately: nothing may reach the 500 ms bound while two
+      // crashes are pending, or a slow run would release the first waiter early
+      // and let a regression pass. Promises are not faked, so the drain still
+      // resolves through the microtask queue.
+      vi.useFakeTimers();
+      try {
+        const { policy, clock } = makePolicy();
+        const first = attachedTail();
+        const second = attachedTail();
+
+        policy.recordCrash(1, first.tail);
+        clock.advance(1_000);
+        // The second crash lands while the first one's pipe is still open, so
+        // the policy's live count is 2 by the time the first line is printed.
+        policy.recordCrash(1, second.tail);
+        // Both crashes took the deferred path: nothing has been logged yet.
+        expect(warnSpy).not.toHaveBeenCalled();
+
+        first.stream.emit('data', 'first crash text\n');
+        first.stream.emit('end');
+        await flushMicrotasks();
+
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        const [firstLine] = warnSpy.mock.calls[0] as [string, string];
+        expect(firstLine).toContain('(crash 1 of 3)');
+        expect(firstLine).not.toContain('(crash 2 of 3)');
+
+        second.stream.emit('data', 'second crash text\n');
+        second.stream.emit('end');
+        await flushMicrotasks();
+
+        expect(warnSpy).toHaveBeenCalledTimes(2);
+        const [secondLine] = warnSpy.mock.calls[1] as [string, string];
+        expect(secondLine).toContain('(crash 2 of 3)');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('reports the latching crash as crash 3 even when a later crash is recorded before its pipe ends', async () => {
+      // Same fake-timer reasoning as above. recordCrash has no exhausted guard,
+      // so a crash after the latch is a real input (the test just before this
+      // one records one), and it moves the live count past the cap while the
+      // latching crash's report is still waiting.
+      vi.useFakeTimers();
+      try {
+        const { policy, clock } = makePolicy();
+        policy.recordCrash(1, makeStderrSource(''));
+        clock.advance(4_000);
+        policy.recordCrash(1, makeStderrSource(''));
+        clock.advance(4_000);
+        const latching = attachedTail();
+        policy.recordCrash(137, latching.tail);
+        clock.advance(1_000);
+        const afterLatch = attachedTail();
+        policy.recordCrash(null, afterLatch.tail, { cause: 'request_timeout', method: 'projects.summaries' });
+
+        // The latch was decided at crash 3 and the report is held for its pipe.
+        expect(policy.exhausted).toBe(true);
+        expect(mockReportHandledError).not.toHaveBeenCalled();
+
+        latching.stream.emit('data', 'Fatal: out of memory in onnxruntime\n');
+        latching.stream.emit('end');
+        await flushMicrotasks();
+
+        expect(mockReportHandledError).toHaveBeenCalledTimes(1);
+        const [, tags, contexts] = mockReportHandledError.mock.calls[0];
+        expect(tags.crashCount).toBe('3');
+        expect(contexts.utility_process.crashCount).toBe(3);
+        // The crash list and cause are the latch's too, not the later crash's: it is a timeout,
+        // and the bounded list would otherwise have shifted it in and the first crash out.
+        expect(tags.cause).toBe('exit');
+        expect(contexts.utility_process.crashes).toEqual(['exit code=1', 'exit code=1', 'exit code=137']);
+
+        // The crash after the latch finishes draining and still does not re-report.
+        afterLatch.stream.emit('end');
+        await flushMicrotasks();
+        expect(mockReportHandledError).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('logs to console.error, and leaks no unhandled rejection, when the deferred emit throws', async () => {
+      // Real timers are fine here: whether the pipe ends or the bound releases
+      // the waiter, the same emit runs and throws, so the outcome is identical.
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const unhandledReasons: unknown[] = [];
+      const recordUnhandled = (reason: unknown): void => {
+        unhandledReasons.push(reason);
+      };
+      process.on('unhandledRejection', recordUnhandled);
+      try {
+        const reportFailure = new Error('error reporting transport is down');
+        mockReportHandledError.mockImplementationOnce(() => {
+          throw reportFailure;
+        });
+
+        const { policy, clock } = makePolicy();
+        policy.recordCrash(1, makeStderrSource(''));
+        clock.advance(4_000);
+        policy.recordCrash(1, makeStderrSource(''));
+        clock.advance(4_000);
+        const { tail, stream } = attachedTail();
+        policy.recordCrash(137, tail);
+
+        // The latch report is deferred behind the open pipe, so nothing threw yet.
+        expect(mockReportHandledError).not.toHaveBeenCalled();
+        expect(errorSpy).not.toHaveBeenCalled();
+
+        stream.emit('data', 'Fatal: out of memory in onnxruntime\n');
+        stream.emit('end');
+        await flushMicrotasks();
+
+        expect(mockReportHandledError).toHaveBeenCalledTimes(1);
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect(errorSpy).toHaveBeenCalledWith(
+          '[utility-process] could not log a worker crash:',
+          reportFailure,
+        );
+
+        // Node raises 'unhandledRejection' only once the microtask queue has
+        // drained, which the awaits above never allow. A macrotask boundary
+        // makes the empty-list assertion below mean something.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(unhandledReasons).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', recordUnhandled);
+        errorSpy.mockRestore();
+        // clearAllMocks in beforeEach does not drop an unconsumed once-implementation.
+        mockReportHandledError.mockReset();
+      }
     });
   });
 });

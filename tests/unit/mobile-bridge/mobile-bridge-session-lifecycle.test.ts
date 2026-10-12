@@ -32,21 +32,21 @@
  * EventEmitter so tests can emit 'message' / 'remoteClosed' the same way the
  * real BridgeSession would.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import type { BrowserWindow } from 'electron';
 import type { CapabilityRequestMessage, CapabilityResponseMessage, RosterDeviceEntry, TransportState } from '@kangentic/protocol';
 import type { MobileDeviceConnectionState } from '../../../src/shared/types';
+import { emitSpawnProgress, __resetSpawnProgressForTest } from '../../../src/main/transition-engine/spawn-progress';
 
-vi.mock('electron', () => ({
-  app: { isReady: () => true, whenReady: () => Promise.resolve() },
-  safeStorage: {
-    isEncryptionAvailable: () => true,
-    encryptString: (plaintext: string) => Buffer.from(`encrypted:${plaintext}`, 'utf8'),
-    decryptString: (buffer: Buffer) => buffer.toString('utf8').replace(/^encrypted:/, ''),
-    getSelectedStorageBackend: () => 'keychain',
-  },
-  ipcMain: { handle: vi.fn(), on: vi.fn(), removeHandler: vi.fn() },
-}));
+vi.mock('electron', async () => {
+  const { createFakeSafeStorage } = await import('../helpers/fake-safe-storage');
+  return {
+    app: { isReady: () => true, whenReady: () => Promise.resolve() },
+    safeStorage: createFakeSafeStorage(),
+    ipcMain: { handle: vi.fn(), on: vi.fn(), removeHandler: vi.fn() },
+  };
+});
 
 vi.mock('../../../src/main/analytics/analytics', () => ({
   trackEvent: vi.fn(),
@@ -78,8 +78,8 @@ const setDeviceCapabilitiesSpy = vi.fn();
 
 vi.mock('../../../src/main/mobile-bridge/identity', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../src/main/mobile-bridge/identity')>()),
-  loadBridgeIdentity: () => fakeIdentity,
-  loadOrCreateBridgeIdentity: () => fakeIdentity,
+  loadBridgeIdentity: async () => fakeIdentity,
+  loadOrCreateBridgeIdentity: async () => fakeIdentity,
 }));
 
 vi.mock('../../../src/main/mobile-bridge/roster-store', async (importOriginal) => ({
@@ -98,6 +98,8 @@ class FakeBridgeSession extends EventEmitter {
   connectionState: MobileDeviceConnectionState = 'idle';
   /** Mutable, same reasoning as connectionState above - read by the same listener for the "(transport <transportState>)" suffix. */
   transportState: TransportState = 'idle';
+  /** Mutable, same reasoning as above - read by the slow-request line, which names it only when the transport still holds bytes. */
+  transportBufferedBytes: number | null = null;
   start = vi.fn();
   dispose = vi.fn();
   sendMessage = vi.fn();
@@ -111,7 +113,10 @@ class FakeBridgeSession extends EventEmitter {
     createdSessions.push(this);
   }
 }
-vi.mock('../../../src/main/mobile-bridge/session/bridge-session', () => ({
+// The real module's other exports (MessageEncodeError, which the service
+// matches a too-large response against) stay real; only the session is faked.
+vi.mock('../../../src/main/mobile-bridge/session/bridge-session', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../src/main/mobile-bridge/session/bridge-session')>()),
   BridgeSession: FakeBridgeSession,
 }));
 
@@ -127,7 +132,56 @@ vi.mock('../../../src/main/mobile-bridge/transport/transport-factory', () => ({
   createTransport: vi.fn(() => fakeTransport),
 }));
 
+// Seams for the attachContext() wiring cases at the bottom of the file. Each
+// wrapper below passes straight through to the real module unless a case sets
+// the matching field, so every other case in this file runs unchanged.
+const attachCapture = vi.hoisted(() => ({
+  /** The options attachContext() built its PushNotifier from. */
+  pushNotifierOptions: null as {
+    resolveTaskContext: (sessionId: string) => { projectId: string; taskId: string; taskTitle: string; sessionKind?: string } | null;
+    resolveTaskContextByTaskId: (taskId: string) => { projectId: string; taskId: string; taskTitle: string } | null;
+  } | null,
+  /** The deps attachContext() registered the capability handlers with. */
+  handlerDeps: null as { spawnProgressFeed: { onTaskSpawnProgressChanged: (listener: (projectId: string, taskId: string) => void) => () => void } } | null,
+  /** Stands in for getProjectRepos when set: the fake repos of one project, or a throw. */
+  projectRepos: null as ((projectId: string) => unknown) | null,
+}));
+
+vi.mock('../../../src/main/ipc/helpers/project-repos', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/main/ipc/helpers/project-repos')>();
+  return {
+    ...actual,
+    getProjectRepos: (...args: Parameters<typeof actual.getProjectRepos>) => (
+      attachCapture.projectRepos ? attachCapture.projectRepos(args[1] ?? '') : actual.getProjectRepos(...args)
+    ),
+  };
+});
+
+vi.mock('../../../src/main/mobile-bridge/push/push-notifier', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/main/mobile-bridge/push/push-notifier')>();
+  class CapturingPushNotifier extends actual.PushNotifier {
+    constructor(options: ConstructorParameters<typeof actual.PushNotifier>[0]) {
+      super(options);
+      attachCapture.pushNotifierOptions = options;
+    }
+  }
+  return { ...actual, PushNotifier: CapturingPushNotifier };
+});
+
+vi.mock('../../../src/main/mobile-bridge/handlers', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/main/mobile-bridge/handlers')>();
+  return {
+    ...actual,
+    registerCapabilityHandlers: (...args: Parameters<typeof actual.registerCapabilityHandlers>) => {
+      attachCapture.handlerDeps = args[1];
+      return actual.registerCapabilityHandlers(...args);
+    },
+  };
+});
+
 const { MobileBridgeService, resetForcedRedialTelemetryForTests } = await import('../../../src/main/mobile-bridge/mobile-bridge-service');
+const { MessageEncodeError, RESPONSE_TOO_LARGE_ERROR } = await import('../../../src/main/mobile-bridge/session/bridge-session');
+const { noteRequestSpan, takeRequestSpans, resetRequestSpansForTests } = await import('../../../src/main/mobile-bridge/request-spans');
 const { trackEvent } = await import('../../../src/main/analytics/analytics');
 const { createTransport } = await import('../../../src/main/mobile-bridge/transport/transport-factory');
 type MobileBridgeServiceInstance = InstanceType<typeof MobileBridgeService>;
@@ -151,6 +205,9 @@ async function openSession(service: MobileBridgeServiceInstance): Promise<FakeBr
   // no test here spawns a PTY).
   const fakeSessionManager = Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() });
   service.attachContext({ sessionManager: fakeSessionManager, boardEvents: { emitBoardChanged: vi.fn() } } as never);
+  // The identity and the secure-storage verdict load once, asynchronously,
+  // in the warm-up attachContext() starts; runSyncSessions() waits for it too.
+  await service.whenStorageReady();
   service.reconcile({ enabled: true, relayUrl: 'wss://relay.example.com' });
   await flushMicrotasks();
   expect(createdSessions.length).toBe(countBefore + 1);
@@ -190,6 +247,214 @@ describe('MobileBridgeService session-lifecycle wiring', () => {
 
     expect(session.sendMessage).toHaveBeenCalledTimes(1);
     expect(session.sendMessage).toHaveBeenCalledWith(fakeResponse);
+
+    service.dispose();
+  });
+
+  it('writes one slow-request warn line naming the verb, action, ids and the spans, and stays quiet under the threshold', async () => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const session = await openSession(service);
+    resetRequestSpansForTests();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // A controllable clock: the handler "takes" whatever the case sets.
+    let clockMs = 0;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => clockMs);
+    let handlerCostMs = 0;
+    service.capabilityRouter.register('read-board', (request) => {
+      noteRequestSpan(session.deviceId, request.requestId, 'seed 800 ms, 120k chars');
+      clockMs += handlerCostMs;
+      return { type: 'capability-response', requestId: request.requestId, ok: true };
+    });
+    session.sendMessage.mockImplementation(() => {
+      clockMs += 40;
+      return 96 * 1024;
+    });
+
+    handlerCostMs = 900;
+    session.emit('message', { type: 'capability-request', requestId: 'slowreq-1234', verb: 'read-board', payload: { action: 'subscribe' } });
+    await flushMicrotasks();
+    const slowLines = warnSpy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('slow request'));
+    expect(slowLines).toEqual(['[mobile-bridge] slow request read-board/subscribe slowreq-1234 from device-A: handler 900 ms, seed 800 ms, 120k chars, send 40 ms, 96 kB frame, longest main-loop block 920 ms']);
+
+    // Under the threshold: no line, and the span registry still let go of the
+    // request (the handler above noted a span for it too).
+    warnSpy.mockClear();
+    handlerCostMs = 100;
+    session.emit('message', { type: 'capability-request', requestId: 'fastreq-1234', verb: 'read-board', payload: {} });
+    await flushMicrotasks();
+    expect(warnSpy.mock.calls.some((call) => String(call[0]).includes('slow request'))).toBe(false);
+    expect(takeRequestSpans(session.deviceId, 'fastreq-1234')).toEqual([]);
+
+    nowSpy.mockRestore();
+    warnSpy.mockRestore();
+    service.dispose();
+  });
+
+  it('lets go of a fast request: its spans are collected and its block probe stopped, so no interval is left ticking', async () => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const session = await openSession(service);
+    resetRequestSpansForTests();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Only the probe's interval and the clock are fake; promises still settle,
+    // so the microtask flush below behaves as in every other case.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
+    try {
+      const timersBeforeRequest = vi.getTimerCount();
+      let timersDuringHandler = -1;
+      service.capabilityRouter.register('read-board', (request) => {
+        noteRequestSpan(session.deviceId, request.requestId, 'seed 5 ms, 1k chars');
+        timersDuringHandler = vi.getTimerCount();
+        return { type: 'capability-response', requestId: request.requestId, ok: true };
+      });
+
+      session.emit('message', { type: 'capability-request', requestId: 'fastreq-1234', verb: 'read-board', payload: {} });
+      await flushMicrotasks();
+
+      expect(session.sendMessage).toHaveBeenCalledTimes(1);
+      // The probe was running while the handler worked, and is gone now.
+      expect(timersDuringHandler).toBe(timersBeforeRequest + 1);
+      expect(vi.getTimerCount()).toBe(timersBeforeRequest);
+      // The span the handler noted was collected although no line was written.
+      expect(takeRequestSpans(session.deviceId, 'fastreq-1234')).toEqual([]);
+      expect(warnSpy.mock.calls.some((call) => String(call[0]).includes('slow request'))).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+      resetRequestSpansForTests();
+      vi.useRealTimers();
+      service.dispose();
+    }
+  });
+
+  it('names the bytes still buffered on the transport in the slow-request line, and only when there are any', async () => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const session = await openSession(service);
+    resetRequestSpansForTests();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    let clockMs = 0;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => clockMs);
+    try {
+      service.capabilityRouter.register('read-board', (request) => {
+        clockMs += 900;
+        return { type: 'capability-response', requestId: request.requestId, ok: true };
+      });
+      session.sendMessage.mockImplementation(() => {
+        clockMs += 40;
+        return 96 * 1024;
+      });
+      const slowLineFor = async (requestId: string): Promise<string> => {
+        warnSpy.mockClear();
+        session.emit('message', { type: 'capability-request', requestId, verb: 'read-board', payload: {} });
+        await flushMicrotasks();
+        const slowLines = warnSpy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('slow request'));
+        expect(slowLines).toHaveLength(1);
+        return slowLines[0];
+      };
+
+      session.transportBufferedBytes = 300 * 1024;
+      expect(await slowLineFor('buffered-1')).toBe(
+        '[mobile-bridge] slow request read-board buffered-1 from device-A: handler 900 ms, send 40 ms, 96 kB frame, 300 kB still buffered, longest main-loop block 920 ms',
+      );
+
+      // A few stalled bytes round up, never down to a contradictory "0 kB".
+      session.transportBufferedBytes = 100;
+      expect(await slowLineFor('buffered-2')).toBe(
+        '[mobile-bridge] slow request read-board buffered-2 from device-A: handler 900 ms, send 40 ms, 96 kB frame, 1 kB still buffered, longest main-loop block 920 ms',
+      );
+
+      // An empty buffer, and a transport that cannot report one, add nothing.
+      const lineWithoutBuffer = '[mobile-bridge] slow request read-board unbuffered-1 from device-A: handler 900 ms, send 40 ms, 96 kB frame, longest main-loop block 920 ms';
+      session.transportBufferedBytes = 0;
+      expect(await slowLineFor('unbuffered-1')).toBe(lineWithoutBuffer);
+      session.transportBufferedBytes = null;
+      expect(await slowLineFor('unbuffered-1')).toBe(lineWithoutBuffer);
+    } finally {
+      nowSpy.mockRestore();
+      warnSpy.mockRestore();
+      resetRequestSpansForTests();
+      service.dispose();
+    }
+  });
+
+  // The payload is whatever JSON the phone sent (JsonValue), and the line that
+  // names the request is built AFTER the response left, inside the promise
+  // callback nothing awaits: a describe step that threw on a null payload would
+  // surface as an unhandled rejection in the main process and drop the line.
+  it.each([
+    ['null', null],
+    ['an array', [1, 2]],
+    ['a string', 'subscribe'],
+    ['a number', 5],
+    ['an object whose action is not a string', { action: 42 }],
+    ['an object with no action', { sessionId: 'sess-1' }],
+  ])('names a slow request whose payload is %s by verb alone, with no action and no throw', async (_label, payload) => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const session = await openSession(service);
+    resetRequestSpansForTests();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    let clockMs = 0;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => clockMs);
+    try {
+      service.capabilityRouter.register('read-board', (request) => {
+        clockMs += 900;
+        return { type: 'capability-response', requestId: request.requestId, ok: true };
+      });
+      session.sendMessage.mockImplementation(() => {
+        clockMs += 40;
+        return 96 * 1024;
+      });
+
+      session.emit('message', { type: 'capability-request', requestId: 'oddpayload-1', verb: 'read-board', payload });
+      await flushMicrotasks();
+
+      const slowLines = warnSpy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('slow request'));
+      expect(slowLines).toEqual([
+        '[mobile-bridge] slow request read-board oddpayload-1 from device-A: handler 900 ms, send 40 ms, 96 kB frame, longest main-loop block 920 ms',
+      ]);
+    } finally {
+      nowSpy.mockRestore();
+      warnSpy.mockRestore();
+      resetRequestSpansForTests();
+      service.dispose();
+    }
+  });
+
+  it('answers a response too large to encode with a short refusal on the same stream, and says so in a warn line', async () => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const session = await openSession(service);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    service.capabilityRouter.register('read-board', (request) => ({ type: 'capability-response', requestId: request.requestId, ok: true, payload: { huge: true } }));
+    session.sendMessage.mockImplementationOnce(() => {
+      throw new MessageEncodeError(new Error('Encoded bridge message exceeds 1048576 bytes'));
+    });
+
+    session.emit('message', { type: 'capability-request', requestId: 'bigreq-1', verb: 'read-board', payload: {} });
+    await flushMicrotasks();
+
+    expect(session.sendMessage).toHaveBeenCalledTimes(2);
+    expect(session.sendMessage).toHaveBeenLastCalledWith({ type: 'capability-response', requestId: 'bigreq-1', ok: false, error: RESPONSE_TOO_LARGE_ERROR, code: 'response-too-large' });
+    expect(
+      warnSpy.mock.calls.some((call) =>
+        String(call[0]).includes('response to read-board bigreq-1 from device-A not sent: Encoded bridge message exceeds 1048576 bytes; answered with a refusal'),
+      ),
+    ).toBe(true);
+
+    warnSpy.mockRestore();
+    service.dispose();
+  });
+
+  it('sends nothing more when a response fails for any reason other than encoding (the session dropped mid-dispatch)', async () => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const session = await openSession(service);
+    service.capabilityRouter.register('read-board', (request) => ({ type: 'capability-response', requestId: request.requestId, ok: true }));
+    session.sendMessage.mockImplementationOnce(() => {
+      throw new Error('BridgeSession is not established yet');
+    });
+
+    session.emit('message', { type: 'capability-request', requestId: 'dropreq-1', verb: 'read-board', payload: {} });
+    await flushMicrotasks();
+
+    // A retry would seal a second frame onto a stream whose transport is gone.
+    expect(session.sendMessage).toHaveBeenCalledTimes(1);
 
     service.dispose();
   });
@@ -368,8 +633,11 @@ describe('MobileBridgeService session-lifecycle wiring', () => {
     service.dispose();
   });
 
-  it('revokeDevice() on an offline (session-less) device drops it without throwing', () => {
+  it('revokeDevice() on an offline (session-less) device drops it without throwing', async () => {
     const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    // The identity is read in the async secure-storage warm-up; the
+    // synchronous roster edits serve that cached copy.
+    await service.whenStorageReady();
 
     expect(() => service.revokeDevice('device-A')).not.toThrow();
 
@@ -524,11 +792,44 @@ describe('MobileBridgeService session-lifecycle wiring', () => {
     service.dispose();
   });
 
+  // The routine releases (the phone replied, or the session is being torn down)
+  // are log lines. The four that sealed held frames under the old keys after the
+  // phone may already have switched are the ones to look for next to a phone
+  // request that timed out, so they are warn lines.
+  it.each([
+    { reason: 'established', level: 'log' },
+    { reason: 'dispose', level: 'log' },
+    { reason: 'deadline', level: 'warn' },
+    { reason: 'overflow', level: 'warn' },
+    { reason: 'read-failed', level: 'warn' },
+    { reason: 'send-failed', level: 'warn' },
+  ] as const)('writes a rekey hold released as "$reason" at $level level in the documented format', async ({ reason, level }) => {
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    const session = await openSession(service);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const rekeyLines = (spy: typeof warnSpy): string[] => spy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('rekey held'));
+    try {
+      session.emit('rekeyHoldReleased', { frames: 3, heldMs: 1250, reason });
+
+      const expectedLine = `[mobile-bridge] device ${session.deviceId.slice(0, 8)} rekey held 3 frame(s) for 1250 ms, released (${reason})`;
+      expect(rekeyLines(level === 'log' ? logSpy : warnSpy)).toEqual([expectedLine]);
+      expect(rekeyLines(level === 'log' ? warnSpy : logSpy)).toEqual([]);
+    } finally {
+      warnSpy.mockRestore();
+      logSpy.mockRestore();
+      service.dispose();
+    }
+  });
+
   it('connectionStateSince is null before a session opens, set at wiring time, bumped only on an actual state change, and cleared when the session is dropped', async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
       const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+      // The identity (and so the roster listDevices reads) loads in the async
+      // secure-storage warm-up.
+      await service.whenStorageReady();
 
       // No session has opened yet for the roster device.
       expect(service.listDevices()[0]).toMatchObject({
@@ -599,5 +900,227 @@ describe('MobileBridgeService session-lifecycle wiring', () => {
     expect(vi.mocked(createTransport)).toHaveBeenCalledWith(expect.objectContaining({ logLabel: fakeDevice.deviceId.slice(0, 8) }));
 
     service.dispose();
+  });
+});
+
+describe('MobileBridgeService.attachContext() task-owner and spawn-progress wiring', () => {
+  /** Task titles by task id for each fake project, or 'throws' for a project whose repos will not open. */
+  type FakeProjects = Record<string, Record<string, string> | 'throws'>;
+
+  const servicesToDispose: Array<InstanceType<typeof MobileBridgeService>> = [];
+
+  /** attachContext() over a fake project list, with `getProjectRepos` answering from `projects` in list order. */
+  function attachWithProjects(projects: FakeProjects): InstanceType<typeof MobileBridgeService> {
+    attachCapture.projectRepos = (projectId) => {
+      const tasks = projects[projectId];
+      if (tasks === 'throws') throw new Error('this project database will not open');
+      return {
+        tasks: { getById: (taskId: string) => (tasks && taskId in tasks ? { id: taskId, title: tasks[taskId] } : undefined) },
+      };
+    };
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    servicesToDispose.push(service);
+    const sessionManager = Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() });
+    const projectRepo = { list: () => Object.keys(projects).map((id) => ({ id })) };
+    service.attachContext({ sessionManager, boardEvents: { emitBoardChanged: vi.fn() }, projectRepo } as never);
+    return service;
+  }
+
+  function resolveForSpawnStall(taskId: string): { projectId: string; taskId: string; taskTitle: string } | null {
+    const options = attachCapture.pushNotifierOptions;
+    if (!options) throw new Error('attachContext() did not build a PushNotifier');
+    return options.resolveTaskContextByTaskId(taskId);
+  }
+
+  /** The feed attachContext() handed the capability handlers, which read-board subscribes to. */
+  function handlerFeed(): NonNullable<typeof attachCapture.handlerDeps>['spawnProgressFeed'] {
+    const deps = attachCapture.handlerDeps;
+    if (!deps) throw new Error('attachContext() did not register the capability handlers');
+    return deps.spawnProgressFeed;
+  }
+
+  function fakeWindow(): BrowserWindow {
+    return { isDestroyed: () => false, webContents: { send: vi.fn() } } as unknown as BrowserWindow;
+  }
+
+  beforeEach(() => {
+    attachCapture.pushNotifierOptions = null;
+    attachCapture.handlerDeps = null;
+    attachCapture.projectRepos = null;
+    __resetSpawnProgressForTest();
+  });
+
+  afterEach(() => {
+    for (const service of servicesToDispose) service.dispose();
+    servicesToDispose.length = 0;
+    attachCapture.projectRepos = null;
+    __resetSpawnProgressForTest();
+  });
+
+  it('a spawn stall resolves the task to the project that owns it and to its title, skipping a project that does not hold it', () => {
+    attachWithProjects({
+      'proj-other': { 'task-9': 'Somebody else\'s task' },
+      'proj-owner': { 'task-1': 'Add dark mode' },
+    });
+
+    expect(resolveForSpawnStall('task-1')).toEqual({ projectId: 'proj-owner', taskId: 'task-1', taskTitle: 'Add dark mode' });
+  });
+
+  it('a spawn stall skips a project whose repos throw and keeps looking', () => {
+    attachWithProjects({
+      'proj-broken': 'throws',
+      'proj-owner': { 'task-1': 'Add dark mode' },
+    });
+
+    expect(resolveForSpawnStall('task-1')).toEqual({ projectId: 'proj-owner', taskId: 'task-1', taskTitle: 'Add dark mode' });
+  });
+
+  it('a spawn stall for a task no project owns resolves to null', () => {
+    attachWithProjects({
+      'proj-broken': 'throws',
+      'proj-other': { 'task-9': 'Somebody else\'s task' },
+    });
+
+    expect(resolveForSpawnStall('task-1')).toBeNull();
+  });
+
+  it('registers the capability handlers with a started spawn-progress feed that names the owning project', () => {
+    attachWithProjects({
+      'proj-broken': 'throws',
+      'proj-other': {},
+      'proj-owner': { 'task-1': 'Add dark mode' },
+    });
+    const onProgressChanged = vi.fn();
+    handlerFeed().onTaskSpawnProgressChanged(onProgressChanged);
+
+    // A real push through the spawn-progress module: only a started feed hears
+    // it, and only a working owner lookup can name the project.
+    emitSpawnProgress(fakeWindow(), 'task-1', 'starting-agent');
+
+    expect(onProgressChanged).toHaveBeenCalledExactlyOnceWith('proj-owner', 'task-1');
+  });
+
+  it('dispose() detaches the spawn-progress feed from the module-level push', () => {
+    const service = attachWithProjects({
+      'proj-owner': { 'task-1': 'Add dark mode', 'task-2': 'Fix the login bug' },
+    });
+    const onProgressChanged = vi.fn();
+    handlerFeed().onTaskSpawnProgressChanged(onProgressChanged);
+    emitSpawnProgress(fakeWindow(), 'task-1', 'starting-agent');
+    expect(onProgressChanged).toHaveBeenCalledTimes(1);
+
+    service.dispose();
+
+    // A DIFFERENT task: task-1's first push opened a throttle window, so a
+    // second change for it would never deliver at once and this would pass even
+    // with the feed still attached.
+    emitSpawnProgress(fakeWindow(), 'task-2', 'starting-agent');
+    expect(onProgressChanged).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The resolver attachContext() hands the PushNotifier to say what a session's
+ * alert is about. A Command Terminal has no task row: the notifier's own tests
+ * inject a resolver, so only this drives the real one, through the options the
+ * service built the notifier with.
+ */
+describe('MobileBridgeService.attachContext() push task-context resolver', () => {
+  interface FakeSessionRow {
+    projectId: string;
+    taskId: string;
+    transient?: boolean;
+    commandTerminalLabel?: string | null;
+    commandTerminalSlot?: string | null;
+  }
+
+  const servicesToDispose: Array<InstanceType<typeof MobileBridgeService>> = [];
+  /** Project ids the service asked for task repos of. A Command Terminal must leave it empty. */
+  const taskRepoReads: string[] = [];
+
+  /** attachContext() over a session manager that knows only `rows`, then the real push resolver. */
+  function resolveSessionContext(rows: Record<string, FakeSessionRow>, sessionId: string) {
+    attachCapture.projectRepos = (projectId) => {
+      taskRepoReads.push(projectId);
+      return { tasks: { getById: (taskId: string) => ({ id: taskId, title: 'Title from the task row' }) } };
+    };
+    const service = new MobileBridgeService({ enabled: true, relayUrl: 'wss://relay.example.com' });
+    servicesToDispose.push(service);
+    const sessionManager = Object.assign(new EventEmitter(), {
+      setMobileTerminalProbe: vi.fn(),
+      getSessionProjectId: (id: string) => rows[id]?.projectId,
+      getSessionTaskId: (id: string) => rows[id]?.taskId,
+      getSession: (id: string) => rows[id],
+    });
+    service.attachContext({ sessionManager, boardEvents: { emitBoardChanged: vi.fn() }, projectRepo: { list: () => [] } } as never);
+    const options = attachCapture.pushNotifierOptions;
+    if (!options) throw new Error('attachContext() did not build a PushNotifier');
+    return options.resolveTaskContext(sessionId);
+  }
+
+  beforeEach(() => {
+    attachCapture.pushNotifierOptions = null;
+    attachCapture.projectRepos = null;
+    taskRepoReads.length = 0;
+  });
+
+  afterEach(() => {
+    for (const service of servicesToDispose) service.dispose();
+    servicesToDispose.length = 0;
+    attachCapture.projectRepos = null;
+  });
+
+  it('a Command Terminal with a name is titled by that name and tagged command-terminal, without reading the task repos', () => {
+    const context = resolveSessionContext({
+      'terminal-1': {
+        projectId: 'proj-1',
+        taskId: 'transient-task-1',
+        transient: true,
+        commandTerminalLabel: 'Fix the flaky login test',
+        commandTerminalSlot: 'slot-2',
+      },
+    }, 'terminal-1');
+
+    expect(context).toEqual({
+      projectId: 'proj-1',
+      taskId: 'transient-task-1',
+      taskTitle: 'Fix the flaky login test',
+      sessionKind: 'command-terminal',
+    });
+    expect(taskRepoReads).toEqual([]);
+  });
+
+  it('a Command Terminal with no name yet is titled by its slot number, without reading the task repos', () => {
+    const context = resolveSessionContext({
+      'terminal-3': {
+        projectId: 'proj-1',
+        taskId: 'transient-task-3',
+        transient: true,
+        commandTerminalLabel: null,
+        commandTerminalSlot: 'slot-3',
+      },
+    }, 'terminal-3');
+
+    expect(context).toEqual({
+      projectId: 'proj-1',
+      taskId: 'transient-task-3',
+      taskTitle: 'Command Terminal 3',
+      sessionKind: 'command-terminal',
+    });
+    expect(taskRepoReads).toEqual([]);
+  });
+
+  it('a task session is titled from its task row and carries no sessionKind', () => {
+    const context = resolveSessionContext({
+      'task-session-1': { projectId: 'proj-1', taskId: 'task-1' },
+    }, 'task-session-1');
+
+    expect(context).toEqual({ projectId: 'proj-1', taskId: 'task-1', taskTitle: 'Title from the task row' });
+    expect(context).not.toHaveProperty('sessionKind');
+    expect(taskRepoReads).toEqual(['proj-1']);
+  });
+
+  it('a session the manager does not know resolves to null', () => {
+    expect(resolveSessionContext({}, 'gone')).toBeNull();
   });
 });

@@ -6,6 +6,13 @@ const esbuild = require('esbuild');
 const rendererOptimizeDeps = require('./renderer-optimize-deps.json');
 const { copyExternalScripts } = require('./copy-external-scripts');
 const { writeExitRecord } = require('./preview-exit-record');
+const {
+  previewGitCeilingDirectories,
+  stoppingMarkerPathFor,
+  moveIntoTrash,
+  listTrashDirs,
+  spawnTrashDeleter,
+} = require('./preview-isolation');
 
 const projectDir = path.resolve(__dirname, '..');
 
@@ -40,15 +47,32 @@ try {
 // terminal tab closes itself. Written by
 // `node scripts/worktree-preview.js --stop` (see stopPreview there).
 const stopFilePath = path.join(projectDir, '.kangentic', `preview-${port}.stop`);
+// Stopping marker: written the moment a stop, a closed terminal, or a closed
+// window reaches this process, and removed with the PID file at the end of
+// cleanup(). The launcher reads it to wait for this preview instead of refusing
+// a relaunch (scripts/preview-isolation.js, findOtherPreviewInstances).
+const stoppingMarkerPath = stoppingMarkerPathFor(projectDir, port);
 try {
   fs.rmSync(stopFilePath, { force: true });
+  fs.rmSync(stoppingMarkerPath, { force: true });
 } catch {
   // best-effort: a stale stop file from a crashed instance must not
   // immediately stop this one; ignore removal failures.
 }
+
+function markStopping() {
+  try {
+    fs.mkdirSync(path.dirname(stoppingMarkerPath), { recursive: true });
+    fs.writeFileSync(stoppingMarkerPath, String(process.pid));
+  } catch {
+    // best-effort: without it a relaunch is refused rather than waited for
+  }
+}
+
 const stopWatcher = setInterval(() => {
   if (fs.existsSync(stopFilePath)) {
     console.log('[dev] Stop requested via stop file - shutting down');
+    markStopping();
     clearInterval(stopWatcher);
     // Ask Electron to quit through its own quit path first; cleanup() kills
     // whatever is still running once that has either finished or timed out.
@@ -144,9 +168,14 @@ function requestGracefulElectronQuit() {
   });
 }
 
-// Detect Electron executable path per-platform
+// Detect Electron executable path per-platform. Electron 42+ downloads its
+// binary on first use instead of in a postinstall, and requiring the package is
+// what does that: it returns the binary's path, fetching it first when an
+// install skipped scripts (`npm ci --ignore-scripts`) or the root postinstall
+// failed. POSIX launches through the package's cli.js, which downloads the same
+// way.
 const electronExe = process.platform === 'win32'
-  ? path.join(projectDir, 'node_modules', 'electron', 'dist', 'electron.exe')
+  ? require(path.join(projectDir, 'node_modules', 'electron'))
   : path.join(projectDir, 'node_modules', '.bin', 'electron');
 
 const esbuildCommon = {
@@ -154,7 +183,7 @@ const esbuildCommon = {
   platform: 'node',
   target: 'node24',
   format: 'cjs',
-  external: ['electron', 'better-sqlite3', 'node-pty', 'sherpa-onnx-node', 'sqlite-vec', '@huggingface/transformers', 'font-list'],
+  external: ['electron', 'better-sqlite3', 'node-pty', 'sherpa-onnx-node', 'sqlite-vec', '@huggingface/transformers', 'font-list', 'koffi'],
   conditions: ['require'],
   define: {
     'MAIN_WINDOW_VITE_DEV_SERVER_URL': JSON.stringify(`http://localhost:${port}`),
@@ -192,6 +221,12 @@ async function start() {
     // This runs for --fresh TOO. It used to be skipped there, which made --fresh the one
     // mode that INHERITED whatever the last preview left behind: the flag exists to test
     // the first-launch experience, and it was the only launch that could not show it.
+    //
+    // Trash an earlier exit moved aside (see cleanup()) and whose detached deleter never
+    // finished is handed to a fresh deleter, off the boot path.
+    for (const leftoverTrashDir of listTrashDirs(path.dirname(ephemeralDataDir))) {
+      spawnTrashDeleter(leftoverTrashDir);
+    }
     try {
       fs.rmSync(ephemeralDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     } catch (rmError) {
@@ -367,9 +402,22 @@ async function start() {
       entryPoints: [path.join(projectDir, 'src/main/transcription/dictation-worker.ts')],
       outfile: path.join(projectDir, '.vite/build/dictation-worker.js'),
     }),
+    // Retrieval worker (Electron utilityProcess entry), same dev-parity
+    // reasoning as the embed worker above.
+    esbuild.build({
+      ...esbuildCommon,
+      entryPoints: [path.join(projectDir, 'src/main/retrieval/worker/retrieval-worker.ts')],
+      outfile: path.join(projectDir, '.vite/build/retrieval-worker.js'),
+    }),
+    // The pty host, as in scripts/build.js.
+    esbuild.build({
+      ...esbuildCommon,
+      entryPoints: [path.join(projectDir, 'src/main/pty/host/pty-host-entry.ts')],
+      outfile: path.join(projectDir, '.vite/build/pty-host.js'),
+    }),
   ]);
   console.timeEnd('[dev] esbuild');
-  console.log('[dev] Main + preload + embed worker + line-count worker + dictation worker built');
+  console.log('[dev] Main + preload + embed, line-count, dictation and retrieval workers and the pty host built');
 
   // Copy external scripts (bridges + adapter plugins) next to the bundle, the
   // same step scripts/build.js runs. Without this, dev runs whatever stale copy
@@ -410,7 +458,15 @@ async function start() {
     const userDataDir = path.join(resolvedTarget, '.kangentic', 'electron-data');
     electronArgs.push(`--user-data-dir=${userDataDir}`);
     electronArgs.push('--ephemeral');
-    spawnEnv = { ...process.env, KANGENTIC_DATA_DIR: ephemeralDataDir };
+    // GIT_CEILING_DIRECTORIES: the preview projects live inside this worktree, so git
+    // started in one whose `.git` is missing would otherwise act on the worktree itself.
+    // Electron, its git calls and its agent terminals all inherit this env. See
+    // scripts/preview-isolation.js.
+    spawnEnv = {
+      ...process.env,
+      KANGENTIC_DATA_DIR: ephemeralDataDir,
+      GIT_CEILING_DIRECTORIES: previewGitCeilingDirectories(ephemeralDataDir, process.env.GIT_CEILING_DIRECTORIES),
+    };
   }
 
   // Ensure the Project 1 pre-clone (started before the build) is on disk before
@@ -486,6 +542,7 @@ function cleanup(exitCode) {
   // scripts/preview-exit-record.js and the --wait loop in
   // scripts/worktree-preview.js.
   writeExitRecord(projectDir, port, { pid: process.pid, exitCode });
+  markStopping();
 
   if (viteServer) {
     viteServer.close().catch(() => {});
@@ -495,29 +552,47 @@ function cleanup(exitCode) {
     electronProc.kill();
     electronProc = null;
   }
-  // Best-effort: remove this instance's PID and stop files so tooling never
-  // finds a stale entry for a preview that already exited. A no-op if
-  // ephemeral mode is about to remove the whole .kangentic/ dir below anyway.
+  // With the junction approach, dev.js runs from the worktree itself so
+  // projectDir IS the worktree. Detect worktree by checking if the path
+  // contains .kangentic/worktrees/ rather than comparing directories.
+  const isWorktreeCheckout = projectDir.replace(/\\/g, '/').includes('.kangentic/worktrees/');
   try {
-    fs.rmSync(pidFilePath, { force: true });
     fs.rmSync(stopFilePath, { force: true });
   } catch {
     // best-effort
   }
-  // Ephemeral mode: remove the worktree's .kangentic/ and .vite/ on exit.
-  // With the junction approach, dev.js runs from the worktree itself so
-  // projectDir IS the worktree. Detect worktree by checking if the path
-  // contains .kangentic/worktrees/ rather than comparing directories.
+  // Ephemeral mode: clear the worktree's .kangentic/ and .vite/ on exit. Deleting
+  // the two repo clones in place took about 7s on Windows, and the preview read
+  // as running the whole time. So everything is RENAMED into a trash folder in
+  // .kangentic/ (instant on one drive) and a detached process deletes it after
+  // this one exits. Kept out of the move: the PID file and the stopping marker,
+  // which tell the launcher this preview is still shutting down, and earlier
+  // trash a previous exit's deleter is still working on.
+  let trashDir = null;
   if (ephemeral) {
-    const normalized = projectDir.replace(/\\/g, '/');
-    if (normalized.includes('.kangentic/worktrees/')) {
+    if (isWorktreeCheckout) {
       const kanDir = path.join(projectDir, '.kangentic');
       const viteDir = path.join(projectDir, '.vite');
-      for (const dir of [kanDir, viteDir]) {
+      trashDir = path.join(kanDir, `trash-${process.pid}-${Date.now()}`);
+      const keptNames = new Set([path.basename(pidFilePath), path.basename(stoppingMarkerPath)]);
+      let kangenticEntries = [];
+      try {
+        kangenticEntries = fs.readdirSync(kanDir)
+          .filter((entryName) => !keptNames.has(entryName) && !entryName.startsWith('trash-'))
+          .map((entryName) => path.join(kanDir, entryName));
+      } catch {
+        // already gone
+      }
+      const moveStartedAt = Date.now();
+      const leftBehind = moveIntoTrash([...kangenticEntries, viteDir], trashDir);
+      logSync(`[dev] Ephemeral cleanup: moved ${kangenticEntries.length + 1 - leftBehind.length} entries to ${trashDir} in ${Date.now() - moveStartedAt}ms`);
+      // A held handle (or a second drive) can refuse the rename. Delete those in
+      // place, the slow way this cleanup always used to take.
+      for (const dir of leftBehind) {
         const removeStartedAt = Date.now();
         try {
           fs.rmSync(dir, { recursive: true, force: true });
-          logSync(`[dev] Ephemeral cleanup: removed ${dir} in ${Date.now() - removeStartedAt}ms`);
+          logSync(`[dev] Ephemeral cleanup: removed ${dir} in place in ${Date.now() - removeStartedAt}ms`);
         } catch (removeError) {
           // Best-effort, but say so: a silent miss here left a stale
           // .kangentic/ behind with no trace of why.
@@ -526,6 +601,17 @@ function cleanup(exitCode) {
       }
     }
   }
+  // Last, so a launcher waiting on this preview never starts another one while
+  // this cleanup is still running.
+  try {
+    fs.rmSync(stoppingMarkerPath, { force: true });
+    fs.rmSync(pidFilePath, { force: true });
+  } catch {
+    // best-effort
+  }
+  // After the PID file and marker are gone, because the deleter's last step
+  // removes .kangentic/ only when nothing else is left in it.
+  if (trashDir && fs.existsSync(trashDir)) spawnTrashDeleter(trashDir);
   logSync('[dev] cleanup:done');
   process.exit(exitCode);
 }
@@ -550,6 +636,7 @@ const CONSOLE_SIGNAL_ELECTRON_EXIT_WAIT_MS = 3000;
 let awaitingElectronExit = false;
 
 function cleanupOnceElectronExits() {
+  markStopping();
   if (awaitingElectronExit || !electronProc || electronProc.exitCode !== null) {
     cleanup(0);
     return;

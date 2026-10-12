@@ -19,13 +19,11 @@
  * a wrong model list is worse than an empty one, because the user acts on it.
  */
 
-import { exec, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execAsync, execFileAsync } from '../../../utility-process/off-main-exec';
 import { quoteArg } from '../../../../shared/paths';
+import { quoteCmdExecutable } from '../../../../shared/shell-quote';
 import type { AgentCapabilities } from '../../../../shared/types';
 
-const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
 
 const HELP_TIMEOUT_MS = 5000;
 const MODELS_TIMEOUT_MS = 10000;
@@ -62,7 +60,9 @@ async function runCursorCli(
   timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string }> {
   if (process.platform === 'win32') {
-    return execAsync(`"${cliPath}" ${args.map((arg) => quoteArg(arg)).join(' ')}`, {
+    // `exec` runs the line through cmd.exe here, so both the head and the args
+    // take cmd's escaping. With no shell hint, quoteArg would apply PowerShell's.
+    return execAsync(`${quoteCmdExecutable(cliPath)} ${args.map((arg) => quoteArg(arg, 'cmd.exe')).join(' ')}`, {
       timeout: timeoutMs,
       windowsHide: true,
       maxBuffer: 1024 * 1024,

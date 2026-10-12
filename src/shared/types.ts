@@ -1,4 +1,7 @@
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from './pop-out';
+import type { ModelLicenseId } from './model-licenses';
+import type { EmbeddingTier } from './embedding-models';
+import type { DictationMode } from './dictation-presets';
 import type { Locale } from './i18n/types';
 import type {
   Announcement,
@@ -97,9 +100,11 @@ export interface AgentCapabilities {
   /**
    * Friendly display name per entry in `models` and per `modelAliases` id
    * (e.g. `claude-opus-4-8` -> "Opus 4.8", `opus` -> "Opus"), computed by the
-   * adapter so no agent-naming knowledge lives in shared or renderer code. An
-   * id absent from this map (or when the map itself is absent) falls back to
-   * showing its raw id.
+   * adapter so no agent-naming knowledge lives in shared or renderer code. The
+   * `agent:list` handler also adds a name for each telemetry-learned id the
+   * adapter can label (`AgentAdapter.modelDisplayName`, `nameLearnedModels`).
+   * An id absent from this map (or when the map itself is absent) falls back
+   * to showing its raw id.
    */
   modelDisplayNames?: Record<string, string>;
   /**
@@ -120,6 +125,31 @@ export interface ModelAliasOption {
    * `claude-opus-5-5`. Absent when the CLI does not say.
    */
   resolvesTo?: string;
+}
+
+/**
+ * What an agent's Knowledge Graph answer run can do beyond the base: a headless,
+ * read-only run with the prompt in and the reply out, which every answering
+ * agent meets.
+ *
+ * Declared by each adapter and read generically, never by agent name. A false
+ * flag is a plainer experience, never a failure: without `streaming` the reply
+ * lands whole, without `search` it comes from the related work alone.
+ */
+export interface AnswerCapabilities {
+  /** Text reaches `onEvent` as the agent writes it. */
+  streaming: boolean;
+  /** The run honours `retrieval`: the agent can call Kangentic's search itself. */
+  search: boolean;
+  /** The run takes a model id, so the Knowledge Graph Model setting is required. */
+  model: boolean;
+  /** The run passes the Knowledge Graph Effort setting as the CLI's own effort flag. The
+   *  setting shows only when this is true AND the CLI reports effort levels. */
+  effort: boolean;
+  /** The level an answer runs at when the user has not chosen one: Kangentic's
+   *  recommendation for reading and reporting, which the user can override.
+   *  Used only when the CLI reports it; otherwise no flag is passed. */
+  defaultEffort?: string;
 }
 
 export interface AgentDetectionInfo {
@@ -148,6 +178,13 @@ export interface AgentDetectionInfo {
   pastedImageReferenceTemplate?: string;
   /** True if the adapter exposes a one-shot summarize capability (used by auto-name task title). */
   supportsSummarize?: boolean;
+  /** True if the adapter can answer a question over supplied context (used by the
+   *  Knowledge Graph's Ask). Read instead of the agent's name, per
+   *  `.claude/rules/agent-adapters-boundary.md`. */
+  supportsAnswerFromContext?: boolean;
+  /** What that answer run can do beyond the base, as the adapter declares it.
+   *  Absent when the agent cannot answer at all. */
+  answerCapabilities?: AnswerCapabilities;
   /** Discovered at detection time; absent for adapters that do not implement discovery. */
   capabilities?: AgentCapabilities;
   /** Present when the adapter can attach to a user-run server instead of spawning locally.
@@ -1033,9 +1070,9 @@ export interface Session {
   /** True for ephemeral command terminal sessions (no task association, no DB persistence). */
   transient?: boolean;
   /**
-   * For a transient session, the durable Command Terminal window SLOT id
-   * (`slot-1`, ...) the renderer allocated at spawn. Null for task agents and for
-   * a transient spawned by a path that sends none.
+   * For a transient session, the durable Command Terminal SLOT id (`slot-1`, ...)
+   * main allocated at spawn (honoring the slot a desktop window asked for). Null
+   * for task agents.
    *
    * On this DTO for CORRECTNESS, which is what separates it from `agentName`
    * (deliberately kept off, as a diagnostic - see `listManagedSummaries` in
@@ -1054,11 +1091,10 @@ export interface Session {
   /** For a transient session, the name auto-derived from its first prompt. Null
    *  until one is derived, and for task agents.
    *
-   *  Derived in the renderer (`auto-name-scheduler.ts`) and pushed to main purely
-   *  so it survives a reload, alongside the slot and branch. Without that, a
-   *  recovered terminal drops back to "Command Terminal N" AND the auto-namer
-   *  re-fires on the next prompt, renaming it after whatever the user happened to
-   *  type second. */
+   *  Derived in main (`command-terminal-namer.ts`), so a terminal started from a
+   *  phone, or in a project the desktop does not have open, is named too. Main
+   *  announces the name on `session-changed`, and the window title, the Agent
+   *  Monitor and the phone all read it from this row. */
   commandTerminalLabel?: string | null;
   /**
    * Parallel-session discriminator for the terminal badge. Null/undefined (main
@@ -1111,18 +1147,18 @@ export interface SessionRecord {
   model_id: string | null;
   model_display_name: string | null;
   /**
-   * Model the session was actually spawned, resumed, or live-switched with (the
-   * `--model` flag value; null = agent default / no flag). Ground truth for the
-   * column-transition injection delta in `prepareInjectionPlan`: a move only
-   * injects `/model` when this differs from the destination's effective model,
-   * so a drifted column config never ghost-injects. Distinct from `model_id`,
-   * which is the agent-reported model captured at exit via metrics.
+   * Model the session was spawned or resumed with (the `--model` flag value;
+   * null = agent default / no flag). Ground truth for the column-transition
+   * delta in `prepareInjectionPlan`: a move restarts the session only when this
+   * differs from the destination's effective model, so a drifted column config
+   * never forces a restart. Distinct from `model_id`, which is the
+   * agent-reported model captured at exit via metrics.
    */
   applied_model: string | null;
   /**
-   * Effort/reasoning level the session was actually spawned, resumed, or
-   * live-switched with (the `--effort` flag value; null = agent default).
-   * Sibling of `applied_model` for the effort field of the injection delta.
+   * Effort/reasoning level the session was spawned or resumed with (the
+   * `--effort` flag value; null = agent default). Sibling of `applied_model`
+   * for the effort field of the delta, behind the agent's own reported effort.
    */
   applied_effort: string | null;
   total_duration_ms: number | null;
@@ -1134,6 +1170,23 @@ export interface SessionRecord {
   tool_breakdown: string | null;
   /** Context compactions during this record's CLI run (PreCompact hooks). Per-run; lifetime = SUM across the task's records. Defaults to 0. */
   compaction_count: number;
+  /**
+   * The PTY grid this session last had: its spawn grid, then every applied
+   * resize except a phone's. Read when the session is resumed after a desktop
+   * restart or a pty host crash, so the successor spawns at it rather than at
+   * the 120x30 default (see `SpawnSessionInput.restoredGrid`). NULL until
+   * recorded, and for rows from before the column existed.
+   */
+  last_pty_cols: number | null;
+  last_pty_rows: number | null;
+  /**
+   * When a transcript read for this record's per-tool Tokens estimates answered
+   * and gave it nothing to keep (no estimates in its window, or none matching a
+   * stored row), as a UTC ISO timestamp. The earlier-run Tokens fill skips a
+   * record with this set, so it does not read the same transcript on every
+   * launch. NULL until such a read; a read that wrote estimates leaves it NULL.
+   */
+  result_tokens_read_at: string | null;
 }
 
 /**
@@ -1147,14 +1200,38 @@ export interface SessionRecord {
 export interface PerToolStat {
   toolName: string;
   callCount: number;
-  /** Sum of (ToolEnd.ts - matching ToolStart.ts) over completed pairs. */
+  /**
+   * Sum of (ToolEnd.ts - matching ToolStart.ts) over paired calls that did not
+   * wait on the user. A call that paused for an answer or an approval is left
+   * out (see `waitedCount`), so this is the tools' own run time.
+   */
   totalDurationMs: number;
   /** Count of `interrupted` events (PostToolUseFailure). Subset of pairs that did not finish cleanly. */
   interruptedCount: number;
-  /** Optional - reserved for adapters that emit per-tool cost. */
+  /**
+   * Optional - calls that paused for the user's answer or approval, a subset of
+   * `callCount + interruptedCount`. Their time is not in `totalDurationMs`,
+   * because nothing marks the moment the user answers. A call is credited with
+   * a wait the way the activity engine credits a permission prompt: to the most
+   * recently started call still running. Unset when no call waited, and on rows
+   * saved before waits were tracked.
+   */
+  waitedCount?: number;
+  /**
+   * Optional - reserved for adapters that report REAL per-tool cost and token
+   * usage. Never an estimate: the table labels these In/Out, which on a tool
+   * row reads as the model's input and output.
+   */
   costUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
+  /**
+   * Optional ESTIMATE of the tokens this tool's results added to the main
+   * conversation's context, summed over its calls, from the size of each
+   * result in the agent's transcript. Not billed tokens, and subagent calls are
+   * not counted. Adapters without a transcript leave it unset.
+   */
+  resultTokens?: number;
 }
 
 /** Record of a cross-agent context handoff. */
@@ -1251,7 +1328,10 @@ export interface SessionSummary {
   startedAt: string;
   exitedAt: string | null;
   exitCode: number | null;
-  /** Per-tool breakdown for the latest captured session record. Empty when missing. */
+  /**
+   * Per-tool breakdown merged by tool name over the same records `toolCallCount`
+   * sums, so the table adds up to the count. Empty when no record has one.
+   */
   toolBreakdown: PerToolStat[];
 }
 
@@ -1392,7 +1472,7 @@ export interface ActivityStatsSnapshot {
    * Increments on each watchdog fire or force-* call; never decrements.
    * Used by the debug overlay's counter strip to flag silent
    * compensations that don't visibly flip the activity pill. In a
-   * clean session, all eight fields read 0.
+   * clean session, all nine fields read 0.
    */
   compensationCounters: {
     /** `timer:stale-thinking` watchdog fires (turnActive held alone). */
@@ -1409,6 +1489,8 @@ export interface ActivityStatsSnapshot {
     unmatchedBgShellEnd: number;
     /** Empty-string `subagent_stop` (spurious inner-loop Stop) ignored, not counted. */
     ignoredInnerSubagentStop: number;
+    /** Named `subagent_stop` for an already-stopped `subagentId` ignored (re-prompted subagent, task #759). */
+    duplicateSubagentStop: number;
     /** `timer:stuck-subagent` fired (a named SubagentStop was dropped, depth reclaimed). */
     stuckSubagent: number;
   };
@@ -1630,6 +1712,18 @@ export interface SessionEvent {
    */
   toolId?: string;
   /**
+   * Optional correlation id for `subagent_start` / `subagent_stop`. When
+   * present, the activity engine releases each subagent's depth slot once:
+   * a second stop for an id whose last event was already a stop is ignored
+   * (task #759, a re-prompted subagent fires two named stops). A start with
+   * the same id re-opens it, because a continued agent keeps its id.
+   *
+   * Source: Claude Code's hook payload carries `agent_id` on SubagentStart
+   * and SubagentStop. Adapters without one leave it undefined and the
+   * engine keeps its count-based depth tracking.
+   */
+  subagentId?: string;
+  /**
    * Polymorphic context for the event:
    * - For `tool_start`/`tool_end`: tool-specific info (file path, command)
    * - For `idle`: an `IdleReason` constant
@@ -1748,9 +1842,10 @@ export interface SessionUsage {
     totalDurationMs: number;
   };
   /**
-   * Cumulative count of completed tool calls for the session. Stamped onto the
-   * usage payload by the orchestrator just before it is pushed to the renderer:
-   * the authoritative count lives in the main-process accumulator and survives
+   * Cumulative count of completed tool calls for the session across its runs:
+   * this run's, from the main-process accumulator, plus its earlier records'
+   * (every resume is a new record). Stamped onto the usage payload by the
+   * orchestrator just before it is pushed to the renderer: the count survives
    * the bounded event cache, so the renderer cannot derive it from
    * `sessionEvents`. Optional because older main builds and non-stamping code
    * paths may omit it; read it with `?? 0`.
@@ -1822,9 +1917,11 @@ export interface TranscriptUsage {
  * transcript. Backfills the live UsageAccumulator count for sessions whose
  * ToolStart/ToolEnd hook events never reached it (e.g. a suspended/parked
  * session), which otherwise reports 0 despite real cost/tokens. Produced by
- * `AgentAdapter.transcriptToolCounts`. `toolBreakdown` entries are
- * callCount-only (`totalDurationMs`/`interruptedCount` are 0 - the transcript
- * has no ToolStart/ToolEnd pairing to derive them from).
+ * `AgentAdapter.transcriptToolCounts`. `toolBreakdown` entries carry no timing
+ * (`totalDurationMs`/`interruptedCount` are 0 - the transcript has no
+ * ToolStart/ToolEnd pairing to derive them from), and carry `resultTokens` when
+ * the adapter can estimate them. The run-end backfill also merges those
+ * `resultTokens` onto a healthy live breakdown by tool name.
  */
 export interface TranscriptToolCounts {
   toolCallCount: number;
@@ -2399,6 +2496,47 @@ export interface GitFileContentResult {
 }
 
 /**
+ * Input for `git:fileImage`: the file and scope of {@link GitFileContentInput},
+ * plus the fingerprints of the sides the caller already holds for that same
+ * file and scope. A side whose fingerprint still matches comes back
+ * `unchanged`, so a diff refresh does not resend megabytes of identical bytes.
+ */
+export interface GitFileImageInput extends GitFileContentInput {
+  knownFingerprints?: { original?: string; modified?: string };
+}
+
+/**
+ * One side of an image file as main read it for the Changes panel. `size` is
+ * the file's byte length. Bytes travel only under `IMAGE_PREVIEW_MAX_BYTES`
+ * (`src/shared/image-preview.ts`); a larger side reports its size alone.
+ * `fingerprint` names the bytes without carrying them: the blob id for a side
+ * read from git, the size and modified time for a working-tree file. A
+ * working-tree file read just after a write gets a fingerprint marked racy,
+ * which never matches, so the next refresh reads it again (see
+ * RECENT_WRITE_WINDOW_MS in diff-service.ts). Callers treat it as opaque.
+ * `unchanged` answers a side whose fingerprint matched the caller's, and the
+ * caller keeps the side it already has.
+ */
+export type GitImageSide =
+  | { kind: 'bytes'; size: number; bytes: Uint8Array; fingerprint: string }
+  | { kind: 'too-large'; size: number; fingerprint: string }
+  | { kind: 'lfs-pointer'; size: number; fingerprint: string }
+  | { kind: 'unchanged'; fingerprint: string }
+  | { kind: 'unreadable' };
+
+/**
+ * Both sides of a changed image, read with the same per-scope revision logic
+ * as {@link GitFileContentResult}. A side is `null` when the status has no
+ * such side: Added and Untracked have no original, Deleted has no modified.
+ * Kept off `GitFileContentResult` on purpose: the mobile bridge forwards that
+ * shape to the phone as JSON, where bytes would not survive.
+ */
+export interface GitImageContentResult {
+  original: GitImageSide | null;
+  modified: GitImageSide | null;
+}
+
+/**
  * Input for the per-file history reader (commits touching a single file, via
  * `git log --follow`). Local-only and fail-safe, mirroring {@link GitCommitGraphInput}.
  */
@@ -2704,13 +2842,15 @@ export interface DictationRemoteEndpoint {
 /** Payload for `dictation.start` (renderer passes the current global config). */
 export interface DictationStartOptions {
   engineMode: DictationEngineMode;
-  /** The FINAL (accurate) model id, or null/undefined for the tier default
-   *  (Parakeet on the accurate tier), or `'none'` for no post-processing pass. */
+  /** The preset or `custom`; main resolves a preset's models itself
+   *  (`src/shared/dictation-presets.ts`). Absent = derived from the ids. */
+  mode?: DictationMode;
+  /** The FINAL (accurate) model id in Custom, or null/undefined for the machine's
+   *  default preset, or `'none'` for no post-processing pass. */
   modelId?: string | null;
-  /** The LIVE (preview) model id: null/undefined = the streaming Zipformer default,
+  /** The LIVE (preview) model id in Custom: null/undefined = the Light preset's,
    *  an offline model id = chunked live, `'none'` = no live preview. */
   liveModelId?: string | null;
-  punctuation: boolean;
   language: string;
 }
 
@@ -2720,17 +2860,36 @@ export interface DictationStartResult {
   engineId: DictationEngineId;
   modelId: string | null;
   needsDownload: boolean;
+  /** True when the live model writes all caps (the Zipformer), so the committed
+   *  text can be its own: with no refinement, or when a refinement falls back
+   *  to the live text. The renderer then sentence-cases a final in that
+   *  all-caps shape. With any other live model a final is typed as written. */
+  sentenceCaseFinal: boolean;
 }
+
+/** The native engine shape a dictation model drives. The one definition: the
+ *  model registry, the engines and the settings options all read it. */
+export type DictationModelEngineKind =
+  | 'online-transducer'
+  | 'offline-whisper'
+  | 'offline-nemo-transducer'
+  | 'offline-moonshine'
+  | 'offline-cohere-transcribe';
 
 /** A user-selectable transcription model (for the settings model dropdown). */
 export interface DictationModelOption {
   id: string;
   displayName: string;
   sizeMb: number;
-  engineKind: 'online-transducer' | 'offline-whisper' | 'offline-nemo-transducer' | 'offline-moonshine';
+  engineKind: DictationModelEngineKind;
   /** Spoken languages this model can transcribe (Whisper / BCP-47 codes). The
    *  Language dropdown shows the intersection of the selected models' sets. */
   languages: string[];
+  /** Higher is more accurate; the dropdowns sort on it. */
+  accuracyRank: number;
+  /** "Best accuracy" through "Basic accuracy", shown after the name. */
+  accuracyLabel: string;
+  license: ModelLicenseId;
 }
 
 /** Hardware + engine snapshot for the settings panel (`dictation.getInfo`). */
@@ -2747,10 +2906,10 @@ export interface DictationInfo {
   /** Selectable offline models (accuracy/size trade-off) - kept as the union for
    *  any general consumer; the two-stage dropdowns use the lists below. */
   availableModels: DictationModelOption[];
-  /** Live-preview model choices: the streaming Zipformer (native, instant) plus
-   *  the offline models small enough to chunk (Parakeet, Whisper tiny/base). */
+  /** Live-preview model choices: the registry's live-capable models, the
+   *  streaming transducers plus the offline models light enough to chunk. */
   liveModels: DictationModelOption[];
-  /** Final/accurate model choices: every offline model (Parakeet + Whisper ladder). */
+  /** Final/accurate model choices: every offline model in the registry. */
   finalModels: DictationModelOption[];
   /** The resolved live + final model ids for the current selection. */
   selectedLiveModelId: string | null;
@@ -2760,16 +2919,21 @@ export interface DictationInfo {
    *  push-to-talk has no fallback engine, so the settings panel surfaces
    *  this rather than leaving it a silent dead end. */
   workerUnavailable: boolean;
-  /** The newest crash's exit code + first error line, when `workerUnavailable`. */
+  /** How the newest crash happened (`exited with code <n>` or `failed to start`)
+   *  plus the first error line, when `workerUnavailable`. */
   workerError?: string;
 }
 
-/** Progress event for an in-flight model download. */
+/** Progress event for an in-flight model download. `downloadedBytes` and
+ *  `totalBytes` span every model the selection downloads; the `model*` pair is
+ *  the one model `modelId` names, for a status line per model. */
 export interface DictationModelProgress {
   modelId: string;
   status: 'downloading' | 'verifying' | 'done' | 'error';
   downloadedBytes: number;
   totalBytes: number;
+  modelDownloadedBytes?: number;
+  modelTotalBytes?: number;
   error?: string;
 }
 
@@ -3058,6 +3222,48 @@ export interface MonitorView {
   textFilter: string;
 }
 
+/**
+ * Why a task's own process was left running when the task ended: it has an
+ * open window, it is a tmux server, or other work uses it too (something under
+ * it is not the task's, or other Kangentic work is connected to it). A launcher
+ * kept because every child is kept takes its children's reason. See
+ * `src/main/pty/process-tag/reap-plan.ts`.
+ */
+export type LeftoverKeptReason = 'window' | 'multiplexer' | 'shared';
+
+/** One process a task left running, as the toast and the list show it. */
+export interface LeftoverProcess {
+  /** Report-scoped id the list's Stop button sends back; never a pid. */
+  id: string;
+  taskId: string;
+  taskTitle: string;
+  pid: number;
+  /** "node (vite)": the program and, for an interpreter, its script. Never more of the command line. */
+  label: string;
+  /** `stopped` by the transition, `failed` to stop, or `kept` running. */
+  outcome: 'stopped' | 'failed' | 'kept';
+  /** Why a `kept` process was left running; null when stopping is off. */
+  reason: LeftoverKeptReason | null;
+  /** Where it worked: the task's worktree, or elsewhere in its project. */
+  place: 'worktree' | 'project';
+}
+
+/** What one burst of terminal transitions (one Done move, a bulk delete) left running. */
+export interface LeftoverProcessReport {
+  id: string;
+  /** False when the user turned stopping off: every process is `kept`. */
+  stoppingEnabled: boolean;
+  processes: LeftoverProcess[];
+  /**
+   * When main sent the report, UTC ISO 8601. A toast that stays up shows how
+   * long ago it was, so one still on screen later does not read as current.
+   */
+  reportedAt: string;
+}
+
+/** `ended`: it had already exited. `failed`: it, or a process under it, is still running. */
+export type LeftoverStopOutcome = 'stopped' | 'ended' | 'failed';
+
 export interface AppConfig {
   /** The theme picked by hand. What the app paints when `themeFollowsSystem` is off. */
   theme: ThemeMode;
@@ -3169,23 +3375,25 @@ export interface AppConfig {
     initScript: string | null;
     /** Symlink the root node_modules into each worktree so agents skip a fresh install. Disable to let initScript own the worktree's deps. */
     linkNodeModules: boolean;
-    /** Minutes between background PR-state refresh sweeps for the open project. null = off (on-open sweep only). */
-    prRefreshIntervalMinutes: number | null;
     /**
-     * Minutes between background `git fetch --all --prune` sweeps of the open
-     * project's remotes, so ahead/behind counts and base-drift checks read
-     * current remote refs without anyone opening a panel. null = off (on-open
-     * sweep only). The sweep only fetches; it never pulls, merges, or rebases.
+     * Keep the open project's PRs current in the background. On, each PR whose
+     * state can still change is checked about 2 minutes after its own last
+     * check, one call at a time and at least 10 s apart
+     * (`pr-refresh-scheduler.ts`). Off, PRs are checked when the project opens
+     * and nothing re-polls a PR whose checks are in flight. Replaces the retired
+     * `prRefreshIntervalMinutes`, which `legacy-git-keys.ts` reads once.
      */
-    autoFetchIntervalMinutes: number | null;
+    prAutoRefresh: boolean;
     /**
-     * Ask the host to evaluate branch policies when judging merge readiness,
-     * where that costs a call of its own (Azure DevOps: one `az rest` per open
-     * PR per sweep, roughly a second each). Off by default for that cost; a
-     * host whose verdict already carries policy (GitHub) ignores it. Without
-     * it an Azure PR's clean merge preview stays `unknown` rather than `ready`.
+     * Keep the open project's remote-tracking refs current, so ahead/behind
+     * counts and base-drift checks read the remote without anyone opening a
+     * panel. On, the project fetches all remotes 5 minutes after its last full
+     * fetch (`git-fetch-scheduler.ts`), and a card dragged toward Done warms the
+     * fetch early. It only fetches; it never pulls, merges, or rebases. Creating
+     * a worktree fetches its base branch whatever this says. Replaces the retired
+     * `autoFetchIntervalMinutes`, which `legacy-git-keys.ts` reads once.
      */
-    prEvaluateBranchPolicies: boolean;
+    autoFetch: boolean;
     /**
      * Count the viewer's own merge bypass as `ready`. On GitHub a PR still
      * waiting on a required review reads `BLOCKED`, or `BEHIND` once somebody
@@ -3301,6 +3509,13 @@ export interface AppConfig {
      * `previewInspectionServer` is also on. Dev-only.
      */
     previewEvalEnabled?: boolean;
+    /**
+     * Run a rolling CPU profile of the main process and keep the windows that
+     * held a stall (`src/devtools/main/stall-profiler.ts`), so a stall no label
+     * covers still names its functions in the event-loop lag report. Dev-only;
+     * defaults on in `/preview` and off for `npm start`.
+     */
+    stallProfiler?: boolean;
   };
 
   /**
@@ -3344,27 +3559,105 @@ export interface AppConfig {
   };
 
   /**
-   * Conversation memory: local index over agent conversation transcripts for
+   * The Knowledge Graph: local index over agent conversation transcripts for
    * search and recall. GLOBAL/shared scope (below the settings separator, in
-   * the Memory tab). Works offline with no API key.
+   * the Knowledge Graph tab). Works offline with no API key.
    */
-  memory?: {
+  knowledgeGraph?: {
     /** Index agent conversation transcripts locally for search/recall.
      *  Default true. Off: no indexing, no conversation search results, and the
      *  embed worker never runs. */
     indexingEnabled?: boolean;
-    /** Semantic (embedding) layer on top of lexical search. Default false;
-     *  turning it on triggers the one-time local model download. */
-    semanticEnabled?: boolean;
+    /** The Knowledge Graph switch: the semantic (embedding) layer on top of
+     *  lexical search, which the map, Ask, task summaries and source code all
+     *  need. Default false; turning it on triggers the one-time download of the
+     *  local model that finds by meaning. A config written before the rename
+     *  carries it as `memory.semanticEnabled`, which `legacy-memory-keys.ts`
+     *  moves here once. */
+    enabled?: boolean;
     /** Selected embedding model id (see src/shared/embedding-models.ts). Default
-     *  'bge-base'. Switching re-embeds the index in the background. */
-    embeddingModel?: string;
+     *  'granite-r2'. Switching re-embeds the index in the background. */
+    localModel?: string;
     /** Which hardware the embedding model runs on. 'auto' (default) prefers a GPU
      *  execution provider (DirectML on Windows, WebGPU elsewhere) and falls back to
      *  CPU if it fails to initialize; 'gpu' forces the same GPU-first chain; 'cpu'
      *  forces the universal CPU path. Offloading to an idle GPU keeps the CPU free
      *  for the agents when many run at once. */
-    acceleration?: MemoryAcceleration;
+    acceleration?: KnowledgeGraphAcceleration;
+    /**
+     * The Knowledge Graph's agent: which agent answers a question from the index
+     * (Ask) and writes task summaries. One choice for both jobs, made in the
+     * Knowledge Graph card's Agent row (`agentJobChoice`).
+     *
+     * GLOBAL, and deliberately separate from the project's default agent: which
+     * agent RUNS YOUR TASKS and which agent READS YOUR HISTORY are different
+     * choices, and only some agents can do the second at all.
+     *
+     * Explicit, with no fallback. It used to follow the project's default agent
+     * and then any capable agent, which meant a question could spend tokens on
+     * an agent and model nobody chose. Unset now means Ask, the prewarmed
+     * process and task summaries wait, and asking opens Settings > Knowledge Graph at this
+     * row.
+     *
+     * An adapter NAME (`claude`, `codex`), never a display name - the name is
+     * the registry key and the display name is copy that can change.
+     */
+    agent?: string | null;
+    /**
+     * Which MODEL the Knowledge Graph's agent runs at, for answers and summaries
+     * alike. A new model applies to new and changed summaries; those already
+     * written stay as written until the Index card's Rebuild rewrites them.
+     *
+     * The reason this exists is cost. Ask is a read-only summarize over your own
+     * local index, and running it at the same frontier model that writes your
+     * code spends subscription budget on re-reading transcripts. A cheaper model
+     * answers most questions about "what did we decide" perfectly well, and
+     * without this field the agent's own default is the only option.
+     *
+     * An ADAPTER-SPECIFIC model id (Claude `haiku`, `opus`), so it is cleared
+     * whenever `agent` changes - an id from one CLI means nothing to
+     * another. Required when the agent's answer run takes a model
+     * (`AnswerCapabilities.model`); there is no "agent default" to fall back on,
+     * for the same reason the agent has none.
+     */
+    model?: string | null;
+    /**
+     * Which effort level the Knowledge Graph's agent ANSWERS at, from the levels its CLI
+     * reports. Optional, unlike the model: unset runs at the adapter's
+     * recommended level (`AnswerCapabilities.defaultEffort`). Summaries ignore it
+     * and always run at that recommended level (`agentJobChoice`). Cleared with
+     * the model whenever `agent` changes, since levels are per CLI
+     * (Claude's `max` is not Grok's).
+     */
+    effort?: string | null;
+    /**
+     * Whether the Knowledge Graph's agent writes a short summary (a task summary
+     * in the UI) of each finished task (what it set out to do, what it ended up
+     * doing), searched with the task's own record and shown to the agent beside
+     * it when it answers.
+     *
+     * ON unless switched off. It spends about one call per ten tasks, in the
+     * background, but only once the Knowledge Graph has an agent, and its
+     * switch stays usable while it waits, so it can be turned off before a call
+     * is made. Read through `taskSummariesOn` (`src/shared/answer-agent.ts`) so
+     * main and the renderer agree that an unset value is on. Switching it off
+     * keeps the summaries already written.
+     */
+    taskSummaries?: boolean;
+    /**
+     * Whether the project's source code (its default branch, as committed:
+     * source files and docs, not tests, fixtures or data files) is indexed and
+     * embedded, so Ask can answer questions about how the code works.
+     *
+     * ON unless switched off. The first fill embeds every passage in the
+     * background (about 12k for this repository: half an hour on a GPU, a
+     * couple of hours on a CPU) and keeps about 4 KB of vectors per passage, so
+     * it waits for the Knowledge Graph (`enabled`) and a Knowledge Graph
+     * agent, the only reader of the code index. Read through `codeIndexOn`
+     * (`src/shared/answer-agent.ts`). Switching it off clears the code index,
+     * which the branch can always rebuild.
+     */
+    sourceCode?: boolean;
   };
 
   /**
@@ -3378,20 +3671,21 @@ export interface AppConfig {
     enabled?: boolean;
     /** Engine selection. `auto` tiers by detected hardware. Default `auto`. */
     engineMode?: DictationEngineMode;
-    /** The FINAL (accurate) model: a model id, null/absent = the tier default
-     *  (Parakeet), or `'none'` = no post-processing pass (keep the live text). */
+    /** The FINAL (accurate) model in Custom: a model id, null/absent = the
+     *  machine's default preset's, or `'none'` = no post-processing pass (keep the
+     *  live text). A preset ignores it. */
     modelId?: string | null;
-    /** The LIVE (preview) model: null/absent = the streaming Zipformer, an offline
-     *  model id = chunked live, `'none'` = no live preview. */
+    /** The LIVE (preview) model in Custom: null/absent = the Light preset's (the
+     *  Zipformer an older config ran), an offline model id = chunked live,
+     *  `'none'` = no live preview. A preset ignores it. */
     liveModelId?: string | null;
-    /** Quality preset. `fast`/`balanced`/`accurate` set AND lock the live +
-     *  refinement models; `custom` unlocks the two dropdowns for manual choice.
-     *  Absent = derive from the model selection (back-compat). UI-only; the engine
-     *  reads the resolved model ids, not this. */
-    mode?: 'fast' | 'balanced' | 'accurate' | 'custom';
-    /** Add punctuation + capitalization to committed text. Default true (OFF = faster path). */
-    punctuation?: boolean;
-    /** BCP-47 language. v1 ships English only. Default `en`. */
+    /** Quality preset, shown as Best (`accurate`), Balanced (`balanced`) and Light
+     *  (`fast`). A preset names its models through `src/shared/dictation-presets.ts`,
+     *  resolved by main each session, so it follows the lineup; `custom` uses the
+     *  two ids above. Absent = derived (`effectiveMode`). */
+    mode?: DictationMode;
+    /** BCP-47 language the user speaks. The presets pick models that cover it.
+     *  Default `en`. */
     language?: string;
     /** Press Enter automatically once the transcription is inserted, submitting it to
      *  the agent. Default true; set false to leave the text in the input for you to
@@ -3490,6 +3784,11 @@ export interface AppConfig {
   skipDeleteConfirm: boolean;
   skipBoardConfigConfirm: boolean;
   autoFocusIdleSession: boolean;
+  /** Stop what a task's agent left running in the task's own folder when the
+   *  task reaches Done or To Do, or is deleted, and what a Command Terminal's
+   *  agent left running in its folder when the terminal ends. Off: nothing is
+   *  stopped, and a toast still lists what kept running. Default true. */
+  stopLeftoverProcesses: boolean;
   /** Click-outside dismiss policy for modeless task-detail windows. Default `focused`. */
   windowLightDismiss: WindowLightDismiss;
   /** One-shot marker for the `single` -> `focused` default flip on `windowLightDismiss`.
@@ -3588,13 +3887,12 @@ export interface AppConfig {
    *
    *  Null until a layout is first saved. See src/renderer/components/monitor/. */
   monitorWorkspace: SerializedWorkspace | null;
-  /** Persisted union of every model ID we've ever seen for each agent: the
-   *  result of the static/JSONL `discoverCapabilities()` walk, plus any model
-   *  that has appeared on a live session's usage stream (Claude reports model
-   *  IDs like `claude-opus-4-7` on `usage.model.id`), plus any value the user
-   *  has typed/picked in an override. Keyed by agent name. Acts as the cache
-   *  for the model dropdowns so they don't depend on re-walking JSONL every
-   *  launch and they "discover" new models the user invokes in real time. */
+  /** Model ids a live session has reported, per agent (`usage.model.id`, via
+   *  `rememberDiscoveredModel`), kept across restarts so a model the user ran
+   *  stays in the dropdowns. Never seeded from capability discovery:
+   *  `useKnownModels` unions the live `capabilities.models` in at read time.
+   *  The `agent:list` handler labels these ids per call (`nameLearnedModels`).
+   *  Keyed by agent name. */
   discoveredModelsByAgent: Record<string, string[]>;
   /** Empirically-observed context-window size (in tokens) per model, learned
    *  from a live session's `status.json` (`context_window.context_window_size`,
@@ -3746,9 +4044,8 @@ export const DEFAULT_CONFIG: AppConfig = {
     copyFiles: [],
     initScript: null,
     linkNodeModules: true,
-    prRefreshIntervalMinutes: 5,
-    autoFetchIntervalMinutes: 5,
-    prEvaluateBranchPolicies: false,
+    prAutoRefresh: true,
+    autoFetch: true,
     prBypassCountsAsReady: true,
   },
   mcpServer: {
@@ -3806,6 +4103,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   skipDeleteConfirm: false,
   skipBoardConfigConfirm: false,
   autoFocusIdleSession: false,
+  stopLeftoverProcesses: true,
   windowLightDismiss: 'focused',
   hasMigratedWindowLightDismissDefault: false,
   hasPurgedSeededDiscoveredModels: false,
@@ -3825,17 +4123,16 @@ export const DEFAULT_CONFIG: AppConfig = {
   discoveredModelsByAgent: {},
   discoveredContextWindowsByAgent: {},
   hotkeyOverrides: {},
-  memory: {
+  knowledgeGraph: {
     indexingEnabled: true,
-    semanticEnabled: false,
-    embeddingModel: 'bge-base',
+    enabled: false,
+    localModel: 'granite-r2',
     acceleration: 'auto',
   },
   dictation: {
     enabled: false,
     engineMode: 'auto',
     modelId: null,
-    punctuation: true,
     language: 'en',
     autoSubmit: true,
     releaseBufferMs: 250,
@@ -3890,7 +4187,12 @@ export interface HostMemorySample {
   /** Windows commit remaining; null on every other platform. */
   commitRemainingBytes: number | null;
   physicalTotalBytes: number;
+  /** The OS's free figure. On Linux this is MemFree, which excludes page cache and
+   *  reads near zero on a healthy machine; read `physicalAvailableBytes` there. */
   physicalFreeBytes: number;
+  /** Linux MemAvailable: the kernel's estimate of memory available without
+   *  swapping, the honest pressure figure there. Null on every other platform. */
+  physicalAvailableBytes: number | null;
 }
 
 /** Pushed when host commit headroom crosses below the warning threshold (an
@@ -4171,7 +4473,7 @@ export interface ImportCheckCliResult {
 // shapes as plain, self-contained types rather than importing them -- keep
 // MOBILE_CAPABILITY_VERBS in sync with packages/protocol/src/capabilities/verbs.ts
 // (CAPABILITY_VERBS) by hand; there is no shell/file/arbitrary-command verb
-// in the protocol, by design.
+// in the protocol, by design (`command-terminal` starts an agent, not a shell).
 export const MOBILE_CAPABILITY_VERBS = [
   'read-stream',
   'read-board',
@@ -4184,12 +4486,14 @@ export const MOBILE_CAPABILITY_VERBS = [
   'board-tool-write',
   'register-push',
   'start-session',
+  'pause-session',
+  'command-terminal',
 ] as const;
 export type MobileCapabilityVerb = (typeof MOBILE_CAPABILITY_VERBS)[number];
 
 export interface MobileBridgeStatus {
   enabled: boolean;
-  /** False when Electron safeStorage can't genuinely encrypt (e.g. the Linux basic_text backend) -- the bridge refuses to create/use an identity in that state. */
+  /** False when Electron safeStorage can't genuinely encrypt (no Linux secret store, or safeStorage disabled). The bridge refuses to create or use an identity in that state. */
   secureStorageAvailable: boolean;
   /** Hex-encoded static public key, for display/verification. Never the private key. */
   identityFingerprint: string | null;
@@ -4361,12 +4665,14 @@ export interface TaskSetRuntimeOverrideInput {
 
 /**
  * Result of `IPC.TASK_SET_RUNTIME_OVERRIDE`. `mode` describes how the change
- * was applied: `live` = slash-command injected into the running PTY,
- * `restart` = session suspended and respawned with `--resume`, `persisted` =
- * task has no live session so the override is saved for next spawn.
+ * was applied: `restart` = session suspended and respawned with `--resume` and
+ * the new launch flags, `persisted` = the override is saved for the next spawn
+ * (no live session, nothing changed to a concrete value, or the session already
+ * runs at the picked effort, say after a manual `/effort`). A task session is
+ * never switched by typing `/model` or `/effort`.
  */
 export type TaskSetRuntimeOverrideResult =
-  | { ok: true; mode: 'live' | 'restart' | 'persisted' }
+  | { ok: true; mode: 'restart' | 'persisted' }
   | { ok: false; reason: string };
 
 /**
@@ -5156,9 +5462,9 @@ export interface SpawnSessionInput {
   resuming?: boolean;
   /** True for ephemeral command terminal sessions. */
   transient?: boolean;
-  /** For a transient session, the renderer's durable Command Terminal window slot
-   *  (`slot-1`, ...). Recorded so the Agent Monitor names the terminal exactly as
-   *  its own window title bar does. See src/shared/command-terminal-name.ts. */
+  /** For a transient session, its durable Command Terminal slot (`slot-1`, ...),
+   *  as `startCommandTerminal` allocated it. Recorded so every surface names the
+   *  terminal the same way. See src/shared/command-terminal-name.ts. */
   commandTerminalSlot?: string | null;
   /** For a transient session, the branch it was actually spawned on (the RESOLVED
    *  branch, after any checkout fallback). Recorded so the monitor can tell you
@@ -5169,6 +5475,13 @@ export interface SpawnSessionInput {
   /** Human-readable agent name for diagnostic logs (e.g. "claude", "gemini").
    *  Survives production minification unlike `agentParser.constructor.name`. */
   agentName?: string;
+  /**
+   * The resolved permission mode the session spawns under, the value its
+   * record's `permission_mode` gets. Carried on the session because the spawn
+   * analytics event fires inside spawn(), before the caller inserts that
+   * record, so it cannot be read from the database at that moment.
+   */
+  permissionMode?: PermissionMode | null;
   /** Sequence of strings to write to PTY before killing for graceful exit (e.g. ['\x03', '/exit\r']). */
   exitSequence?: string[];
   /**
@@ -5190,25 +5503,47 @@ export interface SpawnSessionInput {
   /**
    * Caller-known PTY grid to spawn at, when available (e.g. a Command
    * Terminal branch respawn reusing the still-mounted xterm's current size).
-   * Falls back to `takePendingResize` (a resize that beat the spawn), then to
-   * DEFAULT_PTY_COLS/ROWS - see session-spawn-flow.ts.
+   * A stash under the same id (`takePendingResize`, a resize that beat the
+   * spawn) wins over it. Without either, the spawn takes the replaced row's
+   * grid, then `restoredGrid`, then DEFAULT_PTY_COLS/ROWS - see
+   * session-spawn-flow.ts.
    */
   cols?: number;
   rows?: number;
+  /**
+   * The grid recorded on the session record this spawn replaces
+   * (`SessionRecord.last_pty_cols/rows`). The lowest-priority source before the
+   * default: a same-id stash, `cols`/`rows`, and the in-memory predecessor's
+   * grid all win over it. It matters where no in-memory predecessor qualifies,
+   * which is a resume after a desktop restart (empty registry) or a pty host
+   * crash (the lost row is exited). A grid under the phone's row floor is
+   * ignored, so nothing starts in the bottom panel's strip.
+   */
+  restoredGrid?: { cols: number; rows: number };
 }
 
 export interface SpawnTransientSessionInput {
   projectId: string;
-  /** The window's durable slot id (`slot-1`, `slot-2`, ...). Slots are allocated by
-   *  the renderer's Command Terminal layer, so main cannot derive this; it is sent
-   *  purely so the Agent Monitor can name the terminal the same way its window
-   *  does. Optional so an older caller still spawns, just unnumbered. */
+  /** The window's durable slot id (`slot-1`, `slot-2`, ...). A desktop window is
+   *  anchored to its slot before it spawns, so it asks for that one; main grants
+   *  it when the project has no live terminal in it and refuses otherwise. Omitted,
+   *  main allocates the lowest free slot (how a phone's start is numbered). */
   slot?: string;
   /** Branch to checkout before spawning. If omitted, uses the project's default base branch. */
   branch?: string;
   /** See `SpawnSessionInput.cols`/`rows` - the same seed-the-real-grid escape hatch. */
   cols?: number;
   rows?: number;
+}
+
+export interface SpawnTransientSessionResult {
+  session: Session;
+  /** The slot main gave the terminal (`slot-N`). */
+  slot: string;
+  /** The branch the terminal actually started on, after any checkout fallback. */
+  branch: string;
+  /** Why the start stayed on a branch other than the one it aimed for, when it did. */
+  checkoutError?: string;
 }
 
 export interface NotificationInput {
@@ -5417,12 +5752,97 @@ export interface DevSeedGitChangesResult {
   working: number;
 }
 
-/** Summary of a dev test-harness embedding-backlog seed (see DEV_SEED_EMBEDDING_BACKLOG). */
-export interface DevSeedEmbeddingBacklogResult {
-  /** Number of synthetic pending chunks inserted. */
-  seeded: number;
-  /** The synthetic document id the chunks were written under (e.g. 'dev-seed-embedding-backlog-3'). */
-  docId: string;
+/** Summary of a dev test-harness knowledge-graph seed (see DEV_SEED_KNOWLEDGE_GRAPH). */
+export interface DevSeedKnowledgeGraphResult {
+  /** Synthetic conversations written. */
+  documents: number;
+  /** Chunks written across those conversations. */
+  chunks: number;
+  /** The newest of those chunks, left without vectors for the embedding drain. */
+  pendingChunks: number;
+  /** Planted topic clusters the documents were drawn from. The Knowledge Graph
+   *  layout is expected to recover these, which is what makes the seeded
+   *  corpus a ground truth rather than just filler. */
+  clusters: number;
+  /** Throwaway tasks the sessions were hung off, for provenance edges. */
+  tasks: number;
+  /** Embedding width used, taken from the SELECTED model, never hardcoded. */
+  dimensions: number;
+  /** Model tag stamped on every seeded chunk. */
+  modelTag: string;
+}
+
+/** Summary of a dev test-harness REAL-index mirror (see DEV_SEED_KNOWLEDGE_GRAPH_REAL). */
+export interface DevSeedKnowledgeGraphRealResult {
+  /** The real project the slice was copied from. */
+  sourceProject: string;
+  documents: number;
+  chunks: number;
+  tasks: number;
+  dimensions: number;
+  /** The embedding model tag the copied vectors carry, the source's own. */
+  modelTag: string;
+  /** The newest chunks, copied without their vectors for the embedding drain. */
+  pendingChunks: number;
+}
+
+/** A real-index mirror that had nothing to copy: no real project, or no embedded
+ *  index in it. The harness falls back to the synthetic seed. */
+export interface DevSeedKnowledgeGraphRealUnavailable {
+  unavailable: string;
+}
+
+/**
+ * The web demo's sample install, as board rows for a preview to index (see
+ * DEV_SEED_KNOWLEDGE_GRAPH_DEMO and scripts/capture-demo-knowledge-graph.mjs). Every `key` is the
+ * dataset's own id, so the snapshots read back out can be mapped onto the demo's rows.
+ */
+export interface DevSeedKnowledgeGraphDemoPlan {
+  projects: Array<{
+    key: string;
+    name: string;
+    /** A repository whose history is the one the demo's History pane shows. */
+    path: string;
+    defaultAgent: string;
+    tasks: Array<{
+      key: string;
+      title: string;
+      description: string;
+      labels: string[];
+      displayId: number;
+      done: boolean;
+      archived: boolean;
+    }>;
+    /** Backlog items, which the task-record corpus indexes beside the tasks. */
+    backlog: Array<{
+      title: string;
+      description: string;
+      priority: number;
+      labels: string[];
+    }>;
+    sessions: Array<{
+      key: string;
+      taskKey: string;
+      /** The agent's registry name; the seeder resolves its session type. */
+      agent: string;
+      /** The agent's own id for its history, or null when it keeps none. */
+      agentSessionId: string | null;
+      /** The directory the agent ran in, which its history is filed under. */
+      cwd: string;
+    }>;
+  }>;
+}
+
+/** What a demo-graph seed registered: each project's id and its rows' ids, mapped to the dataset keys. */
+export interface DevSeedKnowledgeGraphDemoResult {
+  projects: Array<{
+    key: string;
+    projectId: string;
+    /** Preview task id to dataset task id. */
+    taskKeys: Record<string, string>;
+    /** Preview session id to dataset session id. */
+    sessionKeys: Record<string, string>;
+  }>;
 }
 
 /** Summary of a dev test-harness usage-data seed (see DEV_SEED_USAGE_DATA). */
@@ -5491,15 +5911,6 @@ export interface ElectronAPI {
      */
     seedGitChanges: (targetPaths: string[]) => Promise<DevSeedGitChangesResult>;
     /**
-     * Seed `count` synthetic pending chunks (embedded_model = NULL) into the
-     * current project's conversation-memory index via the real chunk-write
-     * path, then flag the project dirty - the fast path to a realistic
-     * embedding backlog (thousands of pending chunks) for exercising the
-     * central embedding engine's drain loop under sustained real-worker load,
-     * without needing that many real agent turns to produce it.
-     */
-    seedEmbeddingBacklog: (count: number) => Promise<DevSeedEmbeddingBacklogResult>;
-    /**
      * Seed (or, on a re-click for the same project, append to) a throwaway
      * task + session backed by a real synthetic Claude session JSONL
      * transcript file, `count` turns long - the fast path to a huge realistic
@@ -5517,6 +5928,32 @@ export interface ElectronAPI {
      * fresh batch.
      */
     seedUsageData: (days: number) => Promise<DevSeedUsageDataResult>;
+    /**
+     * Seed a cluster-structured synthetic conversation corpus, the fallback
+     * for a machine with no real index to mirror. Vectors are written
+     * directly rather than inferred, all but the newest `embeddingBacklog`
+     * chunks' (1,000 by default), which are left for the embedding drain.
+     */
+    seedKnowledgeGraph: (options: {
+      documentCount?: number; chunksPerDocument?: number; embeddingBacklog?: number;
+    }) => Promise<DevSeedKnowledgeGraphResult>;
+    /**
+     * Mirror the REAL parent project's conversation index (chunks, vectors,
+     * titles) into this preview, so the Knowledge Graph can be judged against
+     * actual work. A copy, not a re-embed, of all but the newest
+     * `embeddingBacklog` chunks' vectors (1,000 by default), which are left for
+     * the embedding drain. Answers `{ unavailable }` when there is no real index
+     * here to copy.
+     */
+    seedKnowledgeGraphReal: (options: {
+      documentLimit?: number; sourceProject?: string; embeddingBacklog?: number;
+    }) => Promise<DevSeedKnowledgeGraphRealResult | DevSeedKnowledgeGraphRealUnavailable>;
+    /**
+     * Register the web demo's sample install as real projects, with the rows main's indexer
+     * reads, so the demo's Knowledge Graph fixture is built by the shipped pipeline. Driven by
+     * scripts/capture-demo-knowledge-graph.mjs; refuses a second seed into the same preview.
+     */
+    seedKnowledgeGraphDemo: (plan: DevSeedKnowledgeGraphDemoPlan) => Promise<DevSeedKnowledgeGraphDemoResult>;
     /** True only in dev-preview (`/preview`, `--ephemeral`); false in the regular dogfood. */
     isEphemeralPreview: boolean;
     /**
@@ -5736,7 +6173,8 @@ export interface ElectronAPI {
     spawn: (input: SpawnSessionInput, projectId?: string | null) => Promise<Session>;
     kill: (sessionId: string) => Promise<void>;
     suspend: (taskId: string, projectId?: string | null) => Promise<void>;
-    resume: (taskId: string, resumePrompt?: string, projectId?: string | null) => Promise<Session>;
+    /** Null when a newer resume, a suspend, a reset or a relocation cancelled this one. */
+    resume: (taskId: string, resumePrompt?: string, projectId?: string | null) => Promise<Session | null>;
     /**
      * Targeted "is this task's session alive right now?" probe. Returns
      * the live registry Session if main has one for this task, or null
@@ -5820,14 +6258,21 @@ export interface ElectronAPI {
     onIdleTimeout: (callback: (sessionId: string, taskId: string, timeoutMinutes: number, projectId?: string) => void) => () => void;
     getSummary: (taskId: string) => Promise<SessionSummary | null>;
     listSummaries: () => Promise<Record<string, SessionSummary>>;
-    /** Live per-tool breakdown for an active session (from the in-memory accumulator, not the DB). */
+    /**
+     * Per-tool breakdown for an active session across its runs: the stored rows
+     * of its earlier records (same task and isolated swimlane) merged by tool
+     * name with the live in-memory accumulator.
+     */
     getToolBreakdown: (sessionId: string) => Promise<PerToolStat[]>;
-    spawnTransient: (input: SpawnTransientSessionInput) => Promise<{ session: Session; branch: string; checkoutError?: string }>;
+    /**
+     * Estimated result tokens per tool name for an active session across its
+     * runs: the earlier records' estimates (filled from their transcripts where
+     * missing) plus the live run's, read in the retrieval worker. Null when no
+     * run has an estimate. Replaces `getToolBreakdown`'s rows' `resultTokens`.
+     */
+    getToolResultTokens: (sessionId: string) => Promise<Record<string, number> | null>;
+    spawnTransient: (input: SpawnTransientSessionInput) => Promise<SpawnTransientSessionResult>;
     killTransient: (sessionId: string) => Promise<void>;
-    /** Record a transient session's auto-derived name on main, so it survives a
-     *  renderer reload. Fire-and-forget: the renderer has already applied it
-     *  locally, and main only retains it for recovery. */
-    setTransientLabel: (sessionId: string, label: string) => Promise<void>;
     /** Mirror where a Command Terminal's checkout actually sits, re-derived
      *  from live HEAD by the renderer, onto its live registry row so the
      *  Monitor row and a post-reload adopt agree with the pill. Last write
@@ -5955,6 +6400,15 @@ export interface ElectronAPI {
     onWriteFailed: (callback: (message: string) => void) => () => void;
   };
 
+  // Leftover processes: what a task left running when it reached Done, To Do,
+  // or was deleted (see `LeftoverProcessReport`).
+  leftoverProcesses: {
+    /** One report per burst of terminal transitions. Never fires when nothing was left running. */
+    onReport: (callback: (report: LeftoverProcessReport) => void) => () => void;
+    /** Stop one reported process, with everything under it, by its `LeftoverProcess.id`. */
+    stop: (processId: string) => Promise<LeftoverStopOutcome>;
+  };
+
   // Keybindings
   keybindings: {
     /** Probe whether each canonical combo can be claimed as a system-wide global
@@ -6008,6 +6462,7 @@ export interface ElectronAPI {
     listBranches: () => Promise<string[]>;
     diffFiles: (input: GitDiffFilesInput) => Promise<GitDiffFilesResult>;
     fileContent: (input: GitFileContentInput) => Promise<GitFileContentResult>;
+    fileImage: (input: GitFileImageInput) => Promise<GitImageContentResult>;
     subscribeDiff: (worktreePath: string) => void;
     unsubscribeDiff: (worktreePath: string) => void;
     onDiffChanged: (callback: () => void) => () => void;
@@ -6017,8 +6472,8 @@ export interface ElectronAPI {
      * that follows within the throttle window either skips its own fetch or joins the
      * one already in flight and pays only its remainder. Fire-and-forget: never rejects,
      * never prompts (non-interactive git), and shares the background scheduler's cache
-     * and its `git.autoFetchIntervalMinutes` setting, so it is a no-op when the user has
-     * turned background fetching off. The board calls it when a drag of a worktree-backed
+     * and its `git.autoFetch` setting, so it is a no-op when the user has turned
+     * background fetching off. The board calls it when a drag of a worktree-backed
      * card begins, so a Done drop's probe is not starting a fetch after the release.
      */
     prefetchRemotes: (checkPath: string) => Promise<void>;
@@ -6303,6 +6758,10 @@ export interface ElectronAPI {
     export: () => Promise<void>;
     apply: (projectId: string) => Promise<string[]>;
     onChanged: (callback: (projectId: string) => void) => () => void;
+    /** The project-open reconcile's warnings, pushed on every open (an empty list clears the banner). */
+    onWarnings: (callback: (projectId: string, warnings: string[]) => void) => () => void;
+    /** The warnings of the project's last apply, for a renderer that missed the `onWarnings` push. */
+    getLastWarnings: (projectId: string) => Promise<string[]>;
     onShortcutsChanged: (callback: (projectId: string) => void) => () => void;
     /** The board's named Board Profiles (see `BoardProfile`). Empty when the board has none. */
     getBoardProfiles: () => Promise<BoardProfile[]>;
@@ -6494,7 +6953,7 @@ export interface ElectronAPI {
 
   // Conversation viewer (structured transcripts)
   transcripts: {
-    get: (input: TranscriptGetRequest) => Promise<TranscriptGetResponse | TranscriptUnchangedResponse>;
+    get: (input: TranscriptGetRequest) => Promise<TranscriptGetResponse | TranscriptUnchangedResponse | TranscriptDeltaResponse>;
     listSessions: (
       taskId: string,
       projectId?: string | null,
@@ -6502,15 +6961,86 @@ export interface ElectronAPI {
   };
 
   // Conversation memory (search index) status + proactive surfaces.
-  memory: {
-    getStatus: () => Promise<MemoryStatus>;
-    /** Spawn + init the embedding worker ahead of the first Smart query, so
-     *  Quick Find's typing time covers the cold start. Fire-and-forget. */
-    prewarm: () => void;
-    /** Purge the project's conversation index and re-run the backfill sweep
-     *  (recovery from a corrupt/stale index). Resolves when the purge is done;
-     *  the rebuild sweep continues in the background. */
-    rebuildIndex: (projectId?: string | null) => Promise<void>;
+  knowledgeGraph: {
+    getStatus: () => Promise<KnowledgeGraphStatus>;
+    /** Spawn + init the embedding worker ahead of the first question, so the
+     *  time spent typing it covers the cold start. Fire-and-forget. With a
+     *  chat (the Knowledge Graph opening), also starts the answering agent's
+     *  warm session for it. */
+    prewarm: (chat?: KnowledgeGraphAnswerPrewarm) => void;
+    /** The chat's warm answering session is no longer needed (the chat ended,
+     *  or its graph closed). Fire-and-forget. */
+    endChat: (chatId: string) => void;
+    /**
+     * What Rebuild would spend: how many task summaries (summaries) in every
+     * project were written with another agent or model and would be rewritten.
+     * Zero while summaries are off or the Knowledge Graph's agent is not chosen. Read when
+     * Rebuild is pressed, so it asks first only when it will spend calls.
+     */
+    rebuildPlan: () => Promise<KnowledgeGraphRebuildPlan>;
+    /**
+     * Rebuild everything, in every project: forget what every source was read
+     * from (conversations, tasks, commits, session changes, source code) so each
+     * is read again, never dropping what is indexed, and mark the task
+     * summaries written with another agent or model for rewriting. The open
+     * project is read again at once; another project on its next open. Resolves
+     * when the marks are made; the reading continues in the background.
+     */
+    rebuildIndex: () => Promise<KnowledgeGraphRebuildPlan>;
+    /**
+     * One task's summary in a project, for the Knowledge Graph's selected
+     * conversation: null while task summaries are switched off, or when the task
+     * has none. Read on select rather than shipped in every snapshot.
+     */
+    taskSummary: (projectId: string, taskId: string) => Promise<string | null>;
+    /** Cheap read of the cached Knowledge Graph projection plus its coverage
+     *  strip. Never triggers the projection pass. `knownProjectionKey` is the
+     *  key of the map the caller holds, so an unchanged one is not sent again
+     *  (see `KnowledgeGraphSnapshotWire`). */
+    graphSnapshot: (projectId?: string | null, knownProjectionKey?: string | null) => Promise<KnowledgeGraphSnapshotWire | null>;
+    /** Every project with its indexed conversation count and last indexing
+     *  time, for the Projects picker. Cheap: an index-only count per project. */
+    graphProjects: () => Promise<KnowledgeGraphProjectSummary[]>;
+    /** Ask for a background projection refresh. Resolves immediately with the
+     *  first build's progress when the project has no map yet and one is
+     *  running, otherwise null; completion arrives on `onGraphChanged`. */
+    refreshGraph: (projectId?: string | null) => Promise<KnowledgeGraphBuildProgress | null>;
+    /** Push subscription: fires when a projection pass finishes. Returns an
+     *  unsubscribe closure. */
+    onGraphChanged: (callback: (projectId: string) => void) => () => void;
+    /** Push subscription: a first build's progress, throttled. Carries the
+     *  figure itself, so a moving bar costs no snapshot read. Returns an
+     *  unsubscribe closure. */
+    onGraphBuildProgress: (callback: (projectId: string, progress: KnowledgeGraphBuildProgress) => void) => () => void;
+    /**
+     * Ask: the local retrieval, read by an agent that answers from it. Costs a
+     * real CLI call. Every failure comes back as `{ ok: false, reason }` rather
+     * than throwing, so the surface can say what went wrong instead of showing
+     * an empty answer.
+     */
+    answerFromGraph: (
+      question: string,
+      projectId?: string | null,
+      granularity?: string,
+      /** Minted by the caller and echoed on every stream event, so deltas from
+       *  a question the user has moved past are dropped, never appended. */
+      requestId?: string,
+      /** The chat so far and the map's filters. */
+      context?: KnowledgeGraphAnswerContext,
+    ) => Promise<KnowledgeGraphAnswerResult>;
+    /**
+     * Push subscription: progress on an answer in flight. Text as the agent
+     * writes it, a tool call as it starts, and a terminal `done`. The final
+     * `KnowledgeGraphAnswerResult` still arrives whole from `answerFromGraph`, so
+     * nothing structural is ever parsed off a partial stream. Returns an
+     * unsubscribe closure.
+     */
+    onAnswerStream: (callback: (event: KnowledgeGraphAnswerStreamPush) => void) => () => void;
+    /**
+     * Earlier conversations semantically near a task, excluding the task's own.
+     * Proactive recall: what have I already figured out about this?
+     */
+    relatedToTask: (taskId: string, projectId?: string | null) => Promise<KnowledgeGraphQueryHit[]>;
   };
 
   // Platform
@@ -6640,32 +7170,457 @@ export interface SearchRequest {
   mode?: 'keyword' | 'smart';
 }
 
-/** Runtime state of the semantic (embedding) layer, for the palette Smart-mode
- *  UI. `lexical` = enabled but sqlite-vec unavailable, so search stays lexical. */
-export type MemorySemanticState = 'disabled' | 'downloading' | 'lexical' | 'hybrid' | 'error';
+/** Runtime state of the semantic (embedding) layer, for the Knowledge Graph
+ *  settings tab. `lexical` = enabled but sqlite-vec unavailable, so search stays lexical. */
+export type KnowledgeGraphSemanticState = 'disabled' | 'downloading' | 'lexical' | 'hybrid' | 'error';
 
 /** Download/availability state of the selected embedding model. */
-export type MemoryModelState = 'absent' | 'downloading' | 'ready' | 'error';
+export type KnowledgeGraphModelState = 'absent' | 'downloading' | 'ready' | 'error';
 
-/** The selected embedding model's identity + download state, for the settings
- *  model card (mirrors the dictation model-status card). */
-export interface MemoryModelStatus {
+/** The selected embedding model's identity + download state, for the Knowledge
+ *  Graph card's Local model row. */
+export interface KnowledgeGraphModelStatus {
   id: string;
   displayName: string;
-  tier: 'balanced' | 'accurate' | 'max';
+  tier: EmbeddingTier;
   approxSizeMb: number;
   dimensions: number;
-  state: MemoryModelState;
+  state: KnowledgeGraphModelState;
   /** 0..1 while `state === 'downloading'`. */
   progress?: number;
 }
 
-/** Where the embedding model runs. See `AppConfig.memory.acceleration`. */
-export type MemoryAcceleration = 'auto' | 'gpu' | 'cpu';
+/** Where the embedding model runs. See `AppConfig.knowledgeGraph.acceleration`. */
+export type KnowledgeGraphAcceleration = 'auto' | 'gpu' | 'cpu';
 
-export interface MemoryStatus {
+/** One node in the Knowledge Graph: a document in whatever corpus it came from. */
+export interface KnowledgeGraphNode {
+  /** `${corpus}::${docId}`. The corpus prefix is what keeps the graph open to a
+   *  second corpus (repo files) without a node-kind rewrite. */
+  docKey: string;
+  /** Unit-box coordinates, 0..1. One 3D layout: the surface has no flat view. */
+  x: number;
+  y: number;
+  z: number;
+  chunkCount: number;
+  /** Human-readable name, normally the owning task's title. Null when the
+   *  conversation has no task. Without it a node is an opaque hash. */
+  title: string | null;
+  /** The Kangentic session, so a click can open the real transcript. */
+  sessionId: string | null;
+  taskId: string | null;
+  /**
+   * The owning task's board ticket, the `#N` a card prints.
+   *
+   * The surface labels a task with this rather than with its position in the
+   * answer prompt's table: that position is an index into a cost-sorted list,
+   * so rendering it as `#14` would hand the reader a board-shaped number
+   * pointing at a different ticket. Null for a conversation with no task.
+   */
+  displayId: number | null;
+  /** Agent that produced it, as a DISPLAY name resolved from the adapter
+   *  registry ("Claude Code"), never the raw `session_type` ("claude_agent"). */
+  agent: string | null;
+  /** Model the session actually ran at, preferring the applied value over the
+   *  configured one so a mid-session `/model` change is reflected. */
+  model: string | null;
+  /** Reasoning effort the session actually ran at, when the agent reports one. */
+  effort: string | null;
+  /** Wall time the session ran for, in ms. Null while it is still running, or
+   *  for a conversation indexed before metrics were captured. */
+  durationMs: number | null;
+  /** What the session cost, in USD. Null on the same terms as `durationMs`. */
+  costUsd: number | null;
+  /** Input plus output tokens. Null on the same terms as `durationMs`. */
+  tokens: number | null;
+  /** Epoch ms of the last indexed turn, for recency colouring. */
+  lastActivityMs: number | null;
+  /** Where the owning task ended up: `'done'` (in a Done lane, or archived,
+   *  which only a move into Done does), `'active'` (still open on the board), or
+   *  null for a conversation with no task. See the CASE in `documentMetadata`. */
+  outcome: 'done' | 'active' | null;
+  /**
+   * Which labelled region this node sits in, at each granularity.
+   *
+   * Indexed the same way as `KnowledgeGraphProjection.clusterings`, so
+   * `clusters[g]` is this node's region id within `clusterings[g].regions`.
+   */
+  clusters: Record<KnowledgeGraphGranularity, number>;
+}
+
+/**
+ * How finely the map is cut into regions.
+ *
+ * A preference rather than a measurement, and that is the honest framing: every
+ * separation score is maximised by the fewest clusters on a continuous cloud, so
+ * "the right number of regions" is a readability judgement about how much detail
+ * a reader wants, not a fact waiting in the data. All three are computed and
+ * shipped together, so switching costs no rebuild.
+ */
+export type KnowledgeGraphGranularity = 'coarse' | 'balanced' | 'fine';
+
+export const KNOWLEDGE_GRAPH_GRANULARITIES: KnowledgeGraphGranularity[] = ['coarse', 'balanced', 'fine'];
+
+/** One complete carve-up of the map. */
+export interface KnowledgeGraphClustering {
+  granularity: KnowledgeGraphGranularity;
+  regions: KnowledgeGraphCluster[];
+}
+
+/** A named region of the map, derived from the layout and labelled from the
+ *  terms most over-represented in it. */
+export interface KnowledgeGraphCluster {
+  id: number;
+  label: string;
+  /** Centroid of this cluster's members, where its label is anchored. */
+  x: number;
+  y: number;
+  z: number;
+  size: number;
+}
+
+/** A similarity edge between two node indices. Computed in FULL embedding
+ *  dimensionality, so unlike node positions these are exact. */
+export interface KnowledgeGraphEdge {
+  source: number;
+  target: number;
+  similarity: number;
+}
+
+/** A coverage bucket. `tone` is resolved in main so the renderer never has to
+ *  re-derive which index states are genuinely problems - notably
+ *  `missing-source`, which is the steady state for most of a mature corpus and
+ *  must never be painted as an error. */
+export interface KnowledgeGraphCoverageBucket {
+  documents: number;
+  chunks: number;
+  tone: 'ok' | 'neutral' | 'problem';
+}
+
+export interface KnowledgeGraphCoverageSummary {
+  indexed: KnowledgeGraphCoverageBucket;
+  sourceMissingButSearchable: KnowledgeGraphCoverageBucket;
+  empty: KnowledgeGraphCoverageBucket;
+  failed: KnowledgeGraphCoverageBucket;
+  notYetIndexed: KnowledgeGraphCoverageBucket;
+  totalDocumentsWithChunks: number;
+  totalChunks: number;
+  totalEmbeddedChunks: number;
+  embeddedFraction: number;
+  knownDocumentIdsMatched: number;
+}
+
+export interface KnowledgeGraphProjection {
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+  /**
+   * Every granularity, computed together.
+   *
+   * Shipping all three rather than storing the choice and rebuilding on a switch:
+   * the clustering is milliseconds over a layout that is already computed, the
+   * extra payload is one integer per node per granularity, and the alternative
+   * would put a full projection rebuild behind a display control.
+   */
+  clusterings: KnowledgeGraphClustering[];
+  signature: string;
+  modelTag: string;
+  /** Width of the EMBEDDINGS this was projected from (384 / 768 / 1024). The
+   *  LAYOUT is always three components; see `KnowledgeGraphNode`. */
+  dimensions: number;
+  /**
+   * Each node's genuinely nearest conversations, most similar first, computed in
+   * FULL embedding dimensionality.
+   *
+   * Separate from `edges` on purpose, because the two answer different
+   * questions. `edges` is the mesh DRAWN on the map, and it is quantile-pruned
+   * to stay readable - an unpruned mesh at this density is a hairball. That
+   * pruning is global, so a node's true nearest neighbour can be absent from it
+   * entirely, and the detail panel read exactly one neighbour for conversations
+   * that genuinely had several. What is drawn is a legibility decision; what the
+   * panel lists is a claim about the data, and it must not be filtered by the
+   * former.
+   */
+  nodeNeighbors: ReadonlyArray<ReadonlyArray<{ index: number; similarity: number }>>;
+
+  /**
+   * Bytes the conversations occupy: chunk text plus vectors.
+   *
+   * Computed in the background pass, not on the snapshot read, because the text
+   * half is a full scan (~170ms over 52k chunks). It therefore travels with the
+   * map and is exactly as fresh as it. The whole index's size, every corpus, is
+   * `KnowledgeGraphIndexSummary.storageBytes`.
+   */
+  storageBytes: number;
+  builtAt: string;
+}
+
+/** A corpus of the memory index, as the Index panel lists it. */
+export type KnowledgeGraphIndexCorpus = 'conversation' | 'task' | 'change' | 'commit' | 'code';
+
+/** What one corpus holds. */
+export interface KnowledgeGraphIndexCorpusSummary {
+  corpus: KnowledgeGraphIndexCorpus;
+  /** Conversations, task records, sessions with changes, commits on the
+   *  default branch, or source files: the corpus's documents. */
+  documents: number;
+  chunks: number;
+  /** Chunks with a vector; `chunks` minus these are still to be embedded. */
+  embeddedChunks: number;
+  /** False for a corpus kept as text only (session changes, commits), which is
+   *  never embedded and so has no embedded share to show. */
+  embeds: boolean;
+}
+
+/**
+ * What the index holds, every corpus, and its task summaries: one project's, or
+ * several summed (`sumIndexCounts` in `shared/index-summary.ts`). The Settings
+ * card sums these; the map's Index panel sums `KnowledgeGraphIndexSummary`,
+ * which adds the size on disk.
+ */
+export interface KnowledgeGraphIndexCounts {
+  /** One entry per corpus the store knows, in `INDEX_CORPORA` order, present
+   *  with zeros when nothing of it is indexed yet. */
+  corpora: KnowledgeGraphIndexCorpusSummary[];
+  /** One project's task summaries, or every summed project's. */
+  summaries: KnowledgeGraphSummaryCounts;
+}
+
+/**
+ * Everything the index holds, every corpus, for the Index panel. The map and
+ * its coverage describe conversations; this describes the whole store, so a
+ * corpus that is indexed but never drawn (task records, session changes) is
+ * still accounted for.
+ */
+export interface KnowledgeGraphIndexSummary extends KnowledgeGraphIndexCounts {
+  /** Bytes every corpus occupies: text plus vectors. */
+  storageBytes: number;
+}
+
+/** One conversation a task window's prior work lists. */
+export interface KnowledgeGraphQueryHit {
+  /** `${corpus}::${docId}` - the graph node this hit belongs to, so the canvas
+   *  can light it without the renderer re-deriving the join. */
+  docKey: string;
+  sessionId: string;
+  taskId: string | null;
+  taskTitle: string | null;
+  agentName: string | null;
+  snippet: string;
+  score: number;
+  matchKind: 'lexical' | 'semantic' | 'hybrid';
+  /** How many chunks in this conversation matched. */
+  matchCount: number;
+  turnTs: number | null;
+}
+
+/**
+ * One task a Knowledge Graph question is about, as the map and the chat see it.
+ *
+ * The same shape serves the related set (what the local search found before the
+ * agent ran) and the source rows under an answer (what the agent selected), so
+ * a row and a lit node can never disagree about which task they are.
+ */
+export interface KnowledgeGraphRelatedTask {
+  /** The task id, or `conversation:<docKey>` for a conversation with no task. */
+  key: string;
+  taskId: string | null;
+  /** The board ticket, `#561`. Null only for a conversation with no task. */
+  displayId: number | null;
+  title: string;
+  /** 0 to 1: this task's match relative to the question's best. Drives how
+   *  brightly the map lights it. A task the answer selected without the search
+   *  finding it (a board question) carries 1. */
+  strength: number;
+  /** The task's conversations inside the map's filters, so the map can light
+   *  them and a row can open one. */
+  docKeys: string[];
+  /** Where a source row opens: the conversation and turn of the passage that
+   *  matched best, or null when no passage did (then the newest conversation). */
+  passage: { sessionId: string; turnUuid: string | null } | null;
+  /**
+   * The project the task belongs to. Set on every task of a question asked
+   * across projects, so a row opens its conversation in the right project and
+   * names it; absent on a single-project answer, where it is the open one.
+   */
+  projectId?: string;
+  projectName?: string;
+  /**
+   * The ref the answer uses for this task, exactly as written: `#561`, or
+   * `mobile#88` for a task outside the open project in a question asked across
+   * projects, since ticket numbers repeat between projects. Absent means `#N`.
+   */
+  ref?: string;
+}
+
+/** One earlier turn of a Knowledge Graph chat, as a follow-up carries it. */
+export interface KnowledgeGraphAnswerHistoryTurn {
+  question: string;
+  answer: string;
+  /** Keys of the tasks that turn was about, so "of those" has a referent. */
+  taskKeys: string[];
+}
+
+/** What a question carries besides its text. */
+export interface KnowledgeGraphAnswerContext {
+  /** The chat this question belongs to. Keys the agent's MCP URL, so its
+   *  searches reach the right chat's trace. */
+  chatId?: string;
+  /** Earlier turns of the chat, oldest first. */
+  history?: KnowledgeGraphAnswerHistoryTurn[];
+  /**
+   * The conversations inside the map's filters, or null when nothing is
+   * filtered. The filters are the scope of a question: retrieval and the task
+   * table see only these.
+   */
+  scopeDocKeys?: string[] | null;
+  /**
+   * The projects a question is asked across, when the map shows more than one
+   * (or one that is not the open project). Absent means the single project the
+   * call names. `scopeDocKeys` then spans every one of them.
+   */
+  projectIds?: string[];
+}
+
+/** The chat a Knowledge Graph prewarm starts the answering agent for. */
+export interface KnowledgeGraphAnswerPrewarm {
+  /** The chat the warm session belongs to; the next question carries the same id. */
+  chatId: string;
+  /** The project the graph opened on, or null for the open project. */
+  projectId: string | null;
+}
+
+export type KnowledgeGraphAnswerResult =
+  | {
+    ok: true;
+    /** The agent's prose, with its protocol line removed. Tasks are named in it
+     *  by ticket (`#561`), which the chat renders as marks. */
+    answer: string;
+    /**
+     * The tasks the answer is about, in the order to show them: the ones its
+     * prose names first, in the order named, then the rest of its selection.
+     * Empty when the answer is not about particular tasks.
+     */
+    rows: KnowledgeGraphRelatedTask[];
+    /** What the local search found, strongest first: the set the map lights. */
+    related: KnowledgeGraphRelatedTask[];
+    /** How many of `related` the agent was handed ("Reading 14 related tasks"). */
+    handedCount: number;
+    /**
+     * What this question cost to ask, in prompt tokens, estimated with the same
+     * function the chunker sizes text with.
+     */
+    promptTokens: number;
+    /** Which agent produced it, so the surface can say whose answer this is. */
+    agentName: string;
+  }
+  | {
+    ok: false;
+    reason: string;
+    /**
+     * Set when the question could not run because the answering agent or its
+     * model has not been chosen yet. The surface takes the user to Settings >
+     * Knowledge Graph instead of showing an error, since nothing failed.
+     */
+    setup?: AnswerSetupGap;
+  };
+
+/** What is still missing before the Knowledge Graph can answer. */
+export type AnswerSetupGap = 'agent' | 'model';
+
+/**
+ * One step of an answer in flight.
+ *
+ * - `set`: the related work, pushed the moment the local search returns and
+ *   before the agent starts, so the map lights while the agent is still
+ *   booting.
+ * - `search`: the agent searched again; `query` is what it asked, and `docKeys`
+ *   the conversations that came back, which the map rings.
+ * - `text`: the agent writing.
+ * - `tool`: the agent reaching for a tool, for a CLI whose stream says so.
+ * - `done`: the stream is over, whether the answer succeeded or threw.
+ *
+ * Structural parsing (the refs and the selection) waits for the whole answer
+ * and never runs on these.
+ */
+export type KnowledgeGraphAnswerStreamEvent =
+  | { kind: 'set'; related: KnowledgeGraphRelatedTask[]; handedCount: number }
+  | { kind: 'search'; query: string; docKeys: string[] }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; name: string }
+  | { kind: 'done' };
+
+/** A stream event as pushed, tagged with the question it belongs to. */
+export type KnowledgeGraphAnswerStreamPush = KnowledgeGraphAnswerStreamEvent & { requestId: string };
+
+/** One project as the Knowledge Graph's Projects picker lists it. */
+export interface KnowledgeGraphProjectSummary {
+  id: string;
+  name: string;
+  /** Indexed conversations, which is what its map draws. 0 means there is
+   *  nothing to draw, and the picker lists it as not indexed. */
+  conversations: number;
+  /** Indexed task records (tasks and backlog items), searched but never drawn. */
+  taskRecords: number;
+  /** When its index last took in a conversation, epoch ms, so the picker can
+   *  list projects by recent work. Null when nothing is indexed. */
+  lastActivityMs: number | null;
+}
+
+/**
+ * How far a project's first map has got, for the building card's progress row.
+ * One percent across the pass: reading each conversation's vectors is most of
+ * it, then placing them and naming the regions (`buildPercent` in
+ * `graph-service.ts`). Pushed on `onGraphBuildProgress` while it runs.
+ */
+export interface KnowledgeGraphBuildProgress {
+  /** Identifies the pass, unique across retrieval worker restarts, so a reader
+   *  holding an older pass's figure takes the newer pass's even when lower. */
+  pass: number;
+  stage: 'reading' | 'placing' | 'naming';
+  /** 0 to 99: it never reads 100 while work remains. */
+  percent: number;
+}
+
+export interface KnowledgeGraphSnapshot {
+  projectId: string;
+  /** Null until the first projection pass completes. */
+  projection: KnowledgeGraphProjection | null;
+  coverage: KnowledgeGraphCoverageSummary;
+  /** Every corpus the index holds, for the Index panel. */
+  index: KnowledgeGraphIndexSummary;
+  /** A projection pass is running for this project: the first build, or a
+   *  refresh while the old map stays on screen. */
+  building: boolean;
+  /** The first build's progress while it runs; null otherwise, a refresh
+   *  included. */
+  buildProgress: KnowledgeGraphBuildProgress | null;
+  /** Stale projections are still served: a slightly old map beats a blank one. */
+  stale: boolean;
+  semanticAvailable: boolean;
+  /** Identifies `projection` (its signature and the region names laid over it);
+   *  null with no map. The renderer sends it back with its next read, so an
+   *  unchanged map is not sent again. */
+  projectionKey?: string | null;
+}
+
+/**
+ * A snapshot as `graphSnapshot` returns it. The map is about 1 MB and an open
+ * graph re-reads its snapshot on every push, so main sends the map as JSON, and
+ * only when the reader does not already hold it; the renderer store turns this
+ * back into a `KnowledgeGraphSnapshot`. `projection` may also come whole (the
+ * UI tier's and the web demo's mock), and `null` there means no map yet.
+ */
+export interface KnowledgeGraphSnapshotWire extends Omit<KnowledgeGraphSnapshot, 'projection'> {
+  projection?: KnowledgeGraphProjection | null;
+  /** The map as JSON, when the reader's key did not match. */
+  projectionJson?: string;
+  /** The reader's key still matches: keep the map it holds. */
+  projectionUnchanged?: boolean;
+}
+
+export interface KnowledgeGraphStatus {
   indexingEnabled: boolean;
-  semantic: MemorySemanticState;
+  semantic: KnowledgeGraphSemanticState;
   /** Human-readable execution backend the embed worker actually initialized on
    *  (e.g. "DirectML (GPU)", "WebGPU (GPU)", "CPU"), for the settings model card.
    *  Undefined until the worker has embedded at least once this run. */
@@ -6673,14 +7628,137 @@ export interface MemoryStatus {
   /** 0..1 while `semantic === 'downloading'`, else undefined. */
   modelProgress?: number;
   /** The selected model + its download state (present once semantic is on). */
-  model?: MemoryModelStatus;
+  model?: KnowledgeGraphModelStatus;
   /** When `semantic === 'lexical'`, the reason sqlite-vec failed to load (so the
-   *  Memory tab can explain the degrade), or undefined if it simply is not loaded. */
+   *  Knowledge Graph tab can explain the degrade), or undefined if it simply is not loaded. */
   vecError?: string;
   /** When `semantic === 'error'` because the embedding worker crashed past its
-   *  restart cap: its exit code plus the first error line of its stderr (home
-   *  directory redacted), so the Memory tab can say why. Undefined otherwise. */
+   *  restart cap: how it stopped (`exited with code <n>` or `failed to start`)
+   *  plus the first error line of its stderr (home directory redacted), so the
+   *  Knowledge Graph tab can say why. Undefined otherwise. */
   workerError?: string;
+  /** Task summaries summed over every indexed project, for their line in the
+   *  Index card. Absent while semantic search is off or there is no index to
+   *  read (indexing off, no project registered, or no answer from the retrieval
+   *  worker); with none indexed yet it is present with zero counts. */
+  summaries?: KnowledgeGraphSummaryStatus;
+  /** Source code summed over every indexed project, for its line in the Index
+   *  card; the open project's branch size while none holds code. Absent while
+   *  there is nothing to say yet. */
+  code?: KnowledgeGraphCodeStatus;
+  /** The always-indexed sources summed over every indexed project, for their
+   *  lines in the Index card. Absent with indexing off, no project registered,
+   *  or no answer from the retrieval worker; with none indexed yet it is
+   *  present with zero counts. */
+  sources?: KnowledgeGraphSourcesStatus;
+}
+
+/** What a Rebuild spends: the task summaries it rewrites, in every project. */
+export interface KnowledgeGraphRebuildPlan {
+  summariesToRewrite: number;
+}
+
+/**
+ * The sources the index always holds: conversations and task
+ * records (searched by meaning too while semantic search is on) and commits
+ * (by keyword only). Session changes are not listed: nothing searches them,
+ * they only feed the task summaries.
+ */
+export interface KnowledgeGraphSourcesStatus {
+  conversations: KnowledgeGraphSourceStatus;
+  tasks: KnowledgeGraphSourceStatus;
+  commits: KnowledgeGraphSourceStatus;
+}
+
+/** One always-indexed source, as its Index card line reads it. */
+export interface KnowledgeGraphSourceStatus {
+  /** Documents held: conversations, tasks, commits. The Index panel's count. */
+  count: number;
+  /**
+   * Share of its passages with a vector, 0..100 and rounded down, while some
+   * still wait for one. Null when nothing waits: caught up, keyword-only, or
+   * semantic search off.
+   */
+  percent: number | null;
+  /** Minutes the waiting passages take at the measured background rate, or
+   *  null while nothing waits or before a rate has been measured. */
+  minutesLeft: number | null;
+}
+
+/**
+ * Source code, as the Index card's Source code line reads it.
+ *
+ * - `estimate`: code is not indexed, and `files` and `passages` are what
+ *   switching it on would read: the files counted on the branch, the passages
+ *   estimated from their sizes.
+ * - `reading`: switched on, and the branch has not been read yet.
+ * - `indexing`: passages are still waiting for their vectors.
+ * - `ready`: every passage has its vector.
+ * - `nothing-committed`: the project has no commit to read (a folder just
+ *   given `git init`), or no repository at all. Any branch works otherwise.
+ */
+export interface KnowledgeGraphCodeStatus {
+  state: 'estimate' | 'reading' | 'indexing' | 'ready' | 'nothing-committed';
+  files: number;
+  passages: number;
+  /** Passages with their vector: `passages` when ready, 0 in an estimate. */
+  embedded: number;
+  /** Minutes the passages without a vector take at this machine's measured
+   *  background rate, or null before a rate has been measured this launch. */
+  minutesLeft: number | null;
+}
+
+/**
+ * Task summaries for one project, or for every project summed (`sumSummaryCounts`
+ * in `shared/index-summary.ts`). The retrieval worker reads the counts; main adds
+ * what its summary scheduler is doing. Both Index views sum this one record,
+ * so the Settings card and the map's panel cannot disagree.
+ */
+export interface KnowledgeGraphSummaryCounts {
+  /** Summaries written, of the finished tasks (in a Done column) that can have one. */
+  written: number;
+  finishedTasks: number;
+  /** Summaries marked for rewriting and not rewritten yet. */
+  awaitingRewrite: number;
+  /** The finished tasks' summaries by what wrote them, most first. */
+  writtenWith: SummaryChoiceCount[];
+  /** Tasks the agent passed over this run of the app; asked again next launch. */
+  skipped: number;
+  /**
+   * What the scheduler is doing: `writing` while a pass runs or is queued,
+   * `retrying` while a failed call waits out its backoff. Summed, `writing` wins
+   * over `retrying`, which wins over `idle`. Waiting for an agent is not a state
+   * here: the renderer reads that setup gap from config, the same rule main applies.
+   */
+  state: 'idle' | 'writing' | 'retrying';
+  /** How long until a failed call is tried again, as of this read. Set only
+   *  while `retrying`; main measures it so the renderer never reads a clock. */
+  retryInMs: number | null;
+  /**
+   * What a summary would be written with now: the Knowledge Graph's agent, its model, and
+   * the recommended effort main resolves for a summary. Null while summaries are
+   * off or wait for a choice. A rewrite rewrites the summaries written any other
+   * way.
+   */
+  choice: SummaryChoice | null;
+}
+
+/** Task summaries as the Index card's Task summaries line reads them. */
+export interface KnowledgeGraphSummaryStatus extends KnowledgeGraphSummaryCounts {
+  /** Minutes the summaries still to write (and to rewrite) take at the current
+   *  run's measured rate, or null before a pass of the run has written any. */
+  minutesLeft: number | null;
+}
+
+/** What wrote a summary: an adapter name, its model id, and the effort level it ran at. */
+export interface SummaryChoice {
+  agent: string;
+  model: string | null;
+  effort: string | null;
+}
+
+export interface SummaryChoiceCount extends SummaryChoice {
+  count: number;
 }
 
 interface SearchHitBase {
@@ -6838,6 +7916,29 @@ export interface TranscriptGetResponse {
 export interface TranscriptUnchangedResponse {
   unchanged: true;
   revision: number;
+}
+
+/**
+ * Returned by `transcripts.get` instead of a full `TranscriptGetResponse`
+ * when the caller's `knownRevision` is one the reader still holds: only the
+ * entries that changed or were added since, by index. Apply it to the entries
+ * the caller has at `baseRevision`: keep the first `length`, then replace each
+ * upsert's index. Every other field is current, as in a full response.
+ */
+export interface TranscriptDeltaResponse extends Omit<TranscriptGetResponse, 'entries'> {
+  delta: true;
+  baseRevision: number;
+  /** How many entries the conversation has at `revision`. */
+  length: number;
+  /** `[index, entry]` for each entry that is new or changed since `baseRevision`. */
+  upserts: Array<[number, TranscriptEntry]>;
+}
+
+/** The entries a delta describes, applied to those its caller holds. */
+export function applyTranscriptDelta(held: TranscriptEntry[], delta: TranscriptDeltaResponse): TranscriptEntry[] {
+  const entries = held.slice(0, delta.length);
+  for (const [index, entry] of delta.upserts) entries[index] = entry;
+  return entries;
 }
 
 /** One selectable session in the conversation viewer's session picker. */

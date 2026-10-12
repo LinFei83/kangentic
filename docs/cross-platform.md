@@ -109,8 +109,8 @@ Warp builders route their end-of-options marker through `quoteArg`.
 
 | Shell + cwd | Fixup written first | effectiveCwd |
 |-------------|--------------------|--------------|
-| cmd.exe + UNC path (`\\server\share\...`) | `pushd "<unc>"` (maps the UNC path to a temporary drive letter; cmd refuses UNC cwds) | Replaced with home |
-| PowerShell/pwsh + bracketed path (`D:\[foo]\bar`) | `Set-Location -LiteralPath '<cwd>'` | Left unchanged |
+| cmd.exe + UNC path (`\\server\share\...`) | `pushd "<unc>"` (maps the UNC path to a temporary drive letter; cmd refuses UNC cwds), with each `%` escaped by `escapePercentForCmd` | Replaced with home |
+| PowerShell/pwsh + bracketed path (`D:\[foo]\bar`) | `Set-Location -LiteralPath '<cwd>'`, escaped by `escapeForPowerShellSingleQuoted` | Left unchanged |
 
 The PowerShell case fixes a Windows PowerShell 5.1 quirk: it treats `[` / `]` in its startup path as wildcard characters, fails to resolve the location, and silently falls back to `$PSHOME` (`C:\Windows\System32\WindowsPowerShell\v1.0`). node-pty's `cwd` is still a valid Win32 directory, so only PowerShell's provider location needs correcting. Applied to the whole PowerShell family (the extra `Set-Location` is harmless in pwsh 7).
 
@@ -118,7 +118,11 @@ The PowerShell case fixes a Windows PowerShell 5.1 quirk: it treats `[` / `]` in
 
 - `toForwardSlash()` - normalizes backslashes to forward slashes for cross-platform CLI commands
 - `quoteArg(arg, shell?, { multiline? })` - shell-aware quoting: single quotes for Unix-like shells (bash, zsh, WSL), double quotes for PowerShell and cmd, each escaped by its own rules (see `escapeForDoubleQuotedShell` below). The shell parameter is explicitly passed in all spawn calls so quoting always matches the target shell. Falls back to platform detection when shell is omitted. `{ multiline: true }` keeps newlines in prompt-style content (literal inside `'...'` for unix-like shells, backtick-n escapes for PowerShell, flattened for cmd); a bare `--` is emitted as `"--"` for PowerShell hosts. See [npm `.cmd` shims under PowerShell and Git Bash](#npm-cmd-shims-under-powershell-and-git-bash) for the one place that contract does not reach on its own.
-- `escapeForDoubleQuotedShell(text, isCmd)` (`src/shared/shell-quote.ts`) - what `quoteArg` puts inside `"..."`, and the reason cmd and PowerShell are not one branch. They disagree about the backslash. cmd hands the raw command line to the target's C runtime, which reads `\` as an escape in a run immediately before a quote, so that run is doubled or a trailing backslash swallows the closing quote; backtick and `$` are literal there and must NOT be escaped, or the agent receives them doubled. PowerShell is the reverse: backtick is the escape character and `$` starts an expansion, while `\` is not special and escaping it would deliver a doubled path separator. The doc comment carries the measured round-trip table (pwsh 7.6.6, Windows PowerShell 5.1.26100, cmd.exe), including the one case with no answer that is right on both PowerShell hosts.
+- `escapeForDoubleQuotedShell(text, isCmd)` (`src/shared/shell-quote.ts`) - what `quoteArg` puts inside `"..."`, and the reason cmd and PowerShell are not one branch. They disagree about the backslash. cmd hands the raw command line to the target's C runtime, which reads `\` as an escape in a run immediately before a quote, so that run is doubled or a trailing backslash swallows the closing quote; backtick and `$` are literal there and must NOT be escaped, or the agent receives them doubled. PowerShell is the reverse: backtick is the escape character and `$` starts an expansion, while `\` is not special and escaping it would deliver a doubled path separator. PowerShell also ends a double-quoted string at the curly double quotes (U+201C, U+201D, U+201E), so each is doubled. Left bare at a pwsh 7.6 prompt, a task description holding one reached the agent split in two, and a `;` after it ran as a second PowerShell command. A backtick escape was rejected: Windows PowerShell 5.1 at a ConPTY prompt drops these characters from typed input, which left the backtick to turn the next `t` or `n` into a tab or newline. The doc comment carries the measured round-trip table (pwsh 7.6.6, Windows PowerShell 5.1.26100, cmd.exe), including the one case with no answer that is right on both PowerShell hosts.
+- `escapeForPowerShellSingleQuoted(text)` (`src/shared/shell-quote.ts`) - doubles `'` and the four curly single quotes (U+2018 to U+201B, which PowerShell also ends a single-quoted string at). The `Set-Location` cwd fixup uses it. Doubling only `'` left a path holding a curly apostrophe as a parse error on both hosts.
+- `escapePercentForCmd(text)` (`src/shared/shell-quote.ts`) - the cmd-only step `quoteArg` runs after `escapeForDoubleQuotedShell`, and that `quoteForCmdShell` (`src/main/agent/shared/cli-print.ts`) runs for a headless `.cmd` shim launched through `shell: true`. cmd expands `%NAME%` even inside double quotes. Doubling to `%%` does not help, because that escape belongs to batch files, and both routes type a command line instead (the interactive prompt, and `cmd /d /s /c`). There `%%PATH%%` arrives as `%<value>%`. Each `%` is written as `"^%"` instead, and the backslash run before it is doubled so the inserted quote is not read as an escaped one. Any `%name%` pair cmd then forms names a variable that starts with a quote, which none does, and cmd strips the caret because it sits outside the quotes. The renderer's `quoteForShell` does not use it, because a dropped or pasted path usually lands in an agent's input box, where `"^%"` would be literal text. The doc comment carries the measured table (piped stdin, a ConPTY prompt, `shell: true`, and an npm-style `.cmd` shim, which parses the arguments a second time).
+- `quoteCmdExecutable(path)` (`src/shared/shell-quote.ts`) - quotes an executable as the head of a command line cmd.exe parses, with the `%` escape. `spawnCli` and every Windows `exec` of a detected agent CLI (`execVersion` and the adapters' capability probes) use it, because cmd expands a `%NAME%` in the head too and then cannot find the path. `tests/unit/shell-quote.test.ts` scans `src/main` and fails on an `execAsync` command head that is quoted by hand instead.
+- The live round trips behind these escapes run in `tests/unit/command-builder.test.ts` (`quoteArg` typed at a cmd prompt and at each PowerShell host) and `tests/unit/auto-name-clean.test.ts` (`spawnCli` and `quoteForCmdShell` through a `.cmd` shim), on the rig in `tests/unit/helpers/shell-argv-probe.ts`. They need a real cmd.exe and PowerShell, so the Linux unit tier skips them and `.github/workflows/shell-quoting-windows.yml` runs them on Windows when the escapes or their tests change. The cwd fixups above have string pins only, in `tests/unit/pty-spawn.test.ts`. Their round trips were measured by hand, and `pushd` is a cmd builtin with no C runtime parse, so it lands in the folder only because Windows collapses the doubled backslash the `%` escape writes before a `%`.
 - `src/shared/shell-quote.ts` also owns the shell predicates and `sanitizeForPty`, which `src/shared/paths.ts` re-exports. The split exists so the renderer can share the real escaping (`quoteForShell` in `src/renderer/utils/terminal-clipboard.ts`, used by drag-drop and image paste): `paths.ts` imports `node:path` and cannot enter that bundle. `quoteForShell` shares the escaping but not `quoteArg` itself, since `sanitizeForPty` would collapse consecutive spaces in a real path.
 - `isPowerShellShell(shell)` - the PowerShell-family predicate (`powershell` / `pwsh` substring, the exact negation `isUnixLikeShell` applies) shared by `adaptCommandForShell`, `buildSpawnClearPrelude`, `resolveShellArgs`, `resolveSpawnCwd`, `quoteArg`, and `resolveShimLaunch`.
 - Git Bash: paths like `C:\Users\...` become `/c/Users/...`
@@ -129,10 +133,11 @@ The PowerShell case fixes a Windows PowerShell 5.1 quirk: it treats `[` / `]` in
 
 | Module | Build Strategy | Packaging |
 |--------|---------------|-----------|
-| better-sqlite3 | Rebuilt against Electron headers via `scripts/rebuild-native.js` | Included via `files` in `electron-builder.yml`, C++ source excluded |
-| node-pty | Prebuilt NAPI binaries, no rebuild needed, except the macOS `spawn-helper`, which is compiled from `build/spawn-helper/spawn-helper.c` at package time (see macOS Code Signing below) | Included via `files`, prebuilds unpacked from asar via `asarUnpack` |
+| better-sqlite3 | Node-API (13+): every platform's addon ships in the package as `prebuilds/<platform>-<arch>.node`; no rebuild needed | Included via `files` in `electron-builder.yml`, with the C++ and SQLite source and its build-time `node_modules` (the `node-addon-api` headers, never loaded at runtime) excluded; unpacked via `asarUnpack`, because the `kangentic-retrieval` utility process opens the project databases from the unpacked tree. `build/afterPack.js` deletes every prebuild but the target's (glibc on Linux) before the load probes run |
+| node-pty | Prebuilt NAPI binaries, no rebuild needed, except the macOS `spawn-helper`, which is compiled from `build/spawn-helper/spawn-helper.c` at package time (see macOS Code Signing below) | Included via `files`; the whole package unpacked from asar via `asarUnpack`, since the `kangentic-pty-host` utility process loads it from the unpacked tree |
 | sherpa-onnx-node | Prebuilt platform-specific binaries (no rebuild needed) | Included via `files` (`sherpa-onnx-node/**` plus the `sherpa-onnx-*/**` platform packages), unpacked from asar via `asarUnpack: node_modules/sherpa-onnx-*/**` (the voice dictation engine, which runs in its own `kangentic-dictation` utilityProcess - see `.claude/rules/dictation-out-of-process.md` / DESKTOP-X) |
 | font-list | Shells out to `fc-list` (Linux) / a PowerShell script (Windows) / a bundled binary (macOS); no rebuild needed | Included via `files` (`font-list/**`), unpacked from asar via `asarUnpack` since the macOS binary is spawned via `child_process` (Terminal Font Family picker) |
+| koffi | Prebuilt Node-API binary in a per-platform `@koromix/koffi-*` package; no rebuild needed | Included via `files` (`koffi/**` plus `@koromix/koffi-*/**`), unpacked via `asarUnpack` because a native addon cannot be dlopen'd from inside an asar. The `kangentic-pty-host` utility process loads it on Windows and macOS for the task leftover reap (`src/main/pty/process-tag/`), and the afterPack gate makes one native call through it there |
 | sqlite-vec | Loadable SQLite extension shipped as per-platform binary packages; no rebuild needed | Included via `files` (`sqlite-vec/**` plus the `sqlite-vec-*/**` platform packages), unpacked via `asarUnpack` because SQLite's dlopen cannot read a loadable extension inside an asar archive (conversation-memory retrieval) |
 | @huggingface/transformers | Pure JavaScript (transformers.js); no rebuild needed | Included via `files`, unpacked via `asarUnpack` so the embed worker resolves it from the unpacked tree by plain node_modules resolution |
 | onnxruntime-node | Prebuilt native binaries (`onnxruntime_binding.node`, plus `onnxruntime.dll` and `DirectML.dll` on Windows) | Included via `files`, unpacked via `asarUnpack` because a native `.node` addon cannot be dlopen'd from inside asar (the embed worker's execution provider) |
@@ -141,11 +146,11 @@ The PowerShell case fixes a Windows PowerShell 5.1 quirk: it treats `[` / `]` in
 | sharp, `@img/*`, detect-libc, semver | sharp's prebuilt libvips binding (`@img/sharp-<platform>`) plus its pure-JavaScript runtime deps; transformers.js requires sharp at module scope even though the worker never touches an image | Included via `files` and unpacked, for the same reason |
 | simple-git | Pure JavaScript, bundled by esbuild | Not shipped as node_modules; its code is inside `.vite/build/index.js`. A devDependency, like every other bundled package (see `.claude/rules/dependency-block-parity.md`) |
 
-The `files` array in `electron-builder.yml` explicitly whitelists `.vite/build/**`, `package.json`, `better-sqlite3`, `node-pty`, `sherpa-onnx-node`, the `sherpa-onnx-*` platform packages, `font-list`, `bindings`, `file-uri-to-path`, `sqlite-vec`, the `sqlite-vec-*` platform packages, `@huggingface/transformers`, `onnxruntime-node`, `onnxruntime-web`, `onnxruntime-common`, `sharp`, the `@img/*` packages, `detect-libc`, and `semver`. The whitelist governs the app's own files; electron-builder copies every production dependency from `package.json` into the asar on its own, so for a runtime dependency the question is never whether it is in the asar but whether it is unpacked. That also makes the `dependencies` block itself a packaging decision: it used to resolve to 302 packages, most of them already bundled into `.vite/build/**`, and now resolves to 121. `.claude/rules/dependency-block-parity.md` is what keeps it there.
+The `files` array in `electron-builder.yml` explicitly whitelists `.vite/build/**`, `package.json`, `better-sqlite3`, `node-pty`, `sherpa-onnx-node`, the `sherpa-onnx-*` platform packages, `font-list`, `koffi`, the `@koromix/koffi-*` platform packages, `sqlite-vec`, the `sqlite-vec-*` platform packages, `@huggingface/transformers`, `onnxruntime-node`, `onnxruntime-web`, `onnxruntime-common`, `sharp`, the `@img/*` packages, `detect-libc`, and `semver`. The whitelist governs the app's own files; electron-builder copies every production dependency from `package.json` into the asar on its own, so for a runtime dependency the question is never whether it is in the asar but whether it is unpacked. That also makes the `dependencies` block itself a packaging decision: on 0.41.0 it resolved to 302 packages, most of them already bundled into `.vite/build/**`, where 121 were needed (measured then; a new external such as `koffi` adds its own). `.claude/rules/dependency-block-parity.md` is what keeps it there.
 
-The embed worker's closure is the one that bites: the worker is forked from `app.asar.unpacked`, and Node resolution from a real directory never looks inside the asar, so a package the worker reaches only transitively (transformers.js requires `onnxruntime-common` and `sharp` at module scope) must be unpacked too, or the worker exits 1 at module load on every fork. 0.38.0 and 0.39.0 shipped that way (Sentry DESKTOP-6, DESKTOP-H). `build/afterPack.js` now runs `build/verify-unpacked-worker.js` after packing, once per worker with an unpacked native closure to verify (embed and dictation; line-count's only import, `simple-git`, is bundled by esbuild and has no unpacked closure to check): it loads each worker's external(s) from the unpacked tree in a child `node` whose module resolution is fenced to that tree (an unfenced probe would find the repo's own `node_modules` above `out/` and pass), and fails the package with the child's stderr when anything is missing. The dictation worker (DESKTOP-X) reuses the same gate for `sherpa-onnx-node`. `npm run package` runs it too, so the gate holds locally, not only on the release matrix.
+The embed worker's closure is the one that bites: the worker is forked from `app.asar.unpacked`, and Node resolution from a real directory never looks inside the asar, so a package the worker reaches only transitively (transformers.js requires `onnxruntime-common` and `sharp` at module scope) must be unpacked too, or the worker exits 1 at module load on every fork. 0.38.0 and 0.39.0 shipped that way (Sentry DESKTOP-6, DESKTOP-H). `build/afterPack.js` now runs `build/verify-unpacked-worker.js` after packing, once per worker with an unpacked native closure to verify (embed, dictation, the retrieval worker and the pty host; line-count's only import, `simple-git`, is bundled by esbuild and has no unpacked closure to check). For the retrieval worker it also loads better-sqlite3 and sqlite-vec under the packaged Electron binary, and for the pty host it spawns a real process with node-pty and, on Windows and macOS, loads koffi and makes one native call through it, both before the fuses turn `ELECTRON_RUN_AS_NODE` off: it loads each worker's external(s) from the unpacked tree in a child `node` whose module resolution is fenced to that tree (an unfenced probe would find the repo's own `node_modules` above `out/` and pass), and fails the package with the child's stderr when anything is missing. The dictation worker (DESKTOP-X) reuses the same gate for `sherpa-onnx-node`. `npm run package` runs it too, so the gate holds locally, not only on the release matrix.
 
-Separately, how the embed, line-count, and dictation workers are forked bites on Windows too.
+Separately, how the embed, line-count, dictation and retrieval workers and the pty host are forked bites on Windows too.
 `UTILITY_PROCESS_STDIO` in `src/main/utility-process/stderr-tail.ts` must never mix `inherit` with
 a real handle (`pipe` or `ignore`) across the stdout and stderr slots. Electron gives an `inherit`
 slot no Windows branch, so its handle stays null, and it passes both handles to
@@ -162,7 +167,7 @@ mixing rule and also scans every `utilityProcess.fork` call site for the shared 
 
 ### Bridge Script Unpacking
 
-Bridge scripts (`event-bridge.js`, `status-bridge.js`) are executed by Claude Code hooks in a separate `node` process outside Electron. Plain Node.js cannot read files inside asar archives, so `asarUnpack` names them individually, alongside `embed-worker.js`, `line-count-worker.js`, `dictation-worker.js`, and `plugins/**` (unpacked for the retrieval, embedding, and dictation subsystems rather than for the hook bridges). Only those six entries under `.vite/build/` are extracted to `app.asar.unpacked/`; the rest of the directory stays inside the archive. The `resolveBridgeScript()` function in `src/main/agent/shared/bridge-utils.ts` rewrites `app.asar` to `app.asar.unpacked` in resolved paths when running in a packaged build.
+Bridge scripts (`event-bridge.js`, `status-bridge.js`) are executed by Claude Code hooks in a separate `node` process outside Electron. Plain Node.js cannot read files inside asar archives, so `asarUnpack` names them individually, alongside `embed-worker.js`, `line-count-worker.js`, `dictation-worker.js`, `retrieval-worker.js`, `pty-host.js`, and `plugins/**` (the utility processes are forked from the unpacked tree, so these are unpacked for them rather than for the hook bridges). Only those eight entries under `.vite/build/` are extracted to `app.asar.unpacked/`; the rest of the directory stays inside the archive. The `resolveBridgeScript()` function in `src/main/agent/shared/bridge-utils.ts` rewrites `app.asar` to `app.asar.unpacked` in resolved paths when running in a packaged build.
 
 ## Config Directory Locations
 
@@ -183,6 +188,16 @@ electron-builder handles platform-specific packaging via `electron-builder.yml`:
 | Windows | Installer | NSIS |
 | macOS | Disk image + ZIP | DMG |
 | Linux | Package | deb, rpm |
+
+### Windows install-folder ACL grant
+
+The NSIS config includes `build/installer.nsh` (`nsis.include`). Its `customInstall` macro runs on
+every install and every `--updated` auto-update, which recreates the folder, and on a per-user
+(`CurrentUser`) install it runs `icacls "$INSTDIR" /grant *S-1-15-2-1:(OI)(CI)(RX)` to give ALL
+APPLICATION PACKAGES read access. Electron 44.5 aborts at launch when the install folder's ACL
+carries an AppContainer entry without that one (electron/electron#51761). A failed `icacls` is
+logged and the install continues. Delete the file and the `include:` once electron-builder ships
+the grant itself (electron-builder#10242); `tests/unit/nsis-acl-grant.test.ts` fails when it does.
 
 ## Windows Taskbar Identity (AUMID)
 
@@ -216,7 +231,7 @@ The four `child_process` paths that launch a shell able to run anything go throu
 Three gaps remain on purpose:
 
 - `npm start` uses node-pty's stock helper, for PTYs and for the shell launches above. That is harmless by default, because an unpackaged run leaves Sentry off and there is no Crashpad port to inherit. It stops being harmless once a switch turns Sentry on: `KANGENTIC_ERROR_REPORTING=1`, or `KANGENTIC_TELEMETRY=1` with `KANGENTIC_ERROR_REPORTING` left unset (`resolveErrorReportingEnabled` in `src/main/analytics/error-reporting.ts`).
-- Headless agent runs (`src/main/agent/shared/auto-name.ts`) launch an agent binary, not a shell. The helper exits 1 when its target is missing instead of raising ENOENT, and a missing CLI has to keep surfacing as ENOENT, so they stay direct. The docstring on `resolveShellLaunch` says how to route one without losing that.
+- Headless agent runs launch an agent binary, not a shell, from the pty host (`src/main/pty/host/host-cli-processes.ts`), or from `src/main/agent/shared/cli-print.ts` when no host is registered. The host is a utility process Chromium launched, so it holds the Crashpad port and its children inherit it. The helper exits 1 when its target is missing instead of raising ENOENT, and a missing CLI has to keep surfacing as ENOENT, so they stay direct. The docstring on `resolveShellLaunch` says how to route one without losing that.
 - Git runs repository hooks, and git is launched as a plain binary.
 
 What still leaks shows up as the Sentry warning "Foreign process crash reached Kangentic's crash database", split by its `module` tag and release (see "Error Reporting" in `docs/analytics.md`).
@@ -233,7 +248,7 @@ NixOS and CachyOS. DESKTOP-15 is a recovered GPU death on the Ubuntu box three d
 DESKTOP-18 is the identical `LOG(FATAL)` on Windows 10, via `OnProcessCrashed` with
 `EXCEPTION_BREAKPOINT`, on an Intel UHD 630. The shipped code has never had a platform gate. The
 launch-failure route is Linux's in practice, because of how Linux launches the GPU process (see
-"Why a Linux launch failure leaves no trace" below).
+"Why a Linux launch failure left no trace before Electron 44" below).
 
 DESKTOP-18 is worth reading for its timing rather than its stack. All seven of that install's
 runs died between 8.3 and 12.0 seconds after their own `app_start_time`, so Chromium walked its
@@ -265,7 +280,7 @@ identical `LOG(FATAL)`, only faster. A launch failure is not something a renderi
 route around. The same holds for DESKTOP-18's crash shape on Windows, because reaching the fatal at
 all means the rungs below hardware had already been current and had already failed.
 
-### Why a Linux launch failure leaves no trace
+### Why a Linux launch failure left no trace before Electron 44
 
 On Linux the GPU process is not launched directly. `GpuSandboxedProcessLauncherDelegate::GetZygote`
 forks it from the unsandboxed zygote, so a GPU "launch failure" means
@@ -276,10 +291,12 @@ at once:
   `TERMINATION_STATUS_NORMAL_TERMINATION` when the zygote cannot answer, and
   `BrowserChildProcessHostImpl::OnChildDisconnected` drops that status with no crash count and no
   observer call, so no `child-process-gone` fires.
-- Every relaunch through the dead zygote fails to launch, and Electron forwards no launch failure
-  to JS. `electron_api_app.cc` overrides `BrowserChildProcessCrashed` and
-  `BrowserChildProcessKilled` but not `BrowserChildProcessLaunchFailed`. Chromium also runs the
-  delegate that reaches the fatal before it notifies any observer.
+- Every relaunch through the dead zygote fails to launch. Through Electron 41 none of those reached
+  JS: `electron_api_app.cc` overrode `BrowserChildProcessCrashed` and `BrowserChildProcessKilled`
+  but not `BrowserChildProcessLaunchFailed`. Electron 44 overrides it and emits
+  `child-process-gone` with reason `launch-failed` for every relaunch Chromium survives. The one
+  that ends in the fatal still does not reach JS, because Chromium runs the delegate that reaches
+  the fatal before it notifies any observer.
 
 Reproduced in Electron 41.10.7 on Ubuntu 24.04 under WSLg, with `--ignore-gpu-blocklist` so that
 compositing starts on the GPU: SIGKILL the `--type=zygote --no-zygote-sandbox` process, then the GPU
@@ -290,6 +307,13 @@ process. The browser logged `Failed to send GetTerminationStatus message to zygo
 3 min and 4 min into their runs. Why the zygote or its fork failed on those hosts is still unknown.
 A dead zygote and a fork refused at the process limit produce the same stack, so each recorded
 fallback on Linux now carries the answer (below).
+
+The same steps on Electron 44.5.1, same machine (2026-10-04): six launch failures and the fatal
+again, but the first five reached JS as `child-process-gone` with `launch-failed` (exit code 1002),
+and `gpu-health.json` held all five as fault deaths when the process died. So on 44 the next launch
+can see that the GPU ended the run, and the software-rendering recovery engages from the deaths
+alone; `tests/unit/gpu-health.test.ts` pins that measured record. The fallback record below is
+still what covers a machine that dies with no relaunch to fail.
 
 What does reach JS is the fallback itself. Falling back to `DISPLAY_COMPOSITOR` calls
 `OnGpuBlocked`, which notifies `gpu-info-update`, and `gpu_compositing` reads `disabled_software`
@@ -316,6 +340,10 @@ Measured on Electron 41, booting a real window with both switches applied:
 | Control, `--ignore-gpu-blocklist` | Linux (WSLg) | `Browser`, `GPU`, `Utility`, `Tab` | `enabled` | `enabled` |
 | `--disable-gpu --in-process-gpu` | Linux (WSLg) | `Browser`, `Utility`, `Tab` | `disabled_software` | `disabled_off` |
 
+Re-measured on Electron 44.5.1 (2026-10-04) with the same rig: all four rows read the same on both
+platforms, and the recovery window painted on each (about 9,870 red pixels of the rotating box in a
+page capture, against 9,864 for the Windows control).
+
 No GPU process is spawned at all, which is the property the whole recovery path rests on. On Linux
 the window still painted: a page capture found all 10,000 pixels of a 100 px animated box. The
 Linux rows come from Ubuntu 24.04 under WSLg, whose GL is Mesa's d3d12 driver rather than a native
@@ -336,8 +364,9 @@ What ships now, on every platform:
   `child-process-gone` from, so the death that kills the app is one JS is never told about.
   Whatever is going to be on disk has to already be there.
 - The same file records the fallback, from `gpu-info-update`: the moment `gpu_compositing` leaves
-  the GPU after this run was seen compositing on it, and each later status change. A launch-failure
-  ladder leaves nothing else (see above), so the next launch's near-end check reads the latest
+  the GPU after this run was seen compositing on it, and each later status change. Through
+  Electron 41 a launch-failure ladder left nothing else, and on 44 the launch failure that ends in
+  the fatal still leaves nothing else (see above), so the next launch's near-end check reads the latest
   FAULT, a fault death or a fallback, and counts it as what ended the run. A fallback does not
   count when a non-fault death (a kill, a session-teardown exit) came within 5 s before it, since
   that death is what Chromium was falling back from. A machine
@@ -395,14 +424,26 @@ Release notes are not gated by that guard either. The post-update "What's New" d
 
 ## Security Fuses
 
-Electron fuses enabled for production builds:
+`build/afterPack.js` sets every Electron fuse explicitly and passes `strictlyRequireAllFuses`, so
+`flipFuses` fails the build when an Electron upgrade adds a fuse the config does not set, rather
+than shipping it at whatever default it came with.
 
-- **RunAsNode disabled** -- prevents using the app binary as a Node.js runtime
-- **NodeOptions disabled** -- blocks `NODE_OPTIONS` env var injection
-- **Inspection disabled** -- no `--inspect` debugging in production
-- **Cookie encryption enabled** -- encrypts stored cookies
-- **ASAR integrity validation** -- verifies archive hasn't been tampered with
-- **OnlyLoadAppFromAsar** -- prevents loading code from extracted directories
+- **RunAsNode disabled.** The app binary cannot be used as a Node.js runtime.
+- **NodeOptions disabled.** Blocks `NODE_OPTIONS` injection.
+- **Inspection disabled.** No `--inspect` debugging in production.
+- **Cookie encryption enabled.** Encrypts stored cookies.
+- **ASAR integrity validation enabled.** Verifies the archive has not been tampered with.
+- **OnlyLoadAppFromAsar enabled.** Code loads only from the asar, never from an extracted directory.
+- **LoadBrowserProcessSpecificV8Snapshot disabled**, Electron's default. No browser-process
+  snapshot is built.
+- **GrantFileProtocolExtraPrivileges enabled**, Electron's default, and load-bearing: every window
+  loads the renderer over `file://` through `loadFile`, its lazy chunks and the Monaco workers
+  included. Turning it off needs a `protocol.handle` migration first.
+- **WasmTrapHandlers enabled**, Electron's default.
+
+`tests/unit/afterpack-unpacked-worker-verification.test.ts` pins each value by name, fails when
+`@electron/fuses` knows a fuse the config does not set, and reads the installed Electron binary's
+fuse wire so a bump that adds a fuse fails before any packaging run.
 
 ## Windows Long Paths
 
@@ -564,6 +605,16 @@ POSIX; its Windows path never writes TERM, so a child of a PowerShell-launched K
 no TERM at all and capability-detecting TUIs (Antigravity's agy) render monochrome. The default
 gives Windows children the same environment POSIX children already get; an explicit TERM in the
 environment always wins.
+
+The Claude `/model` picker probe (`model-picker-probe.ts`) does not use `buildSpawnEnv` and sets
+`TERM=xterm-256color` unconditionally instead of defaulting it. Its PTY's terminal is Kangentic's
+own `VirtualScreen` grid, so a user's TERM describes a terminal it is not. TERM matters to it for
+the glyph, not for color: Claude Code draws its prompt and select-row markers with the `figures`
+pointer, `❯` only when its Unicode check passes, and on Windows that check reads only the
+environment (`WT_SESSION`, `TERM_PROGRAM=vscode`, `TERM=xterm-256color`, and a few others). A
+packaged app started from the Start menu has none of them, so the CLI drew `>`, the probe's wait
+for `❯` timed out, and the pickers lost their Latest group. `npm start` from Windows Terminal
+inherited `WT_SESSION`, which is why the dev build never showed it.
 
 `COLORTERM` and `TERM_PROGRAM` are deliberately not defaulted, even though VS Code's integrated
 terminal exports both unconditionally. Claude Code already selects truecolor from

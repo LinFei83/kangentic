@@ -135,6 +135,12 @@ export interface SessionUsageWire {
     totalCostUsd: number;
     totalDurationMs: number;
   };
+  /**
+   * Completed tool calls across every run of the session. A resume (an app
+   * restart, a pause and resume) is a new run, and the desktop adds the
+   * session's earlier runs to the live count. Optional: an older desktop
+   * omits it.
+   */
   toolCallCount?: number;
   model: {
     id: string;
@@ -321,6 +327,167 @@ export interface BoardTaskWire {
   archived_at: string | null;
   created_at: string;
   updated_at: string;
+  /**
+   * The task's in-flight spawn-progress label, the text of the desktop card's
+   * preparing footer: "Creating worktree...", "Fetching latest...",
+   * "Waiting (2 ahead)", "Switching model...", "Starting agent...", a git-queue
+   * wait with its elapsed time, and any staleness note the desktop appends
+   * ("Starting agent... (base 3 behind)"). The desktop announces every change
+   * with a `task-updated` board event, coalesced to at most about one a
+   * second per task.
+   *
+   * Untrusted display text, the same terms as `session-ended`'s
+   * `spawnProgressLabel`: never parse it or switch on it, and fall back to
+   * generic copy. It can carry text the desktop did not write: a column
+   * automation's name, in `Running "<name>"...`, from a config a team may
+   * share. From 0.16.0 the desktop strips escape sequences, control characters,
+   * invisible format characters (bidi controls, the zero-width space, the soft
+   * hyphen, the byte order mark) and tag characters outside the England,
+   * Scotland and Wales flag emoji, turns line breaks and tabs into spaces, and
+   * caps it at
+   * 120 characters ending in "...", but a client still caps it for its own
+   * layout.
+   *
+   * Precedence, matching the desktop card: a label overrides a `suspended`
+   * session status (a respawn is in flight behind a session that was just
+   * suspended for it), and never a `running` or `queued` one. A client that
+   * reads the read-stream feed's `status: 'suspended'` during a model or
+   * effort switch shows this label, not "Paused".
+   *
+   * A spawn path that dies without clearing its label leaves it in place for
+   * up to the desktop's 120s spawn-progress TTL, and the TTL expiry sends no
+   * board event, so a stale label can outlive its spawn until the next
+   * snapshot. Null or absent means no spawn is in flight, or a desktop that
+   * predates the field (pre-0.16.0). Under `view: 'sessions'` a task with a
+   * label is kept even while its `session_id` is null, so a first start and
+   * a respawn's gap stay visible.
+   *
+   * Declared OPTIONAL (`?`) like `pr_merge_readiness`; `parseBoardTaskWire`
+   * populates the key from every real wire response.
+   */
+  spawn_progress?: string | null;
+  /**
+   * True when the task's session is paused and the desktop's own task view
+   * would offer Resume for it: the task is not in To Do or Done and not
+   * archived. It is the desktop's promise that `start-session` for this task
+   * resumes the paused session exactly as its Resume button does: the same
+   * conversation, the column's model, effort and permission, a "Resuming
+   * session..." label, and NO enter automations or column message. Gate a
+   * phone's Resume control on THIS field.
+   *
+   * On the board row because the phone always holds the board: a desktop
+   * pause clears the task's `session_id`, so a phone keeps no read-stream on
+   * a paused session (the stream's `resumable` covers only an open session
+   * screen through the suspend itself). A pause, a resume, a column move and
+   * an archive each reach the phone as a `task-updated` board event, after
+   * which the next snapshot carries the new value. Under `view: 'sessions'` a
+   * resumable task is kept even though its `session_id` is null, so an agent
+   * feed can draw it as Paused with a Resume control.
+   *
+   * Explicit on purpose, never inferred from another field: a pre-0.16.0
+   * desktop answers `start-session` by STARTING the column, which re-runs its
+   * enter automations and resends its message (a paused task in Code Review
+   * would get `/code-review` again). Null or absent means such a desktop; a
+   * client offers no Resume then. While `spawn_progress` is non-null a spawn
+   * is already in flight and the desktop card shows that label instead of a
+   * Resume control; a client applies the same precedence. `start-session`
+   * re-checks the column and refuses a To Do, Done or archived task with the
+   * desktop's Resume copy, so a value overtaken by a move is safe to act on.
+   * A paused task that offers no Resume reads false here. From 0.17.0 `paused`
+   * tells it apart from a task with no paused session.
+   *
+   * Declared OPTIONAL (`?`) like `spawns_session`; `parseBoardTaskWire`
+   * populates the key from every real wire response.
+   */
+  resumable?: boolean | null;
+  /**
+   * True when the task has a paused session (a `suspended` session that is not
+   * a Command Terminal) and no live one. No column or archive gate applies. It
+   * is the fact the desktop card's "Paused" footer reads, so a paused task in
+   * Done or on the archived page reads true here while `resumable` reads
+   * false. The desktop draws an archived task as a compact card with no
+   * footer, so a client that matches the desktop card draws "Paused" only
+   * when `archived_at` is null. A move from another column into Done
+   * archives the task in the same step, so only a task that sits in Done
+   * unarchived gets the full card and its footer. A move into To Do removes
+   * the task's session rows, so a task there normally reads false. Gate
+   * Resume on `resumable` only; `resumable: true` always comes with
+   * `paused: true`.
+   *
+   * A desktop pause clears the task's `session_id`, so find a paused session
+   * from this field, not from `session_id`. A respawn queued behind the
+   * desktop's concurrency limit leaves the task holding a paused session and a
+   * queued one; that task reads false, as the desktop card shows the queued
+   * session. While `spawn_progress` is non-null the desktop card shows that
+   * label instead of "Paused"; a client applies the same precedence.
+   *
+   * Under `view: 'sessions'` a paused task that offers no Resume stays out of
+   * the snapshot, because an agent feed has nothing to act on for it. Null or
+   * absent means a desktop that predates the field (pre-0.17.0); a client
+   * then reads a paused task from `resumable` alone, as before.
+   *
+   * Declared OPTIONAL (`?`) like `resumable`; `parseBoardTaskWire` populates
+   * the key from every real wire response.
+   */
+  paused?: boolean | null;
+  /**
+   * True when the task has a live session (`running` or `queued`) and is not
+   * in To Do. It is the desktop's promise that `pause-session` for this task
+   * pauses that session exactly as its Pause button does: the conversation is
+   * kept for a later Resume, and the pause sticks, so a column with auto-spawn
+   * on does not start the task again by itself. Gate a phone's Pause control on
+   * THIS field.
+   *
+   * Done and archived do not clear it, matching the desktop, whose Pause stays
+   * available there because it is the only in-window stop for a live agent. A
+   * move into Done suspends the task's session in the same step, so a task
+   * there normally has no live session and reads false. It reads true only
+   * when that suspend failed and left the agent running.
+   *
+   * Never true while `paused` is true: a paused task has no live session. While
+   * `spawn_progress` is non-null and no session is live, the desktop card still
+   * shows a Pause control, but its click only cancels an in-flight resume or
+   * start, which `pause-session` does not promise. This field reads false
+   * then, and the verb refuses a task with no live session.
+   *
+   * A pause, a session's start and its end each reach the phone as a
+   * `task-updated` board event, after which the next snapshot carries the new
+   * value. Null or absent means a desktop that predates the field
+   * (pre-0.18.0), and a client offers no Pause then: a 0.15.0 to 0.17.0
+   * desktop refuses `pause-session` with the `unsupported-verb` code, and an
+   * older one does not answer it at all.
+   *
+   * Declared OPTIONAL (`?`) like `paused`; `parseBoardTaskWire` populates the
+   * key from every real wire response.
+   */
+  pausable?: boolean | null;
+}
+
+/**
+ * One live Command Terminal of a project (protocol 0.20.0): an agent the
+ * desktop runs at the project root with no task, started from the desktop's
+ * Ctrl+Shift+P layer or by a phone's `command-terminal` start. It is listed
+ * beside a project's tasks in a read-board snapshot (`commandTerminals`), and
+ * the Agents feed draws it with a "Command Terminal" pill.
+ *
+ * - `slot` is the terminal's durable number in its project, 1 to 4. It never
+ *   renumbers while siblings start and stop.
+ * - `name` is what to show: the terminal's own name once it has one, else
+ *   "Command Terminal N". `named` is true once it has its own name (the
+ *   desktop derives one from the first prompt), which is when the phone's
+ *   session header adds its pill.
+ * - `activity` is the raw state and reason, the same shape `read-stream`
+ *   reports, so the phone formats the line ("Running Bash", "Awaiting
+ *   permission") with the formatter it already uses for a task's agent. Both
+ *   are null until the desktop's activity engine has classified the session.
+ */
+export interface CommandTerminalWire {
+  sessionId: string;
+  projectId: string;
+  slot: number;
+  name: string;
+  named: boolean;
+  activity: { state: ActivityStateWire | null; reason: ActivityReasonWire | null };
 }
 
 /** Phone-needed subset of the desktop's BacklogTask row. */
@@ -623,6 +790,31 @@ export function parseBoardTaskWire(value: JsonValue): BoardTaskWire {
     archived_at: nullableString(value, 'archived_at'),
     created_at: requireString(value, 'created_at', 'board task'),
     updated_at: requireString(value, 'updated_at', 'board task'),
+    spawn_progress: nullableString(value, 'spawn_progress'),
+    resumable: nullableBoolean(value, 'resumable'),
+    paused: nullableBoolean(value, 'paused'),
+    pausable: nullableBoolean(value, 'pausable'),
+  };
+}
+
+/**
+ * Narrows one Command Terminal row. Throws on a malformed required field. An
+ * unrecognized activity state or reason reads as null rather than throwing, so
+ * a reason kind a newer desktop adds costs the line, not the whole snapshot.
+ */
+export function parseCommandTerminalWire(value: JsonValue): CommandTerminalWire {
+  if (!isRecord(value)) throw new Error('command terminal must be an object');
+  const activity = isRecord(value.activity) ? value.activity : {};
+  return {
+    sessionId: requireString(value, 'sessionId', 'command terminal'),
+    projectId: requireString(value, 'projectId', 'command terminal'),
+    slot: requireNumber(value, 'slot', 'command terminal'),
+    name: requireString(value, 'name', 'command terminal'),
+    named: requireBoolean(value, 'named', 'command terminal'),
+    activity: {
+      state: isActivityStateWire(activity.state) ? activity.state : null,
+      reason: isActivityReasonWire(activity.reason) ? activity.reason : null,
+    },
   };
 }
 

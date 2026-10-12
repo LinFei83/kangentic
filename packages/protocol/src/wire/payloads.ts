@@ -24,6 +24,7 @@ import {
   parseBacklogItemWire,
   parseBoardColumnWire,
   parseBoardTaskWire,
+  parseCommandTerminalWire,
   parseDiffFileContentWire,
   parseDiffFileListWire,
   parseSessionSummaryWire,
@@ -35,6 +36,7 @@ import {
   type BacklogItemWire,
   type BoardColumnWire,
   type BoardTaskWire,
+  type CommandTerminalWire,
   type DiffFileContentWire,
   type DiffFileListWire,
   type SessionSummaryWire,
@@ -85,6 +87,11 @@ export type ReadStreamSessionStatusWire = 'running' | 'queued' | 'suspended' | '
 
 const READ_STREAM_SESSION_STATUSES: readonly string[] = ['running', 'queued', 'suspended', 'exited'];
 
+/** True for a value that is one of the four session lifecycle statuses. */
+export function isReadStreamSessionStatusWire(value: unknown): value is ReadStreamSessionStatusWire {
+  return typeof value === 'string' && READ_STREAM_SESSION_STATUSES.includes(value);
+}
+
 /** Initial snapshot returned on subscribe; live updates arrive as TerminalEvent/ActivityEvent/TranscriptEvent. */
 export interface ReadStreamResponsePayload {
   scrollback: string;
@@ -109,9 +116,34 @@ export interface ReadStreamResponsePayload {
   ptyDimensions?: TerminalDimensionsWire;
   /**
    * The session's lifecycle status at snapshot time. Absent from
-   * pre-0.5.0 desktops; the phone then assumes 'running'.
+   * pre-0.5.0 desktops; the phone then assumes 'running'. Later changes for
+   * the same session id arrive as the `status` activity payload.
    */
   sessionStatus?: ReadStreamSessionStatusWire;
+  /**
+   * True when the desktop spawned this session as a resume of an earlier
+   * conversation. The desktop card then reads "Resuming agent..." where it
+   * would read "Starting agent...", for as long as a running session has no
+   * model name yet. Fixed for the life of a session id. Absent from pre-0.16.0
+   * desktops; read absent as false.
+   */
+  resuming?: boolean;
+  /**
+   * The streamed session's copy of `BoardTaskWire.resumable`: true when this
+   * session is paused (`suspended`) and the desktop's own task view would
+   * offer Resume for it. Gate a Resume control on the BOARD ROW's field, not
+   * this one: a desktop pause clears the task's `session_id`, so a phone holds
+   * no stream on a paused session once its board refreshes. This copy keeps a
+   * session screen that is open during the suspend current until then, and it
+   * carries the same promise: `start-session` resumes rather than starts.
+   *
+   * Recomputed on each lifecycle edge of this session, and a `status` push
+   * carries it even when it is the only value that changed. A move to Done or
+   * an archive of a paused task is no edge of its row, so this copy can stay
+   * true after the board row's turns false. Absent from pre-0.16.0 desktops,
+   * which a client reads as "offer no Resume".
+   */
+  resumable?: boolean;
 }
 
 /** Phone-side narrowing of a read-stream subscribe response. Throws on a malformed required field. */
@@ -145,10 +177,18 @@ export function parseReadStreamResponsePayload(payload: JsonValue): ReadStreamRe
     response.ptyDimensions = parseTerminalDimensionsWire(payload.ptyDimensions as JsonValue);
   }
   if (payload.sessionStatus !== undefined) {
-    if (typeof payload.sessionStatus !== 'string' || !READ_STREAM_SESSION_STATUSES.includes(payload.sessionStatus)) {
+    if (!isReadStreamSessionStatusWire(payload.sessionStatus)) {
       throw new Error('read-stream response has an invalid "sessionStatus"');
     }
-    response.sessionStatus = payload.sessionStatus as ReadStreamSessionStatusWire;
+    response.sessionStatus = payload.sessionStatus;
+  }
+  if (payload.resuming !== undefined) {
+    if (typeof payload.resuming !== 'boolean') throw new Error('read-stream response has an invalid "resuming"');
+    response.resuming = payload.resuming;
+  }
+  if (payload.resumable !== undefined) {
+    if (typeof payload.resumable !== 'boolean') throw new Error('read-stream response has an invalid "resumable"');
+    response.resumable = payload.resumable;
   }
   return response;
 }
@@ -220,7 +260,12 @@ function parseReadStreamRequestPayload(payload: JsonValue): ReadStreamRequestPay
  * - 'sessions': columns, per-column task counts, and only the non-archived
  *   tasks that carry a `session_id`. This is what an agent feed renders: it
  *   watches every project at once but only ever draws the handful of tasks
- *   with a live agent on them.
+ *   with a live agent on them. From 0.16.0 it also keeps a task with a
+ *   `spawn_progress` label in flight (a first start, or a respawn that has
+ *   nulled `session_id`) and a `resumable` paused task (a desktop pause
+ *   nulls `session_id` too), so the feed can draw "Paused" with a Resume.
+ *   A paused task that offers no Resume (in Done, say) stays out even though
+ *   its row reads `paused: true` from 0.17.0 (see `BoardTaskWire.paused`).
  * - 'full': every non-archived task, for the one project whose board the user
  *   actually has open.
  *
@@ -315,7 +360,7 @@ export interface ReadBoardProjectListResponsePayload {
 export interface ReadBoardSnapshotResponsePayload {
   projectId: string;
   columns: BoardColumnWire[];
-  /** Non-archived tasks; filtered to the ones carrying a `session_id` when `view` is 'sessions'. */
+  /** Non-archived tasks; filtered when `view` is 'sessions' (see ReadBoardView for which tasks it keeps). */
   tasks: BoardTaskWire[];
   /** Absent whenever the request carried a `view` (protocol 0.9.0) - no phone has ever rendered it. */
   backlog?: BacklogItemWire[];
@@ -339,6 +384,20 @@ export interface ReadBoardSnapshotResponsePayload {
    * card to a column needs the real length.
    */
   taskCountsByColumnId?: Record<string, number>;
+  /**
+   * The project's live Command Terminals, ordered by slot (protocol 0.20.0).
+   * Carried by every snapshot view, because the Agents feed lists them beside
+   * every project's task agents. Absent from an older desktop, which has no way
+   * to report them. A `command-terminals-changed` board event says to re-read it.
+   */
+  commandTerminals?: CommandTerminalWire[];
+  /**
+   * True when this desktop serves the `command-terminal` verb AND the device
+   * holds it (protocol 0.20.0). The phone keeps no grant list, so it shows its
+   * Terminals button on this flag, the way `BoardTaskWire.pausable` gates Pause.
+   * Absent from an older desktop: treat that as false.
+   */
+  commandTerminalsOffered?: boolean;
 }
 
 /**
@@ -440,6 +499,12 @@ export function parseReadBoardResponsePayload(payload: JsonValue): ReadBoardResp
   if (payload.view !== undefined && payload.view !== 'full' && payload.view !== 'sessions') {
     throw new Error('read-board response has an invalid "view"');
   }
+  if (payload.commandTerminals !== undefined && !Array.isArray(payload.commandTerminals)) {
+    throw new Error('read-board response has a non-array "commandTerminals"');
+  }
+  if (payload.commandTerminalsOffered !== undefined && typeof payload.commandTerminalsOffered !== 'boolean') {
+    throw new Error('read-board response has a non-boolean "commandTerminalsOffered"');
+  }
   return {
     projectId: payload.projectId,
     columns: payload.columns.map((column) => parseBoardColumnWire(column as JsonValue)),
@@ -453,6 +518,10 @@ export function parseReadBoardResponsePayload(payload: JsonValue): ReadBoardResp
     ...(payload.taskCountsByColumnId !== undefined
       ? { taskCountsByColumnId: parseTaskCountsByColumnId(payload.taskCountsByColumnId) }
       : {}),
+    ...(payload.commandTerminals !== undefined
+      ? { commandTerminals: payload.commandTerminals.map((terminal) => parseCommandTerminalWire(terminal as JsonValue)) }
+      : {}),
+    ...(payload.commandTerminalsOffered !== undefined ? { commandTerminalsOffered: payload.commandTerminalsOffered } : {}),
   };
 }
 
@@ -526,7 +595,14 @@ function parseReadBoardRequestPayload(payload: JsonValue): ReadBoardRequestPaylo
 export type ReadDiffScope = 'working' | 'staged' | 'branch';
 
 export interface ReadDiffRequestPayload {
-  taskId: string;
+  /**
+   * The task whose worktree (or, for a task with none, whose base) to diff.
+   * Optional from protocol 0.20.0: with no `taskId` the desktop diffs the
+   * PROJECT FOLDER against the project's default base branch, exactly as a
+   * Command Terminal window's Changes panel does, and its live pings arrive
+   * as a `DiffEvent` carrying `projectId` instead of `taskId`.
+   */
+  taskId?: string;
   projectId: string;
   filePath?: string;
   scope?: ReadDiffScope;
@@ -545,7 +621,7 @@ export function parseReadDiffResponsePayload(payload: JsonValue): ReadDiffRespon
 
 function parseReadDiffRequestPayload(payload: JsonValue): ReadDiffRequestPayload {
   if (!isRecord(payload)) throw new Error('read-diff payload must be an object');
-  if (typeof payload.taskId !== 'string') throw new Error('read-diff payload missing "taskId"');
+  if (payload.taskId !== undefined && typeof payload.taskId !== 'string') throw new Error('read-diff payload has a non-string "taskId"');
   if (typeof payload.projectId !== 'string') throw new Error('read-diff payload missing "projectId"');
   if (payload.filePath !== undefined && typeof payload.filePath !== 'string') {
     throw new Error('read-diff payload has a non-string "filePath"');
@@ -557,7 +633,7 @@ function parseReadDiffRequestPayload(payload: JsonValue): ReadDiffRequestPayload
     throw new Error('read-diff payload has an invalid "action"');
   }
   return {
-    taskId: payload.taskId,
+    ...(payload.taskId !== undefined ? { taskId: payload.taskId } : {}),
     projectId: payload.projectId,
     filePath: payload.filePath,
     scope: payload.scope,
@@ -663,6 +739,117 @@ export function parseStartSessionResponsePayload(payload: JsonValue): StartSessi
     throw new Error('start-session response has an invalid "outcome"');
   }
   return { ok: payload.ok, outcome: payload.outcome };
+}
+
+// === pause-session ===
+
+/**
+ * Keyed by task, like `start-session`: the desktop resolves the task's live
+ * session itself (a pause clears the task's `session_id`, and a stale phone
+ * view may name a session that already ended). It suspends that session the
+ * way the desktop's Pause button does, in the column the task is already in.
+ */
+export interface PauseSessionRequestPayload {
+  taskId: string;
+  projectId: string;
+}
+
+/**
+ * `ok` means the pause was ACCEPTED: the task had a live session, and the
+ * desktop has recorded it as paused by the user. The agent's own shutdown runs
+ * behind this response, because it can outlast the phone's per-verb budget,
+ * and its end reaches the phone as the board event that carries
+ * `paused: true`. A task with no live session is refused (`ok: false` on the
+ * capability response), so there is no idempotent shape to report here.
+ */
+export interface PauseSessionResponsePayload {
+  ok: boolean;
+}
+
+function parsePauseSessionRequestPayload(payload: JsonValue): PauseSessionRequestPayload {
+  if (!isRecord(payload)) throw new Error('pause-session payload must be an object');
+  if (typeof payload.taskId !== 'string') throw new Error('pause-session payload missing "taskId"');
+  if (typeof payload.projectId !== 'string') throw new Error('pause-session payload missing "projectId"');
+  return {
+    taskId: payload.taskId,
+    projectId: payload.projectId,
+  };
+}
+
+// === command-terminal ===
+
+/**
+ * Start or stop a Command Terminal (protocol 0.20.0). See `command-terminal` in
+ * capabilities/verbs.ts for what one is.
+ *
+ * `start` names only the project. The desktop picks the slot, runs the
+ * project's default agent with its default model and effort, and starts on the
+ * project's default branch the same way its own New terminal does; there is no
+ * branch, model or effort parameter, and the parser below drops any such key.
+ * `stop` names the terminal's session and is refused for any other session.
+ */
+export type CommandTerminalRequestPayload =
+  | { action: 'start'; projectId: string }
+  | { action: 'stop'; sessionId: string };
+
+/**
+ * A `start` is answered once the desktop has the session, before the agent has
+ * drawn anything, so the phone opens the terminal's screen at once and its
+ * stream shows the agent arriving. `slot` is the terminal's number in its
+ * project (1 to 4) and `name` its label, "Command Terminal N" until the
+ * desktop names it from its first prompt.
+ *
+ * Refusals carry a `code` on the capability response: `command-terminal-limit`,
+ * `unknown-project`, `agent-unavailable` or `command-terminal-start-failed`.
+ */
+export interface CommandTerminalStartResponsePayload {
+  ok: true;
+  sessionId: string;
+  slot: number;
+  name: string;
+}
+
+/**
+ * A `stop` is answered once the desktop has ended the terminal. Refusals carry
+ * `unknown-session` (it already ended, so treat it as stopped) or
+ * `not-command-terminal`.
+ */
+export interface CommandTerminalStopResponsePayload {
+  ok: true;
+}
+
+export type CommandTerminalResponsePayload = CommandTerminalStartResponsePayload | CommandTerminalStopResponsePayload;
+
+function parseCommandTerminalRequestPayload(payload: JsonValue): CommandTerminalRequestPayload {
+  if (!isRecord(payload)) throw new Error('command-terminal payload must be an object');
+  if (payload.action === 'start') {
+    if (typeof payload.projectId !== 'string') throw new Error('command-terminal start payload missing "projectId"');
+    return { action: 'start', projectId: payload.projectId };
+  }
+  if (payload.action === 'stop') {
+    if (typeof payload.sessionId !== 'string') throw new Error('command-terminal stop payload missing "sessionId"');
+    return { action: 'stop', sessionId: payload.sessionId };
+  }
+  throw new Error('command-terminal payload has an invalid "action"');
+}
+
+/** Phone-side guard: narrows a decoded `command-terminal` start response before the phone opens the terminal. */
+export function parseCommandTerminalStartResponsePayload(payload: JsonValue): CommandTerminalStartResponsePayload {
+  if (!isRecord(payload)) throw new Error('command-terminal start response must be an object');
+  if (payload.ok !== true) throw new Error('command-terminal start response missing "ok"');
+  if (typeof payload.sessionId !== 'string') throw new Error('command-terminal start response missing "sessionId"');
+  if (typeof payload.slot !== 'number' || !Number.isInteger(payload.slot) || payload.slot < 1) {
+    throw new Error('command-terminal start response has an invalid "slot"');
+  }
+  if (typeof payload.name !== 'string') throw new Error('command-terminal start response missing "name"');
+  return { ok: true, sessionId: payload.sessionId, slot: payload.slot, name: payload.name };
+}
+
+/** Phone-side guard: narrows a decoded pause-session response before the phone acts on it. */
+export function parsePauseSessionResponsePayload(payload: JsonValue): PauseSessionResponsePayload {
+  if (!isRecord(payload)) throw new Error('pause-session response must be an object');
+  if (typeof payload.ok !== 'boolean') throw new Error('pause-session response missing "ok"');
+  return { ok: payload.ok };
 }
 
 // === answer-permission-prompt ===
@@ -847,6 +1034,8 @@ export interface CapabilityRequestPayloadMap {
   'board-tool-write': BoardToolRequestPayload;
   'register-push': RegisterPushRequestPayload;
   'start-session': StartSessionRequestPayload;
+  'pause-session': PauseSessionRequestPayload;
+  'command-terminal': CommandTerminalRequestPayload;
 }
 
 export interface CapabilityResponsePayloadMap {
@@ -861,6 +1050,8 @@ export interface CapabilityResponsePayloadMap {
   'board-tool-write': BoardToolResponsePayload;
   'register-push': RegisterPushResponsePayload;
   'start-session': StartSessionResponsePayload;
+  'pause-session': PauseSessionResponsePayload;
+  'command-terminal': CommandTerminalResponsePayload;
 }
 
 /**
@@ -894,6 +1085,10 @@ export function parseCapabilityRequestPayload<Verb extends CapabilityVerb>(
       return parseRegisterPushRequestPayload(payload) as CapabilityRequestPayloadMap[Verb];
     case 'start-session':
       return parseStartSessionRequestPayload(payload) as CapabilityRequestPayloadMap[Verb];
+    case 'pause-session':
+      return parsePauseSessionRequestPayload(payload) as CapabilityRequestPayloadMap[Verb];
+    case 'command-terminal':
+      return parseCommandTerminalRequestPayload(payload) as CapabilityRequestPayloadMap[Verb];
     default: {
       const exhaustiveCheck: never = verb;
       throw new Error(`Unknown capability verb: ${String(exhaustiveCheck)}`);

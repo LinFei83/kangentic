@@ -104,7 +104,9 @@ const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
 const mockSpawnAgent = vi.fn(async () => {});
-const mockCreateTransitionEngine = vi.fn(() => ({}));
+// Phase 1 runs the source column's exit automations on every move. An empty
+// summary keeps it quiet instead of logging a TypeError per test.
+const mockCreateTransitionEngine = vi.fn(() => ({ executeTransition: vi.fn(async () => ({ failures: [] })) }));
 
 vi.mock('../../src/main/ipc/helpers/index', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
@@ -115,11 +117,10 @@ vi.mock('../../src/main/ipc/helpers/index', () => ({
   cleanupTaskResources: vi.fn(async () => {}),
   deleteTaskWorktree: vi.fn(async () => true),
   autoSpawnForTask: vi.fn(async () => {}),
-  // The Done branch snapshots the session's process tree before suspending and
-  // reaps it before the worktree delete. Inert here; covered by
-  // session-leftover-reap-wiring.test.ts and session-tree-reap.test.ts.
-  captureSessionLeftovers: vi.fn(() => null),
-  reapSessionLeftovers: vi.fn(async () => {}),
+  // The Done branch reaps what the task left running after its session exits
+  // and before the worktree delete. Inert here; covered by
+  // session-leftover-reap-wiring.test.ts and task-tagged-reap.test.ts.
+  reapTaskLeftovers: vi.fn(async () => {}),
 }));
 vi.mock('../../src/main/pr/pr-linking', () => ({
   autoLinkPRForTask: vi.fn(),

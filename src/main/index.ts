@@ -1,23 +1,26 @@
 const PROCESS_START = performance.now();
 
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, powerMonitor, session, shell } from 'electron';
+import { app, BrowserWindow, clipboard, ClipboardItem, dialog, ipcMain, Menu, nativeImage, powerMonitor, session, shell } from 'electron';
 import type { Event as ElectronEvent } from 'electron';
 import type { GpuGraphicsStatus } from '../shared/types';
 import path from 'node:path';
 import fs from 'node:fs';
-import { relaunchApp, devRestartFileFrom } from './app-relaunch';
+import { relaunchApp, devRestartFileFrom, isRestartRequested } from './app-relaunch';
 import { registerAllIpc, getSessionManager, getTerminalSubmitScheduler, getBoardConfigManager, getCurrentProjectId, getOptionalIpcContext, openProjectByPath, deleteProjectFromIndex, pruneStaleWorktreeProjects, activateAllProjects, getLastOpenedProject } from './ipc/register-all';
 import { installDiagnostics } from './diagnostics/install';
 import { startEventLoopLagMonitor } from './diagnostics/event-loop-lag';
+import { skipConsoleListHelper } from './pty/spawn/conpty-console-list';
 import { startHostMemorySampler, getLastHostMemorySample } from './diagnostics/host-memory';
 import { createRendererReloadGate, isRecoverableRendererDeath, formatHostMemoryDetailLine, RENDERER_RELOAD_MAX, RENDERER_RELOAD_WINDOW_MS } from './diagnostics/renderer-recovery';
 // Dev-only (dropped from prod via __KANGENTIC_DEV__ dead-code elimination).
 import { createPreviewClone, fillPreviewClone, registerEphemeralProjectDevIpc } from '../devtools/main/ephemeral-projects';
 import { resolvePreviewTaskLabel } from '../devtools/main/preview-task-title';
 import { registerSeedGitChangesDevIpc } from '../devtools/main/seed-git-changes';
-import { registerSeedEmbeddingBacklogDevIpc } from '../devtools/main/seed-embedding-backlog';
 import { registerSeedLargeConversationDevIpc } from '../devtools/main/seed-large-conversation';
 import { registerSeedUsageDataDevIpc } from '../devtools/main/seed-usage-data';
+import { registerSeedKnowledgeGraphDevIpc } from '../devtools/main/seed-knowledge-graph';
+import { registerSeedKnowledgeGraphRealDevIpc } from '../devtools/main/seed-knowledge-graph-real';
+import { registerSeedKnowledgeGraphDemoDevIpc } from '../devtools/main/seed-knowledge-graph-demo';
 import { installDevtools } from '../devtools/install';
 import { startMcpHttpServer, type McpHttpServerHandle } from './agent/mcp-http-server';
 import { readBrowserAutomationConfig } from './browser/browser-automation-config';
@@ -63,6 +66,7 @@ import { initStartupTimer, mark, phase, endPhase, finishStartupTimer } from './s
 import { resolveBackgroundColor, resolveIconPath, resolveWindowBounds, resolveRendererIndexPath, computeWindowTitle } from './window-utils';
 import { popOutWindowManager } from './pop-out/pop-out-window-manager';
 import { destroyAllLanes } from './browser/browser-lane-manager';
+import { markBrowserGuestWebContents } from './analytics/renderer-classification';
 import { sweepOrphanedBrowserPartitions } from './browser/browser-partition-cleanup';
 import { loadReactDevTools } from './devtools';
 import { syncShutdownCleanup, startHardShutdownFailsafe } from './shutdown';
@@ -74,16 +78,17 @@ import { prRefreshScheduler } from './pr/pr-refresh-scheduler';
 import { gitFetchScheduler } from './git/git-fetch-scheduler';
 import { retrievalService } from './retrieval/retrieval-service';
 import { lineCountClient } from './git/line-count/line-count-client';
-import { setProjectDbInitializer } from './db/database';
+import { retrievalClient } from './retrieval/retrieval-client';
+import { attachCheckpointDriver } from './retrieval/checkpoint-driver';
 import { softly, setGlobalDbFailureNotifier } from './db/soft-db';
 import { ensureGlobalDbReadable, notifyGlobalDbUnavailable } from './db/global-db-dialog';
 import { setSyncWriteFailureNotifier } from './config/write-failure-notice';
 import { sendToRenderer } from './ipc/send-to-renderer';
 import { setWorktreeRemovedListener, setWorktreeRemovingListener } from './git/worktree-manager';
 import { notifyAdaptersWorktreeRemoved } from './ipc/helpers/task-cleanup';
-import { loadVecExtension } from './retrieval/vec-extension';
+import { writeClipboardImage } from './ipc/helpers/clipboard-image';
 import { restoreShellEnv } from './shell-env';
-import { isFirstPartyPermissionAllowed, isEmbeddedBrowserPermissionAllowed } from './permission-policy';
+import { isFirstPartyPermissionAllowed } from './permission-policy';
 import { EXTERNAL_OPEN_SCHEMES, isAllowedExternalUrl } from '../shared/external-url';
 import { MIN_ZOOM, MAX_ZOOM } from '../shared/zoom-steps';
 import { defaultDeveloperFlag, type DeveloperFlagKey } from '../shared/developer-flag-defaults';
@@ -94,7 +99,7 @@ import {
   MAX_LIVE_POPUPS_PER_PANE,
   type WebviewPopupPolicy,
 } from './window-open-policy';
-import { installWebviewDownloadPolicy } from './browser/webview-download-policy';
+import { installEmbeddedBrowserSessionPolicy } from './browser/guest-session-policy';
 // Fork addition: resolves the main process's locale before anything can render a
 // window title or a startup dialog in the wrong language. See docs/i18n-guide.md.
 import { installMainLocale, languageArgument, translate } from './i18n';
@@ -213,6 +218,7 @@ if (__KANGENTIC_DEV__) {
     getIpcContext: () => getOptionalIpcContext() ?? null,
     getInspectionServerEnabled: () => safeReadDeveloperFlag('previewInspectionServer'),
     getEvalEnabled: () => safeReadDeveloperFlag('previewEvalEnabled'),
+    getStallProfilerEnabled: () => safeReadDeveloperFlag('stallProfiler'),
   });
 }
 
@@ -335,9 +341,10 @@ for (const arg of process.argv) {
  * the GpuDataManager, and it throws if called once the app is ready, which is
  * the other half of why this sits at module scope.
  *
- * Verified in Electron 41 on Windows and on Linux (Ubuntu 24.04 under WSLg,
- * whose GL is Mesa's d3d12 driver rather than a native one): with both set,
- * getAppMetrics() reports no GPU process at all, and the window still paints.
+ * Verified in Electron 41, and again in 44.5.1, on Windows and on Linux (Ubuntu
+ * 24.04 under WSLg, whose GL is Mesa's d3d12 driver rather than a native one):
+ * with both set, getAppMetrics() reports no GPU process at all, and the window
+ * still paints.
  * NOT verified on macOS, and no test tier reaches this branch on any platform
  * (see the NODE_ENV note below), so CI being green is not evidence about the
  * switches themselves.
@@ -505,6 +512,17 @@ app.on('web-contents-created', (_event, contents) => {
     // Suppressing it here rather than in the driver because this is Electron's
     // own delegate, which the CDP interception does not sit in front of.
     webPreferences.disableDialogs = true;
+    // Zoom belongs to the pane, not to the site. In Electron's default mode a
+    // zoom is stored PER ORIGIN within the partition, so a zoom in one task's
+    // pane (or the viewport fit an agent applied there) changed every other
+    // pane, pop-out and lane showing the same dev server, and a cross-origin
+    // navigation silently dropped the zoom the toolbar still displayed.
+    // Measured on 44.5.1 with a live guest pair: 'isolated' keeps a 0.5 zoom
+    // out of a second guest on the same origin, keeps the pane's zoom across
+    // reload and same- and cross-origin navigation, and Ctrl+wheel still steps
+    // exactly once through the zoom-changed handler below (identical to the
+    // default mode).
+    webPreferences.zoomMode = 'isolated';
 
     let allowed: boolean;
     try {
@@ -528,6 +546,10 @@ app.on('web-contents-created', (_event, contents) => {
     contents.setWindowOpenHandler(createExternalWindowOpenHandler((url) => shell.openExternal(url)));
     return;
   }
+
+  // A crash in this guest is the user's page, not our UI, even if the guest is
+  // destroyed by the time the SDK asks (renderer-classification.ts).
+  markBrowserGuestWebContents(contents.id);
 
   // Drop the `Electron/` token from the guest's user agent, which some web
   // application firewalls reject as a bot (decision 41). This runs at guest
@@ -680,27 +702,21 @@ app.on('web-contents-created', (_event, contents) => {
   });
 
   // Deny permission requests (camera, mic, geolocation, notifications, ...) on
-  // the embedded pane. The pane is for viewing dev servers, which need none of
-  // these, and agent-driven navigation could otherwise reach a page that
-  // auto-prompts. (embedded-browser.md decision log items 5 and 14.)
-  //
-  // BOTH handlers, reading one predicate. Only the request handler existed
-  // before, so a synchronous permission CHECK fell through to Electron's default
-  // instead of the pane's policy. Set on the SESSION, so the popups above - which
-  // share the guest's Session object - inherit both with no extra wiring.
-  contents.session.setPermissionRequestHandler((_requestingContents, permission, callback) =>
-    callback(isEmbeddedBrowserPermissionAllowed(permission)));
-  contents.session.setPermissionCheckHandler((_requestingContents, permission) =>
-    isEmbeddedBrowserPermissionAllowed(permission));
+  // the embedded pane, and save downloads to the OS Downloads folder rather than
+  // opening Chromium's native save dialog (which can block an agent-driven pane).
+  // The pane is for viewing dev servers, which need none of these permissions,
+  // and agent-driven navigation could otherwise reach a page that auto-prompts.
+  // (embedded-browser.md decision log items 5, 13 and 14.) Both handlers read one
+  // predicate, and both install on the SESSION, so the popups above - which share
+  // the guest's Session object - inherit them. The lane manager installs the
+  // same policy on an offscreen lane's Session, which never reaches this branch.
+  installEmbeddedBrowserSessionPolicy(contents.session);
 
-  // Downloads: saved to the OS Downloads folder rather than denied or left to
-  // Chromium's native save dialog (which can block an agent-driven pane).
-  // Installed once per Session; see the module for why that guard is mandatory.
-  installWebviewDownloadPolicy(contents.session);
-
-  contents.on('will-navigate', (navigationEvent, urlString) => {
+  // The URL comes from the event's details: Electron 44 deprecates the
+  // positional `url` argument.
+  contents.on('will-navigate', (navigationEvent) => {
     try {
-      const parsed = new URL(urlString);
+      const parsed = new URL(navigationEvent.url);
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
         navigationEvent.preventDefault();
       }
@@ -913,6 +929,10 @@ if (!isEphemeral && !isE2ETest) {
     });
   }
 }
+
+// Before any PTY exists: node-pty's Windows kill would otherwise fork a second
+// Kangentic.exe, which lands in the 'second-instance' handler above.
+skipConsoleListHelper();
 
 let mainWindow: BrowserWindow | null = null;
 let activateAllProjectsTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1325,7 +1345,7 @@ const createWindow = () => {
           click: () => {
             try {
               const image = nativeImage.createFromDataURL(params.srcURL);
-              clipboard.writeImage(image);
+              void writeClipboardImage(image, clipboard, (payloads) => new ClipboardItem(payloads));
             } catch {
               // srcURL wasn't a valid data URL - silently ignore
             }
@@ -1445,10 +1465,6 @@ const createWindow = () => {
           // registered in ephemeral preview, the one place its safety guard
           // (preview-projects root) has clones to operate on.
           registerSeedGitChangesDevIpc();
-          // Seed-embedding-backlog dev IPC for the TestHarness "Seed Embedding
-          // Backlog" button - a realistic pending-chunk count for exercising the
-          // central embedding engine's drain loop under sustained real-worker load.
-          registerSeedEmbeddingBacklogDevIpc(getOptionalIpcContext);
           // Seed-large-conversation dev IPC for the TestHarness "Seed Large
           // Conversation" button - a throwaway task/session backed by a real
           // synthetic multi-thousand-turn Claude transcript file, for
@@ -1459,6 +1475,16 @@ const createWindow = () => {
           // real capture repositories, so the usage dashboard has rich charts
           // to show in an ephemeral preview.
           registerSeedUsageDataDevIpc(getOptionalIpcContext);
+          // The TestHarness "Seed Knowledge Graph" button: the REAL-index mirror
+          // (the parent project's actual conversations, titles and vectors), and
+          // the synthetic cluster corpus it falls back to on a machine with no
+          // real index. Either can leave its chunks pending for the embedding
+          // drain instead of writing vectors.
+          registerSeedKnowledgeGraphRealDevIpc(getOptionalIpcContext);
+          registerSeedKnowledgeGraphDevIpc(getOptionalIpcContext);
+          // The web demo's sample install as real projects, so the demo's Knowledge Graph
+          // fixture is built by the shipped pipeline (scripts/capture-demo-knowledge-graph.mjs).
+          registerSeedKnowledgeGraphDemoDevIpc(getOptionalIpcContext);
           // Adopt the two clones the /preview script pre-cloned (overlapping the
           // build); add more on demand via the TestHarness "Create Project" button.
           const project1 = await createPreviewClone(ephemeralContext, cwd); // adopts "Project 1"
@@ -1478,10 +1504,15 @@ const createWindow = () => {
             .catch(() => {});
           return opened;
         } catch (cloneError) {
-          console.error('[DEV] Preview clone seeding failed; falling back to the worktree:', cloneError);
-          // fall through to the normal open below
+          console.error('[DEV] Preview clone seeding failed; opening no project rather than the worktree:', cloneError);
+          return null;
         }
       }
+      // Never fall through to the normal open below. `cwd` is the worktree this
+      // preview runs from, and a board on it would let task moves and agents act
+      // on the real repo. Opening no project is the safe failure.
+      console.error('[DEV] Preview has no IPC context; opening no project rather than the worktree');
+      return null;
     }
 
     if (!projectPath) return null;
@@ -1498,7 +1529,7 @@ const createWindow = () => {
       // prior session - the engine's drain loop is alive but stays parked on
       // an empty dirty-set until something marks this project dirty, and nothing
       // else does for THIS specific path (getStatus()'s self-heal only fires if
-      // the user happens to open Quick Find or Settings -> Memory).
+      // the user happens to open Settings -> Knowledge Graph).
       //
       // This call site fires exactly ONCE per app launch (preloadPromise is a
       // one-shot IIFE inside createWindow, structurally separate from the
@@ -1629,10 +1660,11 @@ Menu.setApplicationMenu(
 app.whenReady().then(async () => {
   mark('app_ready');
 
-  // Load the sqlite-vec extension into every project DB as it opens (after
-  // migrations). Registered before any project opens so the semantic search
-  // layer is available; a load failure degrades to lexical-only.
-  setProjectDbInitializer(loadVecExtension);
+  // sqlite-vec is loaded by the retrieval worker alone, the only process that
+  // reads or writes the index. While the worker is up it also checkpoints the
+  // project databases' WAL, and main's own auto-checkpoint is off (see
+  // checkpoint-driver.ts).
+  attachCheckpointDriver();
 
   // Let agent adapters drop per-directory state for a worktree Kangentic just
   // deleted (Codex records directory trust in ~/.codex/config.toml keyed by
@@ -2376,6 +2408,10 @@ function getShutdownDependencies() {
       // Stop conversation-memory indexing synchronously: drop pending finalize
       // timers and abandon any in-flight sweep (recovered on next open).
       retrievalService.dispose();
+      // Synchronously kill the retrieval worker (if spawned). Its in-flight
+      // calls reject as unavailable, and an index write it was making is left
+      // for the next open to finish, as a crash mid-write already is.
+      retrievalClient.dispose();
       // Synchronously kill the line-count worker (if spawned); in-flight
       // counts abandon and their callers fall back to inline counting.
       lineCountClient.dispose();
@@ -2406,6 +2442,7 @@ function getShutdownDependencies() {
       getOptionalIpcContext()?.desktopNotifier.dispose();
     },
     isEphemeral,
+    isRestartRequested,
   };
 }
 

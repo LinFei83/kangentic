@@ -16,7 +16,8 @@ layer. It is the same engine (`src/renderer/window-manager/`) instantiated twice
 So a Command Terminal is a movable, resizable, maximizable, snappable window, top-layered over a
 slight backdrop blur, and its arrangement persists globally: one blob,
 `AppConfig.commandTerminalWorkspace`, shared across all projects. Several terminals can run at
-once (capped at `MAX_COMMAND_TERMINALS`), tiled among themselves via the engine's N-ary tiling.
+once (capped at `MAX_COMMAND_TERMINALS`, four per project, in `src/shared/command-terminal-name.ts`),
+tiled among themselves via the engine's N-ary tiling.
 
 Each window has full task-detail parity, and both behaviors live in the shared engine, so
 task-detail windows get them too:
@@ -35,6 +36,115 @@ Each window owns a durable slot id (`slot-1`, `slot-2`, ...) as its `anchor`. Th
 `slot` so consumers can filter by project. There is no singleton pointer. The map is preserved
 across HMR via `import.meta.hot.data`; on a hard reload `syncSessions()` best-effort re-pairs
 surviving transient PTYs to slots.
+
+### Main owns the cap and the slots
+
+The renderer used to pick a slot by counting its own windows and enforce the cap the same way.
+That broke once a paired phone could start a terminal: the phone has no window, so a desktop New
+could pick a slot a phone terminal already held. `startCommandTerminal`
+(`src/main/ipc/handlers/transient-sessions.ts`), which both the desktop's `session:spawnTransient`
+and the bridge's `command-terminal` verb run, now allocates the lowest free slot and refuses a
+fifth terminal. The occupied set is the project's non-exited transient registry rows plus a
+module-level reservation map filled synchronously on entry and released in a `finally`, so two
+starts in flight together cannot both pass the cap or share a slot across the spawn's awaits. A
+window that asks for a slot already taken gets a throw, which `CommandTerminalWindow` already toasts
+and closes on.
+
+The renderer still proposes the slot for a window it opens, because the window's anchor exists
+before the spawn. It reads the union of window anchors and the project's live transient rows from
+the session replica, so it only proposes a taken slot in a true race. `spawnTransient` answers with
+the slot main settled on.
+
+## A terminal ends when its agent exits
+
+A Command Terminal is an agent, not a shell. When its agent exits, the terminal ends: the PTY is
+killed, the registry row removed, the session directory deleted, and the desktop window closed. The
+same happens when the PTY exits on its own. Before, a terminal whose agent ran `/exit` stayed open as
+a bare PowerShell or bash prompt at the project root, which became a real exposure once a paired
+phone could type into the session.
+
+The agent-absence sweep (see [Session Lifecycle](session-lifecycle.md#a-session-whose-agent-exited-under-a-surviving-shell))
+is what notices, and the agent's SessionEnd hook asks it to look at once, so `/exit` closes the
+window in about 4 seconds. `/clear` also fires SessionEnd, but its process stays alive and the
+process tree keeps the terminal. Every end, a desktop Stop included, goes through
+`SessionManager.endCommandTerminal`, which refuses a task's session. The session directory
+outlives the shell: a Stop returns at once, but the directory is deleted only after the PTY
+exits, so a still-exiting agent's SessionEnd hook writes into a directory that exists.
+
+The sweep waits for evidence that the agent started before it judges a terminal: the agent's
+first SessionStart, or its first alt-screen entry, which no shell emits. A shell slow to reach the
+agent command (a heavy profile, a cold machine) used to be ended 30 seconds in, before its agent
+ran. Without either signal the sweep judges the terminal after a two-minute ceiling anyway. That
+covers a launch that failed and an agent with neither hooks nor an alt screen, at the cost of
+leaving those up to two minutes longer than before.
+
+The sweep cannot read a WSL shell's tree (its agent is not a Win32 descendant of `wsl.exe`), and
+it does not run at all with the background-shell watcher off. There the agent's SessionEnd is the
+only signal, so a SessionEnd with no SessionStart within 5 seconds ends the terminal. `/clear`
+sends its SessionStart 148 ms after its SessionEnd, and a `/resume` choice 116 ms after (Claude
+Code 2.1.294), well inside that settle. An open `/resume` picker sends neither, so browsing it
+costs nothing. An agent with no SessionEnd hook in either case still outlives its agent until the PTY
+exits. A suspend (the idle timeout, a project relocate) ends a terminal outright, since there is
+no record to resume.
+
+Nothing in the renderer used to close a window when main ended its session, since `App.tsx`
+ignores an intentional exit. `useCloseCommandWindowOnRemoval` (`CommandTerminalLayer.tsx`, mounted
+in `AppLayout` so it runs while the layer is hidden) is its own `session-removed` subscriber: when a
+map entry still points at the removed session, main ended it (the agent exited, the PTY died, or a
+phone pressed Stop), so it clears the entry and closes that slot's window in the current project.
+A desktop Stop and a branch switch scrub the entry BEFORE they send the kill, so their own removal
+push finds nothing to close and the branch switch keeps its window.
+
+## Naming runs in main
+
+A terminal gets its name from its first prompt, summarized by its own agent CLI in its own project
+folder, through `CommandTerminalNamer` (`src/main/agent/shared/command-terminal-namer.ts`). It used
+to be named in the renderer by the open project's default agent, so a terminal a phone started, or
+one in a project the desktop did not have open, never got one. The namer shares the summarize rate
+limit (`autoNameRateLimitPerHour`) with the task namer, skips the synthetic PTY-activity prompt,
+and writes through `setCommandTerminalLabel`, which emits `session-changed` once. The window title,
+the Monitor row, the phone's list and its push alerts all read the name from the registry row
+through `commandTerminalDisplayName`, falling back to "Command Terminal N".
+
+Naming needs an agent whose prompt event carries the prompt's text, and most hooks report only that
+a prompt was submitted. Two agents report it: Claude Code, because a Command Terminal's start passes
+`capturePromptText` and the Claude adapter then copies `UserPromptSubmit`'s `prompt` into the event
+(per session, through that session's own `--settings` file, so task sessions' events stay free of
+prompt text), and Kimi, whose wire parser always carries it. Gemini and Qwen Code have a `prompt`
+field too, but their hooks live in the project's shared settings file, where a terminal's capture
+would leak onto every other session in the folder, so their terminals keep "Command Terminal N".
+Before this, the renderer namer read the same empty field and no Claude terminal was ever named.
+
+## Starting one from a phone
+
+The bridge's `command-terminal` verb (see [Mobile Bridge](mobile-bridge.md#capability-verbs))
+runs the same `startCommandTerminal` as the desktop's New, with `unattended: true`. A user on a
+phone is away from the desk and cannot recover a start that hangs on a credential prompt or a
+slow fetch, so an unattended start keeps the desktop's steps and makes each one unable to block:
+
+- the fetch is non-interactive (`fetchIfStale`'s `nonInteractive` option) and aborts after 5 s;
+- the whole git phase has one 6 s budget, after which the remaining steps are skipped;
+- it never checks out under another live session in the project folder (a sibling terminal, or a
+  task with no worktree), comparing resolved paths, case-folded on Windows. A task in its own
+  worktree does not count: a worktree has its own HEAD;
+- every failure falls back to the branch already checked out, as the dirty-tree stay-put does.
+
+It needs no project open on the desktop. A terminal a phone starts in the project the desktop has
+open gets no window until the layer reopens; the toggle's count and tone update live.
+
+## Leftover processes
+
+A terminal's agent can start something that outlives it: a dev server launched with
+`Start-Process`, a `nohup` job. Measured: a detached `ping` a terminal's agent started kept
+running after the terminal ended, and nothing reported it. So each terminal's PTY carries its own
+`KANGENTIC_TASK_ID` (its made-up task id), and `CommandTerminalLeftoverReaper`
+(`src/main/ipc/helpers/command-terminal-leftovers.ts`) runs the same reap a task gets at Done
+when the terminal ends: it honors "Stop leftover processes" and reports under the terminal's name.
+It runs 12 s after the terminal ends, longer than the pty host gives an agent to exit by itself,
+so it never force-kills Claude while Claude is still shutting down. Nothing is reaped during a
+quit. That host step, which asks the agent a dead shell left running to exit and terminates it
+after the grace (`dead-root-orphans.ts`), runs on Windows only. On macOS and Linux nothing asks
+such an agent to exit, and this reap is the only cleanup.
 
 ## A reattach never touches HEAD
 
@@ -97,8 +207,8 @@ This header has no close button, so an untiled terminal legitimately reads kebab
   `quick-session-button`) that never spawns a terminal, so there is always a discoverable
   one-click way to hide the layer even when a window is maximized over the backdrop.
 - A **New terminal** button, rendered only while the layer is open, positioned to the toggle's
-  left (`quick-session-new-terminal`, calling `spawnAdditionalCommandTerminal()`), disabled at
-  `MAX_COMMAND_TERMINALS`.
+  left (`quick-session-new-terminal`, calling `spawnAdditionalCommandTerminal()`), disabled once
+  the project's windows and live terminals together hold `MAX_COMMAND_TERMINALS` slots.
 
 Both share the custom `CommandTerminalIcon` glyph, not a bare lucide icon. The toggle shows the
 shell-prompt variant; New terminal passes `showPlus` for the center-plus variant (`data-plus` on

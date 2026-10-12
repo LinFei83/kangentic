@@ -40,8 +40,9 @@ Four things that are easy to get wrong, each of which fails silently:
   and every subsequent key is dead.
 - **`z-50` is wrong for a portaled element.** `BaseDialog` is itself `z-50`, and a body portal
   is its sibling. Use `z-[2147483646]`, as `LabelInput` and `KebabMenu` do.
-- **Width and height caps do not survive.** `usePopoverPosition` writes `top`/`left`, so
-  `left-0 right-0` width matching is lost: pass `matchTriggerWidth: true` and the hook writes the
+- **Width and height caps do not survive.** `usePopoverPosition` writes one vertical edge
+  (`top` or `bottom`) and one horizontal edge (`left` or `right`), so `left-0 right-0` width
+  matching is lost: pass `matchTriggerWidth: true` and the hook writes the
   trigger's width onto the menu BEFORE it measures. Do not measure the trigger in a second
   `useLayoutEffect` and pass `width` through `style`. Layout effects run in declaration order, so
   the hook's effect fires first and measures a width-less menu on the mount commit. Its
@@ -52,12 +53,24 @@ Four things that are easy to get wrong, each of which fails silently:
   remounts its comboboxes on every panel open. The same one-line measurement also reads the
   height one row tall, so the fits-below decision was made against the wrong height. Keep the
   `max-h-*` cap on the portaled element, or a tall list fits neither below nor above,
-  `openAbove` fires unconditionally, and `top` goes negative.
+  `openAbove` fires unconditionally, and the menu runs off the top of the window.
 
-Two properties of the pattern to know before you reach for it, both shared with the existing
+Three properties of the pattern to know before you reach for it, all shared with the existing
 portaled sites (`LabelInput`, `KebabMenu`) rather than new:
 
-- **The position is computed once, at open.** `usePopoverPosition` has no `scroll` or `resize`
+- **The side is decided once, at open, and the anchor faces the trigger.** `usePopoverPosition`
+  picks above or below and left or right from the size it measures on open, then anchors the
+  fixed popover on the edge that faces its trigger: `bottom` when it opens above, `right` when it
+  is right-aligned. Content that changes after that (rows an async fetch delivers, a list the
+  user filters) moves only the far edge, so it grows away from the trigger. The hook used to write
+  a `top` computed from the measured height, and `ToolBreakdownPopover`, measured in its 80px
+  empty state, grew down over its own trigger and past the window once its 340px table arrived.
+  The hook also publishes the room on the chosen side as `--popover-available-height` and
+  `--popover-available-width` on the popover. A popover whose content arrives or grows after open
+  caps itself with them, `max-h-[min(340px,var(--popover-available-height,340px))]`, so a short
+  window scrolls inside it instead of spilling out. The hook never writes an inline `max-height`,
+  which would override the consumer's own cap.
+- **Nothing re-measures while it is open.** `usePopoverPosition` has no `scroll` or `resize`
   listener, so a `fixed` menu holds its viewport coordinates while its trigger moves. Scrolling
   the settings tab body, the task-detail edit form, the board-manager body, or a `DataTable`
   while a menu is open visually detaches it. Prefer a trigger that cannot scroll under an open
@@ -98,6 +111,22 @@ A popover with no clipping ancestor at any mount site may stay in flow with a
 
   Neither check can tell whether a mount site actually clips, which is why they are the
   tripwire and the UI specs are the guard.
+- **Test (async content, behavior):** `tests/ui/context-bar-tool-breakdown.spec.ts` resolves the
+  breakdown 300ms after the popover opens and asserts its bottom stays at or above the trigger and
+  inside the window, then shrinks the window so the room above the trigger is under the 340px cap
+  and asserts the popover stays inside and scrolls. The first case read red against the
+  `top`-anchored hook; the second reads red without the `--popover-available-height` cap. A third
+  opens the popover right-aligned and asserts its right edge stays on the trigger's while the
+  arriving table widens it, which reads red against the old `left` computed from the measured
+  width.
+- **Test (available-room caps, behavior):** `tests/ui/popover-first-open-alignment.spec.ts` shrinks
+  the window around the Settings > Git `BranchPicker`, the Settings > Agent `Combobox` and
+  `ModelCombobox`, the Settings > Terminal `FontCombobox`, the Command Terminal's
+  `CommandPalettePopover` and the Knowledge Graph's `KnowledgeGraphProjectsPicker`, and asserts
+  each menu stays inside the window and scrolls, and that a fixed popover opening above or below
+  publishes `--popover-available-height` and `--popover-available-width` matching the room on that
+  side. `tests/ui/context-bar-popover.spec.ts` does the same for `ContextBarPopover`. Each reads red
+  with its consumer's cap put back to the fixed value.
 - **Test (first-open width, behavior):** `tests/ui/popover-first-open-alignment.spec.ts` opens
   the Settings > Agent comboboxes on a fresh page at 1920x1080 and asserts the menu's left edge
   and width match the field on the FIRST open (then again after a close). Each test owns its

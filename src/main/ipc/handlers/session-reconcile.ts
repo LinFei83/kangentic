@@ -1,4 +1,5 @@
 import { SessionRepository } from '../../db/repositories/session-repository';
+import { resolveOwnSessionRecord } from '../../db/repositories/session-own-record';
 import { UsageHistoryRepository } from '../../db/repositories/usage-history-repository';
 import { getProjectDb } from '../../db/database';
 import { getProjectRepos, createTransitionEngine, resolveSpawnOverrides } from '../helpers';
@@ -37,7 +38,7 @@ export function applySuspendDbWrites(
   const db = getProjectDb(projectId);
   const sessionRepo = new SessionRepository(db);
   const usageHistoryRepo = new UsageHistoryRepository(db);
-  const record = sessionRepo.getLatestForTask(taskId);
+  const record = resolveOwnSessionRecord(sessionRepo, task.session_id, taskId);
   const action = decideSuspendDbAction(record);
   if (record && action === 'suspend') {
     captureSessionMetrics(
@@ -69,14 +70,15 @@ export function applySuspendDbWrites(
 
 /**
  * Suspend a live session and re-spawn it in place to apply a settings change
- * (a model change) as CLI flags, WITHOUT re-running the destination column's
- * auto_command or transition actions and WITHOUT sending a continuation prompt.
- * The session resumes idle (the in-progress turn is interrupted; the full
- * conversation is preserved via `--resume`).
+ * (a model or effort change) as CLI flags, WITHOUT re-running the destination
+ * column's auto_command or transition actions and WITHOUT sending a
+ * continuation prompt. The session resumes idle (the in-progress turn is
+ * interrupted; the full conversation is preserved via `--resume`).
  *
  * This is the "settings change in place" restart shared by the user-driven
- * ContextBar model pick (`task:setRuntimeOverride`) and the column-config edit
- * (`SWIMLANE_UPDATE`). It is NOT the column-MOVE restart: a move respawns through
+ * ContextBar model/effort pick (`task:setRuntimeOverride`) and the column or
+ * Board Profile edit (`propagateStrategyToLiveSessions`). It is NOT the
+ * column-MOVE restart: a move respawns through
  * `spawnAgent` so it can deliver the column auto_command / plan-exit continuation.
  *
  * Recovery contract: `suspend` (not `kill`) keeps `--resume <id>` valid, so on a
@@ -235,12 +237,15 @@ export async function restartSessionForSettingsChange(
  * future drift between the DB pointer and the live registry.
  *
  * Callers: `SESSION_RESUME` and `SESSION_RECONCILE` (the original two),
- * `SESSION_SUSPEND`, `task:setRuntimeOverride`, and `handleTaskMove`'s Phase 1
- * ahead of its Priority ladder. The last three were added together (#682):
+ * `pauseTaskSession` (the `SESSION_SUSPEND` body, which the phone's
+ * `pause-session` also runs), `task:setRuntimeOverride`, and `handleTaskMove`'s
+ * Phase 1 ahead of its Priority ladder. Those three were added together (#682):
  * a natural CLI exit marks the record `exited` but leaves `task.session_id`,
  * and each of them keyed a decision on the raw pointer, so a task whose agent
  * had ended by itself was "kept alive" on a move, "suspended" on a pause, and
- * restarted or typed into on a model or effort pick.
+ * restarted or typed into on a model or effort pick. `startTaskSession` (the
+ * phone's `start-session`) and `reconcileAutoSpawnChange`'s auto_spawn-off
+ * suspend joined later for the same reason.
  */
 export function reconcileTaskSessionRef(
   context: IpcContext,

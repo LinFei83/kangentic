@@ -4,7 +4,7 @@ Cross-platform desktop Kanban for Claude Code agents.
 
 ## Tech Stack
 
-- **Runtime:** Electron 41 + Node 24
+- **Runtime:** Electron 44 + Node 24
 - **Frontend:** React 19, Zustand, Tailwind CSS 4, Lucide React icons
 - **Backend:** better-sqlite3, node-pty, simple-git
 - **Build:** Vite (renderer), esbuild (main/preload), electron-builder (packaging)
@@ -112,7 +112,7 @@ won't be found.
   `category`. `'project'` tabs (General, Theme, Agent, Git, Browser, Shortcuts) are per-project
   settings, saved to `.kangentic/config.json`, and hidden when no project is selected.
   `'system'` tabs (Board, Task, Changes, Terminal, Behavior, Performance, Hotkeys, Notifications,
-  Dictation, Memory, MCP Server, Agent Browser, Mobile Devices, Privacy, Developer) are shared
+  Dictation, Knowledge Graph, MCP Server, Agent Browser, Mobile Devices, Privacy, Developer) are shared
   settings that apply across all projects, saved to global config, and remain fully functional with
   no project open. The Task tab holds task-presentation settings split out of Board (Card Density,
   Ticket Numbers) and Terminal (the whole Context Bar section): those describe how an individual
@@ -120,8 +120,8 @@ won't be found.
   and Terminal stays pure terminal cosmetics. The Performance tab holds app-wide rendering:
   Graphics acceleration (Chromium hardware rendering, which the GPU recovery path in
   `src/main/index.ts` turns off after a run the GPU killed) and Animations, which moved from
-  Board because it toggles `.no-motion` on `<html>` and was never board chrome. Memory's own
-  hardware row stayed put and is named "Model acceleration": it pairs with Search quality as one
+  Board because it toggles `.no-motion` on `<html>` and was never board chrome. The Knowledge
+  Graph tab's own hardware row stayed put and is named "Model acceleration": it pairs with Search quality as one
   speed-versus-accuracy decision, and the rename is what keeps it distinct from Graphics
   acceleration. Terminal (shell, font, cursor style,
   colors) is global-only, not per-project: shell in particular was never reliably project-scoped
@@ -180,9 +180,12 @@ task's OWN worktree (`isolated` isolates the conversation, not the filesystem - 
 [docs/session-lifecycle.md](docs/session-lifecycle.md)). Entering the column suspends the task
 agent's session and kills its PTY, so the two never overlap - but it leaves that agent's
 UNCOMMITTED work in the shared tree, which is why the review pass commits by set math over
-`git status` and never `git add -A`. It auto-fixes findings, adds tests, and commits that pass
-itself, so Testing can open on a branch carrying a `*(review)` commit no local agent authored. That is
-expected, not corruption. A finished pass normally leaves the tree clean; a fix on an already-dirty
+`git status` and never `git add -A`. It fixes every finding it verifies (Lows included), applies its
+recommended option on a decision and lists the alternative, adds tests, and commits that pass itself,
+so Testing can open on a branch carrying a `*(review)` commit no local agent authored. That is
+expected, not corruption. The pass ends with a verdict computed by `scripts/review-verdict.mjs`:
+**Ready** (move to Testing) or **Blocked** (move back to Executing and do the named steps). There is no
+"skipped" status, and the commit body carries a `Refuted:`/`Decisions:` ledger the next pass reads. A finished pass normally leaves the tree clean; a fix on an already-dirty
 path stays uncommitted by design, so a dirty tree means the pass is either in flight or left those
 paths deliberately mixed.
 
@@ -257,7 +260,7 @@ session; rules with one load when you touch matching files. Each rule names its 
 - `external-scripts-parity.md` - unbundled bridge/plugin scripts register in `EXTERNAL_SCRIPTS` and are copied by both `build.js` and `dev.js`.
 - `activity-state-classification.md` - bucket `ActivityState` idle-vs-active only via `src/shared/activity-state.ts`.
 - `activity-marks.md` - marks come from `@kangentic/branding` via `ActivityMark`; composited motion only; `IconSlot` for element-type swaps.
-- `command-terminal.md` - slot-keyed windows, global geometry against per-project population, and a reattach that never checks out.
+- `command-terminal.md` - slot-keyed windows, main-owned slots and cap, global geometry against per-project population, a reattach that never checks out, and a terminal that ends when its agent exits.
 - `board-completing-task-chokepoint.md` - hide in-flight Done-completing tasks at KanbanBoard's `tasksPerLane`, never per-lane.
 - `keybindings-registry.md` - shortcuts declared in `KEYBINDINGS` and bound via `useKeybinding`, not ad-hoc keydown listeners.
 - `keyboard-drag-intent.md` - `IntentKeyboardSensor` is the only dnd-kit keyboard sensor, and it arms only on Tab-placed focus.
@@ -267,6 +270,8 @@ session; rules with one load when you touch matching files. Each rule names its 
 - `mcp-tool-list-parity.md` - every registered MCP tool stays in sync with `MCP_TOOL_MANIFEST` and `docs/mcp-server.md`.
 - `mcp-column-field-parity.md` - every `Swimlane` field is a parameter of both MCP column tools, or classified unexposed with a reason.
 - `central-embedding-engine.md` - only `embed-engine.ts` embeds; call sites index and `markDirty()`, never embed inline.
+- `retrieval-out-of-process.md` - the index and agent transcript reads run in the `kangentic-retrieval` worker; main schedules and relays.
+- `pty-host-out-of-process.md` - every PTY and its per-chunk work run in the `kangentic-pty-host` utility process; main holds mirrors and async reads.
 - `dictation-out-of-process.md` - `sherpa-onnx-node` is imported only inside the `kangentic-dictation` utilityProcess worker.
 - `pop-out-surface-registry.md` - every `BrowserWindow` comes from `createWindow` or the pop-out manager, through the registries.
 - `spawn-entry-point-parity.md` - every agent spawn routes through `spawnAgent` / `prepareAgentSpawn` and `runSpawnPreamble`.
@@ -274,13 +279,16 @@ session; rules with one load when you touch matching files. Each rule names its 
 - `release-gates-fail-loudly.md` - a release-path step that guarantees something fails loudly when it cannot.
 - `task-template-vars-parity.md` - promptTemplate keywords are declared once in `TASK_TEMPLATE_VARS`.
 - `settings-tab-scope.md` - a setting's tab must match its persistence scope.
+- `settings-card-design.md` - every settings tab is `SettingsCard`s whose bodies hold only tiles; depth lifts, switches align, descriptions fit one line, short fixed choices are segmented controls.
 - `derived-detail-ownership.md` - task-detail ownership is a host's COMPLETE mounted set, reconciled, never accumulated.
 - `retained-pane-never-remounts.md` - a window with an open Browser pane is RETAINED across a project switch; hide it with `opacity: 0`.
 - `terminal-arrival-focus.md` - an arriving terminal never decides its own focus; route it through `mayTakeArrivalFocus`.
 - `agent-driven-focus.md` - an agent-driven pane SHOWS its focus move, and the driver never takes guest focus itself.
 - `xterm-unicode11-parity.md` - every xterm `Terminal` activates Unicode 11 widths; hand-rolled parsers use `wcwidthV11`.
+- `xterm-dispose-releases-mouse.md` - an opened xterm calls `releaseMouseTracking` before `dispose()`, or its document mouse listener throws on every later click.
 - `cookie-jar-sharing.md` - jar cookies are copied only through `cookie-seed.ts`, and partitions stay task-keyed.
-- `pty-teardown-grace.md` - a young agent's PTY is never force-killed without its exit sequence and the 1500 ms grace.
+- `pty-teardown-grace.md` - a young agent's PTY is never force-killed without its exit sequence and the 1500 ms grace; an agent whose shell died on its own is asked to exit before anything is terminated.
+- `task-process-tag.md` - task PTYs carry `KANGENTIC_TASK_ID`; a terminal transition kills only tagged processes in the task's directories, never shared, visible or tmux ones; env text never leaves a reader.
 - `web-demo-parity.md` - the web build is the real renderer over the mock bridge; every `ElectronAPI` method has a mock.
 - `session-replica-contract.md` - the renderer session store is a replica of main's registry, and a removal is its own push.
 

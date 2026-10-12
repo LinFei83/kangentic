@@ -1,7 +1,7 @@
 /**
- * Tests for `UsageHistoryRepository`. better-sqlite3 cannot load under
- * vitest's system Node, so the DB is mocked with a `prepare`/`run`/`get`
- * surface that records the SQL it was given and the params bound to it.
+ * Tests for `UsageHistoryRepository`. The DB is mocked with a
+ * `prepare`/`run`/`get` surface that records the SQL it was given and the
+ * params bound to it.
  *
  * The history is the source of truth for the usage dashboard's period totals.
  * Its tests pin three contracts that must not silently regress:
@@ -16,6 +16,7 @@
  *      them alone on a re-capture of the same record.
  */
 
+import { passThroughTransaction } from './helpers/transaction-double';
 import { describe, it, expect, vi } from 'vitest';
 import type Database from 'better-sqlite3';
 import {
@@ -40,8 +41,7 @@ function createMockDb(getReturn: unknown = { costUsd: 0, durationMs: 0 }): {
   const db = {
     // `recordSessionUsage` wraps its baseline read and its upsert in one
     // transaction; the fake just runs the body straight through.
-    transaction: vi.fn(<Args extends unknown[]>(fn: (...args: Args) => void) =>
-      (...args: Args) => fn(...args)),
+    transaction: vi.fn(passThroughTransaction),
     prepare: vi.fn((sql: string) => {
       const statement: PreparedStatement = {
         sql,
@@ -258,7 +258,7 @@ describe('UsageHistoryRepository.setTaskGitStats', () => {
           return { changes: isSiblingZeroOut ? 1 : canonicalChanges };
         }),
       })),
-      transaction: vi.fn((fn: (...args: unknown[]) => unknown) => (...args: unknown[]) => fn(...args)),
+      transaction: vi.fn(passThroughTransaction),
     } as unknown as Database.Database;
     return { db, runCalls };
   }

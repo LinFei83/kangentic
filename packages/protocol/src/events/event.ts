@@ -28,6 +28,9 @@
  */
 import type { JsonValue } from '../wire/messages';
 import { isRecord } from '../wire/json-value';
+// A value import in this direction only: wire/ imports events/event for types
+// alone, so there is no runtime cycle.
+import { isReadStreamSessionStatusWire, type ReadStreamSessionStatusWire } from '../wire/payloads';
 import {
   isActivityReasonWire,
   isActivityStateWire,
@@ -64,11 +67,25 @@ export type ActivityEventPayload =
    */
   | { type: 'permission'; promptId: string; pending: boolean; options?: string[] }
   /**
-   * The streamed session's PTY exited. Pushed once by the desktop's
-   * read-stream subscription right before it tears itself down, so the
-   * phone learns "this session is over" from the feed itself instead of
-   * inferring it from silence. `intentional` distinguishes a deliberate
-   * stop (desktop Stop button, suspend, shutdown) from a crash.
+   * The feed's last word: the desktop's read-stream subscription pushes this
+   * once, right before it tears itself down, so the phone learns "this
+   * session is over" from the feed itself instead of inferring it from
+   * silence. Sent when the streamed session's PTY exits. From 0.16.0 it is
+   * also sent when a paused row, which the feed holds without a PTY, is
+   * replaced or removed. `intentional` distinguishes a deliberate stop
+   * (desktop Stop button, suspend, shutdown, a resume replacing a paused row)
+   * from a crash.
+   *
+   * `successorSessionId`, when present, names the session that replaced this
+   * one for the same task. A desktop resume never reuses the paused session's
+   * id: it spawns a new session and drops the paused row, so a feed held on
+   * the paused session can only end, never turn back into `running`. The task
+   * continues as the successor; subscribe to it. Its snapshot carries
+   * `sessionStatus` (`queued` when the desktop's concurrency limit holds it)
+   * and `resuming: true`. Absent when no successor exists (a removed paused
+   * row, or a successor whose own spawn failed), and from pre-0.16.0
+   * desktops, which never end a feed this way and leave it silent instead. An
+   * older phone ignores the field and still sees an ended session.
    *
    * `spawnProgressLabel`, when present, means the desktop had a respawn in
    * flight for this task when the session ended - a same-column respawn
@@ -85,7 +102,8 @@ export type ActivityEventPayload =
    * the desktop's own display text for what it is doing ("Switching
    * model...", "Starting agent...", a live git-queue wait count) - treat it
    * as untrusted display text, not a key to switch on, cap its length, and
-   * fall back to generic copy rather than parsing it.
+   * fall back to generic copy rather than parsing it. From 0.16.0 the desktop
+   * sends it sanitized as `BoardTaskWire.spawn_progress` describes.
    *
    * INTENT, not a guarantee, on the same terms `BoardColumnWire.spawns_session`
    * documents: the desktop can suspend without a successor ever landing (a
@@ -107,7 +125,36 @@ export type ActivityEventPayload =
    * spawn fails still has its label in flight when the PTY dies. The two
    * fields are independent; do not read them as mutually exclusive.
    */
-  | { type: 'session-ended'; intentional: boolean; spawnProgressLabel?: string }
+  | { type: 'session-ended'; intentional: boolean; spawnProgressLabel?: string; successorSessionId?: string }
+  /**
+   * The streamed session's lifecycle status changed after the subscribe
+   * snapshot: `queued` -> `running` when the desktop's concurrency limit
+   * frees a slot, -> `suspended` on a pause or a respawn, -> `exited` when the
+   * desktop retires a session whose agent already ended. Sent only on an
+   * actual change, for the same session id only. A resume is a NEW session
+   * id, so suspended -> running never arrives here: see `session-ended`'s
+   * `successorSessionId`.
+   *
+   * A `suspended` push precedes the PTY's `session-ended` when a running
+   * session is suspended, so for an instant both say the session is parked.
+   *
+   * Precedence, matching the desktop card: a non-null `spawn_progress` on the
+   * task's board row overrides `suspended` (the desktop suspends a session
+   * before every model, agent or effort respawn), and never `running` or
+   * `queued`. Read `suspended` alone as "Paused"; read it next to a label as
+   * that label.
+   *
+   * `resuming` and `resumable` repeat the snapshot fields so the payload is
+   * complete on its own. The desktop re-reads all three on each lifecycle
+   * edge of this session and sends the payload when any of them differs. A
+   * move to Done or an archive of a paused task is no edge of its row, so
+   * `resumable` here can stay true until the feed ends; gate Resume on
+   * `BoardTaskWire.resumable`, which the board event for that move refreshes.
+   * Absent from pre-0.16.0 desktops, whose phones drop the unknown
+   * type through `isBridgeEvent` and keep inferring status from activity
+   * events.
+   */
+  | { type: 'status'; status: ReadStreamSessionStatusWire; resuming: boolean; resumable: boolean }
   /**
    * The agent's most recent assistant message, already collapsed to a short
    * plain-text preview, pushed whenever it changes.
@@ -146,8 +193,20 @@ export interface TerminalResizeEvent {
   payload: TerminalDimensionsWire;
 }
 
+/**
+ * `command-terminals-changed` (protocol 0.20.0): one of the project's Command
+ * Terminals started, ended, or was named. `ids` holds the terminal's session id
+ * and the envelope carries no `taskId`, since a Command Terminal belongs to no
+ * task. The phone re-reads `commandTerminals` from the next snapshot. A change
+ * of activity does not fire it: the terminal's state and reason ride its own
+ * `read-stream` activity events, as a task agent's do, and the snapshot's
+ * `CommandTerminalWire.activity` covers the first paint.
+ *
+ * The union is closed, so a phone built before a kind existed drops that event
+ * (`isBridgeEvent` returns false) and keeps the rest of its feed.
+ */
 export interface BoardEventPayload {
-  change: 'task-created' | 'task-updated' | 'task-deleted' | 'swimlane-updated' | 'backlog-changed';
+  change: 'task-created' | 'task-updated' | 'task-deleted' | 'swimlane-updated' | 'backlog-changed' | 'command-terminals-changed';
   ids: string[];
 }
 
@@ -158,15 +217,28 @@ export interface BoardEvent {
   payload: BoardEventPayload;
 }
 
+/**
+ * "Re-read the diff." A task's diff names its `taskId`. A project-folder diff
+ * (a `read-diff` request with no `taskId`, protocol 0.20.0, for a Command
+ * Terminal's Changes tab) names its `projectId` instead. Exactly one is set.
+ */
 export interface DiffEvent {
   kind: 'diff';
-  taskId: string;
+  taskId?: string;
+  projectId?: string;
   payload: null;
 }
 
 export type BridgeEvent = TranscriptEvent | ActivityEvent | TerminalEvent | TerminalResizeEvent | BoardEvent | DiffEvent;
 
-const BOARD_CHANGES: readonly string[] = ['task-created', 'task-updated', 'task-deleted', 'swimlane-updated', 'backlog-changed'];
+const BOARD_CHANGES: readonly string[] = [
+  'task-created',
+  'task-updated',
+  'task-deleted',
+  'swimlane-updated',
+  'backlog-changed',
+  'command-terminals-changed',
+];
 
 /**
  * Narrows an activity event's payload to its typed union. Throws on a
@@ -197,11 +269,24 @@ export function parseActivityEventPayload(payload: JsonValue): ActivityEventPayl
     }
     case 'session-ended': {
       if (typeof payload.intentional !== 'boolean') throw new Error('session-ended payload is missing "intentional"');
-      if (payload.spawnProgressLabel === undefined) {
-        return { type: 'session-ended', intentional: payload.intentional };
+      if (payload.spawnProgressLabel !== undefined && typeof payload.spawnProgressLabel !== 'string') {
+        throw new Error('session-ended payload has an invalid "spawnProgressLabel"');
       }
-      if (typeof payload.spawnProgressLabel !== 'string') throw new Error('session-ended payload has an invalid "spawnProgressLabel"');
-      return { type: 'session-ended', intentional: payload.intentional, spawnProgressLabel: payload.spawnProgressLabel };
+      if (payload.successorSessionId !== undefined && typeof payload.successorSessionId !== 'string') {
+        throw new Error('session-ended payload has an invalid "successorSessionId"');
+      }
+      return {
+        type: 'session-ended',
+        intentional: payload.intentional,
+        ...(payload.spawnProgressLabel !== undefined ? { spawnProgressLabel: payload.spawnProgressLabel } : {}),
+        ...(payload.successorSessionId !== undefined ? { successorSessionId: payload.successorSessionId } : {}),
+      };
+    }
+    case 'status': {
+      if (!isReadStreamSessionStatusWire(payload.status)) throw new Error('status payload has an invalid "status"');
+      if (typeof payload.resuming !== 'boolean') throw new Error('status payload is missing "resuming"');
+      if (typeof payload.resumable !== 'boolean') throw new Error('status payload is missing "resumable"');
+      return { type: 'status', status: payload.status, resuming: payload.resuming, resumable: payload.resumable };
     }
     case 'message-preview': {
       if (typeof payload.text !== 'string') throw new Error('message-preview payload is missing "text"');
@@ -259,8 +344,14 @@ export function isBridgeEvent(value: unknown): value is BridgeEvent {
       if (typeof change !== 'string' || !BOARD_CHANGES.includes(change)) return false;
       return Array.isArray(value.payload.ids) && value.payload.ids.every((id) => typeof id === 'string');
     }
-    case 'diff':
-      return typeof value.taskId === 'string' && value.payload === null;
+    case 'diff': {
+      if (value.payload !== null) return false;
+      const hasTaskId = typeof value.taskId === 'string';
+      const hasProjectId = typeof value.projectId === 'string';
+      if (value.taskId !== undefined && !hasTaskId) return false;
+      if (value.projectId !== undefined && !hasProjectId) return false;
+      return hasTaskId !== hasProjectId;
+    }
     default:
       return false;
   }

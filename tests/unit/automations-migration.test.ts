@@ -4,11 +4,10 @@
  * Mostly pure-planner tests, which is why the planner is separate from the DB
  * runner: the decisions worth locking are all judgements about what SURVIVES,
  * and none of them need a database. The handful that do (idempotency, the
- * unique name index the planner exists to satisfy) run on the node:sqlite
- * harness, because better-sqlite3 is compiled for Electron's ABI and a suite
- * gated on it skips everywhere, CI included.
+ * unique name index the planner exists to satisfy) run on a real in-memory
+ * better-sqlite3 database, the driver production uses.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   planAutomationsMigration,
   runAutomationsMigration,
@@ -20,36 +19,7 @@ import { runProjectMigrations } from '../../src/main/db/migrations/project-schem
 import { DEFAULT_SPAWN_PROMPT_TEMPLATE } from '../../src/shared/task-template-vars';
 import type DatabaseType from 'better-sqlite3';
 
-type SqliteModule = typeof import('node:sqlite');
-let sqlite: SqliteModule | null = null;
-try {
-  sqlite = await import('node:sqlite');
-} catch {
-  sqlite = null;
-}
-const describeWithSqlite = sqlite ? describe : describe.skip;
-
-/** Mirrors the adapter in task-repository-worktree-skip-reason.test.ts. */
-function adaptDatabase(database: InstanceType<SqliteModule['DatabaseSync']>): DatabaseType.Database {
-  const adapter = {
-    exec: (sql: string) => database.exec(sql),
-    prepare: (sql: string) => database.prepare(sql),
-    pragma: (statement: string) => database.prepare(`PRAGMA ${statement}`).all(),
-    transaction: <Args extends unknown[], Result>(body: (...args: Args) => Result) =>
-      (...args: Args): Result => {
-        database.exec('BEGIN');
-        try {
-          const result = body(...args);
-          database.exec('COMMIT');
-          return result;
-        } catch (error) {
-          database.exec('ROLLBACK');
-          throw error;
-        }
-      },
-  };
-  return adapter as unknown as DatabaseType.Database;
-}
+import { openTestDatabase } from './helpers/test-database';
 
 const PLANNING = 'lane-planning';
 const EXECUTING = 'lane-executing';
@@ -302,9 +272,21 @@ describe("a column's message", () => {
   });
 });
 
-describeWithSqlite('against a real database', () => {
+describe('against a real database', () => {
+  const openDatabases: DatabaseType.Database[] = [];
+
+  afterEach(() => {
+    for (const database of openDatabases.splice(0)) database.close();
+  });
+
+  function openDatabase(): DatabaseType.Database {
+    const database = openTestDatabase();
+    openDatabases.push(database);
+    return database;
+  }
+
   function migratedDatabase(): DatabaseType.Database {
-    const database = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
+    const database = openDatabase();
     runProjectMigrations(database);
     return database;
   }
@@ -327,8 +309,7 @@ describeWithSqlite('against a real database', () => {
   });
 
   it('migrates a column message and clears the field it came from', () => {
-    const database = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
-    runProjectMigrations(database);
+    const database = migratedDatabase();
     // Simulate an upgrade: put a message back and re-run as if this database
     // predated the migration.
     database.prepare("UPDATE swimlanes SET auto_command = '/code-review' WHERE name = 'Code Review'").run();

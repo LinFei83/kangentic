@@ -1,11 +1,23 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { IPC } from '../shared/ipc-channels';
-import type { ElectronAPI, AutomationInterruptedSummary, AutomationRunFailure, NotificationInput, Project, PtyResizeOrigin, Session, SessionUsage, ActivityState, ActivityReason, AssistantMessageTrailEntry, SessionEvent, UpdateDownloadedInfo, HostMemoryPressureEvent, HostMemoryRecoveryEvent, UsageTimePeriod, UsageStatsScope, UsageDayDrill, UsageCustomWindow, TaskBulkDeleteProgress, ProjectMoveProgress, DictationModelProgress, MobilePairingSasPayload, MobilePairingConfirmedPayload, MobilePairingEndedPayload, MonitorSnapshot, TaskDetailHost, TaskDetailRemoteOwner, AutoCommandResultNotice, BrowserDownloadDone, BrowserViewportOverride, GuestMouseButtonEvent, RendererErrorContext } from '../shared/types';
+import type { ElectronAPI, LeftoverProcessReport, AutomationInterruptedSummary, AutomationRunFailure, NotificationInput, Project, PtyResizeOrigin, Session, SessionUsage, ActivityState, ActivityReason, AssistantMessageTrailEntry, SessionEvent, UpdateDownloadedInfo, HostMemoryPressureEvent, HostMemoryRecoveryEvent, UsageTimePeriod, UsageStatsScope, UsageDayDrill, UsageCustomWindow, TaskBulkDeleteProgress, ProjectMoveProgress, DictationModelProgress, MobilePairingSasPayload, MobilePairingConfirmedPayload, MobilePairingEndedPayload, MonitorSnapshot, TaskDetailHost, TaskDetailRemoteOwner, AutoCommandResultNotice, BrowserDownloadDone, BrowserViewportOverride, GuestMouseButtonEvent, RendererErrorContext, KnowledgeGraphAnswerStreamPush, KnowledgeGraphBuildProgress, KnowledgeGraphAnswerContext, DevSeedKnowledgeGraphDemoPlan } from '../shared/types';
 import type { AnnouncementsChangedPayload } from '../shared/announcements';
 import { POPOUT_ARG_PREFIX } from '../shared/pop-out';
 import type { PopOutDescriptor, PopOutKind, PopOutParamsByKind } from '../shared/pop-out';
 import { installConsoleCapture } from './diagnostics/console-capture';
 import { installDevtoolsPreloadHooks } from '../devtools/preload/install-globals';
+
+// Decodes the standard base64 main writes with `Buffer.from(text, 'utf-8').toString('base64')`.
+// Web APIs only, never `Buffer`: this preload is sandboxed, and Electron 45 removes `Buffer`,
+// `setImmediate` and the `events` / `timers` / `url` shims from sandboxed preloads. A `Buffer`
+// here would throw inside the descriptor read's try and silently boot every pop-out as the full
+// app. tests/unit/preload-web-apis-only.test.ts keeps Node globals out of src/preload.
+function decodeBase64Utf8(encoded: string): string {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return new TextDecoder().decode(bytes);
+}
 
 // Pop-out descriptor: `--kangentic-popout=<base64 JSON>` is appended to a pop-out window's
 // additionalArguments by the main process (pop-out-window-manager.ts). Read once at preload
@@ -15,7 +27,7 @@ function readPopOutDescriptor(): PopOutDescriptor | null {
   const arg = process.argv.find((value) => value.startsWith(POPOUT_ARG_PREFIX));
   if (!arg) return null;
   try {
-    return JSON.parse(Buffer.from(arg.slice(POPOUT_ARG_PREFIX.length), 'base64').toString('utf-8')) as PopOutDescriptor;
+    return JSON.parse(decodeBase64Utf8(arg.slice(POPOUT_ARG_PREFIX.length))) as PopOutDescriptor;
   } catch {
     return null;
   }
@@ -302,9 +314,9 @@ const api: ElectronAPI = {
     getSummary: (taskId: string) => ipcRenderer.invoke(IPC.SESSION_GET_SUMMARY, taskId),
     listSummaries: () => ipcRenderer.invoke(IPC.SESSION_LIST_SUMMARIES),
     getToolBreakdown: (sessionId: string) => ipcRenderer.invoke(IPC.SESSION_GET_TOOL_BREAKDOWN, sessionId),
+    getToolResultTokens: (sessionId: string) => ipcRenderer.invoke(IPC.SESSION_GET_TOOL_RESULT_TOKENS, sessionId),
     spawnTransient: (input) => ipcRenderer.invoke(IPC.SESSION_SPAWN_TRANSIENT, input),
     killTransient: (id) => ipcRenderer.invoke(IPC.SESSION_KILL_TRANSIENT, id),
-    setTransientLabel: (sessionId: string, label: string) => ipcRenderer.invoke(IPC.SESSION_SET_TRANSIENT_LABEL, sessionId, label),
     setTransientBranch: (sessionId: string, branch: string) => ipcRenderer.invoke(IPC.SESSION_SET_TRANSIENT_BRANCH, sessionId, branch),
     setFocused: (sessionIds: string[]) => ipcRenderer.invoke(IPC.SESSION_SET_FOCUSED, sessionIds),
     setMounted: (sessionIds: string[]) => ipcRenderer.invoke(IPC.SESSION_SET_MOUNTED, sessionIds),
@@ -368,6 +380,15 @@ const api: ElectronAPI = {
     },
   },
 
+  leftoverProcesses: {
+    onReport: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, report: LeftoverProcessReport) => callback(report);
+      ipcRenderer.on(IPC.LEFTOVER_PROCESSES_REPORT, handler);
+      return () => ipcRenderer.removeListener(IPC.LEFTOVER_PROCESSES_REPORT, handler);
+    },
+    stop: (processId) => ipcRenderer.invoke(IPC.LEFTOVER_PROCESSES_STOP, processId),
+  },
+
   keybindings: {
     probeGlobal: (combos: string[]) => ipcRenderer.invoke(IPC.KEYBINDINGS_PROBE_GLOBAL, combos),
   },
@@ -404,6 +425,7 @@ const api: ElectronAPI = {
     listBranches: () => ipcRenderer.invoke(IPC.GIT_LIST_BRANCHES),
     diffFiles: (input) => ipcRenderer.invoke(IPC.GIT_DIFF_FILES, input),
     fileContent: (input) => ipcRenderer.invoke(IPC.GIT_FILE_CONTENT, input),
+    fileImage: (input) => ipcRenderer.invoke(IPC.GIT_FILE_IMAGE, input),
     subscribeDiff: (worktreePath) => ipcRenderer.send(IPC.GIT_DIFF_SUBSCRIBE, worktreePath),
     unsubscribeDiff: (worktreePath) => ipcRenderer.send(IPC.GIT_DIFF_UNSUBSCRIBE, worktreePath),
     checkPendingChanges: (input) => ipcRenderer.invoke(IPC.GIT_CHECK_PENDING_CHANGES, input),
@@ -675,6 +697,12 @@ const api: ElectronAPI = {
       ipcRenderer.on(IPC.BOARD_CONFIG_CHANGED, handler);
       return () => ipcRenderer.removeListener(IPC.BOARD_CONFIG_CHANGED, handler);
     },
+    onWarnings: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, projectId: string, warnings: string[]) => callback(projectId, warnings);
+      ipcRenderer.on(IPC.BOARD_CONFIG_WARNINGS, handler);
+      return () => ipcRenderer.removeListener(IPC.BOARD_CONFIG_WARNINGS, handler);
+    },
+    getLastWarnings: (projectId: string) => ipcRenderer.invoke(IPC.BOARD_CONFIG_GET_LAST_WARNINGS, projectId),
     onShortcutsChanged: (callback) => {
       const handler = (_event: Electron.IpcRendererEvent, projectId: string) => callback(projectId);
       ipcRenderer.on(IPC.BOARD_CONFIG_SHORTCUTS_CHANGED, handler);
@@ -782,15 +810,50 @@ const api: ElectronAPI = {
   },
 
   transcripts: {
-    get: (input) => ipcRenderer.invoke(IPC.TRANSCRIPT_GET, input),
+    // Main relays the retrieval worker's JSON untouched (a long conversation
+    // is several MB); it is parsed here, in the renderer's process.
+    get: async (input) => {
+      const reply: unknown = await ipcRenderer.invoke(IPC.TRANSCRIPT_GET, input);
+      return typeof reply === 'string' ? JSON.parse(reply) : reply;
+    },
     listSessions: (taskId, projectId) =>
       ipcRenderer.invoke(IPC.TRANSCRIPT_LIST_SESSIONS, taskId, projectId),
   },
 
-  memory: {
-    getStatus: () => ipcRenderer.invoke(IPC.MEMORY_STATUS),
-    prewarm: () => ipcRenderer.send(IPC.MEMORY_PREWARM),
-    rebuildIndex: (projectId) => ipcRenderer.invoke(IPC.MEMORY_REBUILD_INDEX, projectId),
+  knowledgeGraph: {
+    getStatus: () => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_STATUS),
+    prewarm: (chat) => ipcRenderer.send(IPC.KNOWLEDGE_GRAPH_PREWARM, chat),
+    endChat: (chatId) => ipcRenderer.send(IPC.KNOWLEDGE_GRAPH_END_CHAT, chatId),
+    rebuildPlan: () => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_REBUILD_PLAN),
+    rebuildIndex: () => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_REBUILD_INDEX),
+    taskSummary: (projectId, taskId) => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_TASK_SUMMARY, projectId, taskId),
+    graphSnapshot: (projectId, knownProjectionKey) => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_SNAPSHOT, projectId, knownProjectionKey),
+    graphProjects: () => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_PROJECTS),
+    refreshGraph: (projectId) => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_REFRESH, projectId),
+    answerFromGraph: (
+      question: string,
+      projectId?: string | null,
+      granularity?: string,
+      requestId?: string,
+      context?: KnowledgeGraphAnswerContext,
+    ) => ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_ANSWER, question, projectId, granularity, requestId, context),
+    relatedToTask: (taskId: string, projectId?: string | null) =>
+      ipcRenderer.invoke(IPC.KNOWLEDGE_GRAPH_RELATED_TO_TASK, taskId, projectId),
+    onGraphChanged: (callback: (projectId: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, projectId: string) => callback(projectId);
+      ipcRenderer.on(IPC.KNOWLEDGE_GRAPH_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC.KNOWLEDGE_GRAPH_CHANGED, handler);
+    },
+    onGraphBuildProgress: (callback: (projectId: string, progress: KnowledgeGraphBuildProgress) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, projectId: string, progress: KnowledgeGraphBuildProgress) => callback(projectId, progress);
+      ipcRenderer.on(IPC.KNOWLEDGE_GRAPH_BUILD_PROGRESS, handler);
+      return () => ipcRenderer.removeListener(IPC.KNOWLEDGE_GRAPH_BUILD_PROGRESS, handler);
+    },
+    onAnswerStream: (callback: (event: KnowledgeGraphAnswerStreamPush) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, push: KnowledgeGraphAnswerStreamPush) => callback(push);
+      ipcRenderer.on(IPC.KNOWLEDGE_GRAPH_ANSWER_STREAM, handler);
+      return () => ipcRenderer.removeListener(IPC.KNOWLEDGE_GRAPH_ANSWER_STREAM, handler);
+    },
   },
 
   platform: process.platform,
@@ -815,14 +878,18 @@ if (__KANGENTIC_DEV__) {
   const PREVIEW_TITLE_FLAG = '--kangentic-preview-task-title=';
   const previewTitleArg = process.argv.find((arg) => arg.startsWith(PREVIEW_TITLE_FLAG));
   const previewTaskTitle = previewTitleArg
-    ? Buffer.from(previewTitleArg.slice(PREVIEW_TITLE_FLAG.length), 'base64').toString('utf-8')
+    ? decodeBase64Utf8(previewTitleArg.slice(PREVIEW_TITLE_FLAG.length))
     : null;
   api.dev = {
     createEphemeralProject: () => ipcRenderer.invoke(IPC.DEV_CREATE_EPHEMERAL_PROJECT),
     seedGitChanges: (targetPaths: string[]) => ipcRenderer.invoke(IPC.DEV_SEED_GIT_CHANGES, targetPaths),
-    seedEmbeddingBacklog: (count: number) => ipcRenderer.invoke(IPC.DEV_SEED_EMBEDDING_BACKLOG, count),
     seedLargeConversation: (count: number) => ipcRenderer.invoke(IPC.DEV_SEED_LARGE_CONVERSATION, count),
     seedUsageData: (days: number) => ipcRenderer.invoke(IPC.DEV_SEED_USAGE_DATA, days),
+    seedKnowledgeGraph: (options: { documentCount?: number; chunksPerDocument?: number; embeddingBacklog?: number }) =>
+      ipcRenderer.invoke(IPC.DEV_SEED_KNOWLEDGE_GRAPH, options),
+    seedKnowledgeGraphReal: (options: { documentLimit?: number; sourceProject?: string; embeddingBacklog?: number }) =>
+      ipcRenderer.invoke(IPC.DEV_SEED_KNOWLEDGE_GRAPH_REAL, options),
+    seedKnowledgeGraphDemo: (plan: DevSeedKnowledgeGraphDemoPlan) => ipcRenderer.invoke(IPC.DEV_SEED_KNOWLEDGE_GRAPH_DEMO, plan),
     isEphemeralPreview,
     previewTaskTitle,
   };

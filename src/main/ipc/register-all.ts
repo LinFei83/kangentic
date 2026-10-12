@@ -10,6 +10,11 @@ import { trackFeatureUsed, isKnownAnalyticsFeature } from '../analytics/usage';
 import { ProjectRepository } from '../db/repositories/project-repository';
 import { ProjectGroupRepository } from '../db/repositories/project-group-repository';
 import { SessionManager } from '../pty/session-manager';
+import { UtilityPtyHostTransport } from '../pty/host/utility-pty-host-transport';
+import { setOffMainExecutor } from '../utility-process/off-main-exec';
+import { setOffMainPtySpawner } from '../utility-process/off-main-pty';
+import { setOffMainCliSpawner } from '../utility-process/off-main-cli';
+import { PATHS } from '../config/paths';
 import { ConfigManager } from '../config/config-manager';
 import { BoardConfigManager } from '../config/board-config-manager';
 import { DiffWatcher } from '../git/diff-watcher';
@@ -26,6 +31,7 @@ import {
   pruneStaleWorktreeProjects as pruneStaleWorktreeProjectsImpl,
   openProjectByPath as openProjectByPathImpl,
   activateAllProjects as activateAllProjectsImpl,
+  recoverSessionsAfterPtyHostLoss,
   getLastOpenedProject as getLastOpenedProjectImpl,
 } from './handlers/projects';
 import { registerTaskCrudHandlers } from './handlers/task-crud';
@@ -34,6 +40,7 @@ import { registerTaskMoveHandlers } from './handlers/task-move';
 import { registerTaskBranchHandlers } from './handlers/task-branch';
 import { registerTaskRuntimeOverrideHandlers } from './handlers/task-runtime-override';
 import { registerSessionHandlers } from './handlers/sessions';
+import { registerLeftoverProcessHandlers } from './handlers/leftover-processes';
 import { startMetricsSnapshotTimer } from './handlers/metrics-snapshot-timer';
 import { registerTransientSessionHandlers } from './handlers/transient-sessions';
 import { registerTranscriptionHandlers } from './handlers/transcription';
@@ -55,8 +62,16 @@ import { MobileBridgeService } from '../mobile-bridge/mobile-bridge-service';
 import { BoardEventBus } from '../mobile-bridge/board-event-bus';
 import { DesktopNotifier } from '../notifications/desktop-notifier';
 import { ActivityIntervalRecorder } from '../activity-engine/activity-interval-recorder';
+import { CommandTerminalNamer } from '../agent/shared/command-terminal-namer';
+import { CommandTerminalLeftoverReaper } from './helpers/command-terminal-leftovers';
+import { reapTaskLeftovers } from './helpers/task-cleanup';
+import { isShuttingDown } from '../shutdown-state';
+import { agentRegistry } from '../agent/agent-registry';
 import { ActivityIntervalStore } from '../activity-engine/activity-interval-store';
-import { getProjectDb } from '../db/database';
+import { getOpenProjectDb, getProjectDb } from '../db/database';
+import { TranscriptRepository } from '../db/repositories/transcript-repository';
+import { SessionRepository } from '../db/repositories/session-repository';
+import { fillEarlierRunResultTokens } from './handlers/session-metrics';
 import { getProjectRepos } from './helpers';
 import { KANGENTIC_HOSTED_RELAY_URL, resolveRelayUrl } from '../../shared/relay';
 import type { IpcContext } from './ipc-context';
@@ -94,7 +109,54 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   // TerminalSubmitScheduler layers task-keyed scheduling (cancel,
   // fresh-spawn wait, drag-burst coalesce) on top. pasteEngine remains for
   // now until Step 4 of the migration deletes it.
-  const sessionManager = new SessionManager();
+  // Every PTY runs in the `kangentic-pty-host` utility process, so terminal
+  // output never crosses this process's event loop. Forked now, ahead of the
+  // first spawn.
+  const ptyHostTransport = new UtilityPtyHostTransport({ projectsDir: PATHS.projectsDir });
+  const sessionManager = new SessionManager({ ptyHostTransport });
+  ptyHostTransport.start();
+  // One-shot child processes (version probes, help-text reads, gh and git
+  // checks) run in the pty host too: on Windows each spawn's CreateProcess is
+  // synchronous on the calling thread.
+  setOffMainExecutor((request, timeoutMs) => sessionManager.execInPtyHost(request, timeoutMs));
+  // And the probes' short-lived PTYs, so main never runs node-pty at all.
+  setOffMainPtySpawner((file, args, options) => sessionManager.spawnRawInPtyHost(file, args, options));
+  // And the agent CLIs' headless runs (Ask, task summaries, auto-name), which
+  // a summary backfill starts dozens of times a minute.
+  setOffMainCliSpawner((command, args, options) => sessionManager.spawnCliInPtyHost(command, args, options));
+  // Raw terminal transcripts, each written to its session's own project. The
+  // pty host writes them over its own connection; this sink is what the host
+  // core uses if it ever falls back to running in this process. A project
+  // whose database is not open (a deleted one) drops the flush rather than
+  // creating the file again. Sending each 64 KB piece across processes
+  // instead was measured under a heavy terminal and cost main 13 times the
+  // major-GC time (48 collections against 8 in 15 s) for the structured clones.
+  const transcriptRepositories = new WeakMap<object, TranscriptRepository>();
+  sessionManager.enableTranscripts((projectId) => {
+    const db = getOpenProjectDb(projectId);
+    if (!db) return null;
+    let repository = transcriptRepositories.get(db);
+    if (!repository) {
+      repository = new TranscriptRepository(db);
+      transcriptRepositories.set(db, repository);
+    }
+    return repository;
+  });
+  // A resumed session is a new record, so its tool-call count and per-tool
+  // table come partly from the track's earlier records. A project whose
+  // database is not open contributes nothing rather than being opened again.
+  sessionManager.setEarlierRunsSource({
+    readToolTotals: (session) => {
+      const db = getOpenProjectDb(session.projectId);
+      if (!db) return { toolCallCount: 0, toolBreakdown: [] };
+      return new SessionRepository(db).getEarlierRunToolTotals(session.taskId, session.isolatedSwimlaneId ?? null, session.id);
+    },
+    fillMissingResultTokens: async (session) => {
+      const db = getOpenProjectDb(session.projectId);
+      if (!db) return false;
+      return fillEarlierRunResultTokens(sessionManager, new SessionRepository(db), session.id, { queued: true });
+    },
+  });
   const pasteEngine = createPasteEngine(sessionManager);
   const terminalSubmit = new TerminalSubmit(sessionManager, pasteEngine);
   const terminalSubmitScheduler = new TerminalSubmitScheduler(sessionManager, terminalSubmit);
@@ -209,10 +271,53 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   });
   activityIntervalRecorder.start();
 
+  // Command Terminals are named here, from the first prompt, so a terminal a
+  // phone started (or one in a project not open on the desktop) gets a name.
+  const commandTerminalNamer = new CommandTerminalNamer({
+    sessionManager,
+    getAdapter: (agentName) => agentRegistry.get(agentName),
+    readConfig: (projectRoot, agentName) => {
+      const config = requireContext().configManager.getEffectiveConfig(projectRoot);
+      return {
+        rateLimitPerHour: config.autoNameRateLimitPerHour ?? 60,
+        cliPathOverride: config.agent.cliPaths[agentName] ?? null,
+      };
+    },
+  });
+  commandTerminalNamer.start();
+
+  // What a Command Terminal's agent detached is reaped (and reported) once the
+  // terminal ends and any agent still exiting has finished.
+  const commandTerminalLeftovers = new CommandTerminalLeftoverReaper({
+    sessionManager,
+    reap: (projectPath, task) => reapTaskLeftovers(requireContext(), projectPath, [task]),
+    isShuttingDown,
+  });
+  commandTerminalLeftovers.start();
+
   const effectiveConfig = context.configManager.getEffectiveConfig(context.currentProjectPath ?? undefined);
   mobileBridgeService.reconcile({
     enabled: effectiveConfig.mobileBridge?.enabled ?? false,
     relayUrl: resolveRelayUrl(effectiveConfig.mobileBridge),
+  });
+
+  // A pty host crash ends every PTY it held; each was reported exited with a
+  // non-zero code. Once a new host (or the in-process fallback) is up, the
+  // agent sessions resume as they would after a hard shutdown.
+  const sessionsLostToPtyHost = new Map<string, Set<string>>();
+  sessionManager.on('pty-host-lost', (sessionIds: string[]) => {
+    for (const sessionId of sessionIds) {
+      const projectId = sessionManager.getSessionProjectId(sessionId);
+      if (!projectId) continue;
+      const lost = sessionsLostToPtyHost.get(projectId) ?? new Set<string>();
+      lost.add(sessionId);
+      sessionsLostToPtyHost.set(projectId, lost);
+    }
+  });
+  sessionManager.on('pty-host-restarted', () => {
+    const lostByProject = new Map(sessionsLostToPtyHost);
+    sessionsLostToPtyHost.clear();
+    if (lostByProject.size > 0 && context) void recoverSessionsAfterPtyHostLoss(context, lostByProject);
   });
 
   registerProjectHandlers(context);
@@ -222,6 +327,7 @@ export function registerAllIpc(mainWindow: BrowserWindow, mcpServerHandle: McpHt
   registerTaskBranchHandlers(context);
   registerTaskRuntimeOverrideHandlers(context);
   registerSessionHandlers(context);
+  registerLeftoverProcessHandlers(context);
   registerTransientSessionHandlers(context);
   registerTranscriptionHandlers(context);
   registerBoardHandlers(context);

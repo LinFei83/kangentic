@@ -46,7 +46,8 @@ This subsystem aims to be near-100% accurate: notification fires within seconds 
                                                           ▼
                                                 ┌────────────────────┐
                                                 │ ProcessTreeProbe   │
-                                                │ Win: Get-CimInstance│
+                                                │ (pty host)         │
+                                                │ Win: Toolhelp      │
                                                 │ POSIX: ps -A       │
                                                 └────────────────────┘
 ```
@@ -61,7 +62,7 @@ The engine itself is split across modules under `activity-engine/engine/`. Exter
 | `src/main/activity-engine/engine/activity-engine.ts` | Engine class - lifecycle + orchestration (delegates to the modules below) |
 | `src/main/activity-engine/engine/shapes.ts` | `SessionEngineState`, `ActivityEngineOptions`, `TransitionRecord`, `PendingTool`, event sets, default thresholds |
 | `src/main/activity-engine/engine/predicate.ts` | Pure `derivePredicate` / `deriveReason` / `deriveActivityAndReason` - no engine reference, no mutation |
-| `src/main/activity-engine/engine/event-handlers.ts` | Pure `updateCounters` / `updatePermissionFlag` - the big switch on event type |
+| `src/main/activity-engine/engine/event-handlers.ts` | Pure `updateCounters` / `updatePermissionFlag` - the big switch on event type - plus `releaseSubagentSlots`, the one way a reset zeroes `subagentDepth` |
 | `src/main/activity-engine/engine/counter-snapshot.ts` | `snapshotCounters` and `formatCounterDelta` for the audit log |
 | `src/main/activity-engine/engine/state-factory.ts` | `createSessionEngineState` initial-state factory |
 | `src/main/activity-engine/engine/watchdog.ts` | `WatchdogHold` table + `findActiveWatchdogHold` lookup - declarative safety nets |
@@ -73,7 +74,7 @@ Surrounding infrastructure:
 |------|------|
 | `src/main/activity-engine/session-telemetry.ts` | Wires the engine to event ingestion + PTY tracker + watchers + user-interrupt coordinator |
 | `src/main/activity-engine/user-interrupt-coordinator.ts` | 3-second settle timer for Ctrl+C; synthesizes Interrupted if engine still hot |
-| `src/main/activity-engine/usage-accumulator.ts` | Per-tool usage stats (call count, cost, tokens) |
+| `src/main/activity-engine/usage-accumulator.ts` | Per-tool usage stats (call count, run time paired by `toolId`, calls that waited on the user, cost, tokens) |
 | `src/main/activity-engine/pr-command-detector.ts` | PR command pattern detector |
 | `src/main/activity-engine/push-command-detector.ts` | `git push` destination capture: remembers the branch a Bash push named on ToolStart, reports it on that call's ToolEnd (paired by `toolId`) as the task's `pushed_branch` PR anchor; parser in `src/main/git/push-command.ts` |
 | `src/main/activity-engine/pty-activity-tracker.ts` | PTY-byte fallback for non-hook agents |
@@ -81,10 +82,10 @@ Surrounding infrastructure:
 | `src/main/activity-engine/background-shell/process-tree.ts` | Cross-platform descendant enumeration; `listAllProcesses` shared once per cycle |
 | `src/main/activity-engine/background-shell/resume.ts` | Resume-time orphan adoption |
 | `src/main/activity-engine/background-shell/looks-like-shell-id.ts` | Shell-id shape gate |
-| `src/main/agent/event-bridge.js` | Generic hook-to-JSONL bridge; decodes typed `<kind>:<base64(JSON)>` directives (extractTool, extractDetail, setTypeWhen, ...) built by `src/main/agent/shared/directive-builders.ts`. The events-path argument is either a literal path or the sentinel `env:<NAME>`, resolved from the hook process environment at run time - used by adapters whose CLI has no per-session settings mechanism (Grok): one static per-cwd hook file routes each session's events via that session's own spawn env, and a session without the variable (the user's own manual CLI run) is a silent no-op |
+| `src/main/agent/event-bridge.js` | Generic hook-to-JSONL bridge; decodes typed `<kind>:<base64(JSON)>` directives (extractTool, extractToolId, extractSubagentId, extractDetail, setTypeWhen, ...) built by `src/main/agent/shared/directive-builders.ts`. The events-path argument is either a literal path or the sentinel `env:<NAME>`, resolved from the hook process environment at run time - used by adapters whose CLI has no per-session settings mechanism (Grok): one static per-cwd hook file routes each session's events via that session's own spawn env, and a session without the variable (the user's own manual CLI run) is a silent no-op |
 | `src/main/agent/adapters/claude/hook-manager.ts` | Claude Code hook configuration |
 | `src/main/agent/adapters/claude/permission-rejection-transcript.ts` | Manual-deny detector (task #640): scans the durable transcript for a rejected `tool_result` no hook can report |
-| `src/shared/types.ts` | `ActivityState`, `ActivityReason`, `EventType`, `SessionEvent.toolId` |
+| `src/shared/types.ts` | `ActivityState`, `ActivityReason`, `EventType`, `SessionEvent.toolId`, `SessionEvent.subagentId` |
 
 ## ActivityState
 
@@ -195,7 +196,7 @@ The 24 `EventType` values written to `events.jsonl` by `event-bridge.js`, define
 | `SessionStart` | `session_start` | log-only | Session began; carries adapter session metadata |
 | `SessionEnd` | `session_end` | log-only | Session ended (CLI process exited) |
 | `SubagentStart` | `subagent_start` | `thinking` | Main agent spawned a child agent |
-| `SubagentStop` | `subagent_stop` | log-only | Subagent returned; depth counter decrements - EXCEPT an empty-string `detail` ("") which is a spurious inner-loop stop and is ignored (see "Subagent depth") |
+| `SubagentStop` | `subagent_stop` | log-only | Subagent returned; depth counter decrements - EXCEPT an empty-string `detail` ("") which is a spurious inner-loop stop, and a stop whose `subagentId` has already stopped, which is a duplicate. Both are ignored (see "Subagent depth") |
 | `Notification` | `notification` | log-only | Informational notification from the agent |
 | `IdleHint` | `idle_hint` | conditional idle | "Waiting for your input" notification, classified at the source. Ends the turn only when no other holder remains; otherwise log-only (see "Idle hints" below) |
 | `Compact` | `compact` | `thinking` | Context-window compaction in progress |
@@ -291,11 +292,21 @@ Set on any "thinking-initiating" event (`ToolStart`, `Prompt`, `SubagentStart`, 
 
 ### Subagent depth
 
-Tracks nested subagent invocations. `SubagentStart` increments; a `SubagentStop` decrements (clamped to 0), **except a `SubagentStop` whose `detail` is the empty string `""`, which is ignored** (it bumps the `ignoredInnerSubagentStop` compensation counter instead). A subagent runs synchronously inside the parent's turn, so when its inner loop finishes it fires a `Stop` hook (mapped to `Idle`) **while it is still tracked as live**. That `Idle` is the subagent's, not the parent's: the engine therefore does NOT clear the parent's `turnActive` when `subagentDepth > 0` (the parent is blocked on / about to consume the subagent result and has not finished).
+Tracks nested subagent invocations. `SubagentStart` increments; a `SubagentStop` decrements (clamped to 0), **except a `SubagentStop` whose `detail` is the empty string `""`, which is ignored** (it bumps the `ignoredInnerSubagentStop` compensation counter instead), **and a named stop whose `subagentId` already stopped**, which is a duplicate and is also ignored (see "Duplicate named stops" below). A subagent runs synchronously inside the parent's turn, so when its inner loop finishes it fires a `Stop` hook (mapped to `Idle`) **while it is still tracked as live**. That `Idle` is the subagent's, not the parent's: the engine therefore does NOT clear the parent's `turnActive` when `subagentDepth > 0` (the parent is blocked on / about to consume the subagent result and has not finished).
 
 The parent's own Stop **used** to arrive only after every subagent had returned (i.e. at `subagentDepth === 0`). That is no longer true. Claude Code now dispatches Agent subagents in the **background**: measured on session `7faa4308`, `PreToolUse` to `PostToolUse` for the Agent tool averaged **1.7s** while the agents themselves lived 2 to 19 minutes. The parent's turn ends, the agents keep working, and the main loop is auto-re-invoked on completion with no user action. So a parent `Stop` now routinely arrives with agents live, and `subagentDepth` is the **only** signal keeping the board honest during that window - which is why losing it (task #532, see Layer D above) produced multi-minute false idles rather than a cosmetic glitch.
 
-Why the empty-string skip: a real capture (session `87524f38`, task #234 running 3 parallel `Explore` agents then a `Plan` agent) showed every subagent emit **two** stops - a spurious empty-detail (`detail: ""`) inner-loop stop when its inner turn ends, then its authoritative **named** terminal stop (`detail: "Explore"` / `"Plan"`) when the Task tool returns. Counting the empty inner stops drove `subagentDepth` to 0 while subagents were still live, so a later real `Idle` (an Explore inner stop) or `idle_hint` ("waiting for your input", the ~69s Plan window) ended the parent turn early - the board went idle for the tail of the run (task #237, the inverse of a false-active). Ignoring the empty-string inner stops keeps `subagentDepth` accurate so the depth-0 gates above do their job. The guard is strictly `detail === ''`: a detail-**less** stop (no `detail` field, e.g. `session-008`'s hand-crafted stream) and a named stop are real terminal stops and still decrement. Pinned by the `session-017-false-idle-during-live-subagent` (the earlier ordering) and `session-018-parallel-subagent-false-idle` (the harder ordering, this fix) replay fixtures; the raw hook payloads confirm a subagent-context Stop carries `agent_id` while the main-agent Stop does not.
+Why the empty-string skip: a real capture (session `87524f38`, task #234 running 3 parallel `Explore` agents then a `Plan` agent) showed every subagent emit **two** stops - a spurious empty-detail (`detail: ""`) inner-loop stop when its inner turn ends, then its authoritative **named** terminal stop (`detail: "Explore"` / `"Plan"`) when the Task tool returns. Counting the empty inner stops drove `subagentDepth` to 0 while subagents were still live, so a later real `Idle` (an Explore inner stop) or `idle_hint` ("waiting for your input", the ~69s Plan window) ended the parent turn early - the board went idle for the tail of the run (task #237, the inverse of a false-active). Ignoring the empty-string inner stops keeps `subagentDepth` accurate so the depth-0 gates above do their job. The guard is strictly `detail === ''`: a detail-**less** stop (no `detail` field, e.g. `session-008`'s hand-crafted stream) and a named stop are real terminal stops and still decrement, unless the named stop's `subagentId` already stopped (see below). Pinned by the `session-017-false-idle-during-live-subagent` (the earlier ordering) and `session-018-parallel-subagent-false-idle` (the harder ordering, this fix) replay fixtures; the raw hook payloads confirm a subagent-context Stop carries `agent_id` while the main-agent Stop does not.
+
+**Duplicate named stops (task #759).** One agent can also fire two NAMED stops. A background subagent that ends its turn with plain text, without calling `SubagentHandback`, fires a named stop; the CLI then injects `[handback-send-enforce]`, the subagent runs again, calls the handback, and fires a second named stop. Counting both took a live sibling's slot. In the captured incident (task #757, session `a0797fa5`) the correctness `review-finder` did this while a background `test-builder` was running, depth reached 0, and the parent's Stop passed the depth-0 gate: 49s of false idle. The Claude adapter now extracts `agent_id` from `SubagentStart` and `SubagentStop` into the generic `SessionEvent.subagentId` (the `extractSubagentId` directive, its own wire kind, so a stale bridge copy is a logged no-op), and the engine keeps a ledger of each id's last lifecycle event (`subagentLifecycleById`):
+
+- A start marks its id live. A `SendMessage` continuation fires a fresh `SubagentStart` under the same id (captured on CLI 2.1.290), so a start always re-opens the id.
+- A stop for an id whose last event was already a stop is ignored and bumps `duplicateSubagentStop`. Any other stop decrements as before and marks its id stopped.
+- The empty-detail guard runs first and never records an id, so a subagent's inner stops cannot pre-mark it stopped.
+- Every path that force-zeroes the depth (the Interrupted / `turn_failed` bypass, `forceIdle`, the `stuck-subagent` hold) goes through `releaseSubagentSlots`, which also marks the live ids stopped, so a late stop from a released agent cannot take the slot of one started after the reset. The live `turn_retrying` hold preserves the depth (#532) and the ledger with it.
+- An event with no id, or an empty one, never touches the ledger, so other adapters, older payloads, and every earlier fixture keep the count-based decrement. The ledger is FIFO-capped at `MAX_TRACKED_SUBAGENT_IDS`; an evicted id falls back to the count.
+
+Known residual, not fixed: the depth drops at the FIRST stop, so during the ~12s re-run the re-prompted agent is uncounted. If it is the only live subagent, a parent Stop in that window can commit idle until the re-run's next `tool_start` re-arms `turnActive`. Pinned by `session-030-duplicate-named-subagent-stop` (ids augmented, since the bridge did not record them at the time); with the ids stripped the same stream idles on `event:idle`.
 
 ### Background-shell tracking (Set + anonymous fallback)
 
@@ -410,9 +421,9 @@ Any of the three freezes the anchor at the last genuine hook / output growth / r
 
 **Fast heal for the heartbeat-forced case (30s, not 180s).** Freezing the anchor is only half the fix for `turnForcedByHeartbeat`: `lastSignalAt` is frozen at the moment output stopped growing, but the hold still waited the general 180s from there before task #331/#364's follow-up. A hook-less `--resume` resume-picker turn is a distinct class from a genuine `idle_hint`/`retryFailurePending` parked turn - it can never receive ANY confirming hook, so once `lastSignalAt` freezes there is nothing further to wait for. The stale-thinking hold's `effectiveThreshold` therefore checks `state.turnForcedByHeartbeat` FIRST (before the `idleHintPending` short grace) and, when set, uses `DEFAULT_STALE_AFTER_HEARTBEAT_FORCED_MS` (30s) instead of `staleThinkingTimeoutMs` (180s). The anchor is unchanged (still `signal`), so this only shortens how long the net waits once frozen - a live reload that is still genuinely generating keeps refreshing `lastSignalAt` via output-token growth and never reaches the grace. The 30s value is reasoned, not empirically calibrated: it is safe because a too-aggressive heal self-corrects (the next output-growth status write re-triggers `forceThinking(sessionId, true)` via the same idle → thinking heartbeat recovery), so the worst case is a brief idle blip, not a stuck-wrong state. Reuses the stale-thinking hold's `timer:stale-thinking` trigger and `staleThinking` counter rather than adding a new one - a trace cannot distinguish the fast 30s heal from the slow 180s net except by the transition's timestamp relative to when output froze. Pinned by `session-024-fast-heal-hook-less-resume` (enabled vs. disabled-grace red-green) and `session-022-false-active-repainting-past-180s` (updated to assert the tighter 30s deadline).
 
-### 4. Stuck-pending-tools watchdog (5 min)
+### 4. Stuck-pending-tools watchdog (5 min, or 180s once an idle_hint is pending)
 
-Held by `pendingToolCount > 0` alone for 5 minutes. Common cause: user pressed Ctrl+C, the agent killed the bash, but `PostToolUseFailure` didn't propagate. Without this hatch the engine would be stuck in `thinking` forever - the stale-thinking watchdog requires `pendingToolCount === 0` to fire, the bg-shell holds require bg shells, and the Idle clamp only works when Idle actually fires.
+Held by `pendingToolCount > 0` alone for 5 minutes. When an `idle_hint` is pending, the 180s `staleAfterIdleHintMs` budget replaces the cap: the agent reported it is waiting for input while a tool is still pending, so that tool's PostToolUse was lost in an aborted or errored turn. Common cause: user pressed Ctrl+C, the agent killed the bash, but `PostToolUseFailure` didn't propagate. Without this hatch the engine would be stuck in `thinking` forever - the stale-thinking watchdog requires `pendingToolCount === 0` to fire, the bg-shell holds require bg shells, and the Idle clamp only works when Idle actually fires.
 
 Resets `pendingToolCount`, the stack, `currentTool`, AND `turnActive` (the matching Stop hook for this turn was lost along with the PostToolUse). Goes through the stability window for the same reason as the bg-shell holds.
 
@@ -420,7 +431,7 @@ This hold is anchored to the FRESHER of `lastSignalAt` and `lastPtyOutputAt` (`a
 
 ### 5. Stuck-subagent watchdog (5 min)
 
-Held by `subagentDepth > 0` alone (no pending tools, no bg shells, no permission) for 5 minutes. Because the empty-string inner-stop skip (see "Subagent depth") makes `subagentDepth` sticky, a subagent whose authoritative **named** terminal `SubagentStop` is dropped (only its ignored empty inner stop arrived) would leave depth stuck > 0 forever: every other watchdog hold gates on `subagentDepth === 0`, and the `PtyActivityTracker`'s `forceIdle` (which zeroes depth) is suppressed for hook-active agents. This hold is the only recovery. It resets `subagentDepth` (and `turnActive`) and emits synthetic `Idle/Timeout`. Anchored to `signal-or-pty-output` and capped at the long 5-min threshold, so a genuinely live subagent - which refreshes the anchor via its nested tool events and streaming output - never trips it; it fires only after a real, long silence. Disjoint from the holds above by its `subagentDepth > 0` predicate. Tallied as the `stuckSubagent` compensation counter (task #237).
+Held by `subagentDepth > 0` alone (no pending tools, no bg shells, no permission) for 5 minutes. Because the empty-string inner-stop skip (see "Subagent depth") makes `subagentDepth` sticky, a subagent whose authoritative **named** terminal `SubagentStop` is dropped (only its ignored empty inner stop arrived) would leave depth stuck > 0 forever: every other watchdog hold gates on `subagentDepth === 0`, and the `PtyActivityTracker`'s `forceIdle` (which zeroes depth) is suppressed for hook-active agents. This hold is the only recovery. It resets `subagentDepth` (and `turnActive`) through `releaseSubagentSlots`, which also marks the live `subagentId`s stopped so a late named stop from a released agent counts as `duplicateSubagentStop` rather than a decrement, and emits synthetic `Idle/Timeout`. Anchored to `signal-or-pty-output` and capped at the long 5-min threshold, so a genuinely live subagent - which refreshes the anchor via its nested tool events and streaming output - never trips it; it fires only after a real, long silence. Disjoint from the holds above by its `subagentDepth > 0` predicate. Tallied as the `stuckSubagent` compensation counter (task #237).
 
 **Exception while BELIEVED parked (`parkedAnchor: 'signal'` via `parkedWhen`).** Task #532 made this hold reachable during a live `turn_retrying`: the retry hold now PRESERVES `subagentDepth` instead of zeroing it, so this hold arbitrates where stale-thinking used to. Without a narrowing of its own, a parked TUI repainting "retrying in Ns..." streams real PTY bytes that would defer this net forever - exactly what #367 closed for stale-thinking. So this hold also sets `parkedAnchor: 'signal'`, but scopes it with its own `parkedWhen` predicate to `retryFailurePending` ALONE, rather than the default three-flag test used by section 3.
 
@@ -499,7 +510,7 @@ Conclusion: agents almost never explicitly end their bg shells. The only reliabl
 The watcher polls every 2 seconds. For each session with `activeShellCount > 0`:
 
 1. Check if the Claude CLI's root PID is alive. If dead, fire `onRootProcessDied` (engine forceIdle).
-2. Enumerate the Claude CLI's descendant processes via `ps` (POSIX) or `Get-CimInstance Win32_Process` (Windows).
+2. Enumerate the Claude CLI's descendant processes from the process table the pty host lists: `ps` (POSIX) or a Toolhelp snapshot (Windows).
 3. **Tier A (PID-aware):** when a named bg shell's OS PID is known (captured by tree-diff or the foreground-tool memo, see below), the watcher (a) fires `onShellPidExited(shellId)` → engine removes by id when the PID leaves the descendant tree, and (b) confirms liveness via `onShellsObservedAlive` → `markBackgroundShellsAlive` whenever every tracked named shell's PID is still present and there are no anonymous shells - even when the Tier B count is out of sync. This churn-proof liveness is what holds a backgrounded `npx playwright test` active while it spawns and kills its own app-under-test shells (tasks #210/#212).
 4. **Tier B (count heuristic):** filter descendants to "shell-like" basenames (bash, sh, cmd, pwsh). If the topmost shell-like count dropped below `preExistingHelpers + tracked` for 2 consecutive cycles AND no foreground tool is pending, fire `onNaturalExit(delta)` capped at the engine's ANONYMOUS count. Named shells are deliberately excluded from the count-based (anonymous) drain (the engine's ambiguity guard refuses an anonymous decrement against a named shell anyway); they are governed by Tier A PID-exit, the transcript drain (a tracked shell's own terminal `<task-notification>` observed directly in the durable session transcript, see below), the output-quiescence reclaim (a PID-less named shell whose output froze while it shows a persistent deficit, see below), and the 5-min named cap as the final backstop.
 
@@ -544,7 +555,9 @@ One caveat since exempt shells were added: `getActiveShellCount` sums them (it h
 
 ### Cross-platform
 
-- **Windows:** `powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Csv -NoTypeInformation"`. Walks the parent map in JS. Times out at 1.5s.
+The table comes from the pty host (`HostProcessTreeProbe` in `src/main/pty/host/host-process-tree-probe.ts`, over the listing in `host-process-table.ts`), so no enumeration runs on main.
+
+- **Windows:** a Toolhelp snapshot through koffi (`listWin32Processes`, the listing the task reap's reader makes). Measured on 410 processes: about 8 ms, with the snapshot call on the thread pool so the host's event loop is held at most 0.66 ms at a time. It replaced a persistent PowerShell child running `Get-CimInstance Win32_Process` (140 ms median warm, 584 ms cold), which returned the same pids, parents and names. That PowerShell probe is still started, for good, the first time the Toolhelp listing fails. Walks the parent map in JS.
 - **POSIX:** `ps -A -o pid=,ppid=,comm=`. Walks the parent map in JS. Times out at 1.5s.
 - **Liveness probe:** `process.kill(pid, 0)`; treats EPERM as alive (matches existing pattern).
 
@@ -569,15 +582,15 @@ The activity icon on each task card is wrapped in a tooltip rendering `ActivityR
 A global setting under **Developer → Activity Engine Debug Overlay** enables a floating panel showing live engine state. Global, not per-project: Developer is a system tab, and the overlay reads `globalConfig` precisely so a project override cannot toggle it. It shows:
 - Current activity + reason for each running session
 - Raw counters (tools, subagents, bg shells)
-- **Compensation counters** (`staleThinking`, `bgShellHatch`, `stuckPendingTools`, `forceThinking`, `forceIdle`, `unmatchedBgShellEnd`, `ignoredInnerSubagentStop`, `stuckSubagent`) - monotonic tallies of silent recovery events. In a clean session all eight read 0; any non-zero value flags a watchdog / forced transition / unattributable or discarded event that did not visibly flip the activity pill. (`ignoredInnerSubagentStop` is the benign exception: non-zero is normal on any session that ran subagents - it is the count of spurious empty-detail inner stops the engine correctly discarded.)
-- Ring buffer of last 10 transitions
+- **Compensation counters** (`staleThinking`, `bgShellHatch`, `stuckPendingTools`, `forceThinking`, `forceIdle`, `unmatchedBgShellEnd`, `ignoredInnerSubagentStop`, `duplicateSubagentStop`, `stuckSubagent`) - monotonic tallies of silent recovery events. In a clean session all nine read 0; any non-zero value flags a watchdog / forced transition / unattributable or discarded event that did not visibly flip the activity pill. (`ignoredInnerSubagentStop` is the benign exception: non-zero is normal on any session that ran subagents - it is the count of spurious empty-detail inner stops the engine correctly discarded. `duplicateSubagentStop` is benign too: it counts second named stops from re-prompted subagents, and late stops from agents whose slot a reset already released, task #759.)
+- The last 5 transitions from the 50-entry ring buffer (the full ring is read through `kangentic_devtools_engine_state`)
 - **PTY chunk timeline** - bucketed PTY arrivals over the last ~120 seconds (100ms buckets) from `ActivityStatsSnapshot.recentPtyChunks`, rendered by `ActivityTimeline` alongside the watchdog deadline (`lastSignalAt + thresholdMs`). Empty in production builds where the trace recorder is dead-code-eliminated.
 
 Polls `getActivityStats(sessionId)` every 2 seconds. Hidden by default - power users discover via Developer settings; bug reporters can enable + screenshot.
 
 ### Reading a transition trace
 
-Each entry in `recentTransitions` (the ring of 50 returned by `getStatsSnapshot` / the MCP `kangentic_devtools_engine_state` tool; the overlay renders the last 10) carries a `trigger` label naming what caused it. The label vocabulary (`TransitionTrigger` in `src/main/activity-engine/engine/shapes.ts`):
+Each entry in `recentTransitions` (the ring of 50 returned by `getStatsSnapshot` / the MCP `kangentic_devtools_engine_state` tool; the overlay renders the last 5) carries a `trigger` label naming what caused it. The label vocabulary (`TransitionTrigger` in `src/main/activity-engine/engine/shapes.ts`):
 
 | Trigger | Meaning |
 |---------|---------|

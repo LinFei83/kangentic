@@ -13,7 +13,7 @@
 import { test, expect } from '@playwright/test';
 import { chromium, type Browser, type Page } from '@playwright/test';
 import path from 'node:path';
-import { waitForViteReady } from './helpers';
+import { waitForViteReady, gotoVite } from './helpers';
 
 const MOCK_SCRIPT = path.join(__dirname, 'mock-electron-api.js');
 const VITE_URL = `http://localhost:${process.env.PLAYWRIGHT_VITE_PORT || '5173'}`;
@@ -27,7 +27,7 @@ async function launchWithState(preConfigScript: string): Promise<{ browser: Brow
   await page.addInitScript({ path: MOCK_SCRIPT });
   await page.addInitScript(preConfigScript);
 
-  await page.goto(VITE_URL);
+  await gotoVite(page, VITE_URL);
   await page.waitForLoadState('load');
   await page.waitForSelector('text=Kangentic', { timeout: 15000 });
 
@@ -43,7 +43,8 @@ const preConfig = `
     files: [
       { path: 'src/blamed.ts', status: 'M', insertions: 2, deletions: 1, original: 'line one\\nline two\\n', modified: 'line one\\nline two changed\\nline three\\n', language: 'typescript' },
       { path: 'assets/deleted.ts', status: 'D', insertions: 0, deletions: 3, original: 'gone\\n', modified: '', language: 'typescript' },
-      { path: 'assets/logo.png', status: 'M', insertions: 0, deletions: 0, binary: true, original: '', modified: '', language: 'plaintext' },
+      // A non-image binary: an image would open in the image view, which has no View options menu at all.
+      { path: 'assets/font.woff2', status: 'M', insertions: 0, deletions: 0, binary: true, original: '', modified: '', language: 'plaintext' },
     ],
     totalInsertions: 2,
     totalDeletions: 4,
@@ -251,7 +252,7 @@ test.describe('DiffViewer: blame gutter', () => {
       await page.locator('[data-testid="changes-toggle"]').click();
     }
 
-    await fileTree.locator('text=logo.png').click();
+    await fileTree.locator('text=font.woff2').click();
     await expect(await openBlameOption(page)).toBeDisabled();
     await closeViewOptions(page);
 

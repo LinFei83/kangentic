@@ -9,46 +9,17 @@
  *   - session-lineage token dedup (latest row per COALESCE(agent_session_id, id),
  *     summed across lineages - a flat SUM would double-count resumed sessions);
  *   - MAX(files_changed) vs SUM for the other counters;
- *   - latest-record scalars (model, exit code, tool breakdown);
+ *   - latest-record scalars (model, exit code);
+ *   - the tool breakdown merged by tool name over every costed record;
  *   - MIN(started_at) / MAX(COALESCE(exited_at, suspended_at)) timeline;
  *   - sessions with NULL total_cost_usd are excluded entirely.
  *
  * Uses a real in-memory better-sqlite3 DB bootstrapped via runProjectMigrations
- * so the schema matches production exactly. Skips cleanly when better-sqlite3
- * cannot load under the test runner's Node ABI (NODE_MODULE_VERSION mismatch
- * under plain system Node); mirrors the probe pattern in
- * usage-history-migration.test.ts.
+ * so the schema matches production exactly.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import type DatabaseType from 'better-sqlite3';
-
-// ---------------------------------------------------------------------------
-// ABI probe - mirrors usage-history-migration.test.ts.
-// ---------------------------------------------------------------------------
-
-function probeBetterSqlite3(): typeof DatabaseType | null {
-  try {
-    // Use a variable for the module name to avoid the static-require lint rule
-    // (which targets string-literal bare requires in bundled main/preload code;
-    // this is a test helper for a native probe, not a bundled require).
-    const moduleName = 'better-sqlite3';
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const nativeModule = require(moduleName) as unknown;
-    const databaseConstructor = (
-      (nativeModule as { default?: typeof DatabaseType }).default ?? nativeModule
-    ) as typeof DatabaseType;
-    const probeHandle = new databaseConstructor(':memory:');
-    probeHandle.close();
-    return databaseConstructor;
-  } catch {
-    return null;
-  }
-}
-
-const Database = probeBetterSqlite3();
-const CAN_RUN = Database !== null;
-
+import Database from 'better-sqlite3';
 import { runProjectMigrations } from '../../src/main/db/migrations/project-schema';
 import { SessionRepository } from '../../src/main/db/repositories/session-repository';
 
@@ -69,12 +40,13 @@ interface SessionFixture {
   linesRemoved?: number | null;
   filesChanged?: number | null;
   toolBreakdown?: string | null;
-  compactionCount?: number | null;
+  /** NOT NULL DEFAULT 0 in the schema, so unlike the metrics above it has no NULL case. */
+  compactionCount?: number;
   modelDisplayName?: string | null;
 }
 
-describe.runIf(CAN_RUN)('SessionRepository.listAllSummaries (real DB)', () => {
-  let db: InstanceType<typeof DatabaseType>;
+describe('SessionRepository.listAllSummaries (real DB)', () => {
+  let db: Database.Database;
   let repository: SessionRepository;
 
   function insertTask(taskId: string, createdAt: string): void {
@@ -111,13 +83,12 @@ describe.runIf(CAN_RUN)('SessionRepository.listAllSummaries (real DB)', () => {
       fixture.linesRemoved ?? null,
       fixture.filesChanged ?? null,
       fixture.toolBreakdown ?? null,
-      fixture.compactionCount ?? null,
+      fixture.compactionCount ?? 0,
       fixture.modelDisplayName ?? null,
     );
   }
 
   beforeEach(() => {
-    if (!Database) return;
     db = new Database(':memory:');
     runProjectMigrations(db);
     repository = new SessionRepository(db);
@@ -201,7 +172,6 @@ describe.runIf(CAN_RUN)('SessionRepository.listAllSummaries (real DB)', () => {
       linesAdded: null,
       linesRemoved: null,
       filesChanged: null,
-      compactionCount: null,
     });
 
     insertSession({
@@ -271,8 +241,11 @@ describe.runIf(CAN_RUN)('SessionRepository.listAllSummaries (real DB)', () => {
     expect(summary.sessionId).toBe('lineage-a');
     expect(summary.modelDisplayName).toBe('Latest Model');
     expect(summary.exitCode).toBe(1);
+    // Every run's rows. A resume is a new record, and the table must add up
+    // across the same records toolCallCount sums.
     expect(summary.toolBreakdown).toEqual([
       { toolName: 'Edit', callCount: 4, totalDurationMs: 900, interruptedCount: 1 },
+      { toolName: 'Bash', callCount: 2, totalDurationMs: 500, interruptedCount: 0 },
     ]);
     expect(summary.taskCreatedAt).toBe('2026-01-01T08:00:00.000Z');
     expect(summary.startedAt).toBe('2026-01-01T09:00:00.000Z');
@@ -294,6 +267,34 @@ describe.runIf(CAN_RUN)('SessionRepository.listAllSummaries (real DB)', () => {
     expect(summary.toolBreakdown).toEqual([]);
   });
 
+  it('merges the breakdown over exactly the records the tool-call count sums', () => {
+    insertTask('task-mixed', '2026-01-06T08:00:00.000Z');
+    insertSession({
+      id: 'record-costed',
+      taskId: 'task-mixed',
+      startedAt: '2026-01-06T09:00:00.000Z',
+      totalCostUsd: 0.5,
+      toolCallCount: 3,
+      toolBreakdown: JSON.stringify([{ toolName: 'Read', callCount: 3, totalDurationMs: 30, interruptedCount: 0 }]),
+    });
+    // No cost, so the count leaves it out; the table must too, or it would not
+    // add up to the count it sits under.
+    insertSession({
+      id: 'record-uncosted-with-tools',
+      taskId: 'task-mixed',
+      startedAt: '2026-01-06T10:00:00.000Z',
+      totalCostUsd: null,
+      toolCallCount: 50,
+      toolBreakdown: JSON.stringify([{ toolName: 'Read', callCount: 50, totalDurationMs: 500, interruptedCount: 0 }]),
+    });
+
+    const summary = repository.listAllSummaries()['task-mixed'];
+
+    expect(summary.toolCallCount).toBe(3);
+    expect(summary.toolBreakdown).toEqual([{ toolName: 'Read', callCount: 3, totalDurationMs: 30, interruptedCount: 0 }]);
+    expect(summary).toEqual(repository.getSummaryForTask('task-mixed'));
+  });
+
   it('returns an empty record when no session has cost data', () => {
     insertTask('task-empty', '2026-01-05T08:00:00.000Z');
     insertSession({
@@ -304,15 +305,5 @@ describe.runIf(CAN_RUN)('SessionRepository.listAllSummaries (real DB)', () => {
     });
 
     expect(repository.listAllSummaries()).toEqual({});
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Skip-notice for environments where better-sqlite3 cannot load.
-// ---------------------------------------------------------------------------
-
-describe.runIf(!CAN_RUN)('SessionRepository.listAllSummaries tests (skipped)', () => {
-  it('skipped - better-sqlite3 cannot load under this Node runtime (NODE_MODULE_VERSION mismatch)', () => {
-    expect(CAN_RUN).toBe(false);
   });
 });

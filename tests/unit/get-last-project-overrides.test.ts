@@ -91,6 +91,10 @@ vi.mock('../../src/main/config/apply-runtime-config', () => ({
 }));
 vi.mock('../../src/main/ipc/helpers', () => ({
   ensureGitignore: vi.fn(),
+  // The open chain reads the sweep options; without them it throws inside the
+  // promise chain and session recovery silently never runs.
+  leftoverSweepOptions: vi.fn(() => ({ stoppingEnabled: () => false, onReport: () => {} })),
+  reapTaskLeftovers: vi.fn(async () => {}),
 }));
 vi.mock('../../src/main/ipc/helpers/project-entry-search', () => ({
   searchProjectEntries: vi.fn(async () => ({ entries: [], truncated: false })),
@@ -219,6 +223,7 @@ interface MockContext {
     applyConfigOnOpen: ReturnType<typeof vi.fn>;
     exportFromDb: ReturnType<typeof vi.fn>;
     getDefaultBaseBranch: ReturnType<typeof vi.fn>;
+    sendOpenWarnings: ReturnType<typeof vi.fn>;
   };
   mainWindow: {
     isDestroyed: ReturnType<typeof vi.fn>;
@@ -254,6 +259,7 @@ function makeContext(
       applyConfigOnOpen: vi.fn(() => []),
       exportFromDb: vi.fn(),
       getDefaultBaseBranch: vi.fn(() => null),
+      sendOpenWarnings: vi.fn(),
     },
     mainWindow: {
       isDestroyed: vi.fn(() => false),

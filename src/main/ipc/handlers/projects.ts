@@ -9,7 +9,6 @@ import { resumeSuspendedSessions, autoSpawnTasks } from '../../transition-engine
 import { cleanupStaleResourcesAsync, pruneOrphanedWorktreeTasks } from '../../transition-engine/resource-cleanup';
 import { SwimlaneRepository } from '../../db/repositories/swimlane-repository';
 import { AutomationRunRepository } from '../../db/repositories/automation-run-repository';
-import { TranscriptRepository } from '../../db/repositories/transcript-repository';
 import { WorktreeManager } from '../../git/worktree-manager';
 import { isGitRepo, isInsideWorktree, isKangenticWorktree, ensureGitRepo, hasCommits } from '../../git/git-checks';
 import { readWorktreeHeadUnqueued } from '../../git/worktree-head';
@@ -18,7 +17,7 @@ import { getProjectDb, closeProjectDb } from '../../db/database';
 import { softly } from '../../db/soft-db';
 import { PATHS } from '../../config/paths';
 import { applyRuntimeConfig } from '../../config/apply-runtime-config';
-import { ensureGitignore } from '../helpers';
+import { ensureGitignore, leftoverSweepOptions, reapTaskLeftovers } from '../helpers';
 import { searchProjectEntries } from '../helpers/project-entry-search';
 import { trackEvent } from '../../analytics/analytics';
 import { trackMilestone, bucketTaskCount } from '../../analytics/usage';
@@ -28,6 +27,8 @@ import { runWithProjectLogContext } from '../../diagnostics/project-log-context'
 import { prRefreshScheduler } from '../../pr/pr-refresh-scheduler';
 import { gitFetchScheduler } from '../../git/git-fetch-scheduler';
 import { retrievalService } from '../../retrieval/retrieval-service';
+import { retrievalClient } from '../../retrieval/retrieval-client';
+import { repairToolBreakdownDurations } from '../helpers/tool-breakdown-repair';
 import { DEFAULT_AGENT } from '../../../shared/types';
 import type { Project, ProjectGroup, Task, AppConfig, ProjectSearchEntriesInput, ProjectRelocateOptions, ProjectPathProbe, ProjectEnsureGitResult, ProjectOpenByPathOverrides } from '../../../shared/types';
 import type { IpcContext } from '../ipc-context';
@@ -114,6 +115,10 @@ export async function cleanupProject(context: IpcContext, projectId: string, pro
   // Guard: project path must exist
   if (!fs.existsSync(projectPath)) {
     console.warn(`[PROJECT_DELETE] Project path does not exist: ${projectPath} -- skipping filesystem cleanup`);
+    // The retrieval worker and the pty host each hold their own connection,
+    // and Windows will not unlink a file another process has open.
+    await retrievalClient.closeProject(projectId);
+    await context.sessionManager.closeProjectInPtyHost(projectId);
     closeProjectDb(projectId);
     const dbPath = PATHS.projectDb(projectId);
     try { fs.unlinkSync(dbPath); } catch { /* may not exist */ }
@@ -132,10 +137,12 @@ export async function cleanupProject(context: IpcContext, projectId: string, pro
 
   // 1. Kill all active PTY sessions belonging to this project's tasks
   let allTasks: Task[] = [];
+  let archivedTasks: Task[] = [];
   try {
     const db = getProjectDb(projectId);
     const taskRepo = new TaskRepository(db);
     allTasks = taskRepo.list();
+    archivedTasks = taskRepo.listArchived();
   } catch (err) {
     console.error('[PROJECT_DELETE] Failed to read tasks:', err);
   }
@@ -159,6 +166,15 @@ export async function cleanupProject(context: IpcContext, projectId: string, pro
       try { context.sessionManager.remove(task.session_id); } catch { /* may already be dead */ }
     }
   }
+  // Every other session of a task, and a spawn still in flight that no
+  // `session_id` names yet: cancelled and waited for, as every terminal
+  // transition does before its reap, so no PTY starts in a worktree about to go.
+  await Promise.all(allTasks.map((task) => context.sessionManager.removeByTaskId(task.id)));
+
+  // Kill whatever every task of the project left running, archived ones too,
+  // once their sessions have exited and before the worktrees go: a live
+  // process holding a worktree as its cwd blocks the removal on Windows.
+  await reapTaskLeftovers(context, projectPath, [...allTasks, ...archivedTasks]);
 
   // 2. Cleanly detach git worktrees (keeps branches with user code intact)
   if (isGitRepo(projectPath)) {
@@ -206,7 +222,10 @@ export async function cleanupProject(context: IpcContext, projectId: string, pro
     }
   } catch { /* may not exist or not readable -- skip */ }
 
-  // 5. Close the project DB connection before deleting files
+  // 5. Close the project DB connections before deleting files: the retrieval
+  // worker's and the pty host's, then main's.
+  await retrievalClient.closeProject(projectId);
+  await context.sessionManager.closeProjectInPtyHost(projectId);
   closeProjectDb(projectId);
 
   // Steps 6-7 modify the project's .gitignore and .kangentic/ directory.
@@ -299,6 +318,8 @@ export async function pruneStaleWorktreeProjects(context: IpcContext): Promise<v
     console.log(`[PRUNE] Removing ephemeral preview project: ${project.name} (${project.path})`);
 
     // Lightweight cleanup: only delete DB records, not worktree filesystem.
+    await retrievalClient.closeProject(project.id);
+    await context.sessionManager.closeProjectInPtyHost(project.id);
     closeProjectDb(project.id);
     const dbPath = PATHS.projectDb(project.id);
     try { fs.unlinkSync(dbPath); } catch { /* may not exist */ }
@@ -455,9 +476,10 @@ function deferBoardConfigReconcile(context: IpcContext, projectId: string, proje
   setImmediate(() => {
     if (context.currentProjectId !== projectId) return;
     runWithProjectLogContext(projectName, () => {
+      let configWarnings: string[] = [];
       try {
         if (context.boardConfigManager.exists()) {
-          const configWarnings = context.boardConfigManager.applyConfigOnOpen();
+          configWarnings = context.boardConfigManager.applyConfigOnOpen();
           for (const warning of configWarnings) {
             console.warn('[BOARD_CONFIG] Initial reconcile:', warning);
           }
@@ -466,7 +488,18 @@ function deferBoardConfigReconcile(context: IpcContext, projectId: string, proje
         context.boardConfigManager.exportFromDb();
       } catch (error) {
         console.error('[PROJECT_OPEN] Deferred board config work failed:', error);
+        // The error itself goes to the log above, not to the banner: its message
+        // can carry an absolute path, and the banner is on screen in demos and
+        // screen shares.
+        configWarnings = [
+          ...configWarnings,
+          'kangentic.json could not be applied, so the board loaded from the local database. The log has the details.',
+        ];
       }
+      // These used to reach only the log, so a broken file left the board on
+      // stale data with nothing on screen saying why. Sent even when empty, so
+      // the previous project's banner does not stay up.
+      context.boardConfigManager.sendOpenWarnings(projectId, configWarnings);
     });
   });
 }
@@ -552,9 +585,6 @@ export async function openProjectByPath(context: IpcContext, projectPath: string
 
   applyRuntimeConfig(context.sessionManager, context.configManager, project.path);
 
-  // Enable transcript capture for cross-agent handoffs
-  context.sessionManager.setTranscriptRepository(new TranscriptRepository(getProjectDb(project.id)));
-
   // A project seeded milliseconds ago reads as a constant (the default lanes,
   // no tasks, no profiles) and project_create already counts it, so its first
   // real view snapshots instead: nothing is marked, so a later switch back or
@@ -581,17 +611,62 @@ export async function openProjectByPath(context: IpcContext, projectPath: string
     runWithProjectLogContext(project.name, () =>
       pruneOrphanedTasksAndNotify(context, openedProject, taskRepo, sessionRepo)
         .then(() => {
-          cleanupStaleResourcesAsync(openedProject.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager, automationRunRepo, notifyRunsInterrupted(context, openedProject.id))
+          cleanupStaleResourcesAsync(openedProject.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager, automationRunRepo, notifyRunsInterrupted(context, openedProject.id), leftoverSweepOptions(context, openedProject.path))
             .catch((error) => console.error(`[PROJECT_OPEN] Resource cleanup failed for ${openedProject.name}:`, error));
           return resumeSuspendedSessions(openedProject.id, openedProject.path, context.sessionManager, context.configManager, openedProject.default_agent, context.mcpServerHandle, openedProject.default_model, openedProject.default_effort, context.boardConfigManager.getBoardProfiles(openedProject.path));
         })
         .catch((err) => console.error('[PROJECT_OPEN] Session recovery failed:', err))
         .then(() => autoSpawnTasks(openedProject.id, openedProject.path, context.sessionManager, context.configManager, openedProject.default_agent, context.mcpServerHandle, openedProject.default_model, openedProject.default_effort, context.boardConfigManager.getBoardProfiles(openedProject.path)))
-        .catch((err) => console.error('[PROJECT_OPEN] Session reconciliation failed:', err)),
+        .catch((err) => console.error('[PROJECT_OPEN] Session reconciliation failed:', err))
+        .then(() => startToolBreakdownRepair(openedProject)),
     );
   }
 
   return project;
+}
+
+/** Project ids whose duration repair is running (see `startToolBreakdownRepair`). */
+const toolBreakdownRepairsInFlight = new Set<string>();
+
+/**
+ * Fire the one-time repair of per-tool durations saved before tool events were
+ * paired by id, once a cold open has finished its own recovery. Background
+ * and best-effort: the event logs are read in the retrieval worker, only
+ * durations are ever patched, and a run that cannot finish leaves the
+ * `schema_meta` flag unset so the next open tries again
+ * (`helpers/tool-breakdown-repair.ts`, which returns at once once the flag is
+ * set). The flag is written only when a run ends, so a second open path that
+ * fires while one runs would replay every log again;
+ * `toolBreakdownRepairsInFlight` skips it.
+ */
+function startToolBreakdownRepair(project: Project): void {
+  if (toolBreakdownRepairsInFlight.has(project.id)) return;
+  try {
+    const db = getProjectDb(project.id);
+    toolBreakdownRepairsInFlight.add(project.id);
+    void repairToolBreakdownDurations(
+      db,
+      path.join(project.path, '.kangentic', 'sessions'),
+      (sessionsDir, sessionIds) => retrievalClient.call(
+        'sessions.replayToolBreakdowns',
+        { sessionsDir, sessionIds },
+        { timeoutMs: null },
+      ),
+    )
+      .then((result) => {
+        if (result.repaired > 0) {
+          console.log(`[TOOL-BREAKDOWN-REPAIR] ${project.name}: corrected tool durations on ${result.repaired} of ${result.scanned} session records`);
+        }
+        if (result.unreadable > 0) {
+          console.warn(`[TOOL-BREAKDOWN-REPAIR] ${project.name}: ${result.unreadable} event logs could not be read; the next open retries them`);
+        }
+      })
+      .catch((error) => console.error(`[TOOL-BREAKDOWN-REPAIR] ${project.name} failed:`, error))
+      .finally(() => toolBreakdownRepairsInFlight.delete(project.id));
+  } catch (error) {
+    toolBreakdownRepairsInFlight.delete(project.id);
+    console.error(`[TOOL-BREAKDOWN-REPAIR] ${project.name} could not start:`, error);
+  }
 }
 
 /**
@@ -636,6 +711,67 @@ function scheduleBoardSnapshot(context: IpcContext, project: Project): void {
       }
     });
   });
+}
+
+/**
+ * The pty host died and a new one is up: resume the agent sessions it took
+ * down, and only those. Each lost PTY was reported exited with a non-zero
+ * code, so its record is an interrupted one and the startup recovery path
+ * resumes it (`--resume`), honouring the auto-resume setting as it does after
+ * a hard shutdown. Then, as startup does, a fresh agent for each lost task the
+ * resume could not bring back (its session had no agent session id yet, so
+ * there was nothing to resume) when its column starts one. Scoped to the lost
+ * ids and their tasks, so a session that exited or was suspended earlier this
+ * run is not woken with them.
+ */
+export async function recoverSessionsAfterPtyHostLoss(
+  context: IpcContext,
+  lostSessionIdsByProject: ReadonlyMap<string, ReadonlySet<string>>,
+): Promise<void> {
+  for (const [projectId, lostSessionIds] of lostSessionIdsByProject) {
+    if (isShuttingDown()) return;
+    const project = context.projectRepo.getById(projectId);
+    if (!project || !fs.existsSync(project.path)) continue;
+    // Read before the resume, which replaces the rows it brings back.
+    const lostTaskIds = new Set(
+      context.sessionManager.listSessions()
+        .filter((session) => lostSessionIds.has(session.id) && session.taskId)
+        .map((session) => session.taskId),
+    );
+    try {
+      // Inside the try: a board config that fails to read skips this project,
+      // not every project after it.
+      const boardProfiles = context.boardConfigManager.getBoardProfiles(project.path);
+      await runWithProjectLogContext(project.name, async () => {
+        await resumeSuspendedSessions(
+          project.id,
+          project.path,
+          context.sessionManager,
+          context.configManager,
+          project.default_agent,
+          context.mcpServerHandle,
+          project.default_model,
+          project.default_effort,
+          boardProfiles,
+          lostSessionIds,
+        );
+        await autoSpawnTasks(
+          project.id,
+          project.path,
+          context.sessionManager,
+          context.configManager,
+          project.default_agent,
+          context.mcpServerHandle,
+          project.default_model,
+          project.default_effort,
+          boardProfiles,
+          { taskIds: lostTaskIds, lostSessionIds },
+        );
+      });
+    } catch (error) {
+      console.error(`[pty-host] recovering sessions in ${project.name} after the host restarted failed:`, error);
+    }
+  }
 }
 
 /**
@@ -685,7 +821,7 @@ export async function activateAllProjects(context: IpcContext): Promise<void> {
       // background and may still be in flight when activateAllProjects
       // resolves.
       await pruneOrphanedTasksAndNotify(context, project, taskRepo, sessionRepo);
-      cleanupStaleResourcesAsync(project.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager, automationRunRepo, notifyRunsInterrupted(context, project.id))
+      cleanupStaleResourcesAsync(project.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager, automationRunRepo, notifyRunsInterrupted(context, project.id), leftoverSweepOptions(context, project.path))
         .catch((err) => console.error(`[PROJECT_OPEN] Resource cleanup failed for ${project.name}:`, err));
 
       await resumeSuspendedSessions(project.id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort, context.boardConfigManager.getBoardProfiles(project.path));
@@ -694,6 +830,7 @@ export async function activateAllProjects(context: IpcContext): Promise<void> {
       // front to guard rapid double-opens): a failed background activation
       // stays cold, so the user's next explicit open retries recovery.
       context.recoveredProjects.add(project.id);
+      startToolBreakdownRepair(project);
     })),
   );
 
@@ -788,16 +925,16 @@ export function registerProjectHandlers(context: IpcContext): void {
     // Apply project config overrides (always -- config may have changed)
     applyRuntimeConfig(context.sessionManager, context.configManager, project.path);
 
-    // Background PR-state refresh: an immediate (deferred) sweep + the periodic
-    // timer. Runs on EVERY open (cold restart AND warm switch-back) so a PR
-    // merged off-app while away is reflected on return; the sweep is deferred off
-    // the IPC critical path and the timer is torn down on switch/delete/shutdown.
+    // Background PR-state refresh: an immediate (deferred) sweep, then the
+    // per-PR queue. Runs on EVERY open (cold restart AND warm switch-back) so a
+    // PR merged off-app while away is reflected on return; the sweep is deferred
+    // off the IPC critical path and the queue is torn down on switch/delete/shutdown.
     prRefreshScheduler.startForProject(context, project);
 
     // Background remote-tracking refresh, same lifecycle: an immediate deferred
     // `git fetch --all --prune` so every "behind" count is measured against
-    // current refs the moment a project opens, then the periodic timer. Fetch
-    // only; nothing is pulled, merged, or rebased.
+    // current refs the moment a project opens, then one 5 minutes after each
+    // full fetch. Fetch only; nothing is pulled, merged, or rebased.
     gitFetchScheduler.startForProject(context, project);
 
     // Background conversation-memory indexing: a deferred, switch-guarded
@@ -833,13 +970,14 @@ export function registerProjectHandlers(context: IpcContext): void {
           // completes before session recovery reads the DB; the slow
           // filesystem passes are fired without awaiting.
           await pruneOrphanedTasksAndNotify(context, project, taskRepo, sessionRepo);
-          cleanupStaleResourcesAsync(project.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager, automationRunRepo, notifyRunsInterrupted(context, project.id))
+          cleanupStaleResourcesAsync(project.path, taskRepo, swimlaneRepo, sessionRepo, context.sessionManager, automationRunRepo, notifyRunsInterrupted(context, project.id), leftoverSweepOptions(context, project.path))
             .catch((error) => console.error(`[PROJECT_OPEN] Resource cleanup failed for ${project.name}:`, error));
 
           await resumeSuspendedSessions(id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort, context.boardConfigManager.getBoardProfiles(project.path))
             .catch((error) => console.error('[PROJECT_OPEN] Session recovery failed:', error));
           await autoSpawnTasks(id, project.path, context.sessionManager, context.configManager, project.default_agent, context.mcpServerHandle, project.default_model, project.default_effort, context.boardConfigManager.getBoardProfiles(project.path))
             .catch((error) => console.error('[PROJECT_OPEN] Session reconciliation failed:', error));
+          startToolBreakdownRepair(project);
         });
       });
     }

@@ -2,30 +2,33 @@ import { ipcMain, webContents } from 'electron';
 import { IPC } from '../../../shared/ipc-channels';
 import { withTaskLock } from '../task-lifecycle-lock';
 import { SessionRepository } from '../../db/repositories/session-repository';
+import { resolveOwnSessionRecord } from '../../db/repositories/session-own-record';
+import { retrievalClient } from '../../retrieval/retrieval-client';
+import { collectRemoteTargets } from '../../retrieval/remote-targets';
 import { UsageHistoryRepository } from '../../db/repositories/usage-history-repository';
 import { TaskRepository } from '../../db/repositories/task-repository';
 import { getProjectDb } from '../../db/database';
-import { getProjectRepos, ensureTaskWorktree, createTransitionEngine, resolveSpawnOverrides, notifySpawnBlocked } from '../helpers';
+import { getProjectRepos, notifySpawnBlocked } from '../helpers';
 import { linkPR, autoLinkPRForTask, recordPushedBranchForSession } from '../../pr/pr-linking';
-import { resolveProjectContext } from '../helpers/project-repos';
 import { applyProfileToLane } from '../../transition-engine/column-strategy';
 import { loadTaskProfile } from '../helpers/task-profile';
 import { handleTaskMove } from './task-move';
 import { trackEvent } from '../../analytics/analytics';
 import { trackFeatureUsed, trackMilestone } from '../../analytics/usage';
 import { parseModelId } from '../../../shared/model-id';
-import { captureSessionMetrics, refineTranscriptTokens, refineTranscriptToolCounts } from './session-metrics';
+import { captureSessionMetrics, readTranscriptToolResultTokens, refineTranscriptTokens, refineTranscriptToolCounts } from './session-metrics';
 import { captureGitChurn, resolveDefaultBaseBranch } from './git-stats-capture';
 import { markRecordExited, markRecordSuspended, promoteRecord, recoverStaleSessionId } from '../../transition-engine/session-lifecycle';
 import { isShuttingDown } from '../../shutdown-state';
 import { applySuspendDbWrites, reconcileTaskSessionRef } from './session-reconcile';
-import { abortInFlightResume, registerResumeController, releaseResumeController } from './session-resume-controllers';
+import { persistPtyGrid } from './session-grid-persistence';
+import { abortInFlightResume } from './session-resume-controllers';
+import { resumeTaskSession } from './session-resume';
+import { pauseTaskSession } from './session-pause';
 import type { AssistantMessageTrailEntry, PtyResizeOrigin, Session, TaskResolvePrResult } from '../../../shared/types';
 import { agentRegistry } from '../../agent/agent-registry';
 import { MessageTrailTracker } from '../../agent/message-trail-tracker';
 import type { IpcContext } from '../ipc-context';
-import { isAbortError } from '../../../shared/abort-utils';
-import { resumeBlockMessage, resumeBlockReason } from '../../../shared/session-resume-eligibility';
 import { broadcast } from '../../pop-out/window-broadcast';
 
 // Track session start times for duration calculation on exit
@@ -102,163 +105,19 @@ export function registerSessionHandlers(context: IpcContext): void {
     projectId ? context.sessionManager.getEventsCacheForProject(projectId) : context.sessionManager.getEventsCache());
 
   // === Session Suspend / Resume ===
-  ipcMain.handle(IPC.SESSION_SUSPEND, (_, taskId: string, projectId?: string | null) => {
-    // Cancel any in-flight resume BEFORE queueing on the lock - otherwise
-    // we would deadlock waiting for a resume that is stuck in worktree I/O.
-    abortInFlightResume(taskId);
-
-    return withTaskLock(taskId, async () => {
-      const resolvedProjectId = projectId ?? context.currentProjectId;
-      if (!resolvedProjectId) throw new Error('No project is currently open');
-
-      // Reconciled against the registry, as SESSION_RESUME and the task move
-      // are: a pointer at an exited row is cleared and there is nothing to
-      // suspend, and a live PTY the pointer lost is re-linked and suspended.
-      // On the raw pointer, a pause on a task whose CLI had ended by itself
-      // marked its exited record `suspended` and suspended a row that was not
-      // live.
-      const { liveSession } = reconcileTaskSessionRef(context, resolvedProjectId, taskId);
-      if (!liveSession) return; // nothing to suspend
-
-      // DB writes first (capture metrics, mark record suspended, clear
-      // task.session_id) then async PTY shutdown. Capturing metrics before
-      // shutdown is required - caches are still populated; afterwards is
-      // also fine, but doing it first matches task-move's order.
-      applySuspendDbWrites(context, resolvedProjectId, taskId, 'user');
-      await context.sessionManager.suspend(liveSession.id);
-    });
+  // The Pause button. The whole path lives in pauseTaskSession
+  // (session-pause.ts), shared with the phone's pause-session verb, so a
+  // desktop and a phone Pause cannot drift. A task with no live session is a
+  // silent no-op here, as it always was.
+  ipcMain.handle(IPC.SESSION_SUSPEND, async (_, taskId: string, projectId?: string | null): Promise<void> => {
+    await pauseTaskSession(context, taskId, { projectId });
   });
 
-  ipcMain.handle(IPC.SESSION_RESUME, (_, taskId: string, resumePrompt?: string, projectId?: string | null) => {
-    // Cancel any in-flight resume BEFORE queueing on the lock. Moving this
-    // outside the lock is required because Phase 2 (worktree git I/O) runs
-    // unlocked - a second resume must be able to cancel the first's in-flight
-    // fetch. Aborting inside the lock would deadlock: we'd be waiting for a
-    // holder stuck in the now-unlocked git op.
-    abortInFlightResume(taskId);
-    const resumeController = new AbortController();
-    registerResumeController(taskId, resumeController);
-    const { signal } = resumeController;
-
-    return (async (): Promise<Session | null> => {
-      const { projectId: resolvedProjectId, projectPath: resolvedProjectPath } = resolveProjectContext(context, projectId);
-      if (!resolvedProjectId) throw new Error('No project is currently open');
-
-      const { tasks, automations, automationRuns, swimlanes, attachments: attachmentRepo } = getProjectRepos(context, resolvedProjectId);
-
-      try {
-        // Phase 1 (locked, short): validate task + lane, build plan.
-        // Self-heal contract: if main already has a live PTY for this task,
-        // return it instead of throwing. The renderer's view can drift after
-        // rapid project switches (sessions[] entries with status='suspended'
-        // for tasks whose registry entry is actually 'running'). Rather than
-        // surfacing an error the user can't recover from without a restart,
-        // we treat resume as idempotent and return the existing handle. The
-        // renderer's resumeSession action replaces the stale entry and sets
-        // activeSessionId, restoring the terminal attachment. That branch stays
-        // AHEAD of the eligibility check below: handing back a PTY that already
-        // exists spawns nothing, and it is the only path that re-attaches a
-        // drifted renderer, including one drifted onto an archived task.
-        const phase1Result = await withTaskLock(taskId, async () => {
-          const { task, liveSession } = reconcileTaskSessionRef(context, resolvedProjectId, taskId);
-          if (liveSession) {
-            return { kind: 'live' as const, session: liveSession };
-          }
-          const lane = swimlanes.getById(task.swimlane_id);
-          // Truthiness, not `!== null`: a Task assembled without the column
-          // (mocks, wire mappers, MCP-constructed rows) carries `undefined`,
-          // which `!== null` reads as ARCHIVED and would refuse every resume.
-          const blocked = resumeBlockReason({ laneRole: lane?.role, isArchived: Boolean(task.archived_at) });
-          if (blocked) throw new Error(resumeBlockMessage(blocked));
-          return { kind: 'spawn' as const, task };
-        });
-
-        if (phase1Result.kind === 'live') {
-          console.log(
-            `[SESSION_RESUME] Self-heal: returning live session for task ${taskId.slice(0, 8)}`
-            + ` (renderer view was stale)`,
-          );
-          return phase1Result.session;
-        }
-        const planTask = phase1Result.task;
-
-        // Phase 2 (unlocked, slow): git I/O. Serialized per-project by
-        // WorktreeManager.projectQueues. AbortSignal cancels in-flight fetch
-        // when SESSION_SUSPEND / a newer SESSION_RESUME / SESSION_RESET fires.
-        try {
-          // The explicit projectId: if the user switches projects during this
-          // slow git phase, a base-fetch failure's spawn warning must stamp
-          // the resumed task's project, not whatever became ambient.
-          await ensureTaskWorktree(context, planTask, tasks, resolvedProjectPath, { signal, projectId: resolvedProjectId });
-        } catch (worktreeError) {
-          if (isAbortError(worktreeError)) throw worktreeError;
-          const message = worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
-          throw new Error(`Worktree setup failed: ${message}`, { cause: worktreeError });
-        }
-
-        // Phase 3 (locked, short): CAS-check invariants, then spawn the PTY
-        // and write session_id. Re-read task because Phase 2 could have raced
-        // with a concurrent handler that cleared session_id, moved the task
-        // to To Do, or already spawned a session.
-        return await withTaskLock(taskId, async () => {
-          signal.throwIfAborted();
-          // Reconcile against the registry: if a concurrent handler spawned a
-          // live session during our Phase 2 gap, return it (don't duplicate).
-          // If session_id is stale (registry-suspended/missing), reconcile
-          // clears it so we proceed to spawn fresh.
-          const { task: current, liveSession } = reconcileTaskSessionRef(context, resolvedProjectId, taskId);
-          if (liveSession) return liveSession;
-          // Folded through the task's Board Profile so an explicit Resume
-          // restarts on the same rung the task was running, not the column's
-          // base settings. Identity fields (including `role`, checked next) pass
-          // through the fold untouched.
-          const currentLane = applyProfileToLane(
-            swimlanes.getById(current.swimlane_id),
-            loadTaskProfile(context, current, resolvedProjectPath),
-          );
-          // Re-read, not the Phase 1 snapshot: the task could have been moved or
-          // archived (a move to Done archives in the same tick) during the
-          // unlocked git I/O above.
-          const currentBlocked = resumeBlockReason({
-            laneRole: currentLane?.role,
-            isArchived: Boolean(current.archived_at),
-          });
-          if (currentBlocked) throw new Error(resumeBlockMessage(currentBlocked));
-
-          const db = getProjectDb(resolvedProjectId);
-          const sessionRepo = new SessionRepository(db);
-          const engine = createTransitionEngine(
-            context, automations, automationRuns, tasks, sessionRepo, attachmentRepo,
-            resolvedProjectId, resolvedProjectPath,
-          );
-
-          const project = context.projectRepo.getById(resolvedProjectId);
-          const overrides = resolveSpawnOverrides(current, currentLane, project);
-          await engine.resumeSuspendedSession(current, currentLane?.permission_mode, undefined, resumePrompt, signal, undefined, undefined, overrides);
-
-          const updated = tasks.getById(taskId);
-          if (!updated?.session_id) throw new Error('Session resume failed - no session_id on task');
-          const newSession = context.sessionManager.getSession(updated.session_id);
-          if (!newSession) throw new Error('Session resume failed - session not in manager');
-          return newSession;
-        });
-      } catch (error) {
-        if (isAbortError(error)) {
-          console.log(`[SESSION_RESUME] Aborted stale resume for task ${taskId.slice(0, 8)}`);
-          // Clean up partial state under the lock so a concurrent handler
-          // cannot observe a half-written session_id.
-          await withTaskLock(taskId, async () => {
-            context.sessionManager.removeByTaskId(taskId);
-            tasks.update({ id: taskId, session_id: null });
-          });
-          return null;
-        }
-        throw error;
-      } finally {
-        releaseResumeController(taskId, resumeController);
-      }
-    })();
-  });
+  // The Resume button. The whole path lives in resumeTaskSession
+  // (session-resume.ts), shared with the phone's start-session verb for a
+  // paused task, so a desktop and a phone Resume cannot drift.
+  ipcMain.handle(IPC.SESSION_RESUME, (_, taskId: string, resumePrompt?: string, projectId?: string | null) =>
+    resumeTaskSession(context, taskId, { projectId, resumePrompt }));
 
   // === Session Reset (safety-net recovery for unrecoverable sessions) ===
   ipcMain.handle(IPC.SESSION_RESET, (_, taskId: string, projectId?: string | null) => {
@@ -303,18 +162,30 @@ export function registerSessionHandlers(context: IpcContext): void {
     return sessionRepo.getSummaryForTask(taskId);
   });
 
-  ipcMain.handle(IPC.SESSION_LIST_SUMMARIES, () => {
+  // Read in the retrieval worker: aggregating every session row took 66 to
+  // 71 ms on a long history.
+  ipcMain.handle(IPC.SESSION_LIST_SUMMARIES, async () => {
     if (!context.currentProjectId) return {};
-    const db = getProjectDb(context.currentProjectId);
-    const sessionRepo = new SessionRepository(db);
-    return sessionRepo.listAllSummaries();
+    return retrievalClient.call('sessions.summaries', { projectId: context.currentProjectId });
   });
 
-  // Live per-tool breakdown for an active session. Unlike the summary handlers
-  // above, this reads the in-memory accumulator (no DB / project lookup), so it
-  // works mid-session and survives the bounded event cache.
+  // Per-tool breakdown for an active session's track: its earlier runs' stored
+  // rows (one indexed read of the session's records) merged with the live
+  // accumulator, which works mid-session and survives the bounded event cache.
   ipcMain.handle(IPC.SESSION_GET_TOOL_BREAKDOWN, (_, sessionId: string) => {
-    return context.sessionManager.getToolBreakdown(sessionId);
+    return context.sessionManager.refreshToolBreakdownAcrossRuns(sessionId);
+  });
+
+  // The per-tool result-token estimates for the session's track: the earlier
+  // runs' (filled from their transcripts where a record has none) plus the live
+  // run's, which the live accumulator cannot have (hook events carry no token
+  // data). A separate read so the breakdown above stays instant while the
+  // transcripts are read in the retrieval worker. The session's own project
+  // resolves its records.
+  ipcMain.handle(IPC.SESSION_GET_TOOL_RESULT_TOKENS, (_, sessionId: string) => {
+    const projectId = context.sessionManager.getSessionProjectId(sessionId);
+    const sessionRepo = projectId ? new SessionRepository(getProjectDb(projectId)) : null;
+    return readTranscriptToolResultTokens(context.sessionManager, sessionRepo, sessionId);
   });
 
   // Set which sessions are visible in the renderer (terminal panel + command bar overlay).
@@ -449,6 +320,17 @@ export function registerSessionHandlers(context: IpcContext): void {
     },
   );
 
+  // Persist every grid change to the session record, so a resume after a
+  // desktop restart or a pty host crash spawns at the grid the session last had
+  // (SpawnSessionInput.restoredGrid). Writing at each change, not at suspend,
+  // also covers an OS kill and keeps the synchronous quit path untouched.
+  context.sessionManager.on(
+    'pty-resize',
+    (sessionId: string, cols: number, rows: number, origin: PtyResizeOrigin = 'desktop') => {
+      persistPtyGrid(context, sessionId, { cols, rows }, origin);
+    },
+  );
+
   context.sessionManager.on('first-output', (sessionId: string) => {
     const projectId = context.sessionManager.getSessionProjectId(sessionId);
     sendToFocusedRenderers(IPC.SESSION_FIRST_OUTPUT, sessionId, projectId);
@@ -538,7 +420,11 @@ export function registerSessionHandlers(context: IpcContext): void {
         return null;
       }
     },
-    resolveAdapter: (sessionType) => agentRegistry.getBySessionType(sessionType),
+    // Parsed in the retrieval worker: main reads no transcript.
+    readTrail: (facts, cursor) => retrievalClient.call(
+      'transcript.trailRead',
+      { facts, cursor, remoteTargets: collectRemoteTargets(agentRegistry) },
+    ),
   });
   messageTrailTracker.on('trail', (sessionId: string, entries: AssistantMessageTrailEntry[], projectId: string) => {
     if (context.mainWindow.isDestroyed()) return;
@@ -548,13 +434,24 @@ export function registerSessionHandlers(context: IpcContext): void {
 
   context.sessionManager.on('session-changed', (sessionId: string, session: Session) => {
     if (session.status === 'running') {
-      sessionStartTimes.set(sessionId, Date.now());
+      // Stamped once, on the first running emit. 'session-changed' also fires
+      // for a running session whose status did not change (an agent session id
+      // captured, a Command Terminal named), and re-stamping there would
+      // restart the exit's duration mid-session. Session ids are minted once
+      // per spawn and the exit below clears the entry, so this is the
+      // transition into running.
+      if (!sessionStartTimes.has(sessionId)) sessionStartTimes.set(sessionId, Date.now());
 
       // Analytics: track spawn intent on the first running transition. Model
       // is not known yet (arrives later via status.json) and is omitted here -
       // session_exit / task_complete carry the model. permissionMode (the
-      // resolved mode the session record spawned under, not the task's raw
-      // override) and worktree ride the same event as budget-neutral props.
+      // resolved mode the session spawned under, not the task's raw override)
+      // and worktree ride the same event as budget-neutral props.
+      // permissionMode is read off the session itself: this event fires
+      // inside spawn(), before the caller inserts the session's record, so a
+      // record read here found the task's PREVIOUS record, whose mode can be
+      // stale or belong to the task's other track (a main and an isolated
+      // session).
       // This listener sees EVERY spawn path (board move, create, recovery,
       // transient), which also makes it the one chokepoint for the
       // worktree/profile adoption signals and the first_spawn milestone.
@@ -566,6 +463,8 @@ export function registerSessionHandlers(context: IpcContext): void {
             agent: spawnAgentName,
             isTransient: !!session.transient,
           };
+          const spawnPermissionMode = context.sessionManager.getSessionPermissionMode(sessionId);
+          if (spawnPermissionMode) spawnProps.permissionMode = spawnPermissionMode;
           try {
             const spawnProjectId = context.sessionManager.getSessionProjectId(sessionId);
             // Not during shutdown: getProjectDb silently REOPENS a just-closed
@@ -573,8 +472,6 @@ export function registerSessionHandlers(context: IpcContext): void {
             // constructs a fresh connection nothing ever closes again).
             if (!isShuttingDown() && spawnProjectId && session.taskId) {
               const database = getProjectDb(spawnProjectId);
-              const spawnRecord = new SessionRepository(database).getLatestForTask(session.taskId);
-              if (spawnRecord?.permission_mode) spawnProps.permissionMode = spawnRecord.permission_mode;
               const taskRow = new TaskRepository(database).getById(session.taskId);
               if (taskRow) {
                 spawnProps.worktree = !!taskRow.worktree_path;
@@ -598,7 +495,7 @@ export function registerSessionHandlers(context: IpcContext): void {
           const sessionRepo = new SessionRepository(database);
           const managedSession = context.sessionManager.getSession(sessionId);
           if (managedSession) {
-            const record = sessionRepo.getLatestForTask(managedSession.taskId);
+            const record = resolveOwnSessionRecord(sessionRepo, sessionId, managedSession.taskId);
             if (record) {
               promoteRecord(sessionRepo, record.id);
             }
@@ -687,14 +584,22 @@ export function registerSessionHandlers(context: IpcContext): void {
     const exitAgentName = context.sessionManager.getSessionAgentName(exitedSession.id);
     const adapter = exitAgentName ? agentRegistry.get(exitAgentName) : undefined;
     if (!adapter?.describeStartupFailure) return;
-    const startupFailure = adapter.describeStartupFailure(context.sessionManager.getRawScrollback(exitedSession.id), exitCode);
-    if (!startupFailure) return;
-    try {
-      const failedTask = new TaskRepository(getProjectDb(projectId)).getById(exitedSession.taskId);
-      if (failedTask) notifySpawnBlocked(context, failedTask, 'agent', new Error(startupFailure), projectId);
-    } catch {
-      // DB may be closed during shutdown; the notice is best-effort.
-    }
+    const describeStartupFailure = adapter.describeStartupFailure.bind(adapter);
+    // The ring lives in the pty host. The read is posted now, ahead of any
+    // kill that follows, so it sees the CLI's last words.
+    void context.sessionManager.getRawScrollback(exitedSession.id).then((rawScrollback) => {
+      const startupFailure = describeStartupFailure(rawScrollback, exitCode);
+      if (!startupFailure) return;
+      try {
+        const failedTask = new TaskRepository(getProjectDb(projectId)).getById(exitedSession.taskId);
+        if (failedTask) notifySpawnBlocked(context, failedTask, 'agent', new Error(startupFailure), projectId);
+      } catch {
+        // DB may be closed during shutdown; the notice is best-effort.
+      }
+    }).catch(() => {
+      // The host is gone (a quit or a crash) and there is nothing to read, or
+      // the adapter's parser threw on what was there: the notice is best-effort.
+    });
   };
 
   // The agent-absence sweep found a running session whose CLI is gone and is
@@ -907,16 +812,19 @@ export function registerSessionHandlers(context: IpcContext): void {
   // the CLI emits solely on approval; a rejected plan emits no completion, so
   // this handler never runs and the task stays in Planning.
   //
-  // When the destination column changes the effective permission mode (the
-  // common Planning -> Executing pipeline), the move suspends the PTY and
-  // respawns it with --resume plus the destination's CLI flags. A bare
+  // When the destination column changes the model or effort (Planning at
+  // xhigh, Executing at high, for example), the move suspends the PTY and
+  // respawns it with --resume plus the destination's CLI flags. A
+  // permission-only move keeps the live session and sends nothing. So does a
+  // move that switches session track (into an isolated column, or out of one
+  // back to main), lands in an always-new column, or changes agent: that
+  // session is a different conversation, which never saw the plan. A bare
   // --resume leaves the CLI idle waiting for input, so the resumed session
-  // needs an explicit first message: this continuation. Because the move now
-  // happens only after genuine approval, the wording is factually accurate.
-  // Plain English, agent-agnostic. A destination auto_command takes
-  // precedence over it.
-  const PLAN_EXIT_CONTINUATION_PROMPT =
-    'Proceed with implementing the approved plan.';
+  // needs an explicit first message: this continuation. The suspend lands
+  // right after approval and the agent's transcript records it as the user
+  // interrupting, so the continuation says why the session restarted and
+  // names the column whose settings did it. Plain English, agent-agnostic.
+  // A destination column message takes precedence over it.
   context.sessionManager.on('plan-exit', async (sessionId: string) => {
     // Use the session's own projectId -- not the singleton, which may have
     // changed if the user switched projects while the agent was running.
@@ -959,7 +867,7 @@ export function registerSessionHandlers(context: IpcContext): void {
         'auto-move',
         resolvedProjectId,
         resolvedProjectPath,
-        { continuationPrompt: PLAN_EXIT_CONTINUATION_PROMPT },
+        { continuationPrompt: buildPlanExitContinuationPrompt(target.name) },
       );
 
       console.log(`[plan-exit] Auto-moved "${task.title}" -> "${target.name}"`);
@@ -967,4 +875,14 @@ export function registerSessionHandlers(context: IpcContext): void {
       console.error('[plan-exit] Auto-move failed:', err);
     }
   });
+}
+
+/**
+ * The first message of a session resumed by a plan-exit auto-move. Names the
+ * DESTINATION column, whose settings forced the restart. The column
+ * name stays bare: the command builder rewrites double quotes to single
+ * quotes on PowerShell and cmd, so a quoted name would differ by platform.
+ */
+function buildPlanExitContinuationPrompt(targetColumnName: string): string {
+  return `The session restarted to apply the ${targetColumnName} column's settings. Proceed with implementing the approved plan.`;
 }

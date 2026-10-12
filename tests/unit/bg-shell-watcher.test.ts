@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   BgShellWatcher,
   AGENT_ABSENCE_CONFIRM_CYCLES,
-  CAPTURED_TREE_MAX_AGE_MS,
+  AGENT_ABSENCE_REQUEST_CYCLES,
   NAMED_SHELL_QUIESCENT_RECLAIM_CYCLES,
   POLL_BACKOFF_STAGE_ONE_TREE_CYCLES,
   POLL_BACKOFF_STAGE_TWO_TREE_CYCLES,
@@ -2871,16 +2871,16 @@ describe('BgShellWatcher', () => {
       watcher.dispose();
     });
 
-    it('never judges a session that is not a candidate (the transient Command Terminal guard)', async () => {
-      // A Command Terminal is a bare shell BY DESIGN and is registered with the
-      // watcher exactly like a task agent, so its tree is legitimately empty.
-      // Without the candidate gate the sweep would retire every one of them the
-      // moment it opened - the highest-cost false positive in this design.
+    it('never judges a session that is not a candidate', async () => {
+      // The candidate gate is SessionManager's (isAgentAbsenceCandidate): a
+      // session with no agent adapter, a WSL shell, one inside its spawn
+      // grace. Such a session's tree can be legitimately empty, so without the
+      // gate the sweep would retire it on sight.
       const { watcher, probe, rootPids, log } = makeWatcher(); // no candidates
-      rootPids.set('command-terminal', 1234);
+      rootPids.set('bare-shell', 1234);
       probe.alive.add(1234);
-      probe.trees.set(1234, []); // a bare shell: nothing under it, ever
-      watcher.registerSession('command-terminal');
+      probe.trees.set(1234, []); // nothing under it, ever
+      watcher.registerSession('bare-shell');
 
       await watcher.pollNow();
       await watcher.pollNow();
@@ -3036,151 +3036,164 @@ describe('BgShellWatcher', () => {
       expect(probe.listAllCalls).toBeGreaterThanOrEqual(9);
       watcher.dispose();
     });
-  });
 
-  /**
-   * The descendant snapshot session teardown reaps from. The watcher already
-   * walks this subtree every enumerating cycle; publishing it is what lets a
-   * drag-to-Done kill a leaked dev server without paying ~670ms of PowerShell
-   * startup on the interaction path.
-   */
-  describe('getCapturedDescendants', () => {
-    /** A session with a bg shell, so `sessionNeedsTree` keeps cycles enumerating. */
-    function makeTreeSession(descendants: ProcessInfo[]) {
-      const harness = makeWatcher();
-      harness.rootPids.set('s1', 1234);
-      harness.probe.alive.add(1234);
-      harness.probe.trees.set(1234, descendants);
-      harness.shellCounts.set('s1', 1);
-      harness.watcher.registerSession('s1');
-      return harness;
-    }
+    /**
+     * A Command Terminal's agent reports its own `/exit` (its SessionEnd hook),
+     * and the terminal must end within seconds, not at the next 60 s sweep.
+     * `requestAgentAbsenceCheck` keeps the sweep due for that session for a
+     * few cycles; the process tree and the two-observation confirm still decide.
+     */
+    it('a requested check judges the session on the next cycles, whatever the interval', async () => {
+      const { watcher, probe, log } = makeAbsenceSession([], { agentAbsenceSweepIntervalMs: 10 * 60_000 });
 
-    it('returns null before any cycle has enumerated', () => {
-      const { watcher } = makeTreeSession([{ pid: 5001, ppid: 1234, comm: 'bash' }]);
-      expect(watcher.getCapturedDescendants('s1')).toBeNull();
+      await watcher.pollNow(); // anchoring cycle: absent #1, stamps the sweep
+      probe.listAllCalls = 0;
+      await watcher.pollNow();
+      expect(probe.listAllCalls).toBe(0); // not due for ten minutes
+
+      watcher.requestAgentAbsenceCheck('s1');
+      await watcher.pollNow(); // due because requested: absent #2
+      expect(log.agentAbsent).toEqual(['s1']);
       watcher.dispose();
     });
 
-    it('returns null for a session that was never registered', () => {
-      const { watcher } = makeTreeSession([]);
-      expect(watcher.getCapturedDescendants('never-registered')).toBeNull();
+    it('a requested check never retires an agent that is still running (a /clear ends and starts again)', async () => {
+      const { watcher, probe, log } = makeAbsenceSession(
+        [{ pid: 48848, ppid: 1234, comm: 'claude' }],
+        { agentAbsenceSweepIntervalMs: 10 * 60_000 },
+      );
+      await watcher.pollNow(); // anchor
+      probe.listAllCalls = 0;
+
+      watcher.requestAgentAbsenceCheck('s1');
+      for (let cycle = 0; cycle < AGENT_ABSENCE_REQUEST_CYCLES + 3; cycle += 1) await watcher.pollNow();
+
+      expect(log.agentAbsent).toHaveLength(0);
+      // The request spends its looks, then the session waits for the ordinary
+      // interval again rather than enumerating on every cycle forever.
+      expect(probe.listAllCalls).toBe(AGENT_ABSENCE_REQUEST_CYCLES);
       watcher.dispose();
     });
 
-    it('publishes the FULL subtree, including non-shell grandchildren', async () => {
-      // The incident's shape: `func.exe` is a grandchild of a bg shell, and the
-      // shell-like filter the watcher uses for its own counting drops it. A reap
-      // that consumed the filtered list would miss the actual leaked server.
-      const { watcher } = makeTreeSession([
-        { pid: 5001, ppid: 1234, comm: 'bash' },
-        { pid: 5002, ppid: 5001, comm: 'func' },
-      ]);
-      await watcher.pollNow();
+    it('a requested check outlasts an agent still exiting at the first look', async () => {
+      const { watcher, probe, log } = makeAbsenceSession(
+        [{ pid: 48848, ppid: 1234, comm: 'claude' }],
+        { agentAbsenceSweepIntervalMs: 10 * 60_000 },
+      );
+      await watcher.pollNow(); // anchor
 
-      const captured = watcher.getCapturedDescendants('s1');
-      expect(captured?.rootPid).toBe(1234);
-      expect(captured?.pids.sort((a, b) => a - b)).toEqual([5001, 5002]);
+      watcher.requestAgentAbsenceCheck('s1');
+      await watcher.pollNow(); // the CLI is still on its way out
+      probe.trees.set(1234, []);
+      await watcher.pollNow(); // absent #1
+      await watcher.pollNow(); // absent #2
+
+      expect(log.agentAbsent).toEqual(['s1']);
       watcher.dispose();
     });
 
-    it('does not clobber a good snapshot when the probe fails', async () => {
-      const { watcher, probe } = makeTreeSession([{ pid: 5001, ppid: 1234, comm: 'bash' }]);
+    it('ignores a request for a session it does not watch', async () => {
+      const { watcher, probe } = makeAbsenceSession([{ pid: 48848, ppid: 1234, comm: 'claude' }], { agentAbsenceSweepIntervalMs: 10 * 60_000 });
       await watcher.pollNow();
-      expect(watcher.getCapturedDescendants('s1')?.pids).toEqual([5001]);
+      probe.listAllCalls = 0;
 
-      // A timed-out PowerShell returns [] for every session. Storing that would
-      // silently turn every subsequent reap into a no-op.
-      probe.failProbe = true;
+      watcher.requestAgentAbsenceCheck('not-watched');
       await watcher.pollNow();
 
-      expect(watcher.getCapturedDescendants('s1')?.pids).toEqual([5001]);
+      expect(probe.listAllCalls).toBe(0);
       watcher.dispose();
     });
 
-    it('refuses a snapshot older than the staleness ceiling', async () => {
-      const { watcher } = makeTreeSession([{ pid: 5001, ppid: 1234, comm: 'bash' }]);
-      await watcher.pollNow();
-      expect(watcher.getCapturedDescendants('s1')).not.toBeNull();
+    it('a requested check snaps a backed-off poll back to the base cadence', async () => {
+      // A busy session (a pending tool keeps every cycle enumerating) backs the
+      // poll off to 2x after a run of tree cycles. The request follows the
+      // agent's own SessionEnd, so a Command Terminal must not wait out a
+      // stretched interval before its first look.
+      const baseIntervalMs = 100;
+      const { watcher, probe, pendingTools, log } = makeAbsenceSession(
+        [{ pid: 48848, ppid: 1234, comm: 'claude' }],
+        { pollIntervalMs: baseIntervalMs, agentAbsenceSweepIntervalMs: 10 * 60_000 },
+      );
+      pendingTools.set('s1', 1);
+      probe.listAllCalls = 0;
 
-      // PID reuse is the hazard: an old snapshot can name a pid the OS has
-      // since handed to something else.
-      vi.setSystemTime(Date.now() + CAPTURED_TREE_MAX_AGE_MS + 1);
+      // Stage one reached: the next cycle is armed at 2x, 200ms out.
+      await vi.advanceTimersByTimeAsync(POLL_BACKOFF_STAGE_ONE_TREE_CYCLES * baseIntervalMs);
+      expect(probe.listAllCalls).toBe(POLL_BACKOFF_STAGE_ONE_TREE_CYCLES);
 
-      expect(watcher.getCapturedDescendants('s1')).toBeNull();
+      probe.trees.set(1234, []); // the agent exits
+      watcher.requestAgentAbsenceCheck('s1');
+
+      // The look comes one BASE interval later. Left stretched, it would not
+      // fire until 200ms had passed.
+      await vi.advanceTimersByTimeAsync(baseIntervalMs);
+      expect(probe.listAllCalls).toBe(POLL_BACKOFF_STAGE_ONE_TREE_CYCLES + 1);
+      expect(log.agentAbsent).toHaveLength(0); // absent #1
+
+      await vi.advanceTimersByTimeAsync(baseIntervalMs);
+      expect(log.agentAbsent).toEqual(['s1']); // absent #2 confirms, two base cycles after the request
       watcher.dispose();
     });
 
-    it('drops the snapshot on re-register, which swaps in a new root pid', async () => {
-      const { watcher, rootPids, probe } = makeTreeSession([
-        { pid: 5001, ppid: 1234, comm: 'bash' },
-      ]);
-      await watcher.pollNow();
-      expect(watcher.getCapturedDescendants('s1')).not.toBeNull();
+    it('a cancelled request leaves no look due (a /clear ended the agent and started it again)', async () => {
+      const { watcher, probe, log } = makeAbsenceSession(
+        [{ pid: 48848, ppid: 1234, comm: 'claude' }],
+        { agentAbsenceSweepIntervalMs: 10 * 60_000 },
+      );
+      await watcher.pollNow(); // anchor, stamps the sweep
+      probe.listAllCalls = 0;
 
-      // A resume re-registers with a fresh PTY. The old subtree belongs to a
-      // dead root, and those pids may already be somebody else's.
-      rootPids.set('s1', 4321);
-      probe.alive.add(4321);
-      watcher.registerSession('s1');
+      watcher.requestAgentAbsenceCheck('s1');
+      watcher.cancelAgentAbsenceCheck('s1');
+      for (let cycle = 0; cycle < AGENT_ABSENCE_REQUEST_CYCLES + 3; cycle += 1) await watcher.pollNow();
 
-      expect(watcher.getCapturedDescendants('s1')).toBeNull();
+      // Not one process listing: the session is back on the ordinary interval.
+      expect(probe.listAllCalls).toBe(0);
+      expect(log.agentAbsent).toHaveLength(0);
       watcher.dispose();
     });
 
-    it('keeps the snapshot fresh across quiet cycles instead of letting it age out', async () => {
-      // sessionNeedsTree stops enumerating once the bg shell is gone, but the
-      // leaked grandchild is still running. Without the skip-cycle refresh the
-      // snapshot would pass CAPTURED_TREE_MAX_AGE_MS and a Done move minutes
-      // later would reap nothing.
-      const harness = makeTreeSession([
-        { pid: 5001, ppid: 1234, comm: 'bash' },
-        { pid: 5002, ppid: 5001, comm: 'func' },
-      ]);
-      harness.probe.alive.add(5001);
-      harness.probe.alive.add(5002);
-      await harness.watcher.pollNow();
-      expect(harness.watcher.getCapturedDescendants('s1')?.pids).toHaveLength(2);
+    it('cancelling one session withdraws only its own looks', async () => {
+      const harness = makeAbsenceSession(
+        [{ pid: 48848, ppid: 1234, comm: 'claude' }],
+        { agentAbsenceSweepIntervalMs: 10 * 60_000 },
+      );
+      const { watcher, probe, rootPids, agentAbsenceCandidates } = harness;
+      rootPids.set('s2', 5678);
+      probe.alive.add(5678);
+      probe.trees.set(5678, [{ pid: 58848, ppid: 5678, comm: 'claude' }]);
+      agentAbsenceCandidates.add('s2');
+      watcher.registerSession('s2');
+      await watcher.pollNow(); // anchors both sessions and stamps the sweep
+      probe.listAllCalls = 0;
 
-      // Go quiet: no tracked shells, no pending tools, so cycles now skip.
-      harness.shellCounts.set('s1', 0);
-      await harness.watcher.pollNow();
-      vi.setSystemTime(Date.now() + CAPTURED_TREE_MAX_AGE_MS - 1);
-      await harness.watcher.pollNow();
-      vi.setSystemTime(Date.now() + CAPTURED_TREE_MAX_AGE_MS - 1);
-
-      const captured = harness.watcher.getCapturedDescendants('s1');
-      expect(captured?.pids.sort((a, b) => a - b)).toEqual([5001, 5002]);
-      harness.watcher.dispose();
-    });
-
-    it('drops a pid on the cycle it dies, so a recycled pid is never inherited', async () => {
-      const harness = makeTreeSession([
-        { pid: 5001, ppid: 1234, comm: 'bash' },
-        { pid: 5002, ppid: 5001, comm: 'func' },
-      ]);
-      harness.probe.alive.add(5001);
-      harness.probe.alive.add(5002);
-      await harness.watcher.pollNow();
-
-      // The wrapper shell exits; the dev server it started keeps running.
-      harness.shellCounts.set('s1', 0);
-      harness.probe.alive.delete(5001);
-      await harness.watcher.pollNow();
-
-      // 5001 is gone for good, so the OS handing that number to something else
-      // can never make this snapshot aim a kill at it. 5002 is still the leak.
-      expect(harness.watcher.getCapturedDescendants('s1')?.pids).toEqual([5002]);
-      harness.watcher.dispose();
-    });
-
-    it('returns a copy, so a caller cannot mutate watcher state', async () => {
-      const { watcher } = makeTreeSession([{ pid: 5001, ppid: 1234, comm: 'bash' }]);
+      watcher.requestAgentAbsenceCheck('s1');
       await watcher.pollNow();
+      await watcher.pollNow(); // s1 has spent two looks
+      watcher.requestAgentAbsenceCheck('s2'); // s2 starts with a full set
+      watcher.cancelAgentAbsenceCheck('s2');
+      for (let cycle = 0; cycle < AGENT_ABSENCE_REQUEST_CYCLES + 3; cycle += 1) await watcher.pollNow();
 
-      watcher.getCapturedDescendants('s1')!.pids.push(9999);
+      // s1 keeps its remaining three looks: two spent plus three is the full
+      // set. A cancel that did nothing would leave s2's five looks running
+      // (seven in all); one that cleared every request would stop s1 early (two).
+      expect(probe.listAllCalls).toBe(AGENT_ABSENCE_REQUEST_CYCLES);
+      watcher.dispose();
+    });
 
-      expect(watcher.getCapturedDescendants('s1')?.pids).toEqual([5001]);
+    it('cancelling a session it does not watch is a no-op and leaves other requests alone', async () => {
+      const { watcher, probe } = makeAbsenceSession(
+        [{ pid: 48848, ppid: 1234, comm: 'claude' }],
+        { agentAbsenceSweepIntervalMs: 10 * 60_000 },
+      );
+      await watcher.pollNow(); // anchor
+      probe.listAllCalls = 0;
+
+      watcher.requestAgentAbsenceCheck('s1');
+      expect(() => watcher.cancelAgentAbsenceCheck('not-watched')).not.toThrow();
+      for (let cycle = 0; cycle < AGENT_ABSENCE_REQUEST_CYCLES + 3; cycle += 1) await watcher.pollNow();
+
+      expect(probe.listAllCalls).toBe(AGENT_ABSENCE_REQUEST_CYCLES);
       watcher.dispose();
     });
   });

@@ -57,7 +57,14 @@ const PROGRESS_THROTTLE_MS = 100;
  *
  * Sized to comfortably contain the worst-case git path inside `removeWorktree`
  * (3 sequential `runGitWithTimeout` ops at 15s each) plus the fs-rm fallback,
- * so even a fully-pathological git stall surfaces as the inner timeout.
+ * so even a fully-pathological git stall surfaces as the inner timeout. The
+ * leftover reap runs first inside the same budget: up to 3 s waiting for a
+ * parked PTY and 15 s for the pty host's reap, and on a WSL shell up to 20 s
+ * more for the in-distro reap (`WSL_LIST_TIMEOUT_MS`, `WSL_SCRIPT_TIMEOUT_MS`).
+ * It normally takes well under 2 s. Only when the reap AND git both stall to
+ * their bounds does this deadline fire first, reporting a cleanup failure
+ * while the removal finishes in the background; the startup retry takes what
+ * it leaves.
  */
 const TASK_CLEANUP_TIMEOUT_MS = 60_000;
 
@@ -202,14 +209,8 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
         console.log(`[TASK_UPDATE] Skipping branch rename - worktree path missing: ${existing.worktree_path}`);
       } else {
         const worktreeManager = new WorktreeManager(resolvedProjectPath);
-        const effectiveConfig = context.configManager.getEffectiveConfig(resolvedProjectPath);
-        const boardDefaultBranch = context.boardConfigManager.getDefaultBaseBranch();
-        const defaultBaseBranch = boardDefaultBranch || effectiveConfig.git.defaultBaseBranch || 'main';
         const newBranchName = await worktreeManager.withLock(
-          () => worktreeManager.renameBranch(input.id, existing.branch_name!, input.title, {
-            baseBranch: existing.base_branch,
-            defaultBaseBranch,
-          }),
+          () => worktreeManager.renameBranch(input.id, existing.branch_name!, input.title),
           { label: `rename-branch:${input.id.slice(0, 8)}` },
         );
         if (newBranchName) {
@@ -221,7 +222,7 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
       }
     }
 
-    const updated = tasks.update(input);
+    const updated = timeSyncWork('ipc:task:update', () => tasks.update(input));
 
     // The task-detail edit form writes pr_url/pr_number with pr_state and
     // pr_merge_readiness null on purpose (`buildPrFields`), so a stale terminal

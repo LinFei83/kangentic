@@ -1,12 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { exec, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execAsync, execFileAsync } from '../../../utility-process/off-main-exec';
+import { quoteCmdExecutable } from '../../../../shared/shell-quote';
 import { grokHomeDir } from './session-paths';
 import type { AgentCapabilities } from '../../../../shared/types';
 
-const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
 
 const HELP_TIMEOUT_MS = 5000;
 
@@ -110,7 +108,7 @@ async function readHelpCapabilities(cliPath: string): Promise<AgentCapabilities>
   let helpText: string;
   try {
     if (process.platform === 'win32') {
-      const { stdout } = await execAsync(`"${cliPath}" --help`, {
+      const { stdout } = await execAsync(`${quoteCmdExecutable(cliPath)} --help`, {
         timeout: HELP_TIMEOUT_MS,
         windowsHide: true,
         maxBuffer: 1024 * 1024,

@@ -1,9 +1,7 @@
 /**
  * The two automation repositories, against a REAL SQLite engine.
  *
- * node:sqlite rather than better-sqlite3, which is compiled for Electron's Node
- * ABI so a suite gated on it skips everywhere, CI included. Follows the harness
- * already established in worktree-folder-migration.test.ts.
+ * Real better-sqlite3, the driver production uses.
  *
  * The assertions that matter are the ones a mock could never make: that
  * `position` really is per trigger (so the file's two arrays and the UI's two
@@ -11,43 +9,27 @@
  * cascades, and that the whole-column replace survives a name swap the unique
  * index would reject if it were applied row by row.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import type DatabaseType from 'better-sqlite3';
 import { runProjectMigrations } from '../../src/main/db/migrations/project-schema';
 import { AutomationRepository } from '../../src/main/db/repositories/automation-repository';
 import { AutomationRunRepository } from '../../src/main/db/repositories/automation-run-repository';
 import { SwimlaneRepository } from '../../src/main/db/repositories/swimlane-repository';
 import type { AutomationWriteInput } from '../../src/main/db/repositories/automation-repository';
-import type DatabaseType from 'better-sqlite3';
 
-type SqliteModule = typeof import('node:sqlite');
-let sqlite: SqliteModule | null = null;
-try {
-  sqlite = await import('node:sqlite');
-} catch {
-  sqlite = null;
-}
-const describeWithSqlite = sqlite ? describe : describe.skip;
+import { openTestDatabase } from './helpers/test-database';
 
-function adaptDatabase(database: InstanceType<SqliteModule['DatabaseSync']>): DatabaseType.Database {
-  const adapter = {
-    exec: (sql: string) => database.exec(sql),
-    prepare: (sql: string) => database.prepare(sql),
-    pragma: (statement: string) => database.prepare(`PRAGMA ${statement}`).all(),
-    transaction: <Args extends unknown[], Result>(body: (...args: Args) => Result) =>
-      (...args: Args): Result => {
-        database.exec('BEGIN');
-        try {
-          const result = body(...args);
-          database.exec('COMMIT');
-          return result;
-        } catch (error) {
-          database.exec('ROLLBACK');
-          throw error;
-        }
-      },
-  };
-  return adapter as unknown as DatabaseType.Database;
+const openDatabases: DatabaseType.Database[] = [];
+
+function openDatabase(): DatabaseType.Database {
+  const database = openTestDatabase();
+  openDatabases.push(database);
+  return database;
 }
+
+afterEach(() => {
+  for (const database of openDatabases.splice(0)) database.close();
+});
 
 function webhook(name: string, overrides: Partial<AutomationWriteInput> = {}): AutomationWriteInput {
   return {
@@ -60,9 +42,9 @@ function webhook(name: string, overrides: Partial<AutomationWriteInput> = {}): A
   };
 }
 
-describeWithSqlite('AutomationRepository', () => {
+describe('AutomationRepository', () => {
   function setup() {
-    const database = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
+    const database = openDatabase();
     database.exec('PRAGMA foreign_keys = ON');
     runProjectMigrations(database);
     const lanes = new SwimlaneRepository(database);
@@ -187,9 +169,9 @@ describeWithSqlite('AutomationRepository', () => {
   });
 });
 
-describeWithSqlite('AutomationRunRepository', () => {
+describe('AutomationRunRepository', () => {
   function setup() {
-    const database = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
+    const database = openDatabase();
     database.exec('PRAGMA foreign_keys = ON');
     runProjectMigrations(database);
     const lanes = new SwimlaneRepository(database);

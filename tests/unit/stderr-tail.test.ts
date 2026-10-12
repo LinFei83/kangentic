@@ -198,6 +198,82 @@ describe('captureWorkerStderr', () => {
   });
 });
 
+// Electron 44.5.0 drains a utility process's stderr after `exit`, so the text that explains a
+// crash can land just after the crash is recorded. The restart policy waits on whenDrained before
+// it logs; these pin when that wait ends.
+describe('StderrTail.whenDrained', () => {
+  function makeStream(): EventEmitter & { asReadable: () => NodeJS.ReadableStream } {
+    const emitter = new EventEmitter() as EventEmitter & { asReadable: () => NodeJS.ReadableStream };
+    emitter.asReadable = () => emitter as unknown as NodeJS.ReadableStream;
+    return emitter;
+  }
+
+  it('answers null when no stream feeds the tail, so a caller reads at once', () => {
+    expect(makeTail().whenDrained(500)).toBeNull();
+    const childWithoutStderr = makeTail();
+    captureWorkerStderr({ stderr: null }, childWithoutStderr, false);
+    expect(childWithoutStderr.whenDrained(500)).toBeNull();
+  });
+
+  it.each(['end', 'close'] as const)('resolves on the stream\'s %s, after text that arrived late', async (eventName) => {
+    const stream = makeStream();
+    const tail = makeTail();
+    captureWorkerStderr({ stderr: stream.asReadable() }, tail, false);
+    const drained = tail.whenDrained(500);
+    expect(drained).toBeInstanceOf(Promise);
+
+    stream.emit('data', 'Error: the worker died\n');
+    stream.emit(eventName);
+    await drained;
+
+    expect(tail.snapshot()).toBe('Error: the worker died');
+    expect(tail.whenDrained(500)).toBeNull();
+  });
+
+  it('resolves on a broken pipe, since nothing more will arrive', async () => {
+    const stream = makeStream();
+    const tail = makeTail();
+    captureWorkerStderr({ stderr: stream.asReadable() }, tail, false);
+    const drained = tail.whenDrained(500);
+    stream.emit('error', new Error('EPIPE'));
+    await expect(drained).resolves.toBeUndefined();
+  });
+
+  it('resolves at the bound when the stream never ends', async () => {
+    vi.useFakeTimers();
+    try {
+      const stream = makeStream();
+      const tail = makeTail();
+      captureWorkerStderr({ stderr: stream.asReadable() }, tail, false);
+      let resolved = false;
+      void tail.whenDrained(500)?.then(() => {
+        resolved = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(499);
+      expect(resolved).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(resolved).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flushes the bytes the decoder was holding when the stream ends mid-character', () => {
+    const stream = makeStream();
+    const tail = makeTail();
+    captureWorkerStderr({ stderr: stream.asReadable() }, tail, false);
+    const encoded = Buffer.from('café', 'utf8');
+    // A child killed mid-write: the last chunk stops inside the two-byte character, and the
+    // decoder holds that byte back waiting for the rest.
+    stream.emit('data', encoded.subarray(0, encoded.length - 1));
+    expect(tail.snapshot()).toBe('caf');
+    stream.emit('end');
+    // The held byte is flushed (as U+FFFD) rather than silently dropped.
+    expect(tail.snapshot()).toBe('caf�');
+  });
+});
+
 describe('UTILITY_PROCESS_STDIO', () => {
   it('pipes stderr only, with stdin and stdout ignored', () => {
     expect(UTILITY_PROCESS_STDIO).toEqual(['ignore', 'ignore', 'pipe']);
@@ -319,6 +395,94 @@ describe('findForkCallsMissingSharedStdio', () => {
   });
 });
 
+/** Why `source` under-reports its fork failures, or null when it does not.
+ *
+ *  A `utilityProcess.fork` that throws never produced a process, so its catch
+ *  must pass `{ cause: 'fork_failed' }` to `recordCrash`. Left bare, the cause
+ *  defaults to 'exit' and a fork that threw reaches Aptabase and Sentry as an
+ *  exit. The check is a count: a file needs at least as many `recordCrash(`
+ *  calls carrying that cause as it has fork calls. Split out from the tree scan
+ *  for the same reason as `findForkCallsMissingSharedStdio`. */
+function findMissingForkFailedReport(source: string): string | null {
+  const forkCallCount = (source.match(/utilityProcess\s*\.\s*fork\s*\(/g) ?? []).length;
+  if (forkCallCount === 0) return null;
+  // The arguments hold no closing paren, so `[^)]*` ends at the call's own.
+  const recordCrashArguments = [...source.matchAll(/recordCrash\s*\(([^)]*)\)/g)].map((match) => match[1]);
+  const forkFailedCount = recordCrashArguments.filter((argumentText) => /cause:\s*'fork_failed'/.test(argumentText)).length;
+  if (forkFailedCount >= forkCallCount) return null;
+  return `${forkCallCount} utilityProcess.fork call(s) but ${forkFailedCount} recordCrash call(s) with cause: 'fork_failed'`;
+}
+
+describe('findMissingForkFailedReport', () => {
+  it('accepts a fork whose catch reports fork_failed', () => {
+    const source = [
+      `try {`,
+      `  child = utilityProcess.fork(workerPath, [], { stdio: UTILITY_PROCESS_STDIO });`,
+      `} catch (error) {`,
+      `  this.restartPolicy.recordCrash(null, undefined, { cause: 'fork_failed' });`,
+      `}`,
+    ].join('\n');
+    expect(findMissingForkFailedReport(source)).toBeNull();
+  });
+
+  it('flags a fork whose catch records a bare crash, which would report as an exit', () => {
+    const source = [
+      `try {`,
+      `  child = utilityProcess.fork(workerPath, [], { stdio: UTILITY_PROCESS_STDIO });`,
+      `} catch (error) {`,
+      `  this.restartPolicy.recordCrash(null);`,
+      `}`,
+    ].join('\n');
+    expect(findMissingForkFailedReport(source)).toContain('1 utilityProcess.fork call(s) but 0');
+  });
+
+  it('flags a fork whose catch never records a crash', () => {
+    const source = `try { child = utilityProcess.fork(workerPath, []); } catch (error) { console.warn(error); }`;
+    expect(findMissingForkFailedReport(source)).not.toBeNull();
+  });
+
+  it('flags a second fork that has no fork_failed report of its own', () => {
+    const source = [
+      `try { first = utilityProcess.fork(firstWorker, []); } catch { policy.recordCrash(null, undefined, { cause: 'fork_failed' }); }`,
+      `try { second = utilityProcess.fork(secondWorker, []); } catch { policy.recordCrash(null); }`,
+    ].join('\n');
+    expect(findMissingForkFailedReport(source)).toContain('2 utilityProcess.fork call(s) but 1');
+  });
+
+  it('ignores a file that never forks', () => {
+    expect(findMissingForkFailedReport(`policy.recordCrash(1);`)).toBeNull();
+  });
+});
+
+function collectMainSourceFiles(directory: string): string[] {
+  const files: string[] = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const fullPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...collectMainSourceFiles(fullPath));
+    } else if (fullPath.endsWith('.ts') && !fullPath.endsWith('.d.ts')) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+describe('utilityProcess.fork failure reporting', () => {
+  it('every file that forks reports a thrown fork as fork_failed, so it is not counted as an exit', () => {
+    const repoRoot = path.resolve(__dirname, '../..');
+    const offenders: string[] = [];
+    for (const filePath of collectMainSourceFiles(path.join(repoRoot, 'src/main'))) {
+      const reason = findMissingForkFailedReport(fs.readFileSync(filePath, 'utf-8'));
+      if (reason !== null) offenders.push(`${path.relative(repoRoot, filePath).replace(/\\/g, '/')}: ${reason}`);
+    }
+
+    expect(
+      offenders,
+      `Every catch around utilityProcess.fork must call recordCrash(null, undefined, { cause: 'fork_failed' }); a bare recordCrash(null) reports a fork that threw as an exit (see restart-policy.ts, UtilityCrashCause). Offenders:\n${offenders.join('\n')}`,
+    ).toEqual([]);
+  });
+});
+
 describe('utilityProcess.fork call sites', () => {
   it('every utilityProcess.fork call passes the shared UTILITY_PROCESS_STDIO constant, never an inline literal', () => {
     // The value-level tests above (and the ones in embed-client.test.ts /
@@ -337,20 +501,7 @@ describe('utilityProcess.fork call sites', () => {
     const scanRoot = path.join(repoRoot, 'src/main');
     const offenders: string[] = [];
 
-    function collectSourceFiles(directory: string): string[] {
-      const files: string[] = [];
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const fullPath = path.join(directory, entry.name);
-        if (entry.isDirectory()) {
-          files.push(...collectSourceFiles(fullPath));
-        } else if (fullPath.endsWith('.ts') && !fullPath.endsWith('.d.ts')) {
-          files.push(fullPath);
-        }
-      }
-      return files;
-    }
-
-    for (const filePath of collectSourceFiles(scanRoot)) {
+    for (const filePath of collectMainSourceFiles(scanRoot)) {
       const relativePath = path.relative(repoRoot, filePath).replace(/\\/g, '/');
       const source = fs.readFileSync(filePath, 'utf-8');
       for (const lineNumber of findForkCallsMissingSharedStdio(source)) {

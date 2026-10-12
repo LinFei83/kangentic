@@ -16,15 +16,17 @@ import { sendToRenderer } from '../ipc/send-to-renderer';
 //   Has worktree:       starting-agent (a base-drift probe may decorate it, see below)
 //   Cross-agent:        switching-agent → starting-agent → packaging-handoff → detecting-agent
 //   Restore from Done:  resuming → (whichever of the above the task needs)
+//   Resume button:      resuming → (whichever of the above the task needs)
 //   Model change:       switching-model → (whichever of the above the task needs)
 //   Effort respawn:     applying-settings → (whichever of the above the task needs)
 //   Session switch:     new-session → (whichever of the above the task needs)
 //   In-place restart:   switching-model | applying-settings | resending-command
 //                       (restartSessionForSettingsChange: no git work follows)
 //
-// 'resuming' is emitted by TASK_UNARCHIVE / TASK_BULK_UNARCHIVE before any git
-// work, so the card is never silent while the lane resolves and the git op
-// queues. 'switching-model', 'switching-agent', 'applying-settings', and
+// 'resuming' is emitted by TASK_UNARCHIVE / TASK_BULK_UNARCHIVE and by
+// SESSION_RESUME (once it knows it will spawn) before any git work, so the
+// card is never silent while the lane resolves and the git op queues.
+// 'switching-model', 'switching-agent', 'applying-settings', and
 // 'new-session' are emitted the same way by task-move.ts's Phase 1
 // suspend-for-respawn branches, before the suspend that would otherwise leave
 // the card reading a stale "Paused" for the whole unlocked Phase 2 window (see
@@ -52,8 +54,14 @@ import { sendToRenderer } from '../ipc/send-to-renderer';
  * sweep so a spawn path that dies without calling clearSpawnProgress (process
  * killed mid-spawn, uncaught throw bypassing the finally) cannot strand a
  * label here forever.
+ *
+ * `owner` is the claimSpawnProgress() token that pushed the label, or null
+ * for any other push. Only a claim's release() reads it.
  */
-const inFlightSpawnProgress = new Map<string, { label: string; updatedAt: number }>();
+const inFlightSpawnProgress = new Map<string, { label: string; updatedAt: number; owner: SpawnProgressOwner | null }>();
+
+/** Opaque identity of one claimSpawnProgress() region. */
+type SpawnProgressOwner = object;
 
 /**
  * Per-task staleness note appended to every label until the spawn clears
@@ -157,19 +165,47 @@ export function onSpawnProgressTransition(listener: SpawnProgressTransitionListe
 }
 
 /**
+ * Fired on EVERY push, with the label exactly as the renderer receives it
+ * (staleness note applied), or null when the spawn clears. Unlike the
+ * transition listener above it does fire on a label-only change, and on a
+ * re-push of an unchanged label, so a listener that forwards labels elsewhere
+ * (the mobile bridge's spawn-progress feed) dedupes and throttles for itself.
+ * A TTL expiry in getInFlightSpawnProgress() is not a push and fires nothing.
+ */
+type SpawnProgressChangeListener = (taskId: string, label: string | null) => void;
+const spawnProgressChangeListeners = new Set<SpawnProgressChangeListener>();
+
+/** Subscribe to every spawn-progress label push. Returns an unsubscribe function. */
+export function onSpawnProgressChange(listener: SpawnProgressChangeListener): () => void {
+  spawnProgressChangeListeners.add(listener);
+  return () => spawnProgressChangeListeners.delete(listener);
+}
+
+/**
  * TTL safety net. Longer than any realistic worktree-create + fetch + agent
  * spawn (those are bounded by AbortControllers anyway); this only catches the
  * pathological "never cleared" case. Normal cleanup is clearSpawnProgress().
+ * Exported for the mobile bridge's SpawnProgressFeed, which prunes its own
+ * per-task state on the same horizon because a TTL expiry pushes nothing.
  */
-const SPAWN_PROGRESS_TTL_MS = 120_000;
+export const SPAWN_PROGRESS_TTL_MS = 120_000;
 
 /**
  * Update the queryable map and push the change to the renderer. The map is
  * updated UNCONDITIONALLY (before the destroyed-window guard) so it stays the
  * authoritative source of truth even when the send is skipped during teardown.
  * `label === null` removes the entry (spawn done/aborted).
+ *
+ * `owner` stamps who pushed a label: a claim's token, or null for a push from
+ * anywhere else. A re-push of the same label that changes no hands
+ * (setSpawnStaleNote) passes the entry's own owner back in.
  */
-function pushSpawnProgress(mainWindow: BrowserWindow, taskId: string, label: string | null): void {
+function pushSpawnProgress(
+  mainWindow: BrowserWindow,
+  taskId: string,
+  label: string | null,
+  owner: SpawnProgressOwner | null,
+): void {
   const wasTracked = inFlightSpawnProgress.has(taskId);
   if (label === null) {
     inFlightSpawnProgress.delete(taskId);
@@ -187,17 +223,27 @@ function pushSpawnProgress(mainWindow: BrowserWindow, taskId: string, label: str
         spawnStaleNotes.set(taskId, pending.note);
       }
     }
-    inFlightSpawnProgress.set(taskId, { label, updatedAt: Date.now() });
+    inFlightSpawnProgress.set(taskId, { label, updatedAt: Date.now(), owner });
   }
   const isTracked = label !== null;
   if (wasTracked !== isTracked) {
     for (const listener of spawnProgressTransitionListeners) listener(taskId, isTracked);
   }
+  const decoratedLabel = label === null ? null : decorateLabel(taskId, label);
+  // This runs on the spawn path itself: a throwing listener must neither skip
+  // the renderer push below nor throw into the spawn that pushed the label.
+  for (const listener of spawnProgressChangeListeners) {
+    try {
+      listener(taskId, decoratedLabel);
+    } catch (error) {
+      console.warn('[spawn-progress] change listener failed:', error);
+    }
+  }
   // Through the recorded chokepoint, not a raw `webContents.send`: a label is
   // what tells a card and a paired phone that a suspend is a respawn rather
   // than a park, so when that goes wrong the IPC log is where the answer is
   // looked for, and a raw send left every spawn-progress push out of it.
-  sendToRenderer(mainWindow, IPC.TASK_SPAWN_PROGRESS, taskId, label === null ? null : decorateLabel(taskId, label));
+  sendToRenderer(mainWindow, IPC.TASK_SPAWN_PROGRESS, taskId, decoratedLabel);
 }
 
 /**
@@ -261,7 +307,8 @@ export function setSpawnStaleNote(
       return;
     }
     spawnStaleNotes.set(taskId, note);
-    pushSpawnProgress(mainWindow, taskId, entry.label);
+    // A decoration of the same label, so whoever pushed it still owns it.
+    pushSpawnProgress(mainWindow, taskId, entry.label, entry.owner);
     return;
   }
   if (probeGeneration === undefined) return;
@@ -342,7 +389,7 @@ export function emitSpawnProgress(
   taskId: string,
   phase: SpawnPhase,
 ): void {
-  pushSpawnProgress(mainWindow, taskId, PHASE_LABELS[phase]);
+  pushSpawnProgress(mainWindow, taskId, PHASE_LABELS[phase], null);
 }
 
 /**
@@ -412,21 +459,22 @@ export function emitSpawnWaiting(
   } else {
     label = 'Waiting...';
   }
-  pushSpawnProgress(mainWindow, taskId, label);
+  pushSpawnProgress(mainWindow, taskId, label, null);
 }
 
 /**
  * Create an onProgress callback that emits spawn progress labels.
  * The callback accepts phase strings from the git layer and resolves
- * them to user-facing labels via the PHASE_LABELS map. Unknown phases
- * (e.g. raw git progress strings) are passed through verbatim.
+ * them to user-facing labels via the PHASE_LABELS map. Unknown phases are
+ * passed through verbatim: every git caller passes a named phase, and the
+ * automation runner passes `Running "<automation name>"...`.
  */
 export function createProgressCallback(
   mainWindow: BrowserWindow,
   taskId: string,
 ): (phase: string) => void {
   return (phase: string) => {
-    pushSpawnProgress(mainWindow, taskId, PHASE_LABELS[phase as SpawnPhase] ?? phase);
+    pushSpawnProgress(mainWindow, taskId, PHASE_LABELS[phase as SpawnPhase] ?? phase, null);
   };
 }
 
@@ -438,5 +486,43 @@ export function clearSpawnProgress(
   mainWindow: BrowserWindow,
   taskId: string,
 ): void {
-  pushSpawnProgress(mainWindow, taskId, null);
+  pushSpawnProgress(mainWindow, taskId, null, null);
+}
+
+/** A labelled region that clears only its own label. See claimSpawnProgress. */
+export interface SpawnProgressClaim {
+  /** Same contract as createProgressCallback's callback; each push is owned by this claim. */
+  onProgress: (phase: string) => void;
+  /** Clear the task's label, unless a push from another path replaced this claim's since. */
+  release: () => void;
+}
+
+/**
+ * Like createProgressCallback, for a region whose clear must not wipe another
+ * path's label. The label slot is per task, so a region that runs alongside
+ * another spawn of the same task (SESSION_RESUME next to a phone Start, or an
+ * aborted resume next to the resume that aborted it) would otherwise clear
+ * the label the other one is still showing.
+ *
+ * release() clears when this claim still owns the label, or when there is no
+ * label at all (a TTL sweep pushes nothing, so the null still corrects the
+ * renderer). Any other push since this claim's last one means another path
+ * owns the label and clears it itself, so release() leaves it.
+ *
+ * One direction only: an unconditional clearSpawnProgress() elsewhere still
+ * clears a claim's label. Every other region clears that way because
+ * spawnAgent pushes labels of its own and relies on its caller to clear them.
+ */
+export function claimSpawnProgress(mainWindow: BrowserWindow, taskId: string): SpawnProgressClaim {
+  const owner: SpawnProgressOwner = {};
+  return {
+    onProgress: (phase: string) => {
+      pushSpawnProgress(mainWindow, taskId, PHASE_LABELS[phase as SpawnPhase] ?? phase, owner);
+    },
+    release: () => {
+      const entry = inFlightSpawnProgress.get(taskId);
+      if (entry && entry.owner !== owner) return;
+      pushSpawnProgress(mainWindow, taskId, null, null);
+    },
+  };
 }

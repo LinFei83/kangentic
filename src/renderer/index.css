@@ -67,6 +67,11 @@
   --kng-warning: #d9b83f;   /* caution band (true yellow, distinct from attention amber) */
   --kng-danger: #e05d5d;    /* critical band */
 
+  /* Text for "this changed" in the Changes panel: the Modified status label
+     and file-tree icon, and an image's changed dimensions and size pill.
+     Light-base themes override it below; this yellow is ~1.4:1 on them. */
+  --kng-modified: #facc15;
+
   /* Categorical chart series (usage dashboard donuts/legends). Dark-surface
      steps of the validated dataviz reference palette; slot ORDER is the
      CVD-safety mechanism - assign series by slot index, never re-order or
@@ -380,6 +385,15 @@
   --kng-chart-6: #e34948;
 }
 
+/* The dark themes' yellow Modified color reads at ~1.4:1 on light surfaces.
+   #92400e (amber-800) measured 2026-10-06 against every light theme's surface,
+   raised surface, Changes info-tile fill (hover 50% over surface) and the 15%
+   size-pill tint: worst case 4.59:1 (peach pill). VS Code's light #895503 was
+   tried first and fell to 4.13:1 inside the pill. */
+.theme-light, .theme-clay, .theme-sand, .theme-mint, .theme-sky, .theme-peach {
+  --kng-modified: #92400e;
+}
+
 @theme inline {
   --color-surface: var(--kng-surface);
   --color-surface-raised: var(--kng-surface-raised);
@@ -407,6 +421,7 @@
   --color-attention: var(--kng-attention);
   --color-warning: var(--kng-warning);
   --color-danger: var(--kng-danger);
+  --color-modified: var(--kng-modified);
 
   --color-chart-1: var(--kng-chart-1);
   --color-chart-2: var(--kng-chart-2);
@@ -673,6 +688,8 @@
   --toast-duration: 250ms;
 
   --maximize-duration: 125ms;
+
+  --group-collapse-duration: 200ms;
 }
 
 /* Dialog transitions */
@@ -731,6 +748,39 @@
 
 .no-motion .dialog-maximize-anim {
   transition-duration: 0s;
+}
+
+/* A settings group tile's open and close (`CardGroupTile`). The body's one
+   grid row tweens between 0fr and 1fr, so it sizes to its content with no
+   measured height. Visibility tweens with it: it stays visible for the whole
+   of a close and turns on at the start of an open, so a closed body leaves the
+   tab order and the accessibility tree once it has shut. */
+.card-group-body {
+  display: grid;
+  transition:
+    grid-template-rows var(--group-collapse-duration) var(--overlay-enter-ease),
+    visibility var(--group-collapse-duration);
+}
+
+/* Its chevron turns over with the body, on the same clock. Tailwind 4's
+   `rotate-180` sets the `rotate` property, not `transform`, so `rotate` is
+   the one to transition. */
+.card-group-chevron {
+  transition:
+    color var(--group-collapse-duration) var(--overlay-enter-ease),
+    rotate var(--group-collapse-duration) var(--overlay-enter-ease);
+}
+
+.no-motion .card-group-body,
+.no-motion .card-group-chevron {
+  transition-duration: 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card-group-body,
+  .card-group-chevron {
+    transition-duration: 0s;
+  }
 }
 
 /* Disable all CSS keyframe animations when user opts out via Appearance settings.
@@ -838,6 +888,14 @@
   user-select: none;
 }
 
+/* Transparent pixels in the Changes panel's image view (ImageDiffView.tsx),
+   drawn as the background of each image element so it covers exactly the
+   image's area. Two of the theme's own surfaces, so every theme, light or
+   dark, gets a checkerboard that reads as "nothing painted here". */
+.image-diff-checkerboard {
+  background: repeating-conic-gradient(var(--kng-surface-hover) 0% 25%, var(--kng-surface-raised) 0% 50%) 0 0 / 16px 16px;
+}
+
 /* ── Markdown body styles ── */
 
 .markdown-body {
@@ -941,6 +999,34 @@
 
 .markdown-body a:hover {
   text-decoration: underline;
+}
+
+/* The Knowledge Graph chat is about 350px of prose, where `markdown-body` is tuned
+   for a document column. Only the things that actually crowd at that width are
+   overridden - the shared type scale and margins already read correctly. */
+.knowledge-graph-answer-body ul,
+.knowledge-graph-answer-body ol {
+  /* 1.5em of indent spends 5% of the chat on nothing. Enough for the marker. */
+  padding-left: 1.1em;
+}
+
+.knowledge-graph-answer-body h1,
+.knowledge-graph-answer-body h2,
+.knowledge-graph-answer-body h3,
+.knowledge-graph-answer-body h4 {
+  /* An agent's `**Section**` becomes a heading at whatever level it chose, and
+     at document scale those tower over 14px body text in a narrow column. */
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--kng-fg-muted);
+  margin-top: 1.1em;
+}
+
+.knowledge-graph-answer-body pre {
+  /* A fenced block cannot widen the chat; it scrolls inside it instead. */
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .markdown-body .md-table-scroll {

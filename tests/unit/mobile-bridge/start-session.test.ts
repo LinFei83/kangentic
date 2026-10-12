@@ -1,8 +1,10 @@
 /**
  * start-session must route through startTaskSession (the task lock, the
- * stale-pointer reconcile, the To Do / Done / archived gate, and the
- * autoSpawnForTask -> spawnAgent chokepoint), never the engine or a
- * repository directly, and must forward ONLY the two trusted payload fields.
+ * stale-pointer reconcile, the To Do / Done / archived gate, then the desktop
+ * Resume path for a paused task or the autoSpawnForTask -> spawnAgent
+ * chokepoint otherwise; start-session-resume-path.test.ts runs both for real),
+ * never the engine or a repository directly, and must forward ONLY the two
+ * trusted payload fields.
  *
  * It must also answer the phone when the start is ACCEPTED, not when the
  * agent is up: the worktree ensure (a git fetch), the branch checkout, the
@@ -106,6 +108,18 @@ describe('handleStartSession', () => {
     // verbatim, and a blank or mismatched string would leave the user unable
     // to tell "no such project" from any other refusal reason.
     expect(response.error).toContain('No such project:');
+    expect(startTaskSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses a project id the desktop does not know, before any repository is opened', async () => {
+    // A non-empty id used to pass straight through, and the project database
+    // named after it was created and migrated on first open: a phone still
+    // showing a deleted project recreated it, and a path segment reached a
+    // file outside the projects directory.
+    const context = fakeContext();
+    vi.mocked(context.projectRepo.getById).mockReturnValue(undefined);
+    const response = await handleStartSession(fakeRequest({ taskId: 't-1', projectId: 'proj-deleted' }), context);
+    expect(response).toMatchObject({ ok: false, error: 'No such project: proj-deleted' });
     expect(startTaskSessionMock).not.toHaveBeenCalled();
   });
 

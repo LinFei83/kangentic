@@ -11,10 +11,11 @@
  * Two halves, deliberately:
  *
  *   (a) the CONTRACT - the pure predicate every consumer reads;
- *   (b) the STRUCTURAL parity check - that `handlers/sessions.ts` actually
- *       calls it at both lane checks. (a) alone is green the moment it is
- *       written and says nothing about the handler where the bug lived, so
- *       (b) is the regression guard.
+ *   (b) the STRUCTURAL parity check - that `resumeTaskSession`
+ *       (`handlers/session-resume.ts`, the body SESSION_RESUME and a phone
+ *       resume share) actually calls it at both lane checks. (a) alone is
+ *       green the moment it is written and says nothing about the handler
+ *       where the bug lived, so (b) is the regression guard.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -22,12 +23,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   RESUME_HIDDEN_ROLES,
+  isPauseOffered,
+  isPausedTaskSession,
+  isResumeOffered,
+  isTaskPaused,
+  pausedTaskIdsOf,
   resumeBlockMessage,
   resumeBlockReason,
+  resumeBlockReasonForTask,
+  taskSessionStatesOf,
 } from '../../src/shared/session-resume-eligibility';
+import type { Task } from '../../src/shared/types';
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const SESSIONS_HANDLER = 'src/main/ipc/handlers/sessions.ts';
+const SESSION_RESUME_BODY = 'src/main/ipc/handlers/session-resume.ts';
 const RESUME_SUSPENDED = 'src/main/transition-engine/session-startup/resume-suspended.ts';
 
 function readSource(relativePath: string): string {
@@ -66,6 +76,17 @@ describe('resumeBlockReason', () => {
     expect([...RESUME_HIDDEN_ROLES].sort()).toEqual(['done', 'todo']);
   });
 
+  it('resumeBlockReasonForTask reads archived_at by truthiness, so a row assembled without the column is not archived', () => {
+    // A mock, wire-mapped or MCP-constructed Task can carry `undefined` here.
+    // `!== null` would read that as ARCHIVED and refuse every resume.
+    const rowWithoutColumn = {} as Pick<Task, 'archived_at'>;
+    expect(resumeBlockReasonForTask({ task: rowWithoutColumn, laneRole: null })).toBeNull();
+    expect(resumeBlockReasonForTask({ task: { archived_at: null }, laneRole: null })).toBeNull();
+    expect(resumeBlockReasonForTask({ task: { archived_at: '2026-01-01T00:00:00.000Z' }, laneRole: null })).toBe('archived');
+    // Done still wins over archived, as resumeBlockReason orders them.
+    expect(resumeBlockReasonForTask({ task: { archived_at: '2026-01-01T00:00:00.000Z' }, laneRole: 'done' })).toBe('done');
+  });
+
   it('phrases every refusal as user-facing guidance', () => {
     // These strings reach the user verbatim through the task detail's
     // "Failed to resume session: <reason>" toast.
@@ -81,7 +102,15 @@ describe('resumeBlockReason', () => {
 });
 
 describe('SESSION_RESUME routes both lane checks through the shared predicate', () => {
-  const source = readSource(SESSIONS_HANDLER);
+  const source = readSource(SESSION_RESUME_BODY);
+
+  it('the SESSION_RESUME handler delegates to the shared body, so these checks cover it', () => {
+    // The body moved out of sessions.ts so the phone's start-session could
+    // call the same function. Red if the handler grows its own copy again.
+    const handlerSource = readSource(SESSIONS_HANDLER);
+    expect(handlerSource).toMatch(/ipcMain\.handle\(IPC\.SESSION_RESUME,[\s\S]{0,200}resumeTaskSession\(/);
+    expect(handlerSource).not.toMatch(/resumeSuspendedSession\(/);
+  });
 
   it('imports the shared eligibility predicate', () => {
     expect(source).toMatch(/from '\.\.\/\.\.\/\.\.\/shared\/session-resume-eligibility'/);
@@ -98,16 +127,18 @@ describe('SESSION_RESUME routes both lane checks through the shared predicate', 
   it('checks eligibility at BOTH the Phase 1 and Phase 3 lane checks', () => {
     // Phase 2 (worktree git I/O) runs unlocked, so Phase 3 must re-check against
     // the re-read row: a concurrent move to Done archives the task in that gap.
-    const callSites = source.match(/resumeBlockReason\(/g) ?? [];
+    const callSites = source.match(/resumeBlockReasonForTask\(/g) ?? [];
     expect(callSites).toHaveLength(2);
   });
 
-  it('reads archived_at at both call sites, not just the lane role', () => {
-    // Truthiness, never `!== null`: a Task assembled without the column carries
-    // `undefined`, and `!== null` reads that as ARCHIVED, refusing every resume.
-    const archivedReads = source.match(/isArchived: Boolean\((task|current)\.archived_at\)/g) ?? [];
-    expect(archivedReads).toHaveLength(2);
-    expect(source).not.toMatch(/archived_at !== null/);
+  it('hands the row to the predicate at both call sites, the re-read one in Phase 3', () => {
+    // The predicate reads archived_at itself, so passing the row is what makes
+    // the archive state count. Phase 3 must pass the row it re-read under the
+    // lock, not the Phase 1 snapshot, or a move to Done in the gap goes unseen.
+    // Its role comes off the column's own row: the profile fold passes `role`
+    // through, and the check has to run before the try that reports failures.
+    expect(source).toMatch(/resumeBlockReasonForTask\(\{ task, laneRole: lane\?\.role \}\)/);
+    expect(source).toMatch(/resumeBlockReasonForTask\(\{ task: current, laneRole: currentRow\?\.role \}\)/);
   });
 
   it('keeps the self-heal early return ahead of the eligibility check', () => {
@@ -115,9 +146,131 @@ describe('SESSION_RESUME routes both lane checks through the shared predicate', 
     // path that re-attaches a renderer whose view drifted to 'suspended'.
     // Ordering it after the check would strand that renderer on an archived task.
     const selfHealIndex = source.indexOf("return { kind: 'live' as const, session: liveSession }");
-    const firstGuardIndex = source.indexOf('resumeBlockReason(');
+    const firstGuardIndex = source.indexOf('resumeBlockReasonForTask(');
     expect(selfHealIndex).toBeGreaterThan(-1);
     expect(firstGuardIndex).toBeGreaterThan(selfHealIndex);
+  });
+});
+
+describe('the paused-session definition behind the phone\'s Resume promise', () => {
+  it('isPausedTaskSession is a suspended row that is not a Command Terminal', () => {
+    expect(isPausedTaskSession({ status: 'suspended' })).toBe(true);
+    expect(isPausedTaskSession({ status: 'suspended', transient: false })).toBe(true);
+    expect(isPausedTaskSession({ status: 'suspended', transient: true })).toBe(false);
+    for (const status of ['running', 'queued', 'exited'] as const) {
+      expect(isPausedTaskSession({ status })).toBe(false);
+    }
+  });
+
+  it('pausedTaskIdsOf keeps each task with a paused row and no live one once, and nothing else', () => {
+    const taskIds = pausedTaskIdsOf([
+      { taskId: 'task-paused', status: 'suspended' },
+      // A queued successor beside the paused row it will replace: the desktop
+      // shows the queued session and offers no Resume, so the task is not paused.
+      { taskId: 'task-paused-with-queued-successor', status: 'suspended' },
+      { taskId: 'task-paused-with-queued-successor', status: 'queued' },
+      // The live row listed first must not matter.
+      { taskId: 'task-paused-with-running-successor', status: 'running' },
+      { taskId: 'task-paused-with-running-successor', status: 'suspended' },
+      { taskId: 'task-paused-twice', status: 'suspended' },
+      { taskId: 'task-paused-twice', status: 'suspended', transient: false },
+      { taskId: 'task-running', status: 'running' },
+      { taskId: 'task-queued', status: 'queued' },
+      { taskId: 'task-exited', status: 'exited' },
+      // A Command Terminal row is never a task's pause, even carrying its id.
+      { taskId: 'task-command-terminal', status: 'suspended', transient: true },
+      // A Command Terminal with no task, which carries an empty id.
+      { taskId: '', status: 'suspended' },
+    ]);
+    expect([...taskIds].sort()).toEqual(['task-paused', 'task-paused-twice']);
+  });
+
+  it('isTaskPaused answers pausedTaskIdsOf for one task, ignoring every other task\'s rows', () => {
+    const sessions = [
+      { taskId: 'task-paused', status: 'suspended' as const },
+      { taskId: 'task-paused-with-queued-successor', status: 'suspended' as const },
+      { taskId: 'task-paused-with-queued-successor', status: 'queued' as const },
+      // Another task's live row must not unpause this one.
+      { taskId: 'task-running', status: 'running' as const },
+      { taskId: 'task-command-terminal', status: 'suspended' as const, transient: true },
+    ];
+    expect(isTaskPaused(sessions, 'task-paused')).toBe(true);
+    expect(isTaskPaused(sessions, 'task-paused-with-queued-successor')).toBe(false);
+    expect(isTaskPaused(sessions, 'task-running')).toBe(false);
+    expect(isTaskPaused(sessions, 'task-command-terminal')).toBe(false);
+    expect(isTaskPaused(sessions, 'task-unknown')).toBe(false);
+  });
+
+  it('isResumeOffered needs a paused session AND a column and archive state that allow Resume', () => {
+    const liveTask = { archived_at: null };
+    const archivedTask = { archived_at: '2026-01-01T00:00:00.000Z' };
+    expect(isResumeOffered({ hasPausedSession: true, task: liveTask, laneRole: null })).toBe(true);
+    expect(isResumeOffered({ hasPausedSession: false, task: liveTask, laneRole: null })).toBe(false);
+    expect(isResumeOffered({ hasPausedSession: true, task: liveTask, laneRole: 'todo' })).toBe(false);
+    expect(isResumeOffered({ hasPausedSession: true, task: liveTask, laneRole: 'done' })).toBe(false);
+    expect(isResumeOffered({ hasPausedSession: true, task: archivedTask, laneRole: null })).toBe(false);
+  });
+
+  it('taskSessionStatesOf yields the live and the paused tasks from one scan, never the same task in both', () => {
+    const sessions = [
+      { taskId: 'task-running', status: 'running' as const },
+      { taskId: 'task-queued', status: 'queued' as const },
+      { taskId: 'task-paused', status: 'suspended' as const },
+      // A queued successor beside the paused row it will replace: live, not paused.
+      { taskId: 'task-paused-with-queued-successor', status: 'suspended' as const },
+      { taskId: 'task-paused-with-queued-successor', status: 'queued' as const },
+      { taskId: 'task-exited', status: 'exited' as const },
+      { taskId: 'task-command-terminal', status: 'suspended' as const, transient: true },
+      { taskId: '', status: 'running' as const },
+    ];
+    const { liveTaskIds, pausedTaskIds } = taskSessionStatesOf(sessions);
+    expect([...liveTaskIds].sort()).toEqual(['task-paused-with-queued-successor', 'task-queued', 'task-running']);
+    expect([...pausedTaskIds].sort()).toEqual(['task-paused']);
+    for (const taskId of liveTaskIds) expect(pausedTaskIds.has(taskId)).toBe(false);
+    // pausedTaskIdsOf is the same scan's paused half.
+    expect([...pausedTaskIdsOf(sessions)].sort()).toEqual([...pausedTaskIds].sort());
+  });
+
+  it('isPauseOffered needs a live session and a column other than To Do, and keeps Pause in Done', () => {
+    expect(isPauseOffered({ hasLiveSession: true, laneRole: null })).toBe(true);
+    // Done keeps Pause, as the task view does: it is the only stop for a live
+    // agent a failed Done-move suspend left behind.
+    expect(isPauseOffered({ hasLiveSession: true, laneRole: 'done' })).toBe(true);
+    expect(isPauseOffered({ hasLiveSession: true, laneRole: 'todo' })).toBe(false);
+    expect(isPauseOffered({ hasLiveSession: false, laneRole: null })).toBe(false);
+    expect(isPauseOffered({ hasLiveSession: false, laneRole: 'done' })).toBe(false);
+  });
+
+  // The archive half of the check had four hand-written copies, each carrying
+  // the same "truthiness, not `!== null`" warning. The predicates own that read
+  // now; a site that derives `isArchived` again is the drift this pins.
+  it.each([
+    'src/main/ipc/handlers/session-start.ts',
+    'src/main/ipc/handlers/session-resume.ts',
+    'src/main/mobile-bridge/handlers/read-board.ts',
+    'src/main/mobile-bridge/handlers/read-stream.ts',
+  ])('%s leaves the archived_at read to the shared predicate', (relativePath) => {
+    const source = readSource(relativePath);
+    expect(source).not.toMatch(/isArchived:/);
+    expect(source).not.toMatch(/archived_at !== null/);
+  });
+
+  // start-session's resume path and the `resumable` flag the phone gates
+  // Resume on must agree on what "paused" means, or the flag promises a resume
+  // the verb does not deliver. Each site wrote it out by hand before, and
+  // start-session's copy missed the Command Terminal exclusion. All three run
+  // one scan: read-board over every task (taskSessionStatesOf, which also
+  // yields the live set behind `pausable`), start-session and read-stream over
+  // one task through isTaskPaused, which wraps it. read-stream also checks the
+  // one session it streams.
+  it.each([
+    ['src/main/ipc/handlers/session-start.ts', [/isTaskPaused\(/]],
+    ['src/main/mobile-bridge/handlers/read-board.ts', [/taskSessionStatesOf\(/, /isPauseOffered\(/]],
+    ['src/main/mobile-bridge/handlers/read-stream.ts', [/isPausedTaskSession\(/, /isTaskPaused\(/]],
+  ])('%s decides "paused" through the shared definition, with no hand-rolled suspended comparison', (relativePath, sharedCalls) => {
+    const source = readSource(relativePath);
+    for (const sharedCall of sharedCalls) expect(source).toMatch(sharedCall);
+    expect(source.match(/[!=]==\s*'suspended'/g) ?? []).toEqual([]);
   });
 });
 

@@ -27,8 +27,10 @@ import {
   parseReadBoardResponsePayload,
   parseReadDiffResponsePayload,
   parseReadStreamResponsePayload,
+  parsePauseSessionResponsePayload,
   parseStartSessionResponsePayload,
   parseTranscriptWindowResponsePayload,
+  parseCommandTerminalStartResponsePayload,
 } from '../../../packages/protocol/src/wire/payloads';
 import type { JsonValue } from '../../../packages/protocol/src/wire/messages';
 
@@ -60,6 +62,10 @@ const boardTaskFixture: JsonValue = {
   archived_at: null,
   created_at: '2026-07-13T00:00:00.000Z',
   updated_at: '2026-07-13T00:00:00.000Z',
+  spawn_progress: null,
+  resumable: false,
+  paused: false,
+  pausable: true,
 };
 
 describe('parseTranscriptEntriesWire', () => {
@@ -186,6 +192,46 @@ describe('parseActivityEventPayload', () => {
     expect(() => parseActivityEventPayload({ type: 'session-ended', intentional: true, spawnProgressLabel: null })).toThrow(/spawnProgressLabel/);
   });
 
+  it('parses a session-ended payload naming a successor, alone or with a label', () => {
+    const successorOnly: JsonValue = { type: 'session-ended', intentional: true, successorSessionId: 'sess-2' };
+    expect(parseActivityEventPayload(successorOnly)).toEqual(successorOnly);
+    const both: JsonValue = { type: 'session-ended', intentional: true, spawnProgressLabel: 'Starting agent...', successorSessionId: 'sess-2' };
+    expect(parseActivityEventPayload(both)).toEqual(both);
+    expect('successorSessionId' in parseActivityEventPayload({ type: 'session-ended', intentional: true })).toBe(false);
+  });
+
+  it('rejects a session-ended payload with a non-string successorSessionId', () => {
+    expect(() => parseActivityEventPayload({ type: 'session-ended', intentional: true, successorSessionId: 7 })).toThrow(/successorSessionId/);
+    expect(() => parseActivityEventPayload({ type: 'session-ended', intentional: true, successorSessionId: null })).toThrow(/successorSessionId/);
+  });
+
+  it('parses a status payload for every lifecycle status', () => {
+    for (const status of ['running', 'queued', 'suspended', 'exited']) {
+      expect(parseActivityEventPayload({ type: 'status', status, resuming: false, resumable: false })).toEqual({ type: 'status', status, resuming: false, resumable: false });
+    }
+    expect(parseActivityEventPayload({ type: 'status', status: 'running', resuming: true, resumable: false })).toEqual({ type: 'status', status: 'running', resuming: true, resumable: false });
+  });
+
+  it('carries resumable true on a status payload for a paused session the desktop would offer Resume for', () => {
+    expect(parseActivityEventPayload({ type: 'status', status: 'suspended', resuming: false, resumable: true })).toEqual({
+      type: 'status',
+      status: 'suspended',
+      resuming: false,
+      resumable: true,
+    });
+  });
+
+  it('rejects a status payload with an unknown status, or a missing resuming or resumable', () => {
+    expect(() => parseActivityEventPayload({ type: 'status', status: 'zombie', resuming: false, resumable: false })).toThrow(/status/);
+    expect(() => parseActivityEventPayload({ type: 'status', resuming: false, resumable: false })).toThrow(/status/);
+    expect(() => parseActivityEventPayload({ type: 'status', status: 'running', resumable: false })).toThrow(/resuming/);
+    expect(() => parseActivityEventPayload({ type: 'status', status: 'running', resuming: 'yes', resumable: false })).toThrow(/resuming/);
+    // The status payload is new in 0.16.0 alongside resumable, so no desktop
+    // ever sends one without it: absence is malformed, not an older peer.
+    expect(() => parseActivityEventPayload({ type: 'status', status: 'suspended', resuming: false })).toThrow(/resumable/);
+    expect(() => parseActivityEventPayload({ type: 'status', status: 'suspended', resuming: false, resumable: 'yes' })).toThrow(/resumable/);
+  });
+
   it('rejects an invalid state', () => {
     expect(() => parseActivityEventPayload({ type: 'activity', state: 'busy', reason: { kind: 'idle' } })).toThrow(/state/);
   });
@@ -257,6 +303,49 @@ describe('board row guards', () => {
   it('passes through a present pr_merge_readiness value', () => {
     const withReadiness = { ...(boardTaskFixture as Record<string, JsonValue>), pr_merge_readiness: 'blocked' };
     expect(parseBoardTaskWire(withReadiness).pr_merge_readiness).toBe('blocked');
+  });
+
+  it('passes through a spawn_progress label, and reads an absent or non-string one as null (pre-0.16.0 desktop)', () => {
+    const withLabel = { ...(boardTaskFixture as Record<string, JsonValue>), spawn_progress: 'Waiting (2 ahead)' };
+    expect(parseBoardTaskWire(withLabel).spawn_progress).toBe('Waiting (2 ahead)');
+    const withoutLabel = { ...(boardTaskFixture as Record<string, JsonValue>) };
+    delete withoutLabel.spawn_progress;
+    expect(parseBoardTaskWire(withoutLabel).spawn_progress).toBeNull();
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), spawn_progress: 42 }).spawn_progress).toBeNull();
+  });
+
+  it('passes resumable through as true or false, and reads an absent or non-boolean one as null (pre-0.16.0 desktop)', () => {
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), resumable: true }).resumable).toBe(true);
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), resumable: false }).resumable).toBe(false);
+    // Null, not false: an older desktop answers start-session by starting the
+    // column, so "no promise" must stay distinguishable from "not resumable"
+    // and a client offers no Resume for either.
+    const withoutResumable = { ...(boardTaskFixture as Record<string, JsonValue>) };
+    delete withoutResumable.resumable;
+    expect(parseBoardTaskWire(withoutResumable).resumable).toBeNull();
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), resumable: 'yes' }).resumable).toBeNull();
+  });
+
+  it('passes paused through as true or false, and reads an absent or non-boolean one as null (pre-0.17.0 desktop)', () => {
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), paused: true }).paused).toBe(true);
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), paused: false }).paused).toBe(false);
+    // Null, not false: a client reads "unknown" and falls back to resumable
+    // alone, rather than taking an older desktop's silence as "not paused".
+    const withoutPaused = { ...(boardTaskFixture as Record<string, JsonValue>) };
+    delete withoutPaused.paused;
+    expect(parseBoardTaskWire(withoutPaused).paused).toBeNull();
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), paused: 'yes' }).paused).toBeNull();
+  });
+
+  it('passes pausable through as true or false, and reads an absent or non-boolean one as null (pre-0.18.0 desktop)', () => {
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), pausable: true }).pausable).toBe(true);
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), pausable: false }).pausable).toBe(false);
+    // Null, not false: an older desktop refuses pause-session (or never
+    // answers it), so a client offers no Pause for an unknown answer either.
+    const withoutPausable = { ...(boardTaskFixture as Record<string, JsonValue>) };
+    delete withoutPausable.pausable;
+    expect(parseBoardTaskWire(withoutPausable).pausable).toBeNull();
+    expect(parseBoardTaskWire({ ...(boardTaskFixture as Record<string, JsonValue>), pausable: 1 }).pausable).toBeNull();
   });
 
   it('parses a column row', () => {
@@ -490,6 +579,37 @@ describe('read-* response parsers', () => {
     expect(() => parseReadStreamResponsePayload({ ...base, sessionStatus: 3 })).toThrow(/sessionStatus/);
   });
 
+  it('carries resuming when present, tolerates absence (pre-0.16.0 desktop), and rejects a non-boolean', () => {
+    const base: Record<string, JsonValue> = {
+      scrollback: '',
+      activity: { state: null, reason: null },
+      usage: null,
+      awaitedPromptId: null,
+    };
+    expect(parseReadStreamResponsePayload({ ...base, resuming: true }).resuming).toBe(true);
+    expect(parseReadStreamResponsePayload({ ...base, resuming: false }).resuming).toBe(false);
+    expect('resuming' in parseReadStreamResponsePayload(base)).toBe(false);
+    expect(() => parseReadStreamResponsePayload({ ...base, resuming: 'yes' })).toThrow(/resuming/);
+  });
+
+  it('carries resumable true and false, leaves it absent for a pre-0.16.0 desktop, and rejects a non-boolean', () => {
+    const base: Record<string, JsonValue> = {
+      scrollback: '',
+      activity: { state: null, reason: null },
+      usage: null,
+      awaitedPromptId: null,
+      sessionStatus: 'suspended',
+    };
+    expect(parseReadStreamResponsePayload({ ...base, resumable: true }).resumable).toBe(true);
+    expect(parseReadStreamResponsePayload({ ...base, resumable: false }).resumable).toBe(false);
+    // Absent, never defaulted: an older desktop answers start-session by
+    // starting the column, so a phone must be able to tell "no promise" apart
+    // from false, and offer no Resume.
+    expect('resumable' in parseReadStreamResponsePayload(base)).toBe(false);
+    expect(() => parseReadStreamResponsePayload({ ...base, resumable: 'yes' })).toThrow(/resumable/);
+    expect(() => parseReadStreamResponsePayload({ ...base, resumable: null })).toThrow(/resumable/);
+  });
+
   it('parses a read-board project list', () => {
     expect(parseReadBoardResponsePayload({ projects: [{ id: 'p-1', name: 'Alpha' }] })).toEqual({ projects: [{ id: 'p-1', name: 'Alpha' }] });
   });
@@ -562,6 +682,75 @@ describe('read-* response parsers', () => {
     expect(() => parseStartSessionResponsePayload({ ok: true, outcome: 'restarted' })).toThrow(/outcome/);
     expect(() => parseStartSessionResponsePayload('ok' as unknown as JsonValue)).toThrow(/object/);
   });
+
+  it('parses a pause-session response to exactly its ok field', () => {
+    expect(parsePauseSessionResponsePayload({ ok: true, extra: 1 })).toEqual({ ok: true });
+  });
+
+  it('rejects a pause-session response with a missing or non-boolean ok', () => {
+    expect(() => parsePauseSessionResponsePayload({})).toThrow(/ok/);
+    expect(() => parsePauseSessionResponsePayload({ ok: 'yes' })).toThrow(/ok/);
+    expect(() => parsePauseSessionResponsePayload(null)).toThrow(/object/);
+  });
+
+  it('parses a command-terminal start response to exactly its four fields', () => {
+    expect(parseCommandTerminalStartResponsePayload({ ok: true, sessionId: 's-1', slot: 2, name: 'Command Terminal 2', extra: 1 }))
+      .toEqual({ ok: true, sessionId: 's-1', slot: 2, name: 'Command Terminal 2' });
+  });
+
+  it('rejects a command-terminal start response with a missing id or name, or a slot that is not a positive integer', () => {
+    expect(() => parseCommandTerminalStartResponsePayload({ ok: true, slot: 1, name: 'x' })).toThrow(/sessionId/);
+    expect(() => parseCommandTerminalStartResponsePayload({ ok: true, sessionId: 's', slot: 1 })).toThrow(/name/);
+    expect(() => parseCommandTerminalStartResponsePayload({ ok: true, sessionId: 's', slot: 0, name: 'x' })).toThrow(/slot/);
+    expect(() => parseCommandTerminalStartResponsePayload({ ok: true, sessionId: 's', slot: 1.5, name: 'x' })).toThrow(/slot/);
+    expect(() => parseCommandTerminalStartResponsePayload({ ok: false, sessionId: 's', slot: 1, name: 'x' })).toThrow(/ok/);
+  });
+
+  it('parses a snapshot\'s Command Terminals and the offered flag (protocol 0.20.0)', () => {
+    const parsed = parseReadBoardResponsePayload({
+      projectId: 'p-1',
+      columns: [],
+      tasks: [],
+      commandTerminals: [
+        {
+          sessionId: 's-1',
+          projectId: 'p-1',
+          slot: 1,
+          name: 'Audit Unused Feature Flags',
+          named: true,
+          activity: { state: 'permission', reason: { kind: 'permission', since: 10 } },
+        },
+        { sessionId: 's-2', projectId: 'p-1', slot: 2, name: 'Command Terminal 2', named: false, activity: { state: null, reason: null } },
+      ],
+      commandTerminalsOffered: true,
+    });
+    expect(parsed).toMatchObject({
+      commandTerminalsOffered: true,
+      commandTerminals: [
+        { sessionId: 's-1', slot: 1, named: true, activity: { state: 'permission', reason: { kind: 'permission', since: 10 } } },
+        { sessionId: 's-2', slot: 2, named: false, activity: { state: null, reason: null } },
+      ],
+    });
+  });
+
+  it('reads an unknown activity state or reason on a Command Terminal as null rather than failing the snapshot', () => {
+    const parsed = parseReadBoardResponsePayload({
+      projectId: 'p-1',
+      columns: [],
+      tasks: [],
+      commandTerminals: [{ sessionId: 's-1', projectId: 'p-1', slot: 1, name: 'x', named: false, activity: { state: 'dreaming', reason: { kind: 'future-kind' } } }],
+    });
+    expect(parsed).toMatchObject({ commandTerminals: [{ activity: { state: null, reason: null } }] });
+  });
+
+  it('leaves both Command Terminal fields absent for an older desktop, and rejects malformed ones', () => {
+    const parsed = parseReadBoardResponsePayload({ projectId: 'p-1', columns: [], tasks: [] });
+    expect('commandTerminals' in parsed).toBe(false);
+    expect('commandTerminalsOffered' in parsed).toBe(false);
+    expect(() => parseReadBoardResponsePayload({ projectId: 'p-1', columns: [], tasks: [], commandTerminals: {} })).toThrow(/commandTerminals/);
+    expect(() => parseReadBoardResponsePayload({ projectId: 'p-1', columns: [], tasks: [], commandTerminalsOffered: 'yes' })).toThrow(/commandTerminalsOffered/);
+    expect(() => parseReadBoardResponsePayload({ projectId: 'p-1', columns: [], tasks: [], commandTerminals: [{ sessionId: 's-1' }] })).toThrow(/command terminal/);
+  });
 });
 
 describe('parseTranscriptEventPayload', () => {
@@ -620,10 +809,23 @@ describe('isBridgeEvent', () => {
     expect(
       isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'session-ended', intentional: true, spawnProgressLabel: 'Switching model...' } }),
     ).toBe(true);
+    expect(
+      isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'session-ended', intentional: true, successorSessionId: 's-2' } }),
+    ).toBe(true);
+    expect(isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'status', status: 'queued', resuming: false, resumable: false } })).toBe(true);
     expect(isBridgeEvent({ kind: 'terminal', sessionId: 's', taskId: 't', payload: { data: 'bytes' } })).toBe(true);
     expect(isBridgeEvent({ kind: 'terminal-resize', sessionId: 's', taskId: 't', payload: { cols: 48, rows: 26 } })).toBe(true);
     expect(isBridgeEvent({ kind: 'board', projectId: 'p', payload: { change: 'task-updated', ids: ['t-1'] } })).toBe(true);
+    expect(isBridgeEvent({ kind: 'board', projectId: 'p', payload: { change: 'command-terminals-changed', ids: ['s-1'] } })).toBe(true);
     expect(isBridgeEvent({ kind: 'diff', taskId: 't', payload: null })).toBe(true);
+    // A project-folder diff (protocol 0.20.0) names the project instead.
+    expect(isBridgeEvent({ kind: 'diff', projectId: 'p', payload: null })).toBe(true);
+  });
+
+  it('rejects a diff event that names neither or both of task and project', () => {
+    expect(isBridgeEvent({ kind: 'diff', payload: null })).toBe(false);
+    expect(isBridgeEvent({ kind: 'diff', taskId: 't', projectId: 'p', payload: null })).toBe(false);
+    expect(isBridgeEvent({ kind: 'diff', projectId: 7, payload: null })).toBe(false);
   });
 
   it('rejects malformed events', () => {
@@ -637,6 +839,7 @@ describe('isBridgeEvent', () => {
     expect(
       isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'session-ended', intentional: true, spawnProgressLabel: 42 } }),
     ).toBe(false);
+    expect(isBridgeEvent({ kind: 'activity', sessionId: 's', taskId: 't', payload: { type: 'status', status: 'paused', resuming: false, resumable: true } })).toBe(false);
     expect(isBridgeEvent({ kind: 'terminal', sessionId: 's', taskId: 't', payload: { data: 42 } })).toBe(false);
     expect(isBridgeEvent({ kind: 'terminal-resize', sessionId: 's', taskId: 't', payload: { cols: 0, rows: 26 } })).toBe(false);
     expect(isBridgeEvent({ kind: 'terminal-resize', sessionId: 's', payload: { cols: 48, rows: 26 } })).toBe(false);

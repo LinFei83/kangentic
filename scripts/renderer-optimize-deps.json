@@ -7,5 +7,7 @@
   "zustand", "zustand/react/shallow",
   "monaco-editor", "monaco-editor/base/common/errors",
   "recharts",
-  "turndown", "turndown-plugin-gfm"
+  "three", "camera-controls",
+  "turndown", "turndown-plugin-gfm",
+  "pixelmatch"
 ]

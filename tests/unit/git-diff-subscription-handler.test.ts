@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { IPC } from '../../src/shared/ipc-channels';
 import type { IpcContext } from '../../src/main/ipc/ipc-context';
-import type { GitBranchSummaryInput, GitDiffFilesInput } from '../../src/shared/types';
+import type { GitBranchSummaryInput, GitDiffFilesInput, GitFileContentInput, GitFileImageInput, GitImageContentResult } from '../../src/shared/types';
 
 // vi.mock() calls are hoisted above every other statement in this file
 // (including plain `const` declarations), so any outer variable a factory
@@ -26,13 +26,18 @@ vi.mock('electron', () => ({ ipcMain: { handle: mockHandle, on: mockOn } }));
 
 vi.mock('simple-git', () => ({ default: vi.fn(() => ({})) }));
 
-const { mockDiffServiceConstructor } = vi.hoisted(() => ({
+const { mockDiffServiceConstructor, mockGetFileContent, mockGetImageContent } = vi.hoisted(() => ({
   mockDiffServiceConstructor: vi.fn(),
+  // Shared by every constructed service, so a test can tell WHICH reader a
+  // handler called without holding on to the instance it was routed to.
+  mockGetFileContent: vi.fn(),
+  mockGetImageContent: vi.fn(),
 }));
 vi.mock('../../src/main/git/diff-service', () => ({
   DiffService: class {
     getDiffFiles = vi.fn();
-    getFileContent = vi.fn();
+    getFileContent = mockGetFileContent;
+    getImageContent = mockGetImageContent;
     constructor(gitDirectory: string) {
       mockDiffServiceConstructor(gitDirectory);
     }
@@ -320,11 +325,11 @@ describe('registerGitDiffHandlers GIT_PREFETCH_REMOTES gate', () => {
   const PROJECT_PATH = '/mock/project';
   let getEffectiveConfig: ReturnType<typeof vi.fn>;
 
-  /** Mount the handlers with an auto-fetch interval, then return the prefetch handler. */
-  function mountWithInterval(autoFetchIntervalMinutes: number | null): PrefetchHandler {
+  /** Mount the handlers with the auto-fetch switch set, then return the prefetch handler. */
+  function mountWithAutoFetch(autoFetch: boolean): PrefetchHandler {
     vi.clearAllMocks();
     vi.mocked(fetchAllRemotesIfStale).mockResolvedValue(undefined);
-    getEffectiveConfig = vi.fn(() => ({ git: { autoFetchIntervalMinutes } }));
+    getEffectiveConfig = vi.fn(() => ({ git: { autoFetch } }));
     const context = {
       mainWindow: {},
       diffWatcher: { subscribe: vi.fn(() => vi.fn()) },
@@ -338,23 +343,19 @@ describe('registerGitDiffHandlers GIT_PREFETCH_REMOTES gate', () => {
   }
 
   it('fetches non-interactively for the given worktree when auto-fetch is on', async () => {
-    const handler = mountWithInterval(5);
+    const handler = mountWithAutoFetch(true);
 
     await handler(null, WORKTREE_PATH);
 
     // Non-interactive: a drag cannot be allowed to raise a credential prompt.
     expect(fetchAllRemotesIfStale).toHaveBeenCalledWith(WORKTREE_PATH, { nonInteractive: true });
     // Resolved against the current project, so a project override of the
-    // interval applies rather than the global value alone.
+    // switch applies rather than the global value alone.
     expect(getEffectiveConfig).toHaveBeenCalledWith(PROJECT_PATH);
   });
 
-  it.each([
-    ['null (off)', null],
-    ['zero', 0],
-    ['negative', -1],
-  ])('does not fetch when the auto-fetch interval is %s', async (_label, interval) => {
-    const handler = mountWithInterval(interval);
+  it('does not fetch when auto-fetch is off', async () => {
+    const handler = mountWithAutoFetch(false);
 
     await handler(null, WORKTREE_PATH);
 
@@ -366,7 +367,7 @@ describe('registerGitDiffHandlers GIT_PREFETCH_REMOTES gate', () => {
     ['a non-string', 42],
     ['undefined', undefined],
   ])('ignores %s as a path without touching the network', async (_label, checkPath) => {
-    const handler = mountWithInterval(5);
+    const handler = mountWithAutoFetch(true);
 
     await handler(null, checkPath);
 
@@ -376,7 +377,7 @@ describe('registerGitDiffHandlers GIT_PREFETCH_REMOTES gate', () => {
   it('falls back to the global config when no project is open', async () => {
     vi.clearAllMocks();
     vi.mocked(fetchAllRemotesIfStale).mockResolvedValue(undefined);
-    getEffectiveConfig = vi.fn(() => ({ git: { autoFetchIntervalMinutes: 5 } }));
+    getEffectiveConfig = vi.fn(() => ({ git: { autoFetch: true } }));
     const context = {
       mainWindow: {},
       diffWatcher: { subscribe: vi.fn(() => vi.fn()) },
@@ -393,5 +394,87 @@ describe('registerGitDiffHandlers GIT_PREFETCH_REMOTES gate', () => {
     // "global only", and passing null would read as a path.
     expect(getEffectiveConfig).toHaveBeenCalledWith(undefined);
     expect(fetchAllRemotesIfStale).toHaveBeenCalledWith(WORKTREE_PATH, { nonInteractive: true });
+  });
+});
+
+/**
+ * GIT_FILE_IMAGE: the Changes panel's image read. The handler routes to
+ * DiffService.getImageContent, and three things about that route are run by no
+ * other tier. The UI tier drives the mock bridge, the DiffService suites call
+ * the service directly, and the handler's listener is loosely typed, so a swap
+ * to the text reader still typechecks. It must call the IMAGE reader, key the
+ * service by the worktree when there is one, and share one cached service with
+ * the other diff channels so the merge-base cache is not rebuilt per channel.
+ */
+describe('registerGitDiffHandlers GIT_FILE_IMAGE', () => {
+  const PROJECT_PATH = '/mock/project';
+  const IMAGE_RESULT: GitImageContentResult = {
+    original: { kind: 'unchanged', fingerprint: 'blob:abc123' },
+    modified: { kind: 'unreadable' },
+  };
+
+  function getHandler<Input, Result>(channel: string): (event: unknown, input: Input) => Promise<Result> {
+    const entry = mockHandle.mock.calls.find((call) => call[0] === channel);
+    if (!entry) throw new Error(`ipcMain.handle was never called with ${channel}`);
+    return entry[1] as (event: unknown, input: Input) => Promise<Result>;
+  }
+
+  const imageInput = (overrides: Partial<GitFileImageInput> = {}): GitFileImageInput => ({
+    worktreePath: WORKTREE_PATH_A,
+    projectPath: PROJECT_PATH,
+    baseBranch: 'main',
+    filePath: 'img/a.png',
+    status: 'M',
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetImageContent.mockResolvedValue(IMAGE_RESULT);
+    registerGitDiffHandlers({
+      mainWindow: {},
+      diffWatcher: { subscribe: vi.fn(() => vi.fn()) },
+    } as unknown as IpcContext);
+  });
+
+  it('answers with the image reader\'s result for the same input, and never reads the file as text', async () => {
+    const handler = getHandler<GitFileImageInput, GitImageContentResult>(IPC.GIT_FILE_IMAGE);
+    const input = imageInput({ knownFingerprints: { original: 'blob:abc123' } });
+
+    const result = await handler(null, input);
+
+    expect(result).toBe(IMAGE_RESULT);
+    // The input carries the caller's fingerprints through untouched, which is
+    // what lets main answer `unchanged` for a side the caller already holds.
+    expect(mockGetImageContent).toHaveBeenCalledTimes(1);
+    expect(mockGetImageContent).toHaveBeenCalledWith(input);
+    expect(mockGetFileContent).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['the worktree when the task has one', imageInput(), WORKTREE_PATH_A],
+    ['the project when there is no worktree', imageInput({ worktreePath: undefined }), PROJECT_PATH],
+  ])('reads in %s', async (_label, input, expectedDirectory) => {
+    const handler = getHandler<GitFileImageInput, GitImageContentResult>(IPC.GIT_FILE_IMAGE);
+
+    await handler(null, input);
+
+    expect(mockDiffServiceConstructor).toHaveBeenCalledTimes(1);
+    expect(mockDiffServiceConstructor).toHaveBeenCalledWith(expectedDirectory);
+  });
+
+  it('shares one DiffService per directory with the text and file-list channels', async () => {
+    const imageHandler = getHandler<GitFileImageInput, GitImageContentResult>(IPC.GIT_FILE_IMAGE);
+    const contentHandler = getHandler<GitFileContentInput, unknown>(IPC.GIT_FILE_CONTENT);
+    const filesHandler = getHandler<GitDiffFilesInput, unknown>(IPC.GIT_DIFF_FILES);
+
+    await imageHandler(null, imageInput());
+    await contentHandler(null, imageInput());
+    await filesHandler(null, { worktreePath: WORKTREE_PATH_A, projectPath: PROJECT_PATH, baseBranch: 'main' });
+    await imageHandler(null, imageInput());
+
+    // One service means one merge-base cache across a file click's text and
+    // image reads; a handler building its own would redo the merge-base per call.
+    expect(mockDiffServiceConstructor).toHaveBeenCalledTimes(1);
   });
 });

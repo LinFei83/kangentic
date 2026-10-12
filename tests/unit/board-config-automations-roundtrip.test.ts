@@ -9,21 +9,11 @@
  * would go quiet. Converting on READ is what makes a teammate's older file, or
  * simply a file that has not been rewritten yet, still behave.
  *
- * node:sqlite rather than better-sqlite3, whose native binding is built for
- * Electron's ABI so a suite gated on it skips everywhere, CI included.
+ * Real better-sqlite3, the driver production uses.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import type DatabaseType from 'better-sqlite3';
-import type { BoardColumnConfig } from '../../src/shared/types';
-
-type SqliteModule = typeof import('node:sqlite');
-let sqlite: SqliteModule | null = null;
-try {
-  sqlite = await import('node:sqlite');
-} catch {
-  sqlite = null;
-}
-const describeWithSqlite = sqlite ? describe : describe.skip;
+import type { BoardColumnAutomations, BoardColumnConfig } from '../../src/shared/types';
 
 /** The one database every module under test shares, swapped per test. */
 const harness = vi.hoisted(() => ({ db: null as unknown }));
@@ -38,49 +28,19 @@ const { AutomationRepository } = await import('../../src/main/db/repositories/au
 const { SwimlaneRepository } = await import('../../src/main/db/repositories/swimlane-repository');
 const { planColumnAutomations } = await import('../../src/main/config/board-config/apply-automations');
 
-/**
- * Adapt node:sqlite to the slice of better-sqlite3 the migrations and
- * repositories use.
- *
- * Unlike the simpler adapter in the sibling suites, this one supports NESTED
- * transactions, because the code under test genuinely nests: `applyBoardConfigToDb`
- * wraps its whole reconcile in one, and `replaceForColumn` opens its own inside
- * it. better-sqlite3's `transaction()` handles that with SAVEPOINTs, so an
- * adapter that issued a bare BEGIN would fail on a nesting production handles
- * fine, and the test would be reporting on the harness rather than the code.
- */
-function adaptDatabase(database: InstanceType<SqliteModule['DatabaseSync']>): DatabaseType.Database {
-  let depth = 0;
-  const adapter = {
-    exec: (sql: string) => database.exec(sql),
-    prepare: (sql: string) => database.prepare(sql),
-    pragma: (statement: string) => database.prepare(`PRAGMA ${statement}`).all(),
-    transaction: <Args extends unknown[], Result>(body: (...args: Args) => Result) =>
-      (...args: Args): Result => {
-        const savepoint = `sp_${depth}`;
-        const begin = depth === 0 ? 'BEGIN' : `SAVEPOINT ${savepoint}`;
-        const commit = depth === 0 ? 'COMMIT' : `RELEASE ${savepoint}`;
-        const rollback = depth === 0 ? 'ROLLBACK' : `ROLLBACK TO ${savepoint}`;
-        database.exec(begin);
-        depth += 1;
-        try {
-          const result = body(...args);
-          depth -= 1;
-          database.exec(commit);
-          return result;
-        } catch (error) {
-          depth -= 1;
-          database.exec(rollback);
-          throw error;
-        }
-      },
-  };
-  return adapter as unknown as DatabaseType.Database;
-}
+import { openTestDatabase } from './helpers/test-database';
 
-describeWithSqlite('kangentic.json automations round-trip', () => {
+describe('kangentic.json automations round-trip', () => {
+  const openDatabases: DatabaseType.Database[] = [];
+
+  afterEach(() => {
+    harness.db = null;
+    for (const database of openDatabases.splice(0)) database.close();
+  });
+
   function freshDatabase() {
-    const database = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
+    const database = openTestDatabase();
+    openDatabases.push(database);
     database.exec('PRAGMA foreign_keys = ON');
     runProjectMigrations(database);
     harness.db = database;
@@ -316,6 +276,60 @@ describeWithSqlite('kangentic.json automations round-trip', () => {
     });
   });
 
+  // Sentry DESKTOP-1H: `"onEnter": {}` threw "is not iterable" inside the
+  // reconcile transaction, so the whole board's apply rolled back and the
+  // file-watcher path rejected out of `boardConfig:apply`.
+  describe('a malformed automations container', () => {
+    it('warns naming the column, keeps its automations, and applies the rest of the board', () => {
+      const { lanes, automations } = freshDatabase();
+      const executing = lanes.list().find((lane) => lane.name === 'Executing')!;
+      automations.replaceForColumn(executing.id, [
+        { name: 'Setup', type: 'run_script', trigger: 'enter', enabled: true, config: { script: 'npm ci' } },
+      ]);
+
+      const config = build();
+      columnNamed(config, 'Executing')!.automations = { onEnter: {}, onExit: 'Notify' } as unknown as BoardColumnAutomations;
+      const planningColumn = columnNamed(config, 'Planning')!;
+      planningColumn.description = 'Scoped by the file';
+      planningColumn.automations = {
+        onEnter: [{ name: 'Plan ping', type: 'webhook', url: 'https://hooks.example.com/plan' }],
+      };
+
+      let warnings: string[] = [];
+      expect(() => {
+        warnings = applyBoardConfigToDb('p1', config).warnings;
+      }).not.toThrow();
+
+      expect(warnings.some((warning) => warning.includes('"Executing"'))).toBe(true);
+      // Kept, not cleared: on project open the export runs next and would
+      // otherwise write the deletion into the committed file.
+      expect(automations.listForColumn(executing.id).map((row) => row.name)).toEqual(['Setup']);
+      const planning = lanes.list().find((lane) => lane.name === 'Planning')!;
+      expect(planning.description).toBe('Scoped by the file');
+      expect(automations.listForColumn(planning.id).map((row) => row.name)).toEqual(['Plan ping']);
+    });
+
+    it('does not let a malformed value flip a legacy file to automation-aware', () => {
+      // No column carries a well-formed `automations` key, so a column the file
+      // is silent about keeps what the database has. `"automations": "x"` on
+      // one column used to count as declaring the key and cleared every other.
+      const { lanes, automations } = freshDatabase();
+      const planning = lanes.list().find((lane) => lane.name === 'Planning')!;
+      automations.replaceForColumn(planning.id, [
+        { name: 'Kept', type: 'webhook', trigger: 'enter', enabled: true, config: { url: 'https://example.com' } },
+      ]);
+
+      const config = build();
+      for (const column of config.columns) delete column.automations;
+      columnNamed(config, 'Executing')!.automations = 'x' as unknown as BoardColumnAutomations;
+
+      const { warnings } = applyBoardConfigToDb('p1', config);
+
+      expect(automations.listForColumn(planning.id).map((row) => row.name)).toEqual(['Kept']);
+      expect(warnings.some((warning) => warning.includes('"Executing"'))).toBe(true);
+    });
+  });
+
   describe('additive versus destructive', () => {
     it('leaves existing automations alone when the config never mentions them', () => {
       // Same rule the columns and actions already use: a hand-written file that
@@ -359,9 +373,7 @@ describeWithSqlite('kangentic.json automations round-trip', () => {
 });
 
 // `planColumnAutomations` is a pure function of one `BoardColumnConfig`, with
-// no database underneath it. Pinned directly (not gated behind node:sqlite) so
-// the dedup behavior is covered even on a machine where the better-sqlite3
-// native binding is not built.
+// no database underneath it, so the dedup behavior is pinned directly.
 describe('planColumnAutomations name dedup', () => {
   function columnWithDuplicateName(): BoardColumnConfig {
     return {
@@ -405,5 +417,86 @@ describe('planColumnAutomations name dedup', () => {
 
     expect(plan.rows.map((row) => row.name)).toEqual(['Notify', 'Wrap up']);
     expect(plan.warnings).toHaveLength(0);
+  });
+});
+
+// Also with no database underneath it: the DESKTOP-1H throw lives in the planner.
+describe('planColumnAutomations with a malformed container', () => {
+  function planFor(automations: unknown) {
+    return planColumnAutomations({ name: 'Executing', automations: automations as BoardColumnAutomations });
+  }
+
+  it('keeps the column, and does not throw, when onEnter is an object and onExit is not a list', () => {
+    const plan = planFor({ onEnter: {}, onExit: 'Notify' });
+
+    expect(plan.keepExisting).toBe(true);
+    expect(plan.rows).toEqual([]);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toContain('"Executing"');
+    expect(plan.warnings[0]).toContain('onEnter');
+    expect(plan.warnings[0]).toContain('onExit');
+  });
+
+  it('keeps the column when one row was written without brackets, and plans no sibling group', () => {
+    const plan = planFor({
+      onEnter: { name: 'Setup', type: 'run_script', script: 'npm ci' },
+      onExit: [{ name: 'Wrap up', type: 'send_message', message: '/exit-ping' }],
+    });
+
+    expect(plan.keepExisting).toBe(true);
+    expect(plan.rows).toEqual([]);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toContain('onEnter');
+    expect(plan.warnings[0]).not.toContain('onExit');
+  });
+
+  it('keeps the column over a legacy message when the container is malformed', () => {
+    const plan = planColumnAutomations({
+      name: 'Executing',
+      autoCommand: '/pull-request',
+      automations: { onEnter: {} } as unknown as BoardColumnAutomations,
+    });
+
+    expect(plan.keepExisting).toBe(true);
+    expect(plan.rows).toEqual([]);
+  });
+
+  it.each([
+    ['a string', 'x'],
+    ['an array', []],
+    ['a number', 5],
+  ])('keeps the column when automations is %s', (_label, value) => {
+    const plan = planFor(value);
+
+    expect(plan.keepExisting).toBe(true);
+    expect(plan.rows).toEqual([]);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toContain('"Executing"');
+  });
+
+  it('skips a row that is not an object and keeps the rest of the group', () => {
+    const plan = planFor({
+      onEnter: [null, 'Setup', { name: 'Setup', type: 'run_script', script: 'npm ci' }],
+    });
+
+    expect(plan.keepExisting).toBe(false);
+    expect(plan.rows.map((row) => row.name)).toEqual(['Setup']);
+    expect(plan.warnings).toHaveLength(2);
+    for (const warning of plan.warnings) expect(warning).toContain('not an object');
+  });
+
+  it('still reads a null group and a null automations value as none', () => {
+    const nullGroup = planFor({
+      onEnter: null,
+      onExit: [{ name: 'Wrap up', type: 'send_message', message: '/exit-ping' }],
+    });
+    expect(nullGroup.keepExisting).toBe(false);
+    expect(nullGroup.rows.map((row) => row.name)).toEqual(['Wrap up']);
+    expect(nullGroup.warnings).toEqual([]);
+
+    const nullAutomations = planFor(null);
+    expect(nullAutomations.keepExisting).toBe(false);
+    expect(nullAutomations.rows).toEqual([]);
+    expect(nullAutomations.warnings).toEqual([]);
   });
 });

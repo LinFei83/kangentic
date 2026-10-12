@@ -1,4 +1,4 @@
-import type * as pty from 'node-pty';
+import type { PtyDisposable, PtyHandle } from '../host/pty-host-client';
 import type { SessionStatus } from '../../../shared/types';
 import type { SessionQueue } from '../session-queue';
 import type { SessionFileManager } from '../lifecycle/session-file-manager';
@@ -13,7 +13,7 @@ import { isYoungSession, type DeferredKillRegistry } from '../lifecycle/deferred
  * command is attempted independently and errors are swallowed - the
  * caller's next step is to force-kill anyway.
  */
-export function writeExitSequence(ptyRef: pty.IPty, exitSequence: string[]): void {
+export function writeExitSequence(ptyRef: PtyHandle, exitSequence: string[]): void {
   for (const command of exitSequence) {
     try {
       ptyRef.write(command);
@@ -27,7 +27,7 @@ export function writeExitSequence(ptyRef: pty.IPty, exitSequence: string[]): voi
 export interface ShutdownSession {
   id: string;
   taskId: string;
-  pty: pty.IPty | null;
+  pty: PtyHandle | null;
   status: SessionStatus;
   startedAt: string;
   exitSequence: string[];
@@ -37,7 +37,7 @@ export interface ShutdownSession {
    *  stops invoking our callbacks after the session dir is deleted. See
    *  ManagedSession.ptyDisposables for the full contract: only set on the
    *  normal-spawn path, left undefined for placeholder/queued sessions. */
-  ptyDisposables?: pty.IDisposable[];
+  ptyDisposables?: PtyDisposable[];
 }
 
 export interface ShutdownContext<S extends ShutdownSession = ShutdownSession> {
@@ -45,78 +45,7 @@ export interface ShutdownContext<S extends ShutdownSession = ShutdownSession> {
   sessionQueue: SessionQueue;
   sessionFiles: SessionFileManager;
   firstOutputTracker: FirstOutputTracker;
-  killPty: (ptyRef: pty.IPty) => boolean;
-}
-
-/**
- * Gracefully suspend every running PTY session.
- *
- * Sends the adapter-specific exit sequence (Ctrl+C + /exit for Claude,
- * Ctrl+C + /quit for Gemini) to each process so it saves conversation
- * state (JSONL) before exit. Waits up to `timeoutMs` for natural exit,
- * then force-kills any remaining.
- *
- * Uses a shorter wait (200ms) when all running sessions are "fresh"
- * (< 10s old): they have minimal state to flush, so the full 2s
- * deadline would just slow shutdown for no benefit. This matters on
- * recovery-from-crash where many sessions spawn back-to-back.
- *
- * Returns the list of task IDs so the caller (suspendAll's orchestrator
- * in index.ts) can mark them 'suspended' in the DB before exiting.
- */
-export async function suspendAllSessions<S extends ShutdownSession>(
-  context: ShutdownContext<S>,
-  timeoutMs = 2000,
-): Promise<string[]> {
-  const taskIds: string[] = [];
-  const ptysToKill: pty.IPty[] = [];
-  const freshSessionThresholdMs = 10_000;
-  const now = Date.now();
-  let hasLongRunningSession = false;
-
-  for (const session of context.sessions.values()) {
-    if (session.pty && session.status === 'running') {
-      taskIds.push(session.taskId);
-
-      const sessionAge = now - new Date(session.startedAt).getTime();
-      if (sessionAge >= freshSessionThresholdMs) {
-        hasLongRunningSession = true;
-      }
-
-      writeExitSequence(session.pty, session.exitSequence);
-      ptysToKill.push(session.pty);
-      session.status = 'exited';
-    }
-  }
-
-  // Queued sessions have no PTY yet - count them as suspended and drop
-  // the queue so they don't auto-promote after the app reopens.
-  for (const session of context.sessions.values()) {
-    if (session.status === 'queued') {
-      taskIds.push(session.taskId);
-      session.status = 'exited';
-    }
-  }
-  context.sessionQueue.clear();
-
-  if (ptysToKill.length > 0) {
-    const effectiveTimeout = hasLongRunningSession ? timeoutMs : 200;
-    await new Promise((resolve) => setTimeout(resolve, effectiveTimeout));
-  }
-
-  for (const session of context.sessions.values()) {
-    // Preserve files on disk - sessions will be resumed on next app
-    // launch via session recovery. See SessionFileManager.detachPreservingFiles.
-    context.sessionFiles.detachPreservingFiles(session.id);
-
-    if (session.pty) {
-      const ptyRef = session.pty;
-      session.pty = null;
-      context.killPty(ptyRef);
-    }
-  }
-
-  return taskIds;
+  killPty: (ptyRef: PtyHandle) => boolean;
 }
 
 /**

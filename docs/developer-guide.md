@@ -2,12 +2,12 @@
 
 ## Prerequisites
 
-- Node.js 22.12+ (vitest 5 declares `^22.12.0 || ^24.0.0 || >=26.0.0`, so 22.0 through 22.11 cannot run the unit tier)
-- Git 2.25+ (worktree support)
+- Node.js 22.14+ or 24+. better-sqlite3 13 is built against Node-API 10, which Node 22 gained in 22.14.0. On 22.13 or older the first `new Database()` segfaults with no message (WiseLibs/better-sqlite3#1514), so the unit tier's global setup refuses to start there. vitest 5 separately declares `^22.12.0 || ^24.0.0 || >=26.0.0`
+- Git 2.26+ (worktree support)
 - Platform-specific:
-  - **Windows:** Visual Studio Build Tools (for better-sqlite3 native compilation)
-  - **macOS:** Xcode Command Line Tools
-  - **Linux:** `build-essential`, `python3`
+  - **Windows:** no C/C++ toolchain. Every native module ships a Windows prebuild
+  - **macOS:** Xcode Command Line Tools (a macOS package build compiles node-pty's `spawn-helper`)
+  - **Linux:** `build-essential`, `python3` (node-pty ships no Linux prebuild, so it compiles on install)
 
 ## Quick Start
 
@@ -96,7 +96,7 @@ src/
         projects.ts        # PROJECT_* handlers, cleanupProject, openProjectByPath
         session-metrics.ts # Session summary and metrics aggregation
         sessions.ts        # SESSION_* handlers, PTY event listeners
-        system.ts          # Config, Claude, Shell, Git, Dialog, Window, Notifications
+        system.ts          # Config, Claude, Shell, Git, Dialog, Clipboard, Window, Notifications
         task-branch.ts     # TASK_SWITCH_BRANCH / TASK_UPDATE_FROM_BASE handlers
         task-crud.ts       # TASK_LIST, CREATE, UPDATE, DELETE, archive handlers
         task-move.ts       # TASK_MOVE handler with priority rules
@@ -171,7 +171,7 @@ scripts/
 Three parallel processes:
 
 1. **Vite dev server** -- serves renderer with HMR on port 5173 (5174+ in worktrees)
-2. **esbuild watch** -- bundles `src/main/index.ts` → `.vite/build/index.js`, `src/preload/preload.ts` → `.vite/build/preload.js`, and the three `utilityProcess` worker entries as their own bundles next to the main bundle: `src/main/retrieval/embedder/embed-worker.ts`, `src/main/git/line-count/line-count-worker.ts`, and `src/main/transcription/dictation-worker.ts` (the dictation engine - see `.claude/rules/dictation-out-of-process.md`)
+2. **esbuild watch** -- bundles `src/main/index.ts` → `.vite/build/index.js`, `src/preload/preload.ts` → `.vite/build/preload.js`, and the five `utilityProcess` worker entries as their own bundles next to the main bundle: `src/main/pty/host/pty-host-entry.ts` (the pty host: every PTY and its output pipeline, plus main's one-shot child processes - see `.claude/rules/pty-host-out-of-process.md`), `src/main/retrieval/embedder/embed-worker.ts`, `src/main/retrieval/worker/retrieval-worker.ts` (every read and write of the Knowledge Graph index and the agent transcript parses - see `.claude/rules/retrieval-out-of-process.md`), `src/main/git/line-count/line-count-worker.ts`, and `src/main/transcription/dictation-worker.ts` (the dictation engine - see `.claude/rules/dictation-out-of-process.md`)
 3. **Electron** -- launched with `MAIN_WINDOW_VITE_DEV_SERVER_URL` pointing to Vite
 
 `dev.js` owns the Electron child and closes Vite when it exits, so the app never calls
@@ -181,7 +181,7 @@ again with Vite still running (`src/main/app-relaunch.ts`). On Ctrl+C or a close
 waits up to 3 s for Electron to exit on its own before killing it, since Electron gets the same
 signal and records a clean exit itself.
 
-The esbuild externals (`better-sqlite3`, `node-pty`, `sherpa-onnx-node`, `sqlite-vec`, `@huggingface/transformers`, `font-list`, plus `electron` itself) are not bundled. They load at runtime from `node_modules`. The list is declared identically in `scripts/build.js` and `scripts/dev.js`, so change one and change the other. Everything else, `simple-git` included, is bundled. Getting an external into a packaged build is a separate question, covered under Packaging below.
+The esbuild externals (`better-sqlite3`, `node-pty`, `sherpa-onnx-node`, `sqlite-vec`, `@huggingface/transformers`, `font-list`, `koffi`, plus `electron` itself) are not bundled. They load at runtime from `node_modules`. The list is declared identically in `scripts/build.js` and `scripts/dev.js`, so change one and change the other. Everything else, `simple-git` included, is bundled. Getting an external into a packaged build is a separate question, covered under Packaging below.
 
 Flags:
 - `--port=<n>` - override Vite port
@@ -200,12 +200,13 @@ Flags:
    absent is how two releases shipped with unreadable stacks.
 1. `tsc --noEmit` (type check)
 2. Vite builds renderer → `.vite/build/renderer/main_window/`
-3. esbuild bundles main + preload + the three utility-process workers (embed, line-count, dictation), minified
+3. esbuild bundles main + preload + the five utility-process workers (embed, line-count, dictation, retrieval, pty-host), minified
 4. Copies bridge scripts (`status-bridge.js`, `event-bridge.js`) to `.vite/build/`
 5. Uploads node-pty's shipped Windows PDBs to Sentry as debug files (`uploadNativeDebugFiles`):
-   Windows leg only, gated on a `KANGENTIC_SENTRY_TOKEN` / `SENTRY_AUTH_TOKEN` upload token. A
-   missing token is a no-op; with a token present, a failed upload FAILS the build rather than
-   warning past it.
+   Windows leg only, gated on a `KANGENTIC_SENTRY_TOKEN` / `SENTRY_AUTH_TOKEN` upload token and on
+   the build being authorized to upload (CI, or a local `KANGENTIC_SENTRY_UPLOAD=1`). A missing
+   token or a local build is a no-op that says so; with an authorized upload, a failed upload
+   FAILS the build rather than warning past it.
 
 ### Web demo (`npm run build:demo` / `demo/vite.config.mts`)
 
@@ -226,7 +227,11 @@ for a working session, how that peek changes over the recording, the agent messa
 card prints under the default Card Preview, and the scaffolded project's git history, blame, and
 per-commit diffs from `tests/captures/fixtures/demo/history/`, captured by
 `scripts/capture-demo-history.mjs` from the repo `scripts/lib/demo-scaffold-repo.mjs` builds
-out of the scaffold's `commits.json`). The
+out of the scaffold's `commits.json`, the Knowledge Graph each project's map draws from
+`tests/captures/fixtures/demo/graph/`, built by main's own pipeline in a preview through
+`scripts/capture-demo-knowledge-graph.mjs`, and the archived tasks' Completed Tasks rows from
+`tests/captures/fixtures/demo/archived/`, real headless runs recorded by
+`scripts/capture-demo-archived-runs.mjs`). The
 plugin also emits every
 recording's timed byte stream under `recordings/`, which the live frame fetches when a terminal
 mounts to replay the session as it happened, the agent boots a drag or a new Command
@@ -243,13 +248,17 @@ build time to embed a scene by name. `--base=<path>` on the CLI
 moves the base path; the GitHub Pages deploy (`.github/workflows/deploy-demo.yml`, called from
 the release graph after `publish-release`) builds with `--base=/kangentic/`. `demo/README.md`
 documents the URL contract, the scenes, the numbers, and the Electron-only surfaces that stay
-inert in a browser.
+inert in a browser. `npm run demo:serve` serves the build for a manual look (open
+`/demo/stage.html`), and `npm run demo:measure` reports its weight and boot timings (both run
+`demo/measure.mjs`).
 
 The scene registry (`tests/captures/scenes.ts`) has a second consumer: `npm run capture` builds
 the demo, then `tests/captures/features/scenes.capture.ts` opens every scene in it by URL and
 screenshots it per theme into the gitignored `captures/<timestamp>/scenes/`, playing the gesture
 a `driver` scene needs (a held drag, a right-click) with Playwright. The rig has no scene applier
-of its own; `demo/boot.js` is the applier for both consumers. `npm run demo:posters`
+of its own; `demo/boot.js` is the applier for both consumers. A scene whose subject keeps moving
+after `ready` (the Knowledge Graph's camera flight) names `settle`, and the rig shoots only once
+those elements hold still; it refuses a poster of the map's no-GPU card. `npm run demo:posters`
 (`demo/posters.mjs`) drives that same rig for the site's docs figures: every scene in the `clay`
 and `rust` themes at the frame's 2x (`CAPTURE_THEMES`, `CAPTURE_RESOLUTIONS`, and
 `CAPTURE_OUTPUT_ROOT` into `dist/demo-posters/`), checked against the build's own `scenes.json`
@@ -266,7 +275,16 @@ In worktrees, `dev.js` bypasses `vite.config.mts` and creates an inline Vite con
 
 `scripts/worktree-preview.js` creates a `node_modules` junction/symlink from the worktree to the repo root, then opens a native terminal running the dev server. `--env KEY=VALUE` (repeatable) sets a variable in that dev server's environment by splicing it into the terminal command: the tab the launcher opens inherits the terminal host's environment, not the launcher's, so a variable set on the launcher's own process never reaches `dev.js`. Values may not contain quotes, newlines, or `& | < > ^ %`, and the command is visible in the process list, so it must not carry a secret. `tests/unit/worktree-preview-env.test.ts` pins the cmd.exe and POSIX quoting.
 
-`node scripts/worktree-preview.js --stop --port=<port>` writes a stop file; `dev.js` then asks Electron to quit through the dev inspection bridge (`POST /quit`) so the app runs its real quit path (sessions suspended, PTYs killed, the run recorded as a clean exit), and kills it only if that has not finished within 8s. Once Electron is gone nothing holds the two repo clones under `.kangentic/data`, so the ephemeral removal actually runs and takes ten seconds or more on Windows; the launcher waits up to 45s for the dev server to exit before force-killing.
+`node scripts/worktree-preview.js --stop --port=<port>` writes a stop file; `dev.js` then asks Electron to quit through the dev inspection bridge (`POST /quit`) so the app runs its real quit path (sessions suspended, PTYs killed, the run recorded as a clean exit), and kills it only if that has not finished within 8s. The launcher waits up to 45s for the dev server to exit before force-killing. In a dev build, moving a task to Done or To Do, or deleting it, writes the same stop file for every preview in the task's worktree before the leftover reap (waiting 15s, never force-killing).
+
+**Stopping is near-immediate.** Deleting the two repo clones under `.kangentic/data` in place took about 7s on Windows, and the preview counted as running the whole time. Now the exit cleanup renames `.kangentic/`'s contents and `.vite/` into a `.kangentic/trash-<pid>-<time>` folder, which takes milliseconds on one drive. Then it exits and leaves the delete to a detached `scripts/preview-trash-delete.js`. That script also removes `.kangentic/` once it is empty, and the next boot hands any trash it left to a fresh deleter. Measured on Windows: closing the app window took 7.2s to the dev server's exit before and 0.56s after, with the trash gone 6s later in the background. A graceful `--stop` returns in about 0.3s. A rename that a held handle refuses falls back to deleting that entry in place.
+
+**One preview per worktree.** Every preview of a worktree uses the same `<worktree>/.kangentic/data`, and both a launch and an exit cleanup delete it. A relaunch that overlapped the previous preview's exit once lost its clone's `.git` to that cleanup. The fill that followed (`git -C <clone> reset --hard HEAD`) then searched upward, found the worktree itself, and wiped every uncommitted change in it. Three things now stop that:
+- **The launcher.** It refuses to start while another preview of the worktree is running, and prints the `--stop` command. It waits for one that is shutting down, up to the same 45s. It tells the two apart by the PID file and a stopping marker (`preview-<port>.stopping`, or the `--stop` request file). `dev.js` writes the marker the moment a stop, a closed terminal, or a closed window reaches it, and removes it with the PID file as the last step of its cleanup (`scripts/preview-isolation.js`). The exit record cannot serve here, because the `--wait` watcher clears it within a second.
+- **The dev server.** `dev.js` starts the preview's Electron with `GIT_CEILING_DIRECTORIES` set to the preview-projects folder. Electron, its git calls and its agent terminals inherit that, so git started inside a preview project can never find the worktree above it.
+- **Devtools git calls on a clone.** The fill, the team-config checkout and the Seed File Changes button go through `runPreviewGit` (`src/devtools/main/ephemeral-projects.ts`), which sets the same ceiling at the clone's parent. `ensurePreviewClone` clears a leftover clone folder that lost its `.git`, because `git clone` refuses a non-empty destination. If cloning still fails, the preview opens no project. It used to fall back to opening the worktree itself as its board.
+
+`tests/unit/preview-git-isolation.test.ts` and `tests/unit/preview-isolation.test.ts` pin all three against a real repo holding uncommitted work.
 
 `node scripts/worktree-preview.js --wait --port=<port>` blocks until that preview exits, then exits with a code that says why: `0` clean (terminal closed or `--stop`), `1` watcher usage/setup error, `2` crashed (dev server exited non-zero), `3` vanished (force-killed with no recorded exit). `dev.js`'s `cleanup()` writes a small `{ pid, exitCode }` record under `os.tmpdir()` (see `scripts/preview-exit-record.js`) as its first statement, since ephemeral mode removes the whole worktree `.kangentic/` directory on exit and nothing under the worktree would otherwise survive to tell the watcher how the server exited. The `/preview` skill runs this backgrounded by default so the harness delivers a task-notification when the preview exits.
 
@@ -284,6 +302,15 @@ npm run test:unit
 - **Speed:** Sub-second
 - **What to test here:** Pure logic -- parsers, filters, state machines, utility functions
 - **No build needed**, no browser, no Electron
+- **Real databases:** better-sqlite3 loads under the unit tier, so a suite that needs SQLite opens
+  the real driver with `openTestDatabase()` from `tests/unit/helpers/test-database.ts` (`vec: true`
+  loads sqlite-vec, `prepared` records each statement's SQL). Do not probe for the driver and skip:
+  `tests/unit/better-sqlite3-loads-in-vitest.test.ts` already fails if it stops loading, and
+  `tests/unit/helpers/node-api-floor.ts` stops the whole run on a Node without Node-API 10
+  rather than letting each worker segfault
+- **Isolated data directory:** every test file gets its own throwaway `KANGENTIC_DATA_DIR` (and,
+  on Windows and Linux, platform config base) from `tests/unit/helpers/isolate-data-dir.ts`, so a suite that reaches the
+  real `getGlobalDb()` can never open the developer's own database
 
 ### UI Tests (`tests/ui/`)
 
@@ -377,8 +404,14 @@ unit, build, the UI shards, and the Linux Electron E2E shards under xvfb). To ru
 
 ```bash
 npx playwright test              # UI + E2E
+npm run test:headed               # UI + E2E with visible windows (HEADED=1)
 npm run test:unit                 # Unit (separate runner)
+npm run lint                      # ESLint over src/ and packages/protocol/src/, zero warnings allowed
 ```
+
+`npm run validate:kimi-mcp` is a Windows-only manual check, not part of any tier. It builds Kimi's
+`--mcp-config` argument with the real command builder and runs it through `powershell.exe
+-Command` to confirm PowerShell's parser accepts the JSON (`scripts/kimi-validate-mcp.mjs`).
 
 ## Adding Features
 
@@ -420,7 +453,7 @@ npm run test:unit                 # Unit (separate runner)
 - **Escape key** -- all dialogs use global `useEffect` listener
 - **IPC channels** -- `src/shared/ipc-channels.ts` is the single source of truth
 - **Dependency blocks** - `dependencies` is at most the esbuild externals (minus `electron`) plus whatever `electron-builder.yml`'s `files:` names directly. Every external except `electron` has to be there; the `files:` half is a permission, not a requirement, since most of what it names arrives transitively and carries no root declaration. Everything else is bundled and belongs in `devDependencies`. electron-builder copies the whole production closure into the asar, so a stray entry there ships its entire transitive tree for nothing. See `.claude/rules/dependency-block-parity.md`
-- **`allowScripts`** - the block at the bottom of `package.json` is live npm 12 config, not leftovers from a tool nobody uses. npm blocks a dependency's install script unless `allowScripts` covers it, so deleting the key leaves `npm ci` exiting 0 with no electron binary and an uncompiled better-sqlite3. `npm install-scripts ls` shows what npm is blocking; `tests/unit/allow-scripts-coverage.test.ts` fails when a package with an install script is not covered
+- **`allowScripts`** - the block at the bottom of `package.json` is live npm 12 config, not leftovers from a tool nobody uses. npm blocks a dependency's install script unless `allowScripts` covers it, so deleting the key leaves `npm ci` exiting 0 with an unbuilt node-pty and no esbuild binary. The Electron binary is the one exception: electron 42+ has no install script, and the root package's own `postinstall` (`install-electron`) downloads it, which `allowScripts` does not govern. An entry can also be `false`: better-sqlite3 ships a `binding.gyp`, so npm infers a `node-gyp rebuild` install script for it, which is denied because its prebuilds ship in the package. `npm install-scripts ls` shows what npm is blocking; `tests/unit/allow-scripts-coverage.test.ts` fails when a package with an install script is not covered
 - **Lockfile metadata** - never regenerate `package-lock.json` against a populated `node_modules`. npm writes every already-installed package with no `resolved` and no `integrity`, which drops `npm ci`'s supply-chain verification for most of the tree without failing anything. `npm install --package-lock-only` does not repair it; `node scripts/repair-lockfile-integrity.js` does, and `tests/unit/lockfile-integrity.test.ts` fails CI when an entry is missing either field
 
 ## Environment Variables
@@ -469,21 +502,26 @@ electron-builder handles platform-specific packaging via `electron-builder.yml`:
 | macOS | Disk image + ZIP | DMG |
 | Linux | Package | deb, rpm |
 
+The NSIS installer includes `build/installer.nsh`, which grants ALL APPLICATION PACKAGES read access on a per-user install folder; see [Windows install-folder ACL grant](cross-platform.md#windows-install-folder-acl-grant).
+
 Native modules:
-- `better-sqlite3` - rebuilt against Electron headers via `scripts/rebuild-native.js`
-- `node-pty` - uses prebuilt NAPI binaries, no rebuild needed. The one exception is its macOS `spawn-helper`: `build/afterPack.js` compiles Kangentic's own (`build/spawn-helper/spawn-helper.c`, via `build/install-spawn-helper.js`) over the prebuilt one. It clears the inherited mach exception ports before exec, and the afterPack and afterSign gates prove that on the built binary. A macOS package build therefore needs Xcode or the Command Line Tools installed
+- `better-sqlite3` - Node-API (13+), shipping every platform's addon in the package as `prebuilds/<platform>-<arch>.node`, no rebuild needed. The same binary loads under Electron and under plain Node, which is what lets the unit tier open real databases with it. `build/afterPack.js` deletes every prebuild but the target's before its load probes run
+- `node-pty` - uses prebuilt NAPI binaries, no rebuild needed. It loads only in the `kangentic-pty-host` utility process, which runs from the unpacked tree, so all of `node_modules/node-pty/**` is in `asarUnpack` (which also lets the ConPTY conout worker load from a real directory), and the afterPack gate spawns a real process with it under the packaged Electron binary. The one exception to no-rebuild is its macOS `spawn-helper`: `build/afterPack.js` compiles Kangentic's own (`build/spawn-helper/spawn-helper.c`, via `build/install-spawn-helper.js`) over the prebuilt one. It clears the inherited mach exception ports before exec, and the afterPack and afterSign gates prove that on the built binary. A macOS package build therefore needs Xcode or the Command Line Tools installed
 - `sherpa-onnx-node` - prebuilt platform-specific binaries, no rebuild needed (voice dictation, running in its own `kangentic-dictation` utilityProcess worker - see DESKTOP-X in `.claude/rules/dictation-out-of-process.md`; unpacked from asar via the `sherpa-onnx-*` glob in `asarUnpack`)
 - `font-list` - shells out to `fc-list` / a PowerShell script / a bundled macOS binary, no rebuild needed (Terminal Font Family picker; unpacked from asar via `asarUnpack` since the macOS binary is spawned via `child_process`)
-- `sqlite-vec` - a loadable SQLite extension shipped as per-platform binary packages, no rebuild needed (conversation-memory retrieval; unpacked via the `sqlite-vec-*` glob in `asarUnpack`, since dlopen cannot read an extension inside asar)
+- `koffi` - a foreign function interface on Node-API, with its prebuilt binary in a per-platform `@koromix/koffi-*` package, no rebuild needed. The `kangentic-pty-host` utility process loads it on Windows and macOS to read another process's environment, the machine's TCP table on Windows and, on macOS, the process list and each process's sockets, for the task leftover reap (`src/main/pty/process-tag/`). Both packages are unpacked via `asarUnpack`, since a native addon cannot be dlopen'd from inside an asar, and the afterPack gate loads koffi from that tree and makes one native call on Windows and macOS
+- `sqlite-vec` - a loadable SQLite extension shipped as per-platform binary packages, no rebuild needed (Knowledge Graph retrieval; loaded only by the `kangentic-retrieval` worker, never by main; unpacked via the `sqlite-vec-*` glob in `asarUnpack`, since dlopen cannot read an extension inside asar. The worker also needs `better-sqlite3` unpacked, and the afterPack gate loads vec0 under the packaged Electron binary to prove it)
 - `onnxruntime-node` - prebuilt native binaries (`onnxruntime_binding.node`, plus `onnxruntime.dll` and `DirectML.dll` on Windows), no rebuild needed (the embed worker's execution provider; unpacked via `asarUnpack`)
 - `@huggingface/transformers` and `onnxruntime-web` - pure JavaScript, but both shipped and unpacked so the embed worker resolves them from the unpacked tree
 - `onnxruntime-common`, `sharp` (with its `@img/*` platform binding), `detect-libc`, `semver` - what transformers.js requires at module scope; unpacked for the same reason, since the worker never looks inside the asar. `build/afterPack.js` loads the worker's externals from the unpacked tree after packing and fails the build if any of this closure is missing (`build/verify-unpacked-worker.js`)
-- `bindings` and `file-uri-to-path` - pure JavaScript, and better-sqlite3's own transitive closure rather than anything this app imports. They carry a root `dependencies` entry only because `electron-builder.yml`'s `files:` names them directly, which is what `.claude/rules/dependency-block-parity.md` keeps them in that block for
 
-Security fuses enabled: no RunAsNode, no NodeOptions, no inspection, cookie encryption, ASAR integrity validation.
+Security fuses: every fuse is set explicitly with `strictlyRequireAllFuses`, so a new Electron fuse fails the build. The full list and each value is in [Security Fuses](cross-platform.md#security-fuses).
 
 ```bash
 npm run package    # Package for current platform
 npm run make       # Create distributable
+npm run make:win   # Build, then the Windows installer only
+npm run make:mac   # Build, then the macOS DMG and ZIP only
+npm run make:linux # Build, then the Linux deb and rpm only
 npm run publish    # Publish to GitHub (draft release)
 ```

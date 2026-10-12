@@ -17,6 +17,11 @@
  *    reentrant and `autoSpawnForTask` takes its own.
  * 5. The result carries the spawn's `settled` promise rather than awaiting
  *    it, which is what lets the bridge answer inside the phone's budget.
+ * 6. A PAUSED task (a `suspended` registry row) takes the desktop Resume
+ *    button's path, `resumeTaskSession`, never `autoSpawnForTask`, and the
+ *    answer follows that path's own Phase 1 (`live` or `starting`). An exited
+ *    row, and a suspended Command Terminal row (`transient`), are not paused
+ *    and still start the column.
  *
  * session-resume-eligibility.ts is deliberately left unmocked: the refusal
  * copy is exactly what a phone shows, so the test asserts the real strings.
@@ -27,9 +32,17 @@ import type { Session, Task } from '../../src/shared/types';
 const mockReconcileTaskSessionRef = vi.fn();
 const mockSwimlaneGetById = vi.fn();
 const mockAutoSpawnForTask = vi.fn(async () => {});
+type ResumeOptions = { projectId?: string | null; onAccepted?: (acceptance: 'live' | 'resuming') => void };
+const mockResumeTaskSession = vi.fn(
+  async (_context: unknown, _taskId: string, options: ResumeOptions): Promise<Session | null> => {
+    options.onAccepted?.('resuming');
+    return null;
+  },
+);
 
-/** Lock nesting depth at the moment each autoSpawnForTask call was made. */
+/** Lock nesting depth at the moment each autoSpawnForTask or resumeTaskSession call was made. */
 const autoSpawnLockDepths: number[] = [];
+const resumeLockDepths: number[] = [];
 let lockDepth = 0;
 
 vi.mock('../../src/main/ipc/task-lifecycle-lock', () => ({
@@ -56,6 +69,12 @@ vi.mock('../../src/main/ipc/helpers/agent-spawn', () => ({
 vi.mock('../../src/main/ipc/handlers/session-reconcile', () => ({
   reconcileTaskSessionRef: (...args: unknown[]) => mockReconcileTaskSessionRef(...args),
 }));
+vi.mock('../../src/main/ipc/handlers/session-resume', () => ({
+  resumeTaskSession: (context: unknown, taskId: string, options: ResumeOptions) => {
+    resumeLockDepths.push(lockDepth);
+    return mockResumeTaskSession(context, taskId, options);
+  },
+}));
 
 import { startTaskSession } from '../../src/main/ipc/handlers/session-start';
 import type { IpcContext } from '../../src/main/ipc/ipc-context';
@@ -75,8 +94,11 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   } as Task;
 }
 
+/** The registry rows `listSessions` reports; empty means the task has no session at all. */
+let registryRows: Array<Pick<Session, 'id' | 'taskId' | 'status' | 'transient'>> = [];
+
 function makeContext(): IpcContext {
-  return {} as IpcContext;
+  return { sessionManager: { listSessions: () => registryRows } } as unknown as IpcContext;
 }
 
 describe('startTaskSession', () => {
@@ -84,7 +106,10 @@ describe('startTaskSession', () => {
     mockReconcileTaskSessionRef.mockReset();
     mockSwimlaneGetById.mockReset();
     mockAutoSpawnForTask.mockClear();
+    mockResumeTaskSession.mockClear();
     autoSpawnLockDepths.length = 0;
+    resumeLockDepths.length = 0;
+    registryRows = [];
     lockDepth = 0;
     mockSwimlaneGetById.mockReturnValue({ id: LANE_ID, name: 'Working', role: null });
   });
@@ -140,7 +165,7 @@ describe('startTaskSession', () => {
 
   it('throws naming the column and the task when the task\'s column no longer exists', async () => {
     mockReconcileTaskSessionRef.mockReturnValue({ task: makeTask(), liveSession: null });
-    // resumeBlockReason({ laneRole: undefined, isArchived: false }) returns
+    // resumeBlockReasonForTask with no lane role and no archived_at returns
     // null, so this is what reaches the `if (!lane) throw` line rather than
     // the archived/role refusal above it.
     mockSwimlaneGetById.mockReturnValue(undefined);
@@ -204,5 +229,104 @@ describe('startTaskSession', () => {
     expect(result.outcome).toBe('starting');
     if (result.outcome !== 'starting') throw new Error('unreachable');
     expect(result.settled).toBeInstanceOf(Promise);
+  });
+
+  describe('a paused task takes the Resume button\'s path', () => {
+    beforeEach(() => {
+      mockReconcileTaskSessionRef.mockReturnValue({ task: makeTask(), liveSession: null });
+    });
+
+    it('resumes through resumeTaskSession, never autoSpawnForTask, after releasing the lock', async () => {
+      // The suspended row survives the reconcile, which clears only the pointer.
+      registryRows = [{ id: 'sess-paused', taskId: TASK_ID, status: 'suspended' }];
+      const context = makeContext();
+
+      const result = await startTaskSession(context, PROJECT_ID, TASK_ID);
+
+      expect(result.outcome).toBe('starting');
+      expect(mockResumeTaskSession).toHaveBeenCalledTimes(1);
+      expect(mockResumeTaskSession).toHaveBeenCalledWith(context, TASK_ID, expect.objectContaining({ projectId: PROJECT_ID }));
+      // No column start: that is the path that re-runs the enter automations.
+      expect(mockAutoSpawnForTask).not.toHaveBeenCalled();
+      // resumeTaskSession takes its own lock, and withTaskLock is not reentrant.
+      expect(resumeLockDepths).toEqual([0]);
+    });
+
+    it('answers live when the resume\'s own Phase 1 finds a live session', async () => {
+      registryRows = [{ id: 'sess-paused', taskId: TASK_ID, status: 'suspended' }];
+      mockResumeTaskSession.mockImplementationOnce(async (_context, _taskId, options) => {
+        options.onAccepted?.('live');
+        return { id: 'sess-live', taskId: TASK_ID, status: 'running' } as Session;
+      });
+
+      expect(await startTaskSession(makeContext(), PROJECT_ID, TASK_ID)).toEqual({ outcome: 'live' });
+    });
+
+    it('answers on acceptance while the resume\'s git phase is still running', async () => {
+      registryRows = [{ id: 'sess-paused', taskId: TASK_ID, status: 'suspended' }];
+      mockResumeTaskSession.mockImplementationOnce((_context, _taskId, options) => {
+        options.onAccepted?.('resuming');
+        return new Promise<Session | null>(() => {});
+      });
+
+      const result = await startTaskSession(makeContext(), PROJECT_ID, TASK_ID);
+
+      expect(result.outcome).toBe('starting');
+    });
+
+    it('answers starting, and settled resolves, when a Pause or newer resume cancels the resume before it ever accepts', async () => {
+      registryRows = [{ id: 'sess-paused', taskId: TASK_ID, status: 'suspended' }];
+      // resumeTaskSession resolves null WITHOUT calling onAccepted when its
+      // signal aborts while it waits for the task lock (the throwIfAborted at
+      // the top of its Phase 1). Awaiting `accepted` alone would hang here
+      // forever, so the short timeout below reads a hang as a failure.
+      mockResumeTaskSession.mockImplementationOnce(async () => null);
+
+      const result = await startTaskSession(makeContext(), PROJECT_ID, TASK_ID);
+
+      expect(result.outcome).toBe('starting');
+      if (result.outcome !== 'starting') throw new Error('unreachable');
+      await expect(result.settled).resolves.toBeUndefined();
+      // The resume path ran and no column start was made in its place.
+      expect(mockResumeTaskSession).toHaveBeenCalledTimes(1);
+      expect(mockAutoSpawnForTask).not.toHaveBeenCalled();
+    }, 2000);
+
+    // The other half of that race, a resume that REJECTS before accepting, is
+    // pinned by the test below and by start-session-resume-path.test.ts.
+    it('rejects with the resume\'s own refusal when its Phase 1 throws before accepting', async () => {
+      registryRows = [{ id: 'sess-paused', taskId: TASK_ID, status: 'suspended' }];
+      mockResumeTaskSession.mockImplementationOnce(async () => {
+        throw new Error('This task is complete. Move it out of Done to continue working on it.');
+      });
+
+      await expect(startTaskSession(makeContext(), PROJECT_ID, TASK_ID)).rejects.toThrow('Move it out of Done');
+    });
+
+    it('a paused task in Done is refused by the decision itself, before any resume', async () => {
+      registryRows = [{ id: 'sess-paused', taskId: TASK_ID, status: 'suspended' }];
+      mockSwimlaneGetById.mockReturnValue({ id: LANE_ID, name: 'Done', role: 'done' });
+
+      await expect(startTaskSession(makeContext(), PROJECT_ID, TASK_ID)).rejects.toThrow('Move it out of Done');
+      expect(mockResumeTaskSession).not.toHaveBeenCalled();
+      expect(mockAutoSpawnForTask).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an exited session', [{ id: 'sess-ended', taskId: TASK_ID, status: 'exited' as const }]],
+      ['another task\'s paused session', [{ id: 'sess-other', taskId: 'task-other', status: 'suspended' as const }]],
+      // Same task id and `suspended`, so only the transient flag keeps it from
+      // being the task's paused session: a Command Terminal is never resumed.
+      ['a suspended Command Terminal row carrying the same task id', [{ id: 'sess-terminal', taskId: TASK_ID, status: 'suspended' as const, transient: true }]],
+      ['no session at all', []],
+    ])('%s still starts the column through autoSpawnForTask', async (_label, rows) => {
+      registryRows = rows;
+
+      const result = await startTaskSession(makeContext(), PROJECT_ID, TASK_ID);
+
+      expect(result.outcome).toBe('starting');
+      expect(mockAutoSpawnForTask).toHaveBeenCalledWith(expect.anything(), PROJECT_ID, { id: TASK_ID, title: 'Ship the thing' }, LANE_ID, { explicitStart: true });
+      expect(mockResumeTaskSession).not.toHaveBeenCalled();
+    });
   });
 });

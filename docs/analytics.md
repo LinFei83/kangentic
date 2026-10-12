@@ -7,7 +7,7 @@ the same kill switch (below).
 
 ## What We Collect (Aptabase)
 
-Eighteen event types are tracked, all on critical-path actions only:
+Nineteen event types are tracked, all on critical-path actions only:
 
 | Event | When | Properties |
 |-------|------|------------|
@@ -26,8 +26,9 @@ Eighteen event types are tracked, all on critical-path actions only:
 | `board_snapshot` | Once per project per app run, the first time the user views it (the boot auto-open or a sidebar switch); background activation of other projects does not count, and neither does the open that creates a project, whose board is still the default | columns, customColumns, taskBucket (`0` / `1-9` / `10-49` / `50-199` / `200+`), profiles |
 | `update_outcome` | Next launch after the app version changed | result (`applied` / `rolled_back`), fromVersion, toVersion |
 | `spawn_failed` | An agent spawn failed (born-into-column create, MCP auto-spawn, any board-driven resume including a drag move, startup recovery) | agent, reason (`create_spawn`, `auto_spawn`, `resume`, `unknown_agent`, `cli_not_found`) |
-| `utility_worker_crashed` | A Kangentic utility process exited unexpectedly (not an idle recycle or quit): at most twice per service per app run, on the first crash and when the restart cap latches | service (`kangentic-embeddings`, `kangentic-line-count`, `kangentic-dictation`), exitCode (see below), phase (`first` / `latched`) |
+| `utility_worker_crashed` | A Kangentic utility process failed unexpectedly (it exited, failed to fork, never said ready, or stopped answering; not an idle recycle or quit): at most twice per service per app run, on the first crash and when the restart cap latches | service (`kangentic-embeddings`, `kangentic-line-count`, `kangentic-dictation`, `kangentic-retrieval`, `kangentic-pty-host`), exitCode (see below), cause (`exit` / `fork_failed` / `ready_timeout` / `request_timeout`), phase (`first` / `latched`) |
 | `gpu_process_gone` | The GPU process failed (a fault death: not a kill, an OOM, or a Windows session-teardown exit): at most twice per app run, on the first fault and when the escalation threshold latches | reason (Electron's `child-process-gone` reason), exitCode, phase (`first` / `latched`) |
+| `leftover_processes` | Once per leftover-process report, the one a toast shows: a terminal transition (Done, To Do, delete) or a burst of them found something a task's agent left running in its folder, or the startup sweep stopped or failed to stop something. Never sent when a task left nothing | stopped, kept, failed (counts of processes stopped, left running on purpose or with stopping off, and still running after the force kill), stoppingEnabled |
 | `mobile_bridge_forced_redial` | The mobile bridge abandoned a relay socket that still read connected but carried nothing (a socket the relay reaped while the network was away; see `docs/mobile-bridge.md`): at most once per reason per app run | reason (`paired-silent` / `parked-stale`) |
 
 There is no close event. Every quit path exits before a network send can complete, so
@@ -52,9 +53,12 @@ minutes before something unrelated killed it".
 `utility_worker_crashed`'s `exitCode` is the raw value Electron's `utilityProcess` `exit` event
 reports, so it is NOT comparable across platforms (POSIX derives it from `waitpid`, Windows from
 `GetExitCodeProcess`). Group by `service` and platform before reading it. The value `-1` is a
-sentinel meaning "the fork itself threw, so no process ever started and there is no exit code",
-which a real exit code cannot collide with. The matching Sentry tag spells that same case
-`unknown` rather than `-1`. `phase` says which of the two per-run events it is: `first` counts the
+sentinel meaning "there is no exit code", which a real exit code cannot collide with. The matching
+Sentry tag spells that same case `unknown` rather than `-1`. `cause` says why there is none: an
+`exit` normally carries a real code and sends `-1` only if Electron reported none, while
+`fork_failed` (the fork threw, so no process started), `ready_timeout` (the worker never said
+ready) and `request_timeout` (the client killed a worker that stopped answering) always send `-1`.
+Before `cause` was sent, a retrieval worker that hung read as a fork failure. `phase` says which of the two per-run events it is: `first` counts the
 installs that hit a crash at all, `latched` counts the installs whose subsystem gave up (the same
 moment the Sentry issue is filed). The event used to tick on every crash, which with three crashes
 per five-minute decay window read as "71 crashes a day" when it was a handful of installs looping,
@@ -70,7 +74,7 @@ session-teardown exit is written to the record but never ticks, or every shutdow
 would read as a GPU death on the dashboard. Neither fires again for the rest of the RUN, even across a later decay reset and a fresh escalation -
 the phase gate is per-run, not per-window, which is what keeps this at exactly two Aptabase events no
 matter how many separate incidents one launch has. `exitCode`'s `-1` sentinel does NOT carry the same
-meaning it does for `utility_worker_crashed` above: there it means the fork never started, but here it
+meaning it does for `utility_worker_crashed` above: there `cause` says why no code exists, but here it
 means Electron's `child-process-gone` event reported no exit code, a routine and more common case.
 The latch governs this Aptabase tick ONLY. The durable escalation record is written on every death
 from the first (see "Error Reporting" below), because the death that actually kills the app is one
@@ -78,8 +82,11 @@ JS never hears about: Chromium calls `RecordProcessCrash`, and the `LOG(FATAL)` 
 delegate rather than from the observer notification Electron emits `child-process-gone` from. Live
 reporting is impossible here for the same reason - the browser process is gone before an async
 Sentry POST queued at that moment could transmit. A GPU fallback that the tracker records from
-`gpu-info-update` ticks no Aptabase event, because it is not a death. So a launch-failure ladder,
-which produces no `child-process-gone` at all, leaves this count at zero.
+`gpu-info-update` ticks no Aptabase event, because it is not a death. Through Electron 41 a
+launch-failure ladder produced no `child-process-gone` at all and left this count at zero. On
+Electron 44 the launch failures Chromium survives arrive as `child-process-gone` with reason
+`launch-failed`, count as fault deaths, and tick `first` and then `latched`. The launch failure
+that ends in the fatal still never reaches JS.
 
 The curated `feature` vocabulary is `ANALYTICS_FEATURES` in `src/main/analytics/usage.ts`:
 `command_terminal`, `worktree_session`, `board_profile`, `popout_window`, `browser_pane`,
@@ -104,7 +111,10 @@ For Claude sessions, `model` is normalized to its base id via `parseModelId` (`s
 
 `permissionMode` on `session_spawn` / `task_complete` is the RESOLVED mode the session record
 actually spawned under (from `resolveEffectivePermissionMode`), not the task's raw override
-(which is null for most tasks, meaning "inherit"). `worktree` says whether the session ran in a
+(which is null for most tasks, meaning "inherit"). `session_spawn` fires inside the spawn,
+before the session's record is inserted, so it reads the mode the spawn carried onto the session
+(`SpawnSessionInput.permissionMode`, `SessionManager.getSessionPermissionMode`); a Command
+Terminal carries none. `worktree` says whether the session ran in a
 git worktree. `intentional` on `session_exit` distinguishes a deliberate kill/suspend (tagged by
 the session manager) from a genuine agent-side exit, closing the crash-versus-intentional blind
 spot.
@@ -121,8 +131,8 @@ Profiles. Column names and task content never leave the machine.
 `settings_snapshot` answers "what are people actually running with", the question that changes a
 default; a stream of setting-changed events would only say what was touched. It carries only the
 settings that differ from their default, from a fixed allowlist of fifteen global settings
-(`SETTINGS_SNAPSHOT_ALLOWLIST` in `src/main/analytics/settings-snapshot.ts`): `memory.indexingEnabled`,
-`memory.semanticEnabled`, `memory.embeddingModel`, `memory.acceleration`,
+(`SETTINGS_SNAPSHOT_ALLOWLIST` in `src/main/analytics/settings-snapshot.ts`): `knowledgeGraph.indexingEnabled`,
+`knowledgeGraph.enabled`, `knowledgeGraph.localModel`, `knowledgeGraph.acceleration`,
 `agent.maxConcurrentSessions` (bucketed `1-3` / `4-7` / `9-12` / `13-16` / `17+`),
 `agent.queueOverflow`, `agent.autoResumeSessionsOnRestart`, `agent.idleTimeoutMinutes` (bucketed
 `1-15` / `16-60` / `61+`), `browserAutomation.enabled`, `browserAutomation.allowEval`,
@@ -208,22 +218,27 @@ in one Sentry org, one triage surface.
   offline-capable transport is the single point of egress. The renderer init is gated on a boot
   flag (`--kangentic-error-reporting` in `additionalArguments`) that mirrors main's single
   decision, so the two processes can never disagree.
-- **Scrubbing is the SDK's and Sentry's job, not custom code:** the SDK's default
+- **Scrubbing is mostly the SDK's and Sentry's job, not custom code:** the SDK's default
   `normalizePathsIntegration` rewrites stack-frame paths and URLs relative to the app root (the
   user's home directory never reaches Sentry through an app stack frame; breadcrumbs are a separate
   path, below), `sendDefaultPii` stays `false`, and Sentry's server-side data scrubbing is on by
-  default. Any further scrubbing rule belongs in the Sentry UI (Advanced Data Scrubbing), not in a
-  `beforeSend` here. There are three exceptions, all data minimization at the source rather than
-  scrubbing rules, the same shape as the component-stack reduction above. The utility worker's
-  stderr tail (below) is free text, not a stack frame, and Node's `Require stack:` lines print
+  default. Further scrubbing rules belong in the Sentry UI (Advanced Data Scrubbing), not in a
+  `beforeSend` here. There are four exceptions, all done on the machine before anything is sent
+  rather than as Sentry rules, the same shape as the component-stack reduction above. The utility
+  worker's stderr tail (below) is free text, not a stack frame, and Node's `Require stack:` lines print
   absolute install paths under the user's profile, so `src/main/utility-process/stderr-tail.ts`
   replaces the home directory with `~` before the text goes anywhere. A foreign process's crash
   loses its dump, breadcrumbs and full module name in `beforeSend` (see "Native crashes in
-  processes that are not ours" below). And every breadcrumb passes a policy before it is recorded
-  (see "Breadcrumbs are filtered at the source" below).
+  processes that are not ours" below). Every breadcrumb passes a policy before it is recorded
+  (see "Breadcrumbs are filtered at the source" below). And `beforeSendEvent` rewrites this
+  machine's home directory to `~` in every string of the event
+  (`src/main/analytics/redact-event-paths.ts`): an exception message is free text that path
+  normalization never touches, and an OS username is often a real name. Monaco's rethrown
+  diff-editor error put about 48 home paths in one exception value. Native crash events are the
+  part this cannot reach (see "Native crash fields" below).
 - **Filtering is a different concern and does live in code,** in `ignoreErrors`. Scrubbing removes
   data from an event we keep; filtering decides a whole class of event is un-actionable and should
-  never become an issue. Four classes are filtered:
+  never become an issue. Five classes are filtered:
   - Benign Windows stdio write artifacts, in two message shapes. Node's `errnoException` reads
     `write EAGAIN` / `write EPIPE` (the dev `npm start` TTY case) and is matched by those two
     string literals; libuv's `uvException` reads `EPIPE: broken pipe, write` (a packaged GUI
@@ -233,22 +248,103 @@ in one Sentry org, one triage surface.
     (`'Utility' process exited with '<reason>'`). That event is tagged only with the process
     TYPE - `serviceName` / `name` / `exitCode` go into a breadcrumb added AFTER the capture, so it
     can never say which process died and no `beforeSend` could recover THAT event. Electron's internal
-    utility processes (network, audio, storage) are not ours to fix, and Kangentic's own two
-    workers now report themselves (see `utility_process` below), where the service name and exit
-    code are known. Scoped to `'Utility'` deliberately: renderer crashes come through the same
+    utility processes (network, audio, storage) are not ours to fix, and Kangentic's own utility
+    workers (embeddings, line count, dictation, retrieval, PTY host) report themselves (see
+    `utility_process` below), where the service name and exit code are known. Scoped to `'Utility'` deliberately: renderer crashes come through the same
     integration as `'renderer' process exited with ...` and must keep reporting. The breadcrumb
     survives the filter, so an internal utility crash still shows as context on later events.
   - The same SDK integration's GPU variant, but scoped narrower than the Utility filter:
     `'GPU' process exited with 'abnormal-exit'` only, not every reason. A lone GPU death Chromium
     recovers from on its own (DESKTOP-15) is the same un-attributable noise as a utility exit, and
     Kangentic's own GPU health tracker now reports a repeated one (see "A GPU health escalation is
-    reported once" below). `'launch-failed'` is left unfiltered, but it is not a backstop: the
-    integration rides `child-process-gone`, which Electron 41 never emits for a launch failure
-    (it overrides no `BrowserChildProcessLaunchFailed`). DESKTOP-W's launch-failure ladder is caught
-    by the GPU health tracker's fallback record instead - see below.
+    reported once" below). `'launch-failed'` is left unfiltered. Through Electron 41 it never
+    fired: the integration rides `child-process-gone`, and Electron 41 overrode no
+    `BrowserChildProcessLaunchFailed`. Electron 44 does override it, so a GPU launch failure that
+    Chromium survives now reaches this integration (measured on Linux, see `docs/cross-platform.md`).
+    The launch failure that ends in the fatal still does not, so DESKTOP-W's ladder is caught by the
+    GPU health tracker, which on 44 records the survived failures as fault deaths as well as the
+    fallback - see below.
+  - The same integration's message for a Browser pane page's renderer,
+    `'browser-guest' process exited with ...`. The page is the user's, not ours, and a pane page
+    that actually crashes still arrives once, as the reduced native warning described under
+    "A Browser pane page's crash becomes a warning without the page" below.
   - `BENIGN_RENDERER_ERRORS` (`src/shared/benign-renderer-errors.ts`) is spread in, so the one
     registry drives the monaco error funnel, the UI-test collector, and Sentry. Patterns there
     must stay unanchored: monaco re-throws as `message + '\n\n' + stack`.
+- **One monaco error is reported as handled, with diff context.** Monaco catches an event
+  listener's throw and hands it to its error funnel, whose default rethrows it on a timer. Sentry
+  DESKTOP-19 ("Illegal value for lineNumber") arrived that way, as an uncaught error with no app
+  frame. The funnel (`src/renderer/monaco-error-funnel.ts`) now sends it through
+  `reportHandledRendererError` (`src/renderer/error-reporting.ts`) with `source:
+  monaco_line_number`, and does not rethrow it. Two more tags make it searchable:
+  `hide_unchanged_regions` (`true`, `false`, or `unknown` when no live viewer reports it) and
+  `diff_viewers_live` (how many viewers had an editor). Each mounted diff viewer publishes a snapshot
+  reader, and the funnel reads them at the moment of the throw. Each becomes a flat
+  `diff_viewer_N` context: line counts, scroll metrics, visible line ranges, and the collapse and
+  fold state. The funnel's own call stack becomes a `call_site` context. It is captured with a
+  raised stack limit, so it holds the outer frames the original error's 50-frame stack lost. Each
+  frame keeps only its file's base name, because a production location is a `file://` URL under
+  the user's home directory, and the SDK's path normalization does not reach `contexts`. No file
+  path or file content is sent. A stuck editor throws on every scroll tick, so the funnel sends at
+  most one report per 30 seconds. It absorbs the rest without rethrowing them, and the next report
+  carries their count in its `funnel` context (`suppressed_since_last_report`). Every other monaco
+  error keeps monaco's default.
+- **Native crash fields are scrubbed by a Sentry rule, not by the app.** A native crash's frames,
+  module list and crashpad annotations are built on Sentry's servers from the minidump after
+  upload, so `redact-event-paths.ts` never sees them. The `desktop` project carries an Advanced
+  Data Scrubbing rule for them (Project Settings > Security & Privacy > Advanced Data Scrubbing),
+  stored as this `relayPiiConfig`:
+
+  ```json
+  {"rules":{"0":{"type":"userpath","redaction":{"method":"replace","text":"[user]"}}},
+   "applications":{"$string":["0"],"$frame.*":["0"],"debug_meta.images.*.code_file":["0"],
+   "debug_meta.images.*.debug_file":["0"],"tags.*":["0"],"contexts.*.*":["0"]}}
+  ```
+
+  It was tested on 2026-10-03 against synthetic events carrying fake home paths in every place a
+  real leak was measured, in a scratch project with a no-rule control. Sentry's ingest servers
+  take about two minutes to pick up a changed rule, and events sent sooner can still see the old
+  one. With the rule, these arrive scrubbed: exception values, breadcrumb messages, frame
+  `abs_path`, the debug image `code_file` and `debug_file`, the crashpad annotations under
+  `contexts` (`gpu-url-chunk` carried a `file://` URL under the home directory), tags and
+  `extra`. `$string` alone is not enough, because frame, image and tag fields need their own
+  selectors, and `$image.*` is not a valid selector (images take a path).
+  - **Crashpad annotations also pass through the app.** For a dump it uploads, the SDK copies the
+    dump's Crashpad annotations into `contexts.electron` as `crashpad.<key>` on this machine,
+    before `beforeSend`, so `redact-event-paths.ts` rewrites the home directory in them as well.
+    A `LOG(FATAL)` message lands there as `crashpad.LOG_FATAL`, including Electron 44.5's
+    install-folder access check, whose message names the per-user install folder under the home
+    directory (`tests/unit/redact-event-paths.test.ts` pins that case).
+  - **What the rule cannot reach.** Frame `package` (the app's own install path under the user's
+    home directory, 133 occurrences in one real Windows event) survived every selector tried:
+    `$frame.*`, `$frame.package`, the full path, `$stacktrace.**` and `$exception.**`. The
+    readable views (`sentry issue view`, the Sentry MCP) print frame file names, not `package`,
+    so what remains is in raw JSON and the Sentry UI's package column. "Prevent Storing of IP
+    Addresses" removes `user.ip_address`, but the city derived from the address stays in
+    `user.geo`.
+  - **New events only.** A rule never rewrites a stored event, so an event from before the rule
+    keeps its paths until it ages out. The `desktop` project keeps events for 30 days: an event
+    older than that is gone (its issue keeps the counts but shows no latest event), and a search
+    sees no further back. The rule was applied on 2026-10-03, so no stored event predating it
+    survives past early November 2026.
+- **A Browser pane page's crash becomes a warning without the page.** A pane guest (and a popup
+  it opened, and an offscreen lane) runs as Kangentic.exe, so its dump reads as ours, but its
+  content is the user's page: the event's `contexts.electron.crashed_url` names it, and since
+  Electron 42 a guest nearing
+  its heap limit writes its JavaScript stack into a Crashpad annotation, which the SDK parses into
+  exception frames. The SDK's `getRendererName` (`renderer-classification.ts`) names those
+  renderers `browser-guest`. Each surface's webContents is marked when it is created and never
+  unmarked, because the SDK asks only after the dump has settled, up to 5 s after the crash, and
+  a surface closed by then would otherwise read as ours. `beforeSend` (`toBrowserGuestCrashWarning` in
+  `native-crash-event.ts`) rewrites the event into a warning titled "A Browser pane page crashed",
+  grouped by exit reason, with the exception, `crashed_url`, every `crashpad.*` annotation and the
+  minidump removed. The exit reason and code, the versions and our own scope stay, so guest crash
+  rates are still visible. The SDK's `'browser-guest' process exited with ...` message for an
+  abnormal exit is dropped in `ignoreErrors`, like the Utility and GPU ones. A guest dump found
+  only at the next startup has no WebContents to classify and stays an ordinary renderer crash.
+  Our own windows get no name, and the SDK's live native-crash path turns that into
+  `event.process: unknown` rather than `renderer`; `beforeSend` puts `renderer` back when the
+  dump's `crashpad.process_type` annotation says renderer (`restoreOwnRendererProcessTag`).
 - **Native crashes in processes that are not ours become one warning, and their dumps never
   upload.** This happens in `beforeSend` (`beforeSendEvent` -> `filterNativeCrashEvent`), the only
   hook that can see the minidump attachment. On macOS a task's mach exception ports are inherited
@@ -309,15 +405,18 @@ in one Sentry org, one triage surface.
     one-time tail from dumps written before the upgrade and uploaded at its first launch
     (`native_crash.crash_time` separates it), then only the residue.
 - **Tagging shares that hook, and runs before the split.** `beforeSend` is `beforeSendEvent`,
-  which tags and then delegates to `filterNativeCrashEvent`. `tagTruncatedStack` sets
+  which tags, delegates to `filterNativeCrashEvent`, and then rewrites the home directory in what
+  is left (`redactEventHomeDirectory`). `tagTruncatedStack` sets
   `stack_truncated: 'true'` on any event whose parsed stack sits exactly on the SDK's 50-frame
   cap. The parser reads a V8 stack innermost-first and stops there, so a capped event has lost its
   OUTER frames - the app code that called into the library and the timer it ran under - and reads
   as a self-contained third-party failure with `in_app: false` everywhere. Sentry DESKTOP-19 is
-  the case that earned the tag: six events, fifty monaco frames each, no in-app frame, and the app
-  frame that armed the call truncated away. The tag makes "no app frames survived" distinguishable
-  from "no app frames" without counting by hand. Tagging is annotation, not filtering: it never
-  drops an event.
+  the case that earned the tag: six events, fifty monaco frames each, and no in-app frame. Two caps
+  cut it. V8's 50-frame limit cut the original error's outer frames when monaco's listener threw,
+  and the parser then cut the one frame of monaco's own rethrow. Those outer frames now arrive in
+  the handled report's `call_site` context (see the monaco bullet above). The tag makes "no app
+  frames survived" distinguishable from "no app frames" without counting by hand. Tagging is
+  annotation, not filtering: it never drops an event.
 - **Errors only:** release-health session tracking (the SDK's `MainProcessSession` integration,
   on by default) is filtered out, and tracing and session replay are never enabled.
 - **Breadcrumbs are filtered at the source, in both processes.** Every event carries the trail
@@ -363,13 +462,24 @@ in one Sentry org, one triage surface.
   all three error boundaries hand the real `Error` to `captureException` explicitly. Two of them
   also keep the existing Aptabase funnel (`ErrorBoundary` as `boundary: 'root'`,
   `PanelErrorBoundary` as `boundary: 'panel'`); `DiffErrorBoundary` reports to Sentry only.
-- **Handled errors are forwarded too** (`reportHandledError`): the deliberate catch sites that
+- **Handled errors are forwarded too** (`reportHandledError`; the renderer counterpart,
+  `reportHandledRendererError`, serves the monaco funnel above): the deliberate catch sites that
   otherwise emit only a sanitized count - updater structural failures (`source: updater`), PTY
   spawn failures (`source: pty_spawn`), the silent agent-spawn catches (`source: spawn`, with a
   `reason` tag), a Kangentic utility worker that has crashed past its restart cap
-  (`source: utility_process`, with `service`, `exitCode`, and `crashCount`), and a GPU health
+  (`source: utility_process`, with `service`, `exitCode`, `crashCount`, and `cause`), and a GPU health
   escalation reported on the next launch (`source: gpu_process`, with `reason`, `exitCode`, and
-  `crashCount` - see the GPU health bullet below), and a guarded synchronous write that could not
+  `crashCount` - see the GPU health bullet below), a task leftover reap or a leftover-list Stop that
+  failed (`source: task_reap`, with `stage` (`reap` or `stop`) and `code` (`reader_load`,
+  `empty_scan`, `process_list`, `window_list`, `connection_list`, `reap_error`, `host_error`, `wsl_error`), once per stage and code per launch; the message is
+  fixed, and only a `reader_load` event carries text, the path-stripped load error in a
+  `task_reap` context, since any other failure's text can come from a process scan. A failure in
+  a scan pass also carries a `pass` tag. `first`: nothing was signalled yet. `second`: the
+  graceful kills went out. `last`: the force pass ran as well, possibly with no target.
+  `reader_load`, `host_error`, `wsl_error`, and a `reap_error` from the home-directory lookup
+  (which runs before any scan), carry no `pass` tag. A Stop
+  that refused a process, such as Kangentic's own tree or a held PTY, is not reported. Neither is
+  one that found the process still running after the force kill), and a guarded synchronous write that could not
   reach disk (`src/main/config/write-failure-notice.ts`, one report per failing `source` tag per
   outage: `config`, `config_dirs`, `config_project_override`, `import_source`, `browser_url`, the
   three `mobile_bridge_*` stores, `asana_credential`, plus an `errno` tag when the error carries
@@ -380,10 +490,23 @@ in one Sentry org, one triage surface.
   per outage. The `errno` tag is what makes muting it later a Sentry-UI change rather than a code
   change (Sentry DESKTOP-1C). The utility-worker report also
   carries a `utility_process` context block with the last 8 KiB of the worker's stderr (home
-  directory redacted). Both workers are forked with stderr piped for this; with Electron's
+  directory redacted). Every worker is forked with stderr piped for this; with Electron's
   `inherit` default, a packaged GUI build sent the worker's uncaught-exception dump nowhere, so
   every DESKTOP-H event could only say "exit code 1". Content lives in the context, never in a
-  tag or the message, so grouping is unchanged.
+  tag or the message, so grouping is unchanged. The same block lists `crashes`, one line per crash
+  in the decay window, oldest first: the cause (`exit`, `fork_failed`, `ready_timeout` or
+  `request_timeout`), the exit code when there is one, and for a request timeout the method that
+  did not answer and the other methods still pending, as in
+  `request_timeout method=projects.summaries pending=transcript.usage(12)`. The latching crash's
+  cause is also a `cause` tag. Only `exit` is a process exit, so a `request_timeout` latch means the
+  worker hung; DESKTOP-1Q said only "exit code unknown" and could not tell. Each crash is a string
+  because Sentry normalizes contexts to depth 3, which turns an object inside the list into
+  `[Object]`. The pending list names every job in flight, since the retrieval worker schedules
+  nothing itself, but not which one held the loop. For that, the worker runs an event-loop watchdog
+  thread (`src/main/retrieval/worker/event-loop-watchdog.ts`). When its heartbeat stops for about
+  5 s, it writes `[retrieval-worker] event loop held 5 s in <step>` straight to stderr, naming the
+  `timeSyncWork` span that was running (or `outside any labelled step` when none was), so the line
+  is in the stderr tail by the 15 s kill.
 - **Host memory pressure carries a `host_memory` context on every event** (`setHostMemoryContext`,
   `src/main/diagnostics/host-memory.ts`; DESKTOP-16 was a renderer OOM where the crashing process
   held 179 MB while the host had 2.15 MB of Windows commit remaining out of an 89.8 GB limit - a
@@ -394,7 +517,16 @@ in one Sentry org, one triage surface.
   transaction for `setMeasurement` to hang on), so whatever event fires next - including a native
   crash - carries the freshest sample. `correctNativeCrashEvent` prunes `host_memory` under the
   same stale-dump condition as `app_memory`/`free_memory`, since a startup-found dump can otherwise
-  present the uploading launch's memory as the crash's.
+  present the uploading launch's memory as the crash's. The commit fields are Windows-only. On
+  Linux the sample carries `physicalAvailableBytes` instead, the kernel's MemAvailable
+  (`available`, Electron 44+), because `physicalFreeBytes` there is MemFree, which leaves out page
+  cache and reads near zero on a healthy machine. It is null on every other platform, and it is a
+  reading only: no Linux pressure warning is raised from it.
+- **A worker crash is logged after its stderr pipe ends.** Electron 44.5.0 drains a utility
+  process's stderr after `exit`, so `UtilityRestartPolicy.recordCrash` holds the crash's log line
+  and latch report until the pipe ends, bounded at 500 ms (`STDERR_DRAIN_BOUND_MS`). Measured on
+  44.5.1, `end` follows `exit` by about 3 ms. The count, backoff, telemetry and the latch decision
+  stay synchronous.
 - **User-configuration errors are the one deliberate exclusion.** `reportHandledError`
   early-returns on a `UserConfigurationError` (`src/shared/user-configuration-error.ts`). A
   missing agent CLI (`AgentCliNotFoundError`) is the user's environment, not a defect we can ship
@@ -407,17 +539,20 @@ in one Sentry org, one triage surface.
   `utility_worker_crashed` events per service per app run, the first crash and the latch. The same
   volume-versus-diagnostic split as `spawn_failed`.
   Every crash does log its stderr tail to the main console as a
-  `[utility-process] <service> exited with code <n>` warning, which the log mirror persists to
-  `<project>/.kangentic/logs/<date>.log`, so the text is on disk locally whether or not error
-  reporting is on. The Memory settings tab shows the same reason (exit code plus the first error
-  line) while semantic search is off because of it.
+  `[utility-process] <service> <what happened> (crash <i> of <cap>)` warning, which the log
+  mirror persists to `<project>/.kangentic/logs/<date>.log`, so the text is on disk locally whether
+  or not error reporting is on. An exit reads `exited with code <n>`. A crash with no exit says what
+  the worker failed to do, as in `did not answer projects.summaries in time`. The package smoke
+  matches the `(crash <i> of <cap>)` suffix every cause shares. The Knowledge Graph settings tab shows the same reason, plus
+  the first error line, while semantic search is off because of it.
 - **A GPU health escalation is reported once, and on the NEXT launch, not live.**
   `src/main/diagnostics/gpu-health.ts` counts GPU `child-process-gone` deaths the same way
   `UtilityRestartPolicy` counts a worker's, but cannot report live: the failure sequence this exists
   for can end in Chromium calling `LOG(FATAL)` (`IntentionallyCrashBrowserForUnusableGpuProcess`),
   which kills the whole process before an async Sentry POST queued at that moment would ever
-  transmit. (A 90-day search never turned up a `'GPU' process exited with 'launch-failed'` event
-  for a different reason: Electron never emits `child-process-gone` for a launch failure at all.)
+  transmit. (A search of everything Sentry retained never turned up a `'GPU' process exited with 'launch-failed'` event
+  for a different reason: through Electron 41, Electron never emitted `child-process-gone` for a
+  launch failure at all. Electron 44 does, for the ones Chromium survives.)
   EVERY death writes the durable record at `<configDir>/gpu-health.json`, from the first - not
   just a threshold breach.
   The ordering is why: Chromium calls `GpuProcessHost::RecordProcessCrash` (and the `LOG(FATAL)`
@@ -434,7 +569,8 @@ in one Sentry org, one triage surface.
   `gpu-info-update`: once this run has been seen compositing on the GPU, the moment
   `gpu_compositing` leaves it, and each later status change, appends to a bounded `modeChanges`
   list (8 entries) and moves the record's `lastAt`. That is DESKTOP-W's only trace. Its deaths
-  were launch failures, which Electron never forwards to JS, and on Linux the running GPU
+  were launch failures, which Electron 41 never forwarded to JS (Electron 44 forwards the ones
+  Chromium survives), and on Linux the running GPU
   process's death through a dead zygote reads as a normal exit that fires nothing either (see
   "When the GPU process is unusable" in [cross-platform.md](cross-platform.md)). A fallback-only
   record has `count: 0` and `reason: 'hardware-fallback'`. On Linux each fallback entry also
@@ -485,8 +621,10 @@ in one Sentry org, one triage surface.
   three counted failures. A fallback the run survived is not reported: VMs and broken-GL machines
   can fall back at every boot. When it does report, `src/main/index.ts` calls `reportHandledError` with
   the message `GPU process exited repeatedly (...)`, or `GPU left hardware acceleration with no GPU
-  process exit reported` for a fallback-only record, which groups the launch-failure shape as its
-  own issue. It carries tags
+  process exit reported` for a fallback-only record, which groups as its own issue. Through
+  Electron 41 that was the launch-failure shape. On Electron 44 the launch failures Chromium
+  survives count as fault deaths, so that shape reports as `GPU process exited repeatedly`, and
+  the fallback-only message is left for a fallback no reported death explains. It carries tags
   `source: gpu_process`, `reason`, `exitCode`, `crashCount`, and a `gpu_process` context carrying
   `reason`, `exitCode`, `count`, `faultDeathCount` (how many of `count` were fault deaths; the gap
   is kills and teardown exits), `firstAt`, `lastAt`, `escalatedInVersion` (the app version that
@@ -621,14 +759,22 @@ in one Sentry org, one triage surface.
   "Unique Installs" is attached as the Sentry user id, so an issue's Users column means
   "installs affected." It contains no personal data and shares the same kill switches.
 - **Investigating an issue:** the `/sentry` skill (`.claude/skills/sentry/SKILL.md`) teaches an
-  agent to retrieve and diagnose issues from the org via the API.
+  agent to retrieve and diagnose issues from the org. It retrieves through Sentry's own `sentry`
+  CLI (`sentry issue list`, `sentry issue view`, `sentry api`) and keeps the raw API endpoints as
+  the fallback. Nothing rewrites that output on the way to the reader. Home paths are removed
+  earlier: the app rewrites its own home directory in event strings from the first release that
+  includes `redact-event-paths.ts`, and Sentry's rule scrubs most stored fields (see "Native crash
+  fields" above). An event stored before either change, and any frame `package`, can still carry
+  one.
 - **Sourcemaps** upload at release time only: `@sentry/vite-plugin` (renderer) and
   `@sentry/esbuild-plugin` (main/preload) activate when an upload token is present
-  (`KANGENTIC_SENTRY_TOKEN`, or the conventional `SENTRY_AUTH_TOKEN` as a CI fallback), generate
-  hidden maps, upload them with debug IDs, and delete them from the output. Nothing ships in the
+  (`KANGENTIC_SENTRY_TOKEN`, or the conventional `SENTRY_AUTH_TOKEN` as a CI fallback) AND the
+  build is authorized to upload: in CI (`CI=true`), or locally only with an explicit
+  `KANGENTIC_SENTRY_UPLOAD=1`, so a developer's persisted token never uploads a local build. They
+  generate hidden maps, upload them with debug IDs, and delete them from the output. Nothing ships in the
   artifact; resolution is entirely server-side. The DSN in source is a public routing
   identifier by design, not a secret. `KANGENTIC_SENTRY_TOKEN` is also what the `/sentry`
-  skill reads for issue retrieval, so one scoped variable serves both. Both plugins pass an
+  skill's raw-API fallback reads. Normal retrieval uses the `sentry` CLI's stored login instead. Both plugins pass an
   explicit `release.name` of `Kangentic@<version>`, matching what `@sentry/electron` reports at
   runtime; left unset the bundler default is `GITHUB_SHA`, which files the artifacts under a name
   no event ever carries.
@@ -682,8 +828,8 @@ in one Sentry org, one triage surface.
 ## What We Don't Collect
 
 - Task titles, descriptions, or any user-generated content
-- File paths, project names, or code (stack-frame paths are normalized to the app root before
-  they leave the machine)
+- File paths, project names, or code (stack-frame paths are normalized to the app root, and the
+  machine's home directory is rewritten to `~` in event text, before they leave the machine)
 - Console output in Sentry breadcrumbs, except lines under a short list of diagnostic tags, which
   are rebuilt without error text and with paths redacted. Click breadcrumbs lose their title and
   label text, and request breadcrumbs lose any URL that is not Kangentic's own (see "Breadcrumbs

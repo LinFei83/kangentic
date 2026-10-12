@@ -2,6 +2,8 @@ import { closeAll, getProjectDb } from './db/database';
 import { browserPaneRegistry } from './browser/browser-pane-registry';
 import { destroyAllLanes } from './browser/browser-lane-manager';
 import { popOutWindowManager } from './pop-out/pop-out-window-manager';
+import { answerSessionPool } from './retrieval/answer-session-pool';
+import { stopAllCliRuns } from './agent/shared/cli-print';
 import { SessionRepository } from './db/repositories/session-repository';
 import { TaskRepository } from './db/repositories/task-repository';
 import { UsageHistoryRepository } from './db/repositories/usage-history-repository';
@@ -25,6 +27,14 @@ interface ShutdownDependencies {
   stopAnnouncementTimers: () => void;
   clearPendingTimers: () => void;
   isEphemeral: boolean;
+  /**
+   * Whether this quit is a restart the app asked for (app-relaunch.ts). An
+   * ephemeral preview keeps its open project in the index then: the relaunch
+   * adopts the same project row and resumes its suspended sessions. Required,
+   * so a dependency object that drops it fails the typecheck instead of
+   * quietly deleting the preview's project on every in-app restart.
+   */
+  isRestartRequested: () => boolean;
   /**
    * Whether a young session's force-kill may ride the before-quit drain's
    * timer (see SessionManager.killAll). True only on a route where that drain
@@ -107,6 +117,15 @@ export function syncShutdownCleanup(dependencies: ShutdownDependencies): PtyKill
     // shutdown entry points that reach performShutdown() without a 'close' event.
     runCleanupStep('popOutWindowManager.destroyAll', () => popOutWindowManager.destroyAll());
 
+    // End every warm Knowledge Graph answering process. Synchronous: each is a
+    // child process killed in place, and its run directory removed.
+    runCleanupStep('answerSessionPool.disposeAll', () => answerSessionPool.disposeAll());
+
+    // And every headless agent CLI still running outside the pool: a one-shot
+    // answer, a task summary, a title. Each runs detached (POSIX) or outlives
+    // the app (Windows), so one left here keeps running after the quit.
+    runCleanupStep('stopAllCliRuns', () => stopAllCliRuns());
+
     // Close active project's file watchers before killing sessions
     runCleanupStep('boardConfigManager.detach', () => dependencies.getBoardConfigManager().detach());
 
@@ -159,7 +178,10 @@ export function syncShutdownCleanup(dependencies: ShutdownDependencies): PtyKill
           const usageHistoryRepo = new UsageHistoryRepository(db);
           const taskRepo = new TaskRepository(db);
           for (const session of sessions) {
-            const record = sessionRepo.getLatestForTask(session.taskId);
+            // The session's own record with no fallback (see
+            // resolveOwnSessionRecord). A Command Terminal has no record and
+            // is skipped.
+            const record = sessionRepo.findByAnyId(session.id);
             if (record && record.status === 'running') {
               // Flush in-flight metrics from usageCache to the DB BEFORE
               // marking suspended. captureSessionMetrics is fully synchronous
@@ -207,12 +229,17 @@ export function syncShutdownCleanup(dependencies: ShutdownDependencies): PtyKill
     // The worktree directory cleanup (async) is skipped here - pruneStaleWorktreeProjects()
     // handles it on next launch of the main app.
     //
+    // Not on a restart the app asked for: dev.js respawns Electron on the same
+    // data dir, the boot adopts the project row by path, and the sessions
+    // suspended above resume into it. Deleting the row here made every in-app
+    // restart of a preview come back to an empty board.
+    //
     // Wrapped for the same reason the pre-kill steps are: this writes to the
     // global index DB, which can be read-only (Sentry DESKTOP-9), and an
     // unwrapped throw here lands in the outer catch and skips closeAll() below.
     // Open SQLite handles keep the libuv loop referenced past a clean quit,
     // which is the leak class that ends in the 6s hard failsafe exiting with 1.
-    if (dependencies.isEphemeral) {
+    if (dependencies.isEphemeral && !dependencies.isRestartRequested()) {
       runCleanupStep('deleteEphemeralProject', () => {
         const projectId = dependencies.getCurrentProjectId();
         if (projectId) {

@@ -3,6 +3,7 @@ import type { IpcContext } from '../../ipc/ipc-context';
 import type { CapabilityRouter } from '../capability-router';
 import type { SubscriptionRegistry } from '../session/subscription-registry';
 import type { PushRegistrationStore } from '../push/push-registration-store';
+import type { SpawnProgressFeed } from '../spawn-progress-feed';
 import { handleReadStream } from './read-stream';
 import { handleReadBoard } from './read-board';
 import { handleReadDiff } from './read-diff';
@@ -13,6 +14,8 @@ import { handleAnswerPermissionPrompt } from './answer-permission-prompt';
 import { handleBoardTool } from './board-tool';
 import { handleRegisterPush } from './register-push';
 import { handleStartSession } from './start-session';
+import { handlePauseSession } from './pause-session';
+import { handleCommandTerminal } from './command-terminal';
 
 export interface CapabilityHandlerDeps {
   context: IpcContext;
@@ -21,6 +24,8 @@ export interface CapabilityHandlerDeps {
   getSubscriptions: (deviceId: string) => SubscriptionRegistry;
   /** Bridge-owned push registration sidecar; register-push writes it, the push notifier reads it. */
   pushRegistrations: PushRegistrationStore;
+  /** Bridge-owned, throttled spawn-progress label changes; read-board forwards them as task-updated. */
+  spawnProgressFeed: Pick<SpawnProgressFeed, 'onTaskSpawnProgressChanged'>;
 }
 
 /**
@@ -33,7 +38,7 @@ export function registerCapabilityHandlers(router: CapabilityRouter, deps: Capab
   router.register('read-stream', (request, session) =>
     handleReadStream(request, session, deps.context, deps.getSubscriptions(session.deviceId)));
   router.register('read-board', (request, session) =>
-    handleReadBoard(request, session, deps.context, deps.getSubscriptions(session.deviceId)));
+    handleReadBoard(request, session, deps.context, deps.getSubscriptions(session.deviceId), deps.spawnProgressFeed));
   router.register('read-diff', (request, session) =>
     handleReadDiff(request, session, deps.context, deps.getSubscriptions(session.deviceId), deps.diffWatcher));
   router.register('send-user-message', (request) => handleSendUserMessage(request, deps.context));
@@ -45,4 +50,6 @@ export function registerCapabilityHandlers(router: CapabilityRouter, deps: Capab
   router.register('board-tool-write', (request) => handleBoardTool(request, deps.context));
   router.register('register-push', (request, session) => handleRegisterPush(request, session, deps.pushRegistrations));
   router.register('start-session', (request) => handleStartSession(request, deps.context));
+  router.register('pause-session', (request) => handlePauseSession(request, deps.context));
+  router.register('command-terminal', (request) => handleCommandTerminal(request, deps.context));
 }

@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { browserPartitionForTask } from '../../src/shared/browser-partition';
+import {
+  BROWSER_GUEST_RENDERER_NAME,
+  rendererNameForReporting,
+  resetRendererClassificationForTests,
+} from '../../src/main/analytics/renderer-classification';
 
 /**
  * Lane bookkeeping and lifetime.
@@ -26,6 +31,11 @@ interface FakeWindow {
     session: {
       getUserAgent: () => string;
       setUserAgent: (userAgent: string) => void;
+      setPermissionRequestHandler: (
+        handler: (contents: unknown, permission: string, callback: (granted: boolean) => void) => void,
+      ) => void;
+      setPermissionCheckHandler: (handler: (contents: unknown, permission: string) => boolean) => void;
+      on: (event: string, handler: (...args: unknown[]) => void) => void;
     };
     loadURL: (url: string) => Promise<void>;
     once: (event: string, handler: () => void) => void;
@@ -58,6 +68,9 @@ vi.mock('electron', () => ({
           session: {
             getUserAgent: () => DEFAULT_USER_AGENT,
             setUserAgent: vi.fn(),
+            setPermissionRequestHandler: vi.fn(),
+            setPermissionCheckHandler: vi.fn(),
+            on: vi.fn(),
           },
           loadURL: vi.fn(async () => {
             if (loadGate) await loadGate();
@@ -77,6 +90,11 @@ vi.mock('electron', () => ({
       // object assignable to its instance type, and this class declares none.
       return win;
     }
+  },
+  // Not 1, so a lane that ignored the display and took Electron 42+'s fixed
+  // 1.0 offscreen default cannot pass the scale-factor test.
+  screen: {
+    getPrimaryDisplay: () => ({ scaleFactor: 1.5 }),
   },
   // openLane now syncs the task jar with the project identity jar before creating
   // the window; a minimal session stub lets that run without erroring.
@@ -151,6 +169,7 @@ beforeEach(() => {
 
 afterEach(() => {
   resetLanesForTests();
+  resetRendererClassificationForTests();
 });
 
 describe('openLane', () => {
@@ -253,7 +272,16 @@ describe('openLane', () => {
     await openLane(input());
     const options = created[0].options as { show: boolean; webPreferences: Record<string, unknown> };
     expect(options.show).toBe(false);
-    expect(options.webPreferences.offscreen).toBe(true);
+    expect(options.webPreferences.offscreen).toBeTruthy();
+  });
+
+  it('renders at the primary display\'s scale factor, not the fixed 1.0 offscreen default', async () => {
+    // Electron 42 made an offscreen window render at 1.0 unless told otherwise.
+    // The visible pane renders at the display's factor, so without this a page
+    // would see its devicePixelRatio change when its surface moved offscreen.
+    await openLane(input());
+    const options = created[0].options as { webPreferences: { offscreen: { deviceScaleFactor?: number } } };
+    expect(options.webPreferences.offscreen.deviceScaleFactor).toBe(1.5);
   });
 
   it('throttles the frame rate so an unwatched animating page cannot burn CPU', async () => {
@@ -279,6 +307,101 @@ describe('openLane', () => {
       setUserAgent.mock.invocationCallOrder[0],
       'the user agent must be set before loadURL, or the first request still carries the token',
     ).toBeLessThan(vi.mocked(guest.loadURL).mock.invocationCallOrder[0]);
+  });
+
+  // A lane can open before any pane has used this task's partition in this run, and the pane's
+  // policy is installed only from the <webview> branch of web-contents-created, which a lane
+  // never reaches. With no handler, Electron GRANTS every permission request.
+  it('denies device permissions on its own session before its first load', async () => {
+    await openLane(input());
+    const guest = created[0].window.webContents;
+    const requestHandler = vi.mocked(guest.session.setPermissionRequestHandler).mock.calls[0]?.[0];
+    const checkHandler = vi.mocked(guest.session.setPermissionCheckHandler).mock.calls[0]?.[0];
+    expect(requestHandler, 'no permission request handler on the lane session').toBeTypeOf('function');
+    expect(checkHandler, 'no permission check handler on the lane session').toBeTypeOf('function');
+
+    for (const permission of ['media', 'geolocation', 'notifications', 'clipboard-read']) {
+      const callback = vi.fn();
+      requestHandler?.(guest, permission, callback);
+      expect(callback, permission).toHaveBeenCalledWith(false);
+      expect(checkHandler?.(guest, permission), permission).toBe(false);
+    }
+    // The pane's one grant holds on a lane too, so the same page behaves the same in either.
+    expect(checkHandler?.(guest, 'clipboard-sanitized-write')).toBe(true);
+
+    expect(
+      vi.mocked(guest.session.setPermissionRequestHandler).mock.invocationCallOrder[0],
+      'the policy must be in place before the page loads, or its first request meets the default',
+    ).toBeLessThan(vi.mocked(guest.loadURL).mock.invocationCallOrder[0]);
+  });
+
+  it('routes its downloads through the download policy instead of a native save dialog', async () => {
+    await openLane(input());
+    const guest = created[0].window.webContents;
+    expect(vi.mocked(guest.session.on)).toHaveBeenCalledWith('will-download', expect.any(Function));
+  });
+
+  // A lane is a plain BrowserWindow, so Electron reports its page as a 'window' and only the mark
+  // openLane makes names it a Browser pane page. The Sentry SDK asks for that name up to 5 s after
+  // the crash, by which time the lane may be destroyed and getType() throws.
+  describe('crash classification', () => {
+    /** What the SDK hands getRendererName for a live lane: a plain 'window'. */
+    const liveContentsOf = (webContentsId: number) => ({ id: webContentsId, getType: (): string => 'window' });
+
+    /** The same lane once closed: Electron throws on getType() for a destroyed WebContents. */
+    const destroyedContentsOf = (webContentsId: number) => ({
+      id: webContentsId,
+      getType: (): string => {
+        throw new Error('Object has been destroyed');
+      },
+    });
+
+    it('names the lane page a Browser pane page for crash reporting, and no other window', async () => {
+      const lane = await openLane(input());
+      if (!lane.ok) throw new Error(lane.detail);
+      const laneWebContentsId = created[0].window.webContents.id;
+
+      expect(
+        rendererNameForReporting(liveContentsOf(laneWebContentsId)),
+        "a lane renders the user's page, so its crash must be reduced like a pane's, not read as Kangentic's own UI",
+      ).toBe(BROWSER_GUEST_RENDERER_NAME);
+      expect(
+        rendererNameForReporting(liveContentsOf(laneWebContentsId + 1000)),
+        'only the lane the manager created is marked, not an unrelated window',
+      ).toBeUndefined();
+    });
+
+    it('still names it after the lane is destroyed, even though getType() then throws', async () => {
+      const lane = await openLane(input());
+      if (!lane.ok) throw new Error(lane.detail);
+      const laneWebContentsId = created[0].window.webContents.id;
+
+      expect(destroyLane(lane.laneId)).toBe(true);
+      expect(created[0].window.destroyed, 'the lane really is gone before the SDK asks').toBe(true);
+
+      expect(
+        rendererNameForReporting(liveContentsOf(laneWebContentsId)),
+        'destroying a lane must not release its mark: the SDK names a crash up to 5 s late, and a lane closed in that window would ship its page',
+      ).toBe(BROWSER_GUEST_RENDERER_NAME);
+      expect(
+        rendererNameForReporting(destroyedContentsOf(laneWebContentsId)),
+        "a destroyed lane throws on getType(), and must still be named by its mark rather than read as Kangentic's own UI",
+      ).toBe(BROWSER_GUEST_RENDERER_NAME);
+    });
+
+    it('names a lane whose page failed to load, since a crash can land while it loads', async () => {
+      // The mark is made when the window is created, ahead of the load. A mark made only after a
+      // successful load would leave a page that crashes mid-load, or one the failed load then
+      // destroys, to be read as Kangentic's own UI.
+      loadShouldFail = true;
+      const result = await openLane(input());
+      expect(result).toMatchObject({ ok: false, kind: 'lane-load-failed' });
+      expect(created[0].window.destroyed).toBe(true);
+
+      expect(rendererNameForReporting(destroyedContentsOf(created[0].window.webContents.id))).toBe(
+        BROWSER_GUEST_RENDERER_NAME,
+      );
+    });
   });
 
   it('shares the task cookie jar (keyed by task identity) rather than minting a fresh one', async () => {

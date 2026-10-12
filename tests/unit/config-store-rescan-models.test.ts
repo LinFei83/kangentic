@@ -21,6 +21,9 @@
  * leave a picker - a companion one-shot migration in config-manager.ts clears
  * the cache once, and a restored seeding block would defeat it on next launch.
  *
+ * And covers the other direction: `rememberDiscoveredModel` persisting a newly
+ * learned id reloads the list, unforced, so main can label that id.
+ *
  * The throttle state is MODULE-SCOPE in config-store.ts (`modelRescanInFlight`,
  * `modelRescanLastAtMs`), so it would otherwise leak across tests in this
  * file. Each test gets a pristine copy via `vi.resetModules()` + a fresh
@@ -258,5 +261,158 @@ describe('config-store loadAgentList does not seed discoveredModelsByAgent', () 
     expectNeverWroteDiscoveredModelsByAgent(configSetSync);
     expect(useConfigStore.getState().config.discoveredModelsByAgent).toBe(discoveredModelsBefore);
     expect(useConfigStore.getState().config.discoveredModelsByAgent).toEqual(previouslyRememberedModels);
+  });
+});
+
+// Main labels a telemetry-learned model id on each agents.list call
+// (`nameLearnedModels`, agent-list.ts), so the store asks again once it learns
+// one. Without that, the new picker row stays raw until something else reloads.
+describe('config-store rememberDiscoveredModel reloads the agent list', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('reloads the list, unforced, once the newly learned id is persisted', async () => {
+    const agentsList = vi.fn(async (_forceRefresh?: boolean) => [] as AgentDetectionInfo[]);
+    const { useConfigStore, configSet } = await freshConfigStore(agentsList);
+
+    useConfigStore.getState().rememberDiscoveredModel('claude', 'claude-opus-4-1-20250805');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(configSet).toHaveBeenCalledWith({
+      discoveredModelsByAgent: { claude: ['claude-opus-4-1-20250805'] },
+    });
+    expect(agentsList).toHaveBeenCalledTimes(1);
+    // Unforced: a forced call would re-probe every CLI and spawn the /model probe.
+    expect(agentsList.mock.calls[0][0]).toBeFalsy();
+    // The write lands first, so main's per-call labeling sees the new id.
+    expect(configSet.mock.invocationCallOrder[0]).toBeLessThan(agentsList.mock.invocationCallOrder[0]);
+  });
+
+  it('neither writes nor reloads for an id it already knows', async () => {
+    const agentsList = vi.fn(async (_forceRefresh?: boolean) => [] as AgentDetectionInfo[]);
+    const { useConfigStore, configSet } = await freshConfigStore(agentsList);
+    useConfigStore.setState({
+      config: { ...DEFAULT_CONFIG, discoveredModelsByAgent: { claude: ['claude-opus-5-5'] } },
+    });
+
+    useConfigStore.getState().rememberDiscoveredModel('claude', 'claude-opus-5-5');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(configSet).not.toHaveBeenCalled();
+    expect(agentsList).not.toHaveBeenCalled();
+  });
+});
+
+// `updateConfig` carries every config write: window layouts, announcement
+// dismissals, and the telemetry caches live sessions refresh. Only a CLI path
+// edit (`agent`) and a newly learned model id change what the list holds, so
+// those two reload it and every other write must not cost a list request. The
+// sibling context-window cache is the near miss: `rememberModelContextWindow`
+// writes it on live status updates, so a check widened to "any discovered
+// cache" would reload the list all session long.
+describe('config-store updateConfig reloads the agent list only for the keys that change it', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('reloads the list, unforced, after a CLI path write', async () => {
+    const agentsList = vi.fn(async (_forceRefresh?: boolean) => [] as AgentDetectionInfo[]);
+    const { useConfigStore, configSet } = await freshConfigStore(agentsList);
+    const cliPathWrite: DeepPartial<AppConfig> = { agent: { cliPaths: { claude: '/mock/bin/claude' } } };
+
+    await useConfigStore.getState().updateConfig(cliPathWrite);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(configSet).toHaveBeenCalledWith(cliPathWrite);
+    expect(agentsList).toHaveBeenCalledTimes(1);
+    expect(agentsList.mock.calls[0][0]).toBeFalsy();
+  });
+
+  const unrelatedWrites: Array<[string, DeepPartial<AppConfig>]> = [
+    ['context-window cache', { discoveredContextWindowsByAgent: { claude: { 'claude-opus-5-5': 200_000 } } }],
+    ['announcement dismissal', { dismissedAnnouncementIds: ['announcement-one'] }],
+  ];
+
+  it.each(unrelatedWrites)('does not reload the list after a %s write', async (_label, unrelatedWrite) => {
+    const agentsList = vi.fn(async (_forceRefresh?: boolean) => [] as AgentDetectionInfo[]);
+    const { useConfigStore, configSet } = await freshConfigStore(agentsList);
+
+    await useConfigStore.getState().updateConfig(unrelatedWrite);
+    // The reload is fire-and-forget, so give one that should not exist the same
+    // flush the positive cases above need before asserting it never happened.
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(configSet).toHaveBeenCalledWith(unrelatedWrite);
+    expect(agentsList).not.toHaveBeenCalled();
+  });
+});
+
+// The reload `updateConfig` starts is fire-and-forget: it is neither awaited nor
+// returned, so a rejecting `agents.list` can never fail `updateConfig` itself. The
+// only observable symptom of a missing `.catch(() => undefined)` is Node's
+// 'unhandledRejection', so this block listens for that. It uses REAL timers on
+// purpose: `vi.useFakeTimers()` fakes `setImmediate`, which is how the macrotask
+// boundary below lets Node run its unhandled-rejection check.
+describe('config-store updateConfig survives a failed agent list reload', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('resolves, keeps the list already shown, and raises no unhandled rejection when the reload rejects', async () => {
+    const alreadyShownAgent = makeClaudeAgentInfo(['claude-opus-4-8']);
+    const agentsList = vi.fn(async (_forceRefresh?: boolean): Promise<AgentDetectionInfo[]> => {
+      throw new Error('agent list failed');
+    });
+    const { useConfigStore, configSet } = await freshConfigStore(agentsList);
+    const alreadyShownList = [alreadyShownAgent];
+    useConfigStore.setState({ agentList: alreadyShownList, agentListLoaded: true });
+
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+    try {
+      await expect(
+        useConfigStore.getState().updateConfig({
+          discoveredModelsByAgent: { claude: ['claude-opus-4-1-20250805'] },
+        }),
+      ).resolves.toBeUndefined();
+
+      // Cross a macrotask boundary so Node's unhandled-rejection check, which
+      // runs after the microtask queue drains, can fire before we assert on it.
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+
+    // Positive controls: the write landed and the reload really was attempted
+    // (unforced), so the assertions below are about the failure path and not a
+    // reload that never ran.
+    expect(configSet).toHaveBeenCalledWith({
+      discoveredModelsByAgent: { claude: ['claude-opus-4-1-20250805'] },
+    });
+    expect(agentsList).toHaveBeenCalledTimes(1);
+    expect(agentsList.mock.calls[0][0]).toBeFalsy();
+
+    // The failed reload keeps the list the user already sees.
+    expect(useConfigStore.getState().agentList).toBe(alreadyShownList);
+    expect(useConfigStore.getState().agentListLoaded).toBe(true);
+
+    // The behavior under test: the rejection was swallowed, not left unhandled.
+    expect(unhandledRejections).toEqual([]);
   });
 });

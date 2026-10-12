@@ -71,6 +71,7 @@ vi.mock('../../src/main/transcription/models/model-registry', () => ({
 vi.mock('../../src/main/transcription/engines/engine-selection', () => ({
   listEngineInfos: vi.fn(() => []),
   computeEngineKey: vi.fn(() => 'stub-key'),
+  finalNeedsSentenceCase: vi.fn(() => false),
   selectEngine: vi.fn(() => ({
     id: 'stub',
     info: { id: 'stub', displayName: 'Stub Engine', streaming: false, punctuation: true, license: 'MIT', requiresModelDownload: false },
@@ -142,7 +143,6 @@ const PREWARM_CONFIG: DictationConfig = {
   engineMode: 'auto',
   modelId: null,
   liveModelId: null,
-  punctuation: true,
   language: 'en',
 };
 
@@ -164,7 +164,6 @@ import { TranscriptionService } from '../../src/main/transcription/transcription
 
 const START_OPTIONS: DictationStartOptions = {
   engineMode: 'auto',
-  punctuation: true,
   language: 'en',
 };
 
@@ -409,7 +408,6 @@ const INFO_CONFIG: DictationConfig = {
   engineMode: 'auto',
   modelId: null,
   liveModelId: null,
-  punctuation: true,
   language: 'en',
 };
 

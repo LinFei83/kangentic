@@ -6,9 +6,11 @@
  */
 import { IPC } from '../../shared/ipc-channels';
 import { getProjectDb } from '../db/database';
-import { autoSpawnForTask, captureSessionLeftovers, reapSessionLeftovers } from '../ipc/helpers';
+import { autoSpawnForTask, reapTaskLeftovers } from '../ipc/helpers';
 import { handleTaskMove } from '../ipc/handlers/task-move';
 import { runAutomationAgain } from '../ipc/helpers/automation-run-again';
+import { applyTaskSettingsToLiveSession } from '../ipc/handlers/task-runtime-override';
+import { withTaskLock } from '../ipc/task-lifecycle-lock';
 import { WorktreeManager } from '../git/worktree-manager';
 import { sendToRenderer } from '../ipc/send-to-renderer';
 import {
@@ -21,6 +23,9 @@ import type { IpcContext } from '../ipc/ipc-context';
 import type { AppConfig } from '../../shared/types';
 import { RequestResolver } from './mcp-http/project-resolver';
 import { prResolveOptionsFromGitConfig, prRepollInFlightFromGitConfig } from '../pr/pr-linking';
+import type { TaskKnowledge } from '../retrieval/task-knowledge';
+import { retrievalClient } from '../retrieval/retrieval-client';
+import { taskSummariesOn } from '../../shared/answer-agent';
 
 /**
  * Resolve a project ID to a CommandContext, or return null if the project
@@ -133,14 +138,39 @@ export function buildCommandContextForProject(
       ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'task-updated', ids: [task.id] });
     },
 
-    onTaskDeleted: (task) => {
-      // An MCP delete is a terminal transition, so it reaps what the session
-      // left running, exactly as the UI delete path does in `cleanupTaskSession`.
-      // Taken BEFORE the kill: the watcher stops publishing once the session
-      // ends and POSIX reparents the children to init at once, so there is no
-      // tree left to walk afterwards.
-      const leftovers = captureSessionLeftovers(ipcContext, task.session_id);
+    // The same apply step the ContextBar pick runs, so a pin an agent or the
+    // phone sets reaches the running session instead of waiting for the next
+    // spawn. Only the fields the write moved count, as on a pick. Per-task
+    // locked so it cannot race a drag. Not limited to the active project the
+    // way a column edit is: this restarts an existing session in place and
+    // spawns nothing new, which is what the pick already does for any project.
+    //
+    // Deferred a macrotask, not just backgrounded: the lock starts its body
+    // synchronously, and the restart writes the agent's exit sequence into the
+    // PTY. Run inline, that lands before the tool reply is sent, so an agent
+    // updating its own task loses the reply that tells it its turn is ending.
+    onTaskSettingsChanged: (task, changed) => {
+      if (!task.session_id) return;
+      const taskId = task.id;
+      setImmediate(() => {
+        void withTaskLock(taskId, () => applyTaskSettingsToLiveSession(
+          ipcContext, projectId, projectPath, taskId, changed,
+        )).then((result) => {
+          // A restart (or a failed one) cleared task.session_id, so the board
+          // holds a stale id. Quiet re-sync, as a column edit's restart sends.
+          if (!result.ok || result.mode === 'restart') {
+            sendToRenderer(ipcContext.mainWindow, IPC.TASK_SESSION_RESYNC, projectId);
+          }
+          if (!result.ok) {
+            console.warn(`[mcp-http update_task] Could not apply settings to task ${taskId.slice(0, 8)}: ${result.reason}`);
+          }
+        }).catch((error) => {
+          console.error(`[mcp-http update_task] Settings apply failed for task ${taskId.slice(0, 8)}:`, error);
+        });
+      });
+    },
 
+    onTaskDeleted: (task) => {
       // Kill any live PTY for the task. The exit promise is captured BETWEEN the
       // kill and the remove: awaitExit resolves at once for a row that is gone,
       // and a young session's kill waits out its exit-sequence grace
@@ -154,33 +184,41 @@ export function buildCommandContextForProject(
           ipcContext.sessionManager.remove(task.session_id);
         } catch { /* may already be dead */ }
       }
-      ipcContext.sessionManager.removeByTaskId(task.id);
+      // Resolves once a spawn of the task still in flight has settled: the PTY
+      // its host may already have started holds the worktree until it exits,
+      // and the task row may not name that session yet (see task-cleanup.ts).
+      const spawnsSettled = ipcContext.sessionManager.removeByTaskId(task.id);
 
-      // Best-effort worktree + branch cleanup
-      if (task.worktree_path) {
+      // The exit wait and the reap run BEFORE the per-project git queue is
+      // taken: holding it for the grace would head-of-line block every other
+      // task's worktree work in the project (see task-cleanup.ts).
+      const worktreePath = task.worktree_path;
+      void (async () => {
+        await sessionExited;
+        await spawnsSettled;
+        // An MCP delete is a terminal transition, so it kills what the task's
+        // agents left running, exactly as the UI delete path does in
+        // `cleanupTaskSession`. Every task, worktree or not: a project-folder
+        // task's dev server outlives it just the same. Before the removal: a
+        // live process holding the worktree as its cwd is what makes the
+        // delete fail on Windows.
+        await reapTaskLeftovers(ipcContext, projectPath, [{ id: task.id, worktree_path: worktreePath, title: task.title }]);
+        // Best-effort worktree + branch cleanup
+        if (!worktreePath) return;
         const worktreeManager = new WorktreeManager(projectPath);
-        // The exit wait and the reap run BEFORE the per-project git queue is
-        // taken: holding it for the grace would head-of-line block every other
-        // task's worktree work in the project (see task-cleanup.ts).
-        void (async () => {
-          await sessionExited;
-          // Before the removal: a live process holding the worktree as its cwd
-          // is what makes the delete fail on Windows.
-          await reapSessionLeftovers(task.id, leftovers);
-          await worktreeManager.withLock(async () => {
-            const removed = await worktreeManager.removeWorktree(task.worktree_path!);
-            if (removed && task.branch_name) {
-              const config = ipcContext.configManager.getEffectiveConfig(projectPath);
-              if (config.git.autoCleanup) {
-                try { await worktreeManager.pruneWorktrees(); } catch { /* best effort */ }
-                await worktreeManager.removeBranch(task.branch_name);
-              }
+        await worktreeManager.withLock(async () => {
+          const removed = await worktreeManager.removeWorktree(worktreePath);
+          if (removed && task.branch_name) {
+            const config = ipcContext.configManager.getEffectiveConfig(projectPath);
+            if (config.git.autoCleanup) {
+              try { await worktreeManager.pruneWorktrees(); } catch { /* best effort */ }
+              await worktreeManager.removeBranch(task.branch_name);
             }
-          }, { label: `mcp-worktree:${task.id.slice(0, 8)}` });
-        })().catch((error) => {
-          console.error(`[mcp-http delete] Worktree cleanup failed for task ${task.id.slice(0, 8)}:`, error);
-        });
-      }
+          }
+        }, { label: `mcp-worktree:${task.id.slice(0, 8)}` });
+      })().catch((error) => {
+        console.error(`[mcp-http delete] Cleanup failed for task ${task.id.slice(0, 8)}:`, error);
+      });
 
       sendToRenderer(ipcContext.mainWindow, IPC.TASK_DELETED_BY_AGENT, task.id, task.title, projectId);
       ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'task-deleted', ids: [task.id] });
@@ -277,6 +315,30 @@ export function buildCommandContextForProject(
     // row, and the task's current state rather than the state at failure time.
     onRunAutomation: (automationId, taskId) =>
       runAutomationAgain(ipcContext, projectId, taskId, automationId),
+
+    // Written summaries show whatever the Task summaries switch says: the
+    // switch stops new ones being written, and the ones already written keep
+    // helping, as they do in search and Ask. The whole read waits on the index,
+    // which is the switch that says whether the index may be read at all.
+    readTaskKnowledge: async (taskIds) => {
+      let knowledgeGraph: AppConfig['knowledgeGraph'];
+      try {
+        knowledgeGraph = ipcContext.configManager.load().knowledgeGraph;
+      } catch {
+        knowledgeGraph = undefined;
+      }
+      if (knowledgeGraph?.indexingEnabled === false) return { indexOn: false };
+      let byTask: Map<string, TaskKnowledge>;
+      try {
+        byTask = await retrievalClient.call('task.knowledge', { projectId, taskIds });
+      } catch (error) {
+        console.warn('[MCP] could not read task knowledge:', error instanceof Error ? error.message : error);
+        byTask = new Map();
+      }
+      return { indexOn: true, summariesOn: taskSummariesOn(knowledgeGraph), byTask };
+    },
+
+    listSessionSummaries: () => retrievalClient.call('sessions.summaries', { projectId }),
   };
 }
 

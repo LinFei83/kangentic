@@ -8,9 +8,12 @@ import {
 import type { DiffWatcher } from '../../git/diff-watcher';
 import { DiffService } from '../../git/diff-service';
 import { getProjectRepos } from '../../ipc/helpers/project-repos';
+import { resolveProjectDefaultBaseBranch } from '../../ipc/helpers/default-base-branch';
 import type { IpcContext } from '../../ipc/ipc-context';
+import { resolveProjectRoot } from '../../../shared/git-utils';
 import type { BridgeSession } from '../session/bridge-session';
 import type { SubscriptionRegistry } from '../session/subscription-registry';
+import { resolveKnownProject } from './known-project';
 import { sendEvent } from './send-event';
 import { toWireJson } from './wire-mappers';
 
@@ -27,8 +30,19 @@ function getOrCreateService(gitDirectory: string): DiffService {
   return service;
 }
 
-function subscriptionKeyFor(taskId: string): string {
-  return `diff:${taskId}`;
+/**
+ * A task's diff is keyed by its task id. A project-folder diff (no task id, for
+ * a Command Terminal's Changes tab) is keyed by the project, and the prefix
+ * keeps the two from ever colliding.
+ */
+function subscriptionKeyFor(taskId: string | undefined, projectId: string): string {
+  return taskId !== undefined ? `diff:${taskId}` : `diff:project:${projectId}`;
+}
+
+interface DiffTarget {
+  worktreePath: string | undefined;
+  projectPath: string;
+  baseBranch: string;
 }
 
 export async function handleReadDiff(
@@ -39,39 +53,59 @@ export async function handleReadDiff(
   diffWatcher: DiffWatcher,
 ): Promise<CapabilityResponseMessage> {
   const payload = parseCapabilityRequestPayload('read-diff', request.payload);
-  const subscriptionKey = subscriptionKeyFor(payload.taskId);
+  const subscriptionKey = subscriptionKeyFor(payload.taskId, payload.projectId);
 
   if (payload.action === 'unsubscribe') {
     subscriptions.remove(subscriptionKey);
     return { type: 'capability-response', requestId: request.requestId, ok: true };
   }
 
-  const project = context.projectRepo.getById(payload.projectId);
+  const project = resolveKnownProject(context, payload.projectId);
   if (!project) {
     return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such project: ${payload.projectId}` };
   }
-  const repos = getProjectRepos(context, payload.projectId);
-  const task = repos.tasks.getById(payload.taskId);
-  if (!task) {
-    return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such task: ${payload.taskId}` };
+  const { projectId, projectPath } = project;
+
+  let target: DiffTarget;
+  if (payload.taskId !== undefined) {
+    const repos = getProjectRepos(context, projectId);
+    const task = repos.tasks.getById(payload.taskId);
+    if (!task) {
+      return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such task: ${payload.taskId}` };
+    }
+    target = { worktreePath: task.worktree_path ?? undefined, projectPath, baseBranch: task.base_branch ?? 'main' };
+  } else {
+    // The project folder, exactly as a Command Terminal window's Changes panel
+    // shows it: the resolved project root, no worktree, against the project's
+    // effective default base (the board-overlaid chain the terminal's own
+    // spawn checks out), never HEAD.
+    const projectRoot = resolveProjectRoot(projectPath);
+    target = { worktreePath: undefined, projectPath: projectRoot, baseBranch: resolveProjectDefaultBaseBranch(context, projectRoot) };
   }
 
-  const worktreePath = task.worktree_path ?? undefined;
-  const baseBranch = task.base_branch ?? 'main';
-  const gitDirectory = worktreePath ?? project.path;
+  const { worktreePath, baseBranch } = target;
+  const diffProjectPath = target.projectPath;
+  const gitDirectory = worktreePath ?? diffProjectPath;
   const service = getOrCreateService(gitDirectory);
 
   if (payload.filePath) {
     // The wire contract does not carry the file's diff status (added/modified/deleted/...),
     // which getFileContent requires - resolve it from the current file list first.
-    const fileList = await service.getDiffFiles({ worktreePath, projectPath: project.path, baseBranch, scope: payload.scope });
+    const fileList = await service.getDiffFiles({ worktreePath, projectPath: diffProjectPath, baseBranch, scope: payload.scope });
     const entry = fileList.files.find((file) => file.path === payload.filePath);
     if (!entry) {
       return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such file in the diff: ${payload.filePath}` };
     }
+    // A binary file has no text to diff, and reading it as UTF-8 would ship a
+    // garbled decode of its bytes (megabytes for a screenshot) over the relay.
+    // The phone already knows the file is binary from the list entry.
+    if (entry.binary) {
+      const emptyPayload: DiffFileContentWire = { original: '', modified: '', language: 'plaintext' };
+      return { type: 'capability-response', requestId: request.requestId, ok: true, payload: toWireJson(emptyPayload) };
+    }
     const content = await service.getFileContent({
       worktreePath,
-      projectPath: project.path,
+      projectPath: diffProjectPath,
       baseBranch,
       filePath: payload.filePath,
       status: entry.status,
@@ -84,15 +118,18 @@ export async function handleReadDiff(
   }
 
   // GitDiffFilesResult is a structurally exact mirror of DiffFileListWire.
-  const fileList: DiffFileListWire = await service.getDiffFiles({ worktreePath, projectPath: project.path, baseBranch, scope: payload.scope });
+  const fileList: DiffFileListWire = await service.getDiffFiles({ worktreePath, projectPath: diffProjectPath, baseBranch, scope: payload.scope });
 
   const watchPath = gitDirectory;
+  const taskId = payload.taskId;
   // Use the per-subscriber teardown DiffWatcher.subscribe returns, NOT
   // unsubscribe(watchPath): the watcher multiplexes callbacks per path, so a
   // blanket unsubscribe(watchPath) would kill a co-located subscription (a
   // second device, or another worktree-less task in the same repo) too.
   const unsubscribeDiff = diffWatcher.subscribe(watchPath, () => {
-    sendEvent(session, { kind: 'diff', taskId: payload.taskId, payload: null });
+    sendEvent(session, taskId !== undefined
+      ? { kind: 'diff', taskId, payload: null }
+      : { kind: 'diff', projectId, payload: null });
   });
   subscriptions.set(subscriptionKey, unsubscribeDiff);
 

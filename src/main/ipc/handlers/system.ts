@@ -12,15 +12,17 @@ import { getProjectDb } from '../../db/database';
 import { HandoffRepository } from '../../db/repositories/handoff-repository';
 import { syncProjectMcpConfig } from './projects';
 import { applyRuntimeConfig } from '../../config/apply-runtime-config';
-import { listAgents, invalidateAgentListCache } from '../../agent/agent-list';
+import { listAgents, invalidateAgentListCache, nameLearnedModels } from '../../agent/agent-list';
 import { agentRegistry } from '../../agent/agent-registry';
 import { agentCliNotFoundMessage } from '../../agent/shared/agent-cli-not-found';
+import { tryAcquireSummarizeSlot } from '../../agent/shared/summarize-rate-limit';
 import { broadcast } from '../../pop-out/window-broadcast';
 import { resolveRelayUrl } from '../../../shared/relay';
 import { EXTERNAL_OPEN_SCHEMES, isAllowedExternalUrl } from '../../../shared/external-url';
-import { writePastedImage } from '../helpers/clipboard-image';
+import { readClipboardImage, writePastedImage } from '../helpers/clipboard-image';
 import { openPathBounded } from '../helpers/open-path';
 import { resolveShellLaunch } from '../../pty/spawn/shell-launch';
+import { COMMAND_TERMINAL_NOTIFICATION_TASK_ID } from '../../../shared/notification-constants';
 import type {
   NotificationInput,
   AgentCommand,
@@ -36,6 +38,24 @@ import type { IpcContext } from '../ipc-context';
 // Held only so a shown Notification is not garbage-collected before the user
 // interacts with it (Electron's Notification has no other owner).
 const activeNotifications = new Set<Notification>();
+
+/**
+ * The OS identity of a task's toast. `id` (the Windows toast Tag, the macOS
+ * UNNotificationRequest identifier) is the task id, so a new toast for a task
+ * REPLACES the one already in Action Center or Notification Center instead of
+ * stacking beside it: the newest state (finished, crashed, waiting) is the only
+ * one worth acting on. `groupId` is the project, so a project's toasts group
+ * together. Task and project ids are uuidv4, 36 characters, under the 64 Windows
+ * allows for a Tag or a Group.
+ *
+ * The Command Terminal sentinel takes no `id`: it stands for every Command
+ * Terminal in every project, so one shared id would collapse them all into a
+ * single toast. Electron then gives each a random id, as before.
+ */
+export function notificationIdentity(input: NotificationInput): { id?: string; groupId: string } {
+  if (input.taskId === COMMAND_TERMINAL_NOTIFICATION_TASK_ID) return { groupId: input.projectId };
+  return { id: input.taskId, groupId: input.projectId };
+}
 
 /**
  * Shows a native OS notification and wires its click round-trip back to the
@@ -54,6 +74,7 @@ export function showDesktopNotification(context: IpcContext, input: Notification
   const notification = new Notification({
     title: input.title,
     body: input.body,
+    ...notificationIdentity(input),
   });
 
   activeNotifications.add(notification);
@@ -61,6 +82,16 @@ export function showDesktopNotification(context: IpcContext, input: Notification
   const cleanup = () => {
     activeNotifications.delete(notification);
   };
+
+  // Since Electron 42 macOS notifications go through UNNotification, which
+  // needs a signed app and the user's permission: an unsigned `npm start` or a
+  // user who denied notifications gets `failed` and never `close`. Without this
+  // the toast vanished with no trace and its object stayed in
+  // activeNotifications for the rest of the run.
+  notification.on('failed', (_failedEvent, error) => {
+    console.warn('[NOTIFICATION] The OS did not show a notification:', error);
+    cleanup();
+  });
 
   notification.on('click', () => {
     cleanup();
@@ -135,10 +166,10 @@ export function registerSystemHandlers(context: IpcContext): void {
     if (config.mcpServer && context.currentProjectId && context.currentProjectPath) {
       syncProjectMcpConfig(context, context.currentProjectId, context.currentProjectPath);
     }
-    // Re-evaluate the embed-worker warm-hold: toggling memory.semanticEnabled off
+    // Re-evaluate the embed-worker warm-hold: toggling knowledgeGraph.enabled off
     // should release the resident worker promptly rather than waiting for its
     // next idle-recycle window.
-    if (config.memory) {
+    if (config.knowledgeGraph) {
       void import('../../retrieval/retrieval-service').then(({ retrievalService }) => {
         retrievalService.reconcileEmbedWorker(context);
       });
@@ -215,18 +246,18 @@ export function registerSystemHandlers(context: IpcContext): void {
       // the CONFIG_SET_PROJECT broadcast note). Scoped to the current project since only
       // its pop-outs are open.
       broadcast(context.mainWindow, IPC.CONFIG_CHANGED);
-      // Re-arm the PR-refresh timer so a changed interval (Git tab) takes effect
-      // immediately without reopening the project. Imported lazily so registering
+      // Restart the PR-refresh queue so a flipped Auto-refresh PRs switch (Git
+      // tab) takes effect immediately without reopening the project. Imported lazily so registering
       // the system handlers does not pull the gh-backed PR runtime into this
       // module's graph (keeps unit tests that stub node:child_process light).
       void import('../../pr/pr-refresh-scheduler').then(({ prRefreshScheduler }) => {
         prRefreshScheduler.startForProject(context, project);
       });
-      // Re-arm the background remote-fetch timer for the same reason. A static
+      // Restart the background remote-fetch clock for the same reason. A static
       // import: the scheduler's graph (worktree manager, fetch throttle) is
       // already part of this module's, so there is no runtime to keep out.
       gitFetchScheduler.startForProject(context, project);
-      // Re-run the conversation-memory sweep so toggling memory.indexingEnabled
+      // Re-run the conversation-memory sweep so toggling knowledgeGraph.indexingEnabled
       // on takes effect without reopening the project.
       void import('../../retrieval/retrieval-service').then(({ retrievalService }) => {
         retrievalService.startForProject(context, project);
@@ -306,10 +337,13 @@ export function registerSystemHandlers(context: IpcContext): void {
   // The inventory is cached across calls (bootstrap, welcome screen, Settings,
   // and the column manager all request it) and rebuilt only on agent-config
   // change or an explicit forceRefresh (the Agent settings "re-detect" button).
-  // See src/main/agent/agent-list.ts.
+  // See src/main/agent/agent-list.ts. The labels for telemetry-learned model
+  // ids go on per call, outside the cache, so a newly learned id is named on
+  // the next request without a rebuild.
   ipcMain.handle(IPC.AGENT_LIST, async (_event, forceRefresh?: boolean): Promise<AgentDetectionInfo[]> => {
     const config = context.configManager.load();
-    return listAgents(config.agent.cliPaths, forceRefresh ?? false);
+    const agents = await listAgents(config.agent.cliPaths, forceRefresh ?? false);
+    return nameLearnedModels(agents, config.discoveredModelsByAgent);
   });
 
   // "Test connection" in the Agent settings tab. Reads the server record
@@ -335,15 +369,6 @@ export function registerSystemHandlers(context: IpcContext): void {
     }
   });
 
-  // Sliding-window rate limit for summarize calls. Each entry is a Date.now()
-  // timestamp. We expire entries older than 1 hour on every check. A burst of
-  // task creation can otherwise spam the agent CLI and burn the user's
-  // subscription quota; this caps the damage. The window is in-memory only -
-  // a restart clears the limit, which is the correct behavior (the user has
-  // explicitly chosen to start a new session).
-  const summarizeRateLimitWindow: number[] = [];
-  const ONE_HOUR_MS = 60 * 60 * 1000;
-
   // Summarize a free-form prompt into a short task title via the active
   // project's default agent (or `input.agentName` if provided). Returns a
   // discriminated result so renderer code can show a graceful error toast
@@ -359,21 +384,14 @@ export function registerSystemHandlers(context: IpcContext): void {
         const { agentRegistry } = await import('../../agent/agent-registry');
         const config = context.configManager.load();
 
-        // Apply the sliding-window rate limit before doing any work.
+        // Apply the sliding-window rate limit before doing any work. Shared
+        // with main's Command Terminal namer (summarize-rate-limit.ts).
         const limit = config.autoNameRateLimitPerHour ?? 60;
-        if (limit > 0) {
-          const now = Date.now();
-          const cutoff = now - ONE_HOUR_MS;
-          while (summarizeRateLimitWindow.length > 0 && summarizeRateLimitWindow[0] < cutoff) {
-            summarizeRateLimitWindow.shift();
-          }
-          if (summarizeRateLimitWindow.length >= limit) {
-            return {
-              ok: false,
-              reason: `rate limit reached (${limit}/hour); try again later or raise the cap in Settings`,
-            };
-          }
-          summarizeRateLimitWindow.push(now);
+        if (!tryAcquireSummarizeSlot(limit)) {
+          return {
+            ok: false,
+            reason: `rate limit reached (${limit}/hour); try again later or raise the cap in Settings`,
+          };
         }
 
         // Resolve which adapter to ask. Caller may name a specific agent
@@ -627,20 +645,27 @@ export function registerSystemHandlers(context: IpcContext): void {
   });
 
   // === Dialog ===
+  // The parent of the last folder this dialog returned. Electron 43 stopped letting the OS
+  // remember where a folder dialog was last left: with no defaultPath it now opens in
+  // Downloads. This puts the remembering back for the session.
+  let lastPickedFolderParent: string | null = null;
   ipcMain.handle(IPC.DIALOG_SELECT_FOLDER, async (_event, options?: SelectFolderOptions) => {
     // Both additions are scoped to callers that actually pass options (today: Add project).
     // The no-argument callers - relocating a project, locating one whose folder moved - are
-    // pointing at a folder that already exists, so starting them at $HOME every time discards
-    // the location the OS remembered, and offering "New folder" there invites creating an empty
-    // directory that cannot be the thing they were asked to find.
+    // pointing at a folder that already exists, so they start where the user last picked a
+    // folder (home before the first pick, never Downloads), and offering "New folder" there
+    // invites creating an empty directory that cannot be the thing they were asked to find.
     const result = await dialog.showOpenDialog(context.mainWindow, {
       properties: options ? ['openDirectory', 'createDirectory'] : ['openDirectory'],
       title: options?.title,
       buttonLabel: options?.buttonLabel,
       message: options?.message,
-      defaultPath: options ? (options.defaultPath ?? app.getPath('home')) : undefined,
+      defaultPath: options
+        ? (options.defaultPath ?? app.getPath('home'))
+        : (lastPickedFolderParent ?? app.getPath('home')),
     });
     if (result.canceled || result.filePaths.length === 0) return null;
+    lastPickedFolderParent = path.dirname(result.filePaths[0]);
     return result.filePaths[0];
   });
 
@@ -684,9 +709,9 @@ export function registerSystemHandlers(context: IpcContext): void {
   // costs no fidelity and saves no tokens: the cap sits at the knee where the
   // chain normalizes anyway, so the dropped pixels are ones the model would
   // never have seen. See `src/shared/image-fidelity.ts` for what was measured.
-  ipcMain.handle(IPC.CLIPBOARD_READ_IMAGE, (): string | null => {
-    const image = clipboard.readImage();
-    if (image.isEmpty()) return null;
+  ipcMain.handle(IPC.CLIPBOARD_READ_IMAGE, async (): Promise<string | null> => {
+    const image = await readClipboardImage(clipboard, (bytes) => nativeImage.createFromBuffer(bytes));
+    if (!image) return null;
     // A write failure degrades to the same null an empty clipboard returns
     // rather than rejecting the renderer's invoke (see writePastedImage).
     return writePastedImage(image);
@@ -712,14 +737,15 @@ export function registerSystemHandlers(context: IpcContext): void {
   });
 
   // Write text to the clipboard natively in the main process rather than via the web
-  // `navigator.clipboard.writeText()`. Electron's clipboard module is synchronous and
-  // focus- and permission-independent, whereas the web API rejects with NotAllowedError
-  // when the document does not hold focus - exactly the state during a native context-menu
-  // click (Menu.popup steals focus) and the case a TUI app's OSC 52 copy sequence hits.
-  // Same rationale as CLIPBOARD_READ_IMAGE above.
-  ipcMain.handle(IPC.CLIPBOARD_WRITE_TEXT, (_event, text: string): void => {
+  // `navigator.clipboard.writeText()`. Electron's clipboard module is focus- and
+  // permission-independent, whereas the web API rejects with NotAllowedError when the
+  // document does not hold focus - exactly the state during a native context-menu click
+  // (Menu.popup steals focus) and the case a TUI app's OSC 52 copy sequence hits. Since
+  // Electron 44 the write is a promise; awaiting it lets a failed write reach the
+  // renderer's own catch. Same rationale as CLIPBOARD_READ_IMAGE above.
+  ipcMain.handle(IPC.CLIPBOARD_WRITE_TEXT, async (_event, text: string): Promise<void> => {
     if (typeof text !== 'string' || text.length === 0) return;
-    clipboard.writeText(text);
+    await clipboard.writeText(text);
   });
 
   // === Handoffs ===

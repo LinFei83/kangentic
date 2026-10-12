@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, CircleAlert, Copy, RefreshCw } from 'lucide-react';
+import { Bot, Check, CircleAlert, Copy, RefreshCw, SquareTerminal } from 'lucide-react';
 import { useConfigStore } from '../../../stores/config-store';
 import { useProjectStore } from '../../../stores/project-store';
 import type { AgentDetectionInfo, AgentPermissionEntry, AppConfig, PermissionMode } from '../../../../shared/types';
@@ -9,8 +9,10 @@ import { useAgentCapabilityResolution } from '../../../hooks/useAgentCapabilityR
 import { useModelAliases, useModelContextWindows, useModelDisplayNames } from '../../../hooks/useKnownModels';
 import { ModelCombobox } from '../../dialogs/ModelCombobox';
 import { Combobox } from '../../dialogs/Combobox';
-import { SectionHeader, SettingRow, INPUT_CLASS, useScopedUpdate } from '../shared';
+import { INPUT_CLASS, useScopedUpdate } from '../shared';
+import { SettingsCard, CardRow } from '../settings-card';
 import { settingProps } from '../settings-registry';
+import { useSettingsProject } from '../use-settings-project';
 import { AgentExecutionFields } from './agent-execution-fields';
 import { AgentLaunchOptionFields } from './agent-launch-option-fields';
 
@@ -21,8 +23,12 @@ export function AgentTab({ config, globalConfig, agentList }: {
 }) {
   const updateGlobal = useScopedUpdate('global');
   const updateProject = useScopedUpdate('project');
-  const currentProject = useProjectStore((state) => state.currentProject);
-  const refreshCurrentProject = useProjectStore((state) => state.loadCurrent);
+  // The project the panel is editing (the switcher's pick), which is the one
+  // `updateProject` writes to. Not `currentProject`, the board's project.
+  const project = useSettingsProject();
+  const setDefaultAgent = useProjectStore((state) => state.setDefaultAgent);
+  const setDefaultModel = useProjectStore((state) => state.setDefaultModel);
+  const setDefaultEffort = useProjectStore((state) => state.setDefaultEffort);
   const refreshAgentList = useConfigStore((state) => state.loadAgentList);
   const [refreshing, setRefreshing] = useState(false);
   const [copiedAgent, setCopiedAgent] = useState<string | null>(null);
@@ -51,7 +57,7 @@ export function AgentTab({ config, globalConfig, agentList }: {
     setRefreshing(false);
   };
 
-  const effectiveAgent = currentProject?.default_agent ?? DEFAULT_AGENT;
+  const effectiveAgent = project?.default_agent ?? DEFAULT_AGENT;
   const agentPermissions: AgentPermissionEntry[] = agentList.find((agent) => agent.name === effectiveAgent)?.permissions ?? DEFAULT_PERMISSIONS;
   const detectedAgents = useMemo(() => agentList.filter((agent) => agent.found), [agentList]);
   const undetectedAgents = useMemo(() => agentList.filter((agent) => !agent.found), [agentList]);
@@ -67,39 +73,40 @@ export function AgentTab({ config, globalConfig, agentList }: {
   const showDefaultEffortPicker = defaultEffortOptions.length > 0;
 
   const handleDefaultAgentChange = async (agentName: string) => {
-    if (!currentProject) return;
-    await window.electronAPI.projects.setDefaultAgent(currentProject.id, agentName);
-    // Switch to the new agent's recommended default permission mode
+    if (!project) return;
+    await setDefaultAgent(project.id, agentName);
+    // Switch to the new agent's recommended default permission mode. The path is
+    // this render's, captured at the gesture. The switcher can move the panel
+    // during the await above, and the mode belongs with the agent just written.
     const newDefault = getAgentDefaultPermission(agentList, agentName);
     if (newDefault !== config.agent.permissionMode) {
-      updateProject({ agent: { permissionMode: newDefault } });
+      updateProject({ agent: { permissionMode: newDefault } }, project.path);
     }
     // Previous model/effort defaults were valid for the previous agent's
     // capability matrix; clear so the user re-picks from the new agent.
-    await window.electronAPI.projects.setDefaultModel(currentProject.id, null);
-    await window.electronAPI.projects.setDefaultEffort(currentProject.id, null);
-    await refreshCurrentProject();
+    await setDefaultModel(project.id, null);
+    await setDefaultEffort(project.id, null);
   };
 
   const handleDefaultModelChange = async (model: string) => {
-    if (!currentProject) return;
-    await window.electronAPI.projects.setDefaultModel(currentProject.id, model || null);
-    await refreshCurrentProject();
+    if (!project) return;
+    await setDefaultModel(project.id, model || null);
   };
 
   const handleDefaultEffortChange = async (effort: string) => {
-    if (!currentProject) return;
-    await window.electronAPI.projects.setDefaultEffort(currentProject.id, effort || null);
-    await refreshCurrentProject();
+    if (!project) return;
+    await setDefaultEffort(project.id, effort || null);
   };
 
   return (
-    <>
-      <SectionHeader
-        label="Project Defaults"
+    <div className="space-y-4">
+      <SettingsCard
+        icon={<Bot size={16} />}
+        label="Project defaults"
+        description="The agent, model and permissions new sessions start with."
         searchIds={['project.defaultAgent', 'project.defaultModel', 'project.defaultEffort', 'agent.permissionMode']}
-      />
-      <SettingRow {...settingProps('project.defaultAgent')}>
+      >
+      <CardRow {...settingProps('project.defaultAgent')}>
         <Combobox
           value={effectiveAgent}
           onChange={handleDefaultAgentChange}
@@ -109,14 +116,14 @@ export function AgentTab({ config, globalConfig, agentList }: {
               : [{ value: DEFAULT_AGENT, label: agentDisplayName(DEFAULT_AGENT) }]
           }
           allowClear={false}
-          disabled={!currentProject}
+          disabled={!project}
           testId="project-default-agent"
         />
-      </SettingRow>
+      </CardRow>
       {showDefaultModelPicker && (
-        <SettingRow {...settingProps('project.defaultModel')}>
+        <CardRow {...settingProps('project.defaultModel')}>
           <ModelCombobox
-            value={currentProject?.default_model ?? ''}
+            value={project?.default_model ?? ''}
             onChange={handleDefaultModelChange}
             availableModels={defaultModelOptions}
             placeholder="Agent default"
@@ -127,21 +134,21 @@ export function AgentTab({ config, globalConfig, agentList }: {
             modelDisplayNames={defaultModelDisplayNames}
             modelAliases={defaultModelAliases}
           />
-        </SettingRow>
+        </CardRow>
       )}
       {showDefaultEffortPicker && (
-        <SettingRow {...settingProps('project.defaultEffort')}>
+        <CardRow {...settingProps('project.defaultEffort')}>
           <Combobox
-            value={currentProject?.default_effort ?? ''}
+            value={project?.default_effort ?? ''}
             onChange={handleDefaultEffortChange}
             options={defaultEffortOptions.map((level) => ({ value: level, label: level }))}
             placeholder="Agent default"
             placeholderVariant="muted"
             testId="project-default-effort"
           />
-        </SettingRow>
+        </CardRow>
       )}
-      <SettingRow {...settingProps('agent.permissionMode')}>
+      <CardRow {...settingProps('agent.permissionMode')}>
         <Combobox
           value={config.agent.permissionMode}
           onChange={(nextValue) => updateProject({ agent: { permissionMode: nextValue as PermissionMode } })}
@@ -149,19 +156,23 @@ export function AgentTab({ config, globalConfig, agentList }: {
           allowClear={false}
           testId="agent-permission-mode"
         />
-      </SettingRow>
-      <SectionHeader
+      </CardRow>
+      </SettingsCard>
+
+      <SettingsCard
+        icon={<SquareTerminal size={16} />}
         label="Agent CLI"
+        description="Where the agent's command-line tool runs, and how it starts."
         searchIds={['agent.cliPaths', 'agent.executionMode', 'agent.executionServerUrl', 'agent.executionServerAuth', 'agent.executionWorkingDirectory', 'agent.launchOptions']}
-      />
+      >
       {agentList.filter((agent) => agent.name === effectiveAgent).map((agent) => {
         const loginCommand = agentLoginCommand(agent.name);
         const unauthenticated = agent.found && agent.authenticated === false;
         return (
         <Fragment key={agent.name}>
-          <SettingRow
+          <CardRow
             {...settingProps('agent.cliPaths')}
-            label={`${agent.displayName} Path`}
+            label={`${agent.displayName} path`}
             trailing={
               unauthenticated ? (
                 <span className="text-xs flex items-center gap-1 text-amber-400">
@@ -215,12 +226,13 @@ export function AgentTab({ config, globalConfig, agentList }: {
                 </button>
               </div>
             )}
-          </SettingRow>
+          </CardRow>
           <AgentExecutionFields agent={agent} config={config} globalConfig={globalConfig} />
           <AgentLaunchOptionFields agent={agent} globalConfig={globalConfig} />
         </Fragment>
         );
       })}
-    </>
+      </SettingsCard>
+    </div>
   );
 }

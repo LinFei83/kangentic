@@ -1,7 +1,7 @@
 /**
  * Comprehensive SessionManager unit tests covering scrollback, spawn failure,
  * shell arguments, environment filtering, data buffering, write/resize guards,
- * remove, suspendAll, killAll, query methods, and synthetic session_end.
+ * remove, killAll, query methods, and synthetic session_end.
  *
  * Follows the same mock/setup patterns as session-suspend.test.ts and
  * event-activity-derivation.test.ts.
@@ -264,26 +264,23 @@ describe('Scrollback clearing on resize', () => {
     expect(scrollback).toContain('hello world');
   });
 
-  it('reports a resize the just-died PTY rejected instead of throwing it at the renderer', async () => {
+  it('a resize the just-died PTY rejects never throws at the renderer, and the host records it', async () => {
     const { session, mockPty } = await spawnSession();
     // node-pty's WindowsPtyAgent.resize throws this once the child has exited
     // but before the 'exit' event (which nulls session.pty) lands, up to ~1s
     // later on Windows. Every guard before the native call still passes in
     // that window, so the throw used to escape as an unhandled IPC rejection.
+    // The PTY now lives in the pty host: main reports the resize and the host
+    // catches the native throw, recording it for the terminal forensics.
     mockPty.resize.mockImplementationOnce(() => {
       throw new Error('Cannot resize a pty that has already exited');
     });
     vi.mocked(traceTerminal).mockClear();
-    // The catch block must return early: a regression that lets control fall
-    // through to the success path (deleting the `return { colsChanged };`
-    // inside the catch in session-manager.ts) would still trace
-    // 'resize-applied' and emit 'pty-resize' for a resize whose native call
-    // never actually took effect. Observing both proves the early return, not
-    // just the trace call.
-    const resizes: Array<[string, number, number]> = [];
-    manager.on('pty-resize', (sessionId: string, cols: number, rows: number) => resizes.push([sessionId, cols, rows]));
 
-    const result = manager.resize(session.id, 200, 40);
+    let result: ReturnType<typeof manager.resize> | undefined;
+    expect(() => {
+      result = manager.resize(session.id, 200, 40);
+    }).not.toThrow();
 
     expect(result).toEqual({ colsChanged: true });
     const failed = vi.mocked(traceTerminal).mock.calls.find((call) => call[1] === 'resize-failed');
@@ -293,9 +290,6 @@ describe('Scrollback clearing on resize', () => {
       rows: 40,
       message: expect.stringContaining('already exited'),
     });
-    expect(resizes).toEqual([]);
-    const applied = vi.mocked(traceTerminal).mock.calls.find((call) => call[1] === 'resize-applied');
-    expect(applied).toBeUndefined();
   });
 
   it('a rows-only resize arms the repaint settle (arming widens; the report stays colsChanged)', async () => {
@@ -309,7 +303,7 @@ describe('Scrollback clearing on resize', () => {
     expect(result).toEqual({ colsChanged: false });
 
     // But the settle armed on the rows change, visible via the diagnostics row.
-    const dimensions = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    const dimensions = (await manager.getTerminalDimensions()).find((row) => row.sessionId === session.id);
     expect(dimensions?.pendingRepaintAt).not.toBeNull();
     expect(dimensions?.lastRows).toBe(50);
 
@@ -325,7 +319,7 @@ describe('Scrollback clearing on resize', () => {
     // spawnSession()'s own initial resize (120x30) matches the PTY's actual
     // spawn dims, so it is a same-geometry no-op and never arms the gate -
     // the diagnostics row reports null for an unresized session.
-    const beforeResize = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    const beforeResize = (await manager.getTerminalDimensions()).find((row) => row.sessionId === session.id);
     expect(beforeResize?.geometryChangedAtRingIndex).toBeNull();
 
     feedData('hello world');
@@ -334,7 +328,7 @@ describe('Scrollback clearing on resize', () => {
     // before that index was drawn for the OLD (120x30) geometry.
     manager.resize(session.id, 200, 40);
 
-    const afterResize = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    const afterResize = (await manager.getTerminalDimensions()).find((row) => row.sessionId === session.id);
     expect(afterResize?.geometryChangedAtRingIndex).toBe('hello world'.length);
   });
 
@@ -348,7 +342,7 @@ describe('Scrollback clearing on resize', () => {
     // an AWAITED settle here would ride the full REPAINT_MAX_WAIT_MS (400ms)
     // deadline - confirm it actually armed before killing.
     manager.resize(session.id, 120, 50);
-    const dimensionsBeforeKill = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    const dimensionsBeforeKill = (await manager.getTerminalDimensions()).find((row) => row.sessionId === session.id);
     expect(dimensionsBeforeKill?.pendingRepaintAt).not.toBeNull();
 
     // kill() nulls session.pty (unlike remove(), it does NOT clear the
@@ -380,7 +374,7 @@ describe('Scrollback clearing on resize', () => {
     // an AWAITED settle here would ride the full REPAINT_MAX_WAIT_MS (400ms)
     // deadline - confirm it actually armed before killing.
     manager.resize(session.id, 120, 50);
-    const dimensionsBeforeKill = manager.getTerminalDimensions().find((row) => row.sessionId === session.id);
+    const dimensionsBeforeKill = (await manager.getTerminalDimensions()).find((row) => row.sessionId === session.id);
     expect(dimensionsBeforeKill?.pendingRepaintAt).not.toBeNull();
 
     // Same guard as getScrollback (see the sibling test above), applied to
@@ -479,68 +473,282 @@ describe('Scrollback clearing on resize', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2b. Pre-spawn resize queue (stale-width race on auto-resume)
+// 2b. Respawn grid (a successor starts at the grid of the row it replaces)
 // ---------------------------------------------------------------------------
 
-describe('Pre-spawn resize queue', () => {
+describe('Respawn grid', () => {
+  // Every board respawn (a column move, a model switch, a resume) mints a NEW
+  // session id: the transition engine passes randomUUID() as the spawn id. So
+  // these spawns name no id. A same-id spawn is a queue promotion, covered in
+  // 'Caller-owned session IDs' and 'Resting grid restore'.
   let manager: SessionManager;
 
   beforeEach(() => {
     manager = new SessionManager();
   });
 
-  it('spawns a resumed session at dimensions from a resize that arrived while suspended', async () => {
-    const mock1 = createMockPty();
-    vi.mocked(pty.spawn).mockReturnValue(mock1.mockPty as unknown as pty.IPty);
-    const session = await manager.spawn({ taskId: 'task-pending-resize', command: '', cwd: tmpDir });
-
-    // Suspend: the PTY is torn down (pty=null) but the record persists for resume.
-    await manager.suspend(session.id);
-
-    // A renderer resize arrives while suspended, before the resume spawn. It is
-    // stashed rather than dropped (the secondary stale-width hole: xterm never
-    // re-sends unchanged dims, so a dropped resize would strand the PTY at the
-    // default width forever).
-    expect(manager.resize(session.id, 190, 40)).toEqual({ colsChanged: false });
-
-    // Resume: performSpawn consumes the stash and spawns the PTY at 190x40
-    // instead of the 120x30 default, so the mount-time resize is a no-op and no
-    // corrective repaint window opens.
-    const mock2 = createMockPty();
-    vi.mocked(pty.spawn).mockReturnValue(mock2.mockPty as unknown as pty.IPty);
-    await manager.spawn({ id: session.id, taskId: 'task-pending-resize', command: '', cwd: tmpDir, resuming: true });
-
-    expect(pty.spawn).toHaveBeenLastCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.objectContaining({ cols: 190, rows: 40 }),
-    );
-
-    manager.kill(session.id);
+  afterEach(async () => {
+    manager.killAll();
+    await new Promise((resolve) => setTimeout(resolve, 20));
   });
 
-  it('drops a queued resize when the session is killed before respawn', async () => {
-    const mock1 = createMockPty();
-    vi.mocked(pty.spawn).mockReturnValue(mock1.mockPty as unknown as pty.IPty);
-    const session = await manager.spawn({ taskId: 'task-killed-resize', command: '', cwd: tmpDir });
+  async function spawnFor(
+    taskId: string,
+    extra: { resuming?: boolean; restoredGrid?: { cols: number; rows: number } } = {},
+  ) {
+    const mock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
+    const session = await manager.spawn({ taskId, command: '', cwd: tmpDir, ...extra });
+    return { session, ...mock };
+  }
 
+  /** The grid the last PTY was spawned at (the mock reports 120x30 regardless). */
+  function lastSpawnGrid(): [number, number] {
+    const calls = vi.mocked(pty.spawn).mock.calls;
+    const options = calls[calls.length - 1][2] as { cols: number; rows: number };
+    return [options.cols, options.rows];
+  }
+
+  /**
+   * Spawning at 120x30 made whatever showed the old session reshape the new
+   * one mid-boot (a resize plus two geometry re-asserts). Starting at the old
+   * grid turns the mount fit into a no-op.
+   */
+  it('starts a respawn at the grid its predecessor last had', async () => {
+    const { session } = await spawnFor('task-respawn-grid');
+    manager.resize(session.id, 190, 50);
+    await manager.suspend(session.id);
+
+    const { session: successor, mockPty: successorPty } = await spawnFor('task-respawn-grid', { resuming: true });
+
+    expect(successor.id).not.toBe(session.id);
+    expect(lastSpawnGrid()).toEqual([190, 50]);
+    // The surface that showed the old session fits the new one to the same box.
+    manager.resize(successor.id, 190, 50);
+    expect(successorPty.resize).not.toHaveBeenCalled();
+  });
+
+  it('prefers a resize that arrived while the predecessor was suspended', async () => {
+    const { session } = await spawnFor('task-respawn-stash');
+    manager.resize(session.id, 150, 40);
+    await manager.suspend(session.id);
+    // Stashed, not dropped: xterm never re-sends unchanged dims, and this is
+    // newer than the grid the PTY last had.
+    expect(manager.resize(session.id, 190, 40)).toEqual({ colsChanged: false });
+
+    await spawnFor('task-respawn-stash', { resuming: true });
+
+    expect(lastSpawnGrid()).toEqual([190, 40]);
+  });
+
+  /**
+   * A sub-floor grid is the bottom panel's strip. Carried to a successor
+   * nothing shows, it would start the agent in a 14-row letterbox; carried
+   * while the panel still holds the old session, it saves the reshape.
+   */
+  it('carries a strip-shaped grid only while a surface still holds the predecessor', async () => {
+    const { session: unheld } = await spawnFor('task-respawn-strip-unheld');
+    manager.resize(unheld.id, 306, 14);
+    await manager.suspend(unheld.id);
+    await spawnFor('task-respawn-strip-unheld', { resuming: true });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+
+    const { session: held } = await spawnFor('task-respawn-strip-held');
+    manager.setMountedSessions([held.id]);
+    manager.resize(held.id, 306, 14);
+    await manager.suspend(held.id);
+    await spawnFor('task-respawn-strip-held', { resuming: true });
+    expect(lastSpawnGrid()).toEqual([306, 14]);
+  });
+
+  /**
+   * The strip floor is MOBILE_USABLE_MIN_ROWS (20): a 20-row grid is usable, so
+   * an unheld successor still starts there, and only a shorter one is dropped.
+   */
+  it('treats a 20-row grid as usable, so it carries to an unheld successor and 19 rows does not', async () => {
+    const { session: usable } = await spawnFor('task-respawn-floor-usable');
+    manager.resize(usable.id, 306, 20);
+    await manager.suspend(usable.id);
+    await spawnFor('task-respawn-floor-usable', { resuming: true });
+    expect(lastSpawnGrid()).toEqual([306, 20]);
+
+    const { session: sliver } = await spawnFor('task-respawn-floor-sliver');
+    manager.resize(sliver.id, 306, 19);
+    await manager.suspend(sliver.id);
+    await spawnFor('task-respawn-floor-sliver', { resuming: true });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+  });
+
+  /**
+   * A phone-held grid is given back by the size guard on release, but an exit
+   * disarms the guard without restoring. Inherited, it would stick to the
+   * successor with nothing left to undo it.
+   */
+  it('does not hand a phone-held grid to the successor', async () => {
+    const { session } = await spawnFor('task-respawn-phone-hold');
+    manager.resize(session.id, 190, 50);
+    manager.resize(session.id, 80, 40, 'mobile');
+    await manager.suspend(session.id);
+
+    await spawnFor('task-respawn-phone-hold', { resuming: true });
+
+    expect(lastSpawnGrid()).toEqual([190, 50]);
+  });
+
+  /**
+   * suspend() marks the row `suspended` BEFORE its graceful shutdown resolves,
+   * so for up to a few seconds the row is suspended with a live PTY and a
+   * phone can still resize it. That resize reaches the stash branch, which
+   * serves a desktop fit and must not take a phone's: the successor starts at
+   * the stash (successorGridFor), and an exit disarms the size guard without
+   * giving the phone's grid back.
+   */
+  it('does not stash a phone resize that lands while the predecessor is suspending', async () => {
+    const { session } = await spawnFor('task-respawn-phone-suspending');
+    manager.resize(session.id, 190, 50);
+
+    // No await yet: suspend() has run up to its graceful shutdown, so the row
+    // is already suspended but its PTY is still alive.
+    const suspending = manager.suspend(session.id);
+    expect(manager.getSession(session.id)?.status).toBe('suspended');
+    expect(manager.isWritable(session.id)).toBe(true);
+    expect(manager.resize(session.id, 80, 40, 'mobile')).toEqual({ colsChanged: false });
+    await suspending;
+
+    await spawnFor('task-respawn-phone-suspending', { resuming: true });
+
+    expect(lastSpawnGrid()).toEqual([190, 50]);
+  });
+
+  /**
+   * After a desktop restart the registry is empty, so no in-memory row speaks
+   * for the session being resumed: the grid recorded on its session record does.
+   */
+  it('starts a resume with no in-memory predecessor at the recorded grid', async () => {
+    await spawnFor('task-restored', { resuming: true, restoredGrid: { cols: 210, rows: 48 } });
+
+    expect(lastSpawnGrid()).toEqual([210, 48]);
+  });
+
+  it('drops a recorded strip-shaped grid, and one that is not a real grid', async () => {
+    // Nothing can still hold the old session, so the panel strip never carries.
+    await spawnFor('task-restored-strip', { restoredGrid: { cols: 306, rows: 14 } });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+
+    await spawnFor('task-restored-garbage', { restoredGrid: { cols: Number.NaN, rows: 48 } });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+
+    // Either axis alone is enough to refuse it, and a NaN row would sail past
+    // the row floor (NaN < 20 is false) into pty.spawn if only cols were checked.
+    await spawnFor('task-restored-garbage-rows', { restoredGrid: { cols: 210, rows: Number.NaN } });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+
+    await spawnFor('task-restored-infinite', { restoredGrid: { cols: 210, rows: Number.POSITIVE_INFINITY } });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+  });
+
+  /**
+   * The grid comes off disk, and nothing downstream clamps it before pty.spawn:
+   * a fractional size must be floored here, and a width below the 2-column
+   * minimum SessionManager.resize also clamps to must not become a PTY.
+   */
+  it('floors a recorded grid to whole cells and refuses one narrower than 2 columns', async () => {
+    await spawnFor('task-restored-fractional', { restoredGrid: { cols: 210.7, rows: 48.9 } });
+    expect(lastSpawnGrid()).toEqual([210, 48]);
+
+    await spawnFor('task-restored-one-column', { restoredGrid: { cols: 1, rows: 48 } });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+
+    // The floor is inclusive: 2 columns is the narrowest real grid.
+    await spawnFor('task-restored-two-columns', { restoredGrid: { cols: 2, rows: 48 } });
+    expect(lastSpawnGrid()).toEqual([2, 48]);
+
+    // The row floor is inclusive too: 20 rows is the shortest usable grid (a
+    // phone can fill its screen from it), one fewer is a strip.
+    await spawnFor('task-restored-twenty-rows', { restoredGrid: { cols: 210, rows: 20 } });
+    expect(lastSpawnGrid()).toEqual([210, 20]);
+
+    await spawnFor('task-restored-nineteen-rows', { restoredGrid: { cols: 210, rows: 19 } });
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+  });
+
+  it('lets an in-memory predecessor win over the recorded grid', async () => {
+    const { session } = await spawnFor('task-restored-inherit');
+    manager.resize(session.id, 190, 50);
+    await manager.suspend(session.id);
+
+    await spawnFor('task-restored-inherit', { resuming: true, restoredGrid: { cols: 210, rows: 48 } });
+
+    expect(lastSpawnGrid()).toEqual([190, 50]);
+  });
+
+  /**
+   * A pty host crash leaves the lost row exited, which hands no grid on in
+   * memory, so its recovery resume relies on the recorded grid too.
+   */
+  it('falls back to the recorded grid when the predecessor exited', async () => {
+    const { session, triggerExit } = await spawnFor('task-restored-crashed');
+    manager.resize(session.id, 150, 40);
+    triggerExit(1);
+
+    await spawnFor('task-restored-crashed', { resuming: true, restoredGrid: { cols: 210, rows: 48 } });
+
+    expect(lastSpawnGrid()).toEqual([210, 48]);
+  });
+
+  it('a killed predecessor hands nothing on', async () => {
+    const { session } = await spawnFor('task-killed-resize');
+    manager.resize(session.id, 170, 45);
     await manager.suspend(session.id);
     manager.resize(session.id, 190, 40); // stashed while suspended
-    manager.kill(session.id); // deliberate teardown clears the stash
+    manager.kill(session.id); // deliberate teardown: an end, not a respawn
 
-    // A fresh spawn for the same task must NOT inherit the killed session's
-    // stashed dims: it spawns at the default.
-    const mock2 = createMockPty();
-    vi.mocked(pty.spawn).mockReturnValue(mock2.mockPty as unknown as pty.IPty);
-    const fresh = await manager.spawn({ taskId: 'task-killed-resize', command: '', cwd: tmpDir });
+    // Neither the stash nor the grid the killed PTY last had carries over.
+    await spawnFor('task-killed-resize');
 
-    expect(pty.spawn).toHaveBeenLastCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.objectContaining({ cols: 120, rows: 30 }),
-    );
+    expect(lastSpawnGrid()).toEqual([120, 30]);
+  });
 
-    manager.kill(fresh.id);
+  /**
+   * A queue promotion keeps its id, and its row stays `queued` with no PTY
+   * through the host round trip, which is after the spawn read its stash. A
+   * resize that reaches the placeholder in that window (a renderer fit, a
+   * phone's subscribe-time park) is stashed for a spawn that already read it.
+   * Left orphaned under the live id, it would outrank the PTY's real grid in
+   * successorGridFor after a suspend and start the successor at a grid the
+   * PTY never had.
+   */
+  it('does not let a resize stashed during a promotion outrank the live grid for the successor', async () => {
+    manager.setMaxConcurrent(1);
+    const { session: slotHolder } = await spawnFor('task-promotion-slot');
+    const queued = await manager.spawn({ taskId: 'task-promotion-resize', command: '', cwd: tmpDir });
+    expect(queued.status).toBe('queued');
+
+    // pty.spawn runs synchronously inside the host round trip, while the
+    // placeholder is still the task's registry row and still `queued`.
+    const duringHostSpawn: { statusSeen?: string; dimensionsAfterResize?: { cols: number; rows: number } | null } = {};
+    const promotedMock = createMockPty();
+    vi.mocked(pty.spawn).mockImplementationOnce(() => {
+      duringHostSpawn.statusSeen = manager.getSession(queued.id)?.status;
+      manager.resize(queued.id, 200, 45);
+      duringHostSpawn.dimensionsAfterResize = manager.getDimensions(queued.id);
+      return promotedMock.mockPty as unknown as pty.IPty;
+    });
+    manager.kill(slotHolder.id);
+    await vi.waitFor(() => expect(manager.getSession(queued.id)?.status).toBe('running'));
+
+    // The injection landed where it was meant to: the stash existed for the
+    // placeholder, which had not yet become the live row.
+    expect(duringHostSpawn.statusSeen).toBe('queued');
+    expect(duringHostSpawn.dimensionsAfterResize).toEqual({ cols: 200, rows: 45 });
+
+    // The PTY is then fitted to a grid of its own and suspended.
+    manager.resize(queued.id, 190, 50);
+    await manager.suspend(queued.id);
+
+    await spawnFor('task-promotion-resize', { resuming: true });
+
+    expect(lastSpawnGrid()).toEqual([190, 50]);
   });
 });
 
@@ -583,95 +791,6 @@ describe('Remove', () => {
 
   it('remove on non-existent session does not throw', () => {
     expect(() => manager.remove('nonexistent-id')).not.toThrow();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 4. SuspendAll
-// ---------------------------------------------------------------------------
-
-describe('SuspendAll', () => {
-  let manager: SessionManager;
-
-  beforeEach(() => {
-    manager = new SessionManager();
-  });
-
-  async function spawnSession(taskId: string) {
-    const mock = createMockPty();
-    vi.mocked(pty.spawn).mockReturnValue(mock.mockPty as unknown as pty.IPty);
-    const session = await manager.spawn({
-      taskId,
-      command: '',
-      cwd: tmpDir,
-    });
-    return { session, ...mock };
-  }
-
-  it('sends exit sequence to all running sessions', async () => {
-    const { mockPty: pty1 } = await spawnSession('task-sa-1');
-    const { mockPty: pty2 } = await spawnSession('task-sa-2');
-
-    await manager.suspendAll(0);
-
-    // Default exit sequence is ['\x03'] (Ctrl+C only) when no exitSequence is provided
-    expect(pty1.write).toHaveBeenCalledWith('\x03');
-    expect(pty2.write).toHaveBeenCalledWith('\x03');
-  });
-
-  it('returns task IDs of all sessions', async () => {
-    await spawnSession('task-sa-a');
-    await spawnSession('task-sa-b');
-
-    const taskIds = await manager.suspendAll(0);
-
-    expect(taskIds).toContain('task-sa-a');
-    expect(taskIds).toContain('task-sa-b');
-  });
-
-  it('marks running sessions as exited', async () => {
-    const { session } = await spawnSession('task-sa-exit');
-
-    await manager.suspendAll(0);
-
-    const result = manager.getSession(session.id);
-    expect(result?.status).toBe('exited');
-  });
-
-  it('includes queued sessions in returned task IDs', async () => {
-    manager.setMaxConcurrent(1);
-
-    await spawnSession('task-sa-running');
-
-    // Second session should be queued
-    const mock2 = createMockPty();
-    vi.mocked(pty.spawn).mockReturnValue(mock2.mockPty as unknown as pty.IPty);
-    const queued = await manager.spawn({
-      taskId: 'task-sa-queued',
-      command: '',
-      cwd: tmpDir,
-    });
-    expect(queued.status).toBe('queued');
-
-    const taskIds = await manager.suspendAll(0);
-
-    expect(taskIds).toContain('task-sa-running');
-    expect(taskIds).toContain('task-sa-queued');
-  });
-
-  it('clears session queue', async () => {
-    manager.setMaxConcurrent(1);
-    await spawnSession('task-sa-q1');
-
-    const mock2 = createMockPty();
-    vi.mocked(pty.spawn).mockReturnValue(mock2.mockPty as unknown as pty.IPty);
-    await manager.spawn({ taskId: 'task-sa-q2', command: '', cwd: tmpDir });
-
-    expect(manager.queuedCount).toBe(1);
-
-    await manager.suspendAll(0);
-
-    expect(manager.queuedCount).toBe(0);
   });
 });
 
@@ -1464,15 +1583,18 @@ describe('Transcript-fallback handoff', () => {
       statusFileReader: { handleStatusChange(id: string): void };
     };
 
-    // Let the fire-and-forget eager attach (awaits the mocked locate) settle.
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(true);
+    // Wait for the fire-and-forget eager attach (it awaits the mocked locate)
+    // AND its first transcript read. Polled, not a fixed wait: a fixed 30 ms
+    // saw the attach but not the read on a loaded CI runner.
+    await vi.waitFor(() => {
+      expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(true);
+      expect(manager.getUsageCache()[session.id]?.model.displayName).toBe('Opus 4.8');
+    });
     // The fallback populated the card model + token occupancy from the
     // transcript, but NO window (it is not derivable from a model id): window
     // stays the 0 "unknown size" sentinel and the percentage stays 0, so the
     // card shows the model name only until status.json flows.
     const fallbackUsage = manager.getUsageCache()[session.id];
-    expect(fallbackUsage?.model.displayName).toBe('Opus 4.8');
     expect(fallbackUsage?.contextWindow.usedTokens).toBe(5000);
     expect(fallbackUsage?.contextWindow.contextWindowSize).toBe(0);
     expect(fallbackUsage?.contextWindow.usedPercentage).toBe(0);
@@ -1495,7 +1617,8 @@ describe('Transcript-fallback handoff', () => {
     );
     managerInternals.statusFileReader.handleStatusChange(session.id);
 
-    expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false);
+    // The status read is async; the detach follows its dispatch.
+    await vi.waitFor(() => expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false));
   });
 
   // On a RESUME the transcript already holds the PRE-suspend conversation, whose
@@ -1630,8 +1753,9 @@ describe('Transcript-fallback handoff', () => {
 
     // Proves the nested onAgentSessionId capture actually fired - without
     // this, the assertion below would pass for the wrong reason (like the
-    // sibling test, purely from the unconditional detach wiring).
-    expect(capturedAgentSessionIds).toContain('handoff-session-uuid-nested');
+    // sibling test, purely from the unconditional detach wiring). The status
+    // read is async, so wait for its dispatch.
+    await vi.waitFor(() => expect(capturedAgentSessionIds).toContain('handoff-session-uuid-nested'));
     // The fallback still ends up detached: onFirstStatus's detach (fired
     // immediately after onUsageParsed, in the same synchronous call stack)
     // must win over the nested re-attach.
@@ -1696,22 +1820,29 @@ describe('Transcript-fallback handoff', () => {
     // First status write: normal capture of the launch id, fallback detaches.
     fs.writeFileSync(statusPath, statusPayload('fork-uuid-original'));
     managerInternals.statusFileReader.handleStatusChange(session.id);
-    expect(capturedAgentSessionIds).toEqual(['fork-uuid-original']);
+    // Status reads are async: wait for each dispatch before the next write.
+    await vi.waitFor(() => expect(capturedAgentSessionIds).toEqual(['fork-uuid-original']));
     expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false);
 
     // The fork: status.json re-reports a DIFFERENT id.
     fs.writeFileSync(statusPath, statusPayload('fork-uuid-after-clear'));
     managerInternals.statusFileReader.handleStatusChange(session.id);
 
-    expect(capturedAgentSessionIds).toEqual(['fork-uuid-original', 'fork-uuid-after-clear']);
+    await vi.waitFor(() => expect(capturedAgentSessionIds).toEqual(['fork-uuid-original', 'fork-uuid-after-clear']));
     // The live session mutated and 'session-changed' carried the new id out.
     expect(sessionChangedAgentIds).toContain('fork-uuid-after-clear');
     // The deliberately-detached transcript fallback stays detached.
     expect(managerInternals.sessionHistoryReader.isAttached(session.id)).toBe(false);
 
-    // Same-id churn after the fork stays quiet.
+    // Same-id churn after the fork stays quiet. Wait for the read to be
+    // dispatched, so the assertion below checks a delivered status.
+    const dispatchSpy = vi.spyOn(
+      managerInternals.statusFileReader as unknown as { dispatchStatus: (...args: unknown[]) => void },
+      'dispatchStatus',
+    );
     fs.writeFileSync(statusPath, statusPayload('fork-uuid-after-clear'));
     managerInternals.statusFileReader.handleStatusChange(session.id);
+    await vi.waitFor(() => expect(dispatchSpy).toHaveBeenCalledTimes(1));
     expect(capturedAgentSessionIds).toEqual(['fork-uuid-original', 'fork-uuid-after-clear']);
   });
 });
@@ -2269,8 +2400,9 @@ describe('safeKillPty behavior', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       expect(() => manager.killAll()).not.toThrow();
+      // The kill lands in the pty host, which logs the unexpected errno.
       expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('[SESSION]'),
+        expect.stringContaining('[pty-host]'),
         expect.anything(),
       );
     } finally {
@@ -2308,100 +2440,43 @@ describe('safeKillPty behavior', () => {
     }
   });
 
-  // -- suspend() skips 1500ms post-kill wait when kill returns false --------
+  // -- suspend() when the force-kill finds the PTY already dead ----------------
 
   /**
-   * The regression this test locks in:
-   *
    * suspend() sends the exit sequence, waits up to 1500ms for a natural exit,
-   * then force-kills. If the PTY is already dead (EACCES/ESRCH), safeKillPty
-   * returns false and the second 1500ms wait must be SKIPPED entirely.
-   * Without the `if (killLanded)` guard, suspend() would burn a full 1500ms
-   * on every shutdown operation involving an already-dead process.
-   *
-   * We verify this by measuring wall-clock time: if the wait is skipped,
-   * suspend() resolves well under 200ms. If the wait is not skipped it would
-   * take at least 1500ms - a 7x difference that is not attributable to
-   * timer jitter.
+   * then force-kills and waits up to another 1500ms for the kill to propagate.
+   * The PTY lives in the pty host, so a kill that finds the child already dead
+   * (EACCES/ESRCH) fails there, not in main's call: main can skip the second
+   * wait only once the host has REPORTED the exit (RemotePty.kill then throws
+   * ESRCH, see pty-host-client.test.ts). Otherwise the dead child's exit arrives
+   * on its own and ends the wait; with no exit at all, suspend() is bounded by
+   * the two waits and never throws.
    */
-  /**
-   * Authoritative timing test using fake timers.
-   *
-   * Sequence of events inside suspend() after the PTY's exit sequence is sent:
-   *  T+0ms    natural-exit wait starts (1500ms timeout)
-   *  T+1500ms timeout fires, exitedNaturally=false
-   *  T+1500ms force-kill attempted: PTY.kill() throws EACCES -> killLanded=false
-   *  T+1500ms `if (killLanded)` is false -> second wait SKIPPED -> suspend() returns
-   *
-   * With real timers: suspend() resolves at T+1500ms.
-   * With fake timers advanced by 1500ms: suspend() resolves immediately after
-   *   the advance, with no further timer pending.
-   *
-   * We advance fake time by 1500ms and then confirm suspend() has settled.
-   * If the second wait were NOT skipped, a further 1500ms advance would be
-   * required - the test would hang waiting on the unresolved promise.
-   */
-  it('suspend() skips 1500ms post-kill wait when PTY.kill() throws EACCES (killLanded=false)', async () => {
-    vi.useFakeTimers();
-    try {
-      const dead = createAlreadyDeadPty('EACCES');
-      vi.mocked(pty.spawn).mockReturnValue(dead.mockPty as unknown as pty.IPty);
+  for (const errnoCode of ['EACCES', 'ESRCH'] as const) {
+    it(`suspend() settles within the grace and propagation waits when the host's kill throws ${errnoCode}`, async () => {
+      vi.useFakeTimers();
+      try {
+        const dead = createAlreadyDeadPty(errnoCode);
+        vi.mocked(pty.spawn).mockReturnValue(dead.mockPty as unknown as pty.IPty);
 
-      const freshManager = new SessionManager();
+        const freshManager = new SessionManager();
+        const session = await freshManager.spawn({ taskId: `task-kill-dead-${errnoCode}`, command: '', cwd: tmpDir });
 
-      const session = await freshManager.spawn({ taskId: 'task-kill-skip-eacces', command: '', cwd: tmpDir });
+        let settled = false;
+        const suspendPromise = freshManager.suspend(session.id).then(() => { settled = true; });
 
-      // Start suspend() - it will block on the natural-exit wait (1500ms timer).
-      // Do NOT emit the 'exit' event - we want exitedNaturally=false so the
-      // force-kill path runs.
-      let settled = false;
-      const suspendPromise = freshManager.suspend(session.id).then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(1500);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1500);
+        await suspendPromise;
+        expect(settled).toBe(true);
 
-      // Advance past the natural-exit timeout only. If killLanded=false correctly
-      // skips the second 1500ms wait, the promise resolves after this advance.
-      await vi.advanceTimersByTimeAsync(1500);
-
-      // Flush any queued microtasks.
-      await Promise.resolve();
-
-      expect(settled).toBe(true);
-
-      // Advance another 1500ms to confirm no second wait is pending.
-      await vi.advanceTimersByTimeAsync(1500);
-      await suspendPromise;
-
-      freshManager.killAll();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('suspend() skips 1500ms post-kill wait when PTY.kill() throws ESRCH (killLanded=false)', async () => {
-    vi.useFakeTimers();
-    try {
-      const dead = createAlreadyDeadPty('ESRCH');
-      vi.mocked(pty.spawn).mockReturnValue(dead.mockPty as unknown as pty.IPty);
-
-      const freshManager = new SessionManager();
-
-      const session = await freshManager.spawn({ taskId: 'task-kill-skip-esrch', command: '', cwd: tmpDir });
-
-      let settled = false;
-      const suspendPromise = freshManager.suspend(session.id).then(() => { settled = true; });
-
-      await vi.advanceTimersByTimeAsync(1500);
-      await Promise.resolve();
-
-      expect(settled).toBe(true);
-
-      await vi.advanceTimersByTimeAsync(1500);
-      await suspendPromise;
-
-      freshManager.killAll();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+        freshManager.killAll();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -2834,8 +2909,8 @@ describe('Per-renderer focus scoping', () => {
   }
 
   /** Bytes emitted-but-unacknowledged for a session, via the public pipeline-stats seam. */
-  function inFlightBytesFor(sessionId: string): number {
-    const stats = manager.getPipelineStats();
+  async function inFlightBytesFor(sessionId: string): Promise<number> {
+    const stats = await manager.getPipelineStats();
     return stats.find((row) => row.sessionId === sessionId)?.inFlightBytes ?? 0;
   }
 
@@ -2855,16 +2930,16 @@ describe('Per-renderer focus scoping', () => {
 
     // Sanity: both sessions actually accumulated in-flight accounting, or the
     // assertions below would pass vacuously.
-    expect(inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
-    expect(inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
+    expect(await inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
+    expect(await inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
 
     // Renderer 2 changes its OWN focus away from session B. Session B was in
     // renderer 2's affected set (previous ∪ new), so it is released. Session A
     // was never in renderer 2's set and must be left alone.
     manager.setFocusedSessions([], RENDERER_2);
 
-    expect(inFlightBytesFor(sessionB.id)).toBe(0);
-    expect(inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
+    expect(await inFlightBytesFor(sessionB.id)).toBe(0);
+    expect(await inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
   });
 
   it('clearFocusedSessionsFor releases only sessions no other renderer still has focused', async () => {
@@ -2882,16 +2957,16 @@ describe('Per-renderer focus scoping', () => {
     feedB('hello-b');
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    expect(inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
-    expect(inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
+    expect(await inFlightBytesFor(sessionA.id)).toBeGreaterThan(0);
+    expect(await inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
 
     // Renderer 1's window closes. Session A had no other consumer, so its
     // accounting is released. Session B is still held by renderer 2 and must
     // keep its in-flight accounting intact.
     manager.clearFocusedSessionsFor(RENDERER_1);
 
-    expect(inFlightBytesFor(sessionA.id)).toBe(0);
-    expect(inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
+    expect(await inFlightBytesFor(sessionA.id)).toBe(0);
+    expect(await inFlightBytesFor(sessionB.id)).toBeGreaterThan(0);
   });
 
   it('getRenderersFocusedOn reports every renderer currently showing a session', async () => {
@@ -2909,7 +2984,7 @@ describe('Per-renderer focus scoping', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Resting grid: a session nobody is showing goes back to the spawn grid
+// Resting grid: a session nobody is showing goes to the resting grid
 // ---------------------------------------------------------------------------
 
 describe('Resting grid restore', () => {
@@ -3155,7 +3230,9 @@ describe('Resting grid restore', () => {
    */
   it('parks immediately for a subscribing phone, overriding only a sub-floor hold', async () => {
     const { session, mockPty } = await spawnSession('task-rest-subscribe');
+    // A surface that sized the PTY has an xterm mounted: that is the hold.
     manager.setFocusedSessions([session.id]);
+    manager.setMountedSessions([session.id]);
 
     // Held at a usable grid: respected, never touched.
     manager.resize(session.id, 190, 50);
@@ -3171,8 +3248,191 @@ describe('Resting grid restore', () => {
     // Unheld: parks as before.
     grabPanelGridUnwatched(session.id);
     manager.setFocusedSessions([]);
+    manager.setMountedSessions([]);
     manager.parkRestingGridForMobileSubscriber(session.id);
     expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  /**
+   * A focus claim with no xterm behind it holds no grid. A minimized pop-out
+   * monitor focuses its windows' sessions without building their terminals,
+   * and a detail window restored with Changes expanded keeps its claim while
+   * its TerminalTab is unmounted. Neither ever sized the PTY, so it sits at
+   * the 120x30 spawn default, which is above the floor and so out of reach of
+   * the sub-floor override. Nothing mounted means nothing can disagree with a
+   * reshape, and a surface that mounts later fits the PTY to itself anyway.
+   */
+  it('parks past a focus claim with no mounted terminal for a subscribing phone', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-focus-only');
+    manager.setFocusedSessions([session.id]);
+
+    manager.parkRestingGridForMobileSubscriber(session.id);
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  it('still treats a focus claim as a hold for the background park', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-focus-only-debounced');
+    manager.setFocusedSessions([session.id]);
+
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([120, 30]);
+  });
+
+  /**
+   * A full queue hands back a `queued` placeholder with no PTY, and the task
+   * row (so the phone) learns that id. The promotion keeps the id, so the
+   * phone's subscription survives into the real spawn - which used to land at
+   * the 120x30 default with nothing left to park it. Parking the placeholder
+   * stashes the resting grid, so the PTY is BORN there: no reflow mid-boot.
+   */
+  it('parks a queued placeholder so its promotion spawns at the resting grid', async () => {
+    manager.setMaxConcurrent(1);
+    const { session: slotHolder } = await spawnSession('task-rest-queue-slot');
+    manager.setFocusedSessions([slotHolder.id]);
+    const queued = await manager.spawn({ taskId: 'task-rest-queued', command: '', cwd: tmpDir });
+    expect(queued.status).toBe('queued');
+
+    manager.parkRestingGridForMobileSubscriber(queued.id);
+    // The seed the phone is served right now already reports the resting grid.
+    expect(manager.getDimensions(queued.id)).toEqual({ cols: REST_COLS, rows: REST_ROWS });
+
+    const gridEvents: Array<[number, number, string]> = [];
+    manager.on('pty-resize', (resizedSessionId: string, cols: number, rows: number, origin: string) => {
+      if (resizedSessionId === queued.id) gridEvents.push([cols, rows, origin]);
+    });
+    const promoted = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(promoted.mockPty as unknown as pty.IPty);
+    manager.kill(slotHolder.id);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(manager.getSession(queued.id)?.status).toBe('running');
+    // The mock reports 120x30 whatever it was spawned at, so read the spawn.
+    expect(pty.spawn).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ cols: REST_COLS, rows: REST_ROWS }),
+    );
+    expect(promoted.mockPty.resize).not.toHaveBeenCalled();
+    // The phone subscribed before the PTY existed, so the spawn's own grid
+    // announcement is how it hears the real grid (read-stream forwards it as
+    // terminal-resize). Exactly one: the post-spawn park found nothing to do.
+    expect(gridEvents).toEqual([[REST_COLS, REST_ROWS, 'spawn']]);
+  });
+
+  /**
+   * The phone re-subscribes with terminal:true on every cold-launch fan-out,
+   * reconnect and foreground. A redundant resize would make the TUI redraw,
+   * which shows on the phone as a flash, so a session already at the resting
+   * grid must not even enter resize(): no PTY resize (no SIGWINCH), no
+   * buffer resize, no grid event.
+   */
+  it('a repeat subscribe at the resting grid touches nothing', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-repeat-subscribe');
+    manager.parkRestingGridForMobileSubscriber(session.id);
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+
+    const gridEvents: Array<[number, number]> = [];
+    manager.on('pty-resize', (_sessionId: string, cols: number, rows: number) => gridEvents.push([cols, rows]));
+    mockPty.resize.mockClear();
+    vi.mocked(traceTerminal).mockClear();
+
+    manager.parkRestingGridForMobileSubscriber(session.id);
+    // A focus claim with nothing mounted is overridden, and still a no-op.
+    manager.setFocusedSessions([session.id]);
+    manager.parkRestingGridForMobileSubscriber(session.id);
+    manager.setFocusedSessions([]);
+    await settle();
+    manager.parkRestingGridForMobileSubscriber(session.id);
+
+    expect(mockPty.resize).not.toHaveBeenCalled();
+    expect(gridEvents).toEqual([]);
+    const resizeTraces = vi.mocked(traceTerminal).mock.calls
+      .filter(([tracedSessionId, event]) => tracedSessionId === session.id && String(event).startsWith('resize'));
+    expect(resizeTraces).toEqual([]);
+  });
+
+  it('leaves a suspended row alone: its resume spawns under a new id', async () => {
+    const { session } = await spawnSession('task-rest-suspended');
+    await manager.suspend(session.id);
+
+    manager.parkRestingGridForMobileSubscriber(session.id);
+
+    expect(manager.getDimensions(session.id)).toEqual({ cols: 120, rows: 30 });
+  });
+
+  /**
+   * Nothing re-ran the park decision when a PTY came up, so a session a phone
+   * streams from before its PTY exists depended on some later focus or mount
+   * change to ever be parked.
+   */
+  it('parks a PTY that comes up unheld while a phone streams it', async () => {
+    const { mockPty } = await spawnSession('task-rest-born-unheld');
+
+    await settle();
+
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  /**
+   * The park is a grid the PTY really has, and the surface or phone that shows
+   * the session next meets its successor, which gets a new id. Starting that
+   * successor at the parked grid means a phone still streaming the task finds
+   * the resting grid in place with no park mid-boot (and agrees with what
+   * persistPtyGrid records, which counts a park too). Remembering only desktop
+   * resizes would hand the successor the pre-park spawn grid instead.
+   */
+  it('starts a respawn at the resting grid its predecessor was parked at', async () => {
+    const { session, mockPty } = await spawnSession('task-rest-respawn-parked');
+    await settle();
+    expect([mockPty.cols, mockPty.rows]).toEqual([REST_COLS, REST_ROWS]);
+    await manager.suspend(session.id);
+
+    const successorMock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(successorMock.mockPty as unknown as pty.IPty);
+    const successor = await manager.spawn({ taskId: 'task-rest-respawn-parked', command: '', cwd: tmpDir, resuming: true });
+    spawnedSessionIds.push(successor.id);
+
+    expect(successor.id).not.toBe(session.id);
+    // The mock reports 120x30 whatever it was spawned at, so read the spawn.
+    // Compared as a bare grid: a failed toHaveBeenCalledWith would print the
+    // whole spawn environment.
+    const spawnCalls = vi.mocked(pty.spawn).mock.calls;
+    const spawnOptions = spawnCalls[spawnCalls.length - 1][2] as { cols: number; rows: number };
+    expect([spawnOptions.cols, spawnOptions.rows]).toEqual([REST_COLS, REST_ROWS]);
+  });
+
+  /**
+   * A resume mints a new id and drops the replaced row, so a grid stashed or
+   * recorded under the old id is never read again. It used to stay in the
+   * maps for the life of the app.
+   */
+  it('drops the grids kept for a row a new-id respawn replaces', async () => {
+    const { session } = await spawnSession('task-rest-sibling');
+    mobileStreamWatchers = new Set();
+    await manager.suspend(session.id);
+    manager.resize(session.id, 190, 40);
+    expect(manager.getLastDesktopDimensions(session.id)).toEqual({ cols: 190, rows: 40 });
+
+    const successorMock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(successorMock.mockPty as unknown as pty.IPty);
+    const successor = await manager.spawn({ taskId: 'task-rest-sibling', command: '', cwd: tmpDir, resuming: true });
+    expect(successor.id).not.toBe(session.id);
+
+    expect(manager.getLastDesktopDimensions(session.id)).toBeNull();
+    // Nothing is left for a later spawn under the old id to inherit. The
+    // successor is killed first so it hands no grid on either (see
+    // 'Respawn grid'), which leaves the old id's stash as the only source.
+    manager.kill(successor.id);
+    const laterMock = createMockPty();
+    vi.mocked(pty.spawn).mockReturnValue(laterMock.mockPty as unknown as pty.IPty);
+    await manager.spawn({ id: session.id, taskId: 'task-rest-sibling', command: '', cwd: tmpDir });
+    expect(pty.spawn).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ cols: 120, rows: 30 }),
+    );
   });
 
   it('a size-guard hold blocks even the subscribe-time rescue', async () => {

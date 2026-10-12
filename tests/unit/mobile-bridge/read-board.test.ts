@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const tasksList = vi.fn();
+const tasksListArchivedPage = vi.fn();
 const swimlanesList = vi.fn();
 const backlogList = vi.fn();
 
 vi.mock('../../../src/main/ipc/helpers/project-repos', () => ({
-  getProjectRepos: vi.fn(() => ({ tasks: { list: tasksList }, swimlanes: { list: swimlanesList } })),
+  getProjectRepos: vi.fn(() => ({ tasks: { list: tasksList, listArchivedPage: tasksListArchivedPage }, swimlanes: { list: swimlanesList } })),
 }));
 vi.mock('../../../src/main/db/database', () => ({
   getProjectDb: vi.fn(() => ({})),
@@ -17,20 +18,95 @@ vi.mock('../../../src/main/db/repositories/backlog-repository', () => ({
     }
   },
 }));
+vi.mock('../../../src/main/db/repositories/session-repository', () => ({
+  SessionRepository: class {
+    getSummaryForTask(): unknown {
+      return null;
+    }
+  },
+}));
 
 import type { CapabilityRequestMessage } from '@kangentic/protocol';
+import type { BrowserWindow } from 'electron';
 import { handleReadBoard } from '../../../src/main/mobile-bridge/handlers/read-board';
 import { deriveProjectAccentColor, PROJECT_ACCENT_PALETTE } from '../../../src/main/mobile-bridge/handlers/project-color';
 import type { IpcContext } from '../../../src/main/ipc/ipc-context';
 import type { BridgeSession } from '../../../src/main/mobile-bridge/session/bridge-session';
 import { SubscriptionRegistry } from '../../../src/main/mobile-bridge/session/subscription-registry';
+import type { SpawnProgressChangedListener } from '../../../src/main/mobile-bridge/spawn-progress-feed';
+import {
+  createProgressCallback,
+  emitSpawnProgress,
+  emitSpawnWaiting,
+  getInFlightSpawnProgress,
+  __resetSpawnProgressForTest,
+} from '../../../src/main/transition-engine/spawn-progress';
+
+/** A spawn-progress feed that never fires, for the tests that are not about it. */
+const noSpawnProgressFeed = { onTaskSpawnProgressChanged: vi.fn(() => vi.fn()) };
+
+/** What the fake session registry lists; `resumable` reads it once per snapshot. */
+let registryRows: Array<{
+  id: string;
+  taskId: string;
+  status: string;
+  transient?: boolean;
+  projectId?: string;
+  commandTerminalSlot?: string | null;
+  commandTerminalLabel?: string | null;
+}> = [];
+/** The fake activity engine's state and reason per session id. */
+let activityStates: Record<string, string> = {};
+let activityReasons: Record<string, unknown> = {};
+
+function fakeSessionManager(): Record<string, unknown> {
+  return {
+    listSessions: () => registryRows,
+    getActivityCache: () => activityStates,
+    getActivityReason: (sessionId: string) => activityReasons[sessionId] ?? null,
+  };
+}
+
+/** A spawn-progress feed whose listener the test can fire, and whose release it can observe. */
+function controllableSpawnProgressFeed(): {
+  feed: { onTaskSpawnProgressChanged: (listener: SpawnProgressChangedListener) => () => void };
+  fire: (projectId: string, taskId: string) => void;
+  release: ReturnType<typeof vi.fn>;
+} {
+  let captured: SpawnProgressChangedListener | undefined;
+  const release = vi.fn();
+  return {
+    feed: {
+      onTaskSpawnProgressChanged: (listener) => {
+        captured = listener;
+        return release;
+      },
+    },
+    fire: (projectId, taskId) => captured?.(projectId, taskId),
+    release,
+  };
+}
+
+function fakeWindow(): BrowserWindow {
+  return { isDestroyed: () => false, webContents: { send: vi.fn() } } as unknown as BrowserWindow;
+}
 
 function fakeRequest(payload: Record<string, unknown>): CapabilityRequestMessage {
   return { type: 'capability-request', requestId: 'req-1', verb: 'read-board', payload };
 }
 
-function fakeSession(): BridgeSession {
-  return { deviceId: 'device-1', isEstablished: true, sendMessage: vi.fn() } as unknown as BridgeSession;
+function fakeSession(capabilities: readonly string[] = ['read-board', 'command-terminal']): BridgeSession {
+  return { deviceId: 'device-1', isEstablished: true, sendMessage: vi.fn(), capabilities: new Set(capabilities) } as unknown as BridgeSession;
+}
+
+/** The context the view, resumable and spawn-progress suites share; the session registry lists `registryRows`. */
+function boardContext(): IpcContext {
+  return {
+    projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha', path: 'C:/projects/alpha' })) },
+    boardEvents: { onBoardChanged: vi.fn(() => vi.fn()) },
+    sessionManager: fakeSessionManager(),
+    configManager: { getEffectiveConfig: vi.fn(() => ({ showTaskNumbers: true })) },
+  } as unknown as IpcContext;
 }
 
 describe('handleReadBoard', () => {
@@ -43,6 +119,12 @@ describe('handleReadBoard', () => {
     // instead of silently deriving one from an absent field.
     swimlanesList.mockReset().mockReturnValue([{ id: 'lane-1', handoff_context: true, role: null, auto_spawn: true }]);
     backlogList.mockReset().mockReturnValue([{ id: 'b-1', external_metadata: { secret: true } }]);
+    // getInFlightSpawnProgress() reads a module-level singleton; a label left
+    // by one test would decorate another's snapshot.
+    __resetSpawnProgressForTest();
+    registryRows = [];
+    activityStates = {};
+    activityReasons = {};
   });
 
   it('with no projectId, returns the project bootstrap list (with derived accent colors, group and position) and never touches task repos', async () => {
@@ -54,7 +136,7 @@ describe('handleReadBoard', () => {
     } as unknown as IpcContext;
     const subscriptions = new SubscriptionRegistry();
 
-    const response = await handleReadBoard(fakeRequest({}), fakeSession(), context, subscriptions);
+    const response = await handleReadBoard(fakeRequest({}), fakeSession(), context, subscriptions, noSpawnProgressFeed);
 
     expect(response.ok).toBe(true);
     expect(response.payload).toEqual({
@@ -77,13 +159,13 @@ describe('handleReadBoard', () => {
       projectRepo: { list: vi.fn(() => []), getById: vi.fn() },
       projectGroupRepo: { list: vi.fn(() => []) },
     } as unknown as IpcContext;
-    const response = await handleReadBoard(fakeRequest({ action: 'unsubscribe' }), fakeSession(), context, new SubscriptionRegistry());
+    const response = await handleReadBoard(fakeRequest({ action: 'unsubscribe' }), fakeSession(), context, new SubscriptionRegistry(), noSpawnProgressFeed);
     expect(response.ok).toBe(true);
   });
 
   it('rejects an unknown project id', async () => {
     const context = { projectRepo: { getById: vi.fn(() => undefined) } } as unknown as IpcContext;
-    const response = await handleReadBoard(fakeRequest({ projectId: 'ghost' }), fakeSession(), context, new SubscriptionRegistry());
+    const response = await handleReadBoard(fakeRequest({ projectId: 'ghost' }), fakeSession(), context, new SubscriptionRegistry(), noSpawnProgressFeed);
     expect(response.ok).toBe(false);
     expect(response.error).toMatch(/no such project/i);
   });
@@ -97,21 +179,24 @@ describe('handleReadBoard', () => {
     const context = {
       projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha', path: 'C:/projects/alpha' })) },
       boardEvents: { onBoardChanged },
+      sessionManager: fakeSessionManager(),
       configManager: { getEffectiveConfig: vi.fn(() => ({ showTaskNumbers: false })) },
     } as unknown as IpcContext;
     const subscriptions = new SubscriptionRegistry();
     const session = fakeSession();
 
-    const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1' }), session, context, subscriptions);
+    const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1' }), session, context, subscriptions, noSpawnProgressFeed);
 
     expect(response.ok).toBe(true);
     expect(response.payload).toEqual({
       projectId: 'proj-1',
       columns: [{ id: 'lane-1', role: null, spawns_session: true }],
-      tasks: [{ id: 't-1', session_id: 'sess-1' }],
+      tasks: [{ id: 't-1', session_id: 'sess-1', spawn_progress: null, resumable: false, paused: false, pausable: false }],
       backlog: [{ id: 'b-1' }],
       projectColor: deriveProjectAccentColor('proj-1'),
       showTicketNumbers: false,
+      commandTerminals: [],
+      commandTerminalsOffered: true,
     });
     const snapshot = response.payload as { columns: object[]; tasks: object[]; backlog: object[] };
     expect(snapshot.tasks[0]).not.toHaveProperty('detail_view_state');
@@ -132,14 +217,6 @@ describe('handleReadBoard', () => {
   });
 
   describe('view projections (protocol 0.9.0)', () => {
-    function boardContext(): IpcContext {
-      return {
-        projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha', path: 'C:/projects/alpha' })) },
-        boardEvents: { onBoardChanged: vi.fn(() => vi.fn()) },
-        configManager: { getEffectiveConfig: vi.fn(() => ({ showTaskNumbers: true })) },
-      } as unknown as IpcContext;
-    }
-
     beforeEach(() => {
       tasksList.mockReturnValue([
         { id: 't-1', swimlane_id: 'lane-1', session_id: 'sess-1' },
@@ -154,6 +231,7 @@ describe('handleReadBoard', () => {
         fakeSession(),
         boardContext(),
         new SubscriptionRegistry(),
+        noSpawnProgressFeed,
       );
 
       const snapshot = response.payload as {
@@ -176,6 +254,7 @@ describe('handleReadBoard', () => {
         fakeSession(),
         boardContext(),
         new SubscriptionRegistry(),
+        noSpawnProgressFeed,
       );
 
       const snapshot = response.payload as { tasks: Array<{ id: string }>; view: string };
@@ -192,6 +271,7 @@ describe('handleReadBoard', () => {
         fakeSession(),
         boardContext(),
         new SubscriptionRegistry(),
+        noSpawnProgressFeed,
       );
 
       expect(response.payload).toHaveProperty('backlog');
@@ -205,17 +285,424 @@ describe('handleReadBoard', () => {
     const context = {
       projectRepo: { getById: vi.fn(() => ({ id: 'proj-1', name: 'Alpha', path: 'C:/projects/alpha' })) },
       boardEvents: { onBoardChanged: vi.fn(() => unsubscribe) },
+      sessionManager: fakeSessionManager(),
       configManager: { getEffectiveConfig: vi.fn(() => ({ showTaskNumbers: true })) },
     } as unknown as IpcContext;
     const subscriptions = new SubscriptionRegistry();
     const session = fakeSession();
 
-    await handleReadBoard(fakeRequest({ projectId: 'proj-1' }), session, context, subscriptions);
+    await handleReadBoard(fakeRequest({ projectId: 'proj-1' }), session, context, subscriptions, noSpawnProgressFeed);
     expect(subscriptions.has('board:proj-1')).toBe(true);
 
-    const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', action: 'unsubscribe' }), session, context, subscriptions);
+    const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', action: 'unsubscribe' }), session, context, subscriptions, noSpawnProgressFeed);
     expect(response.ok).toBe(true);
     expect(unsubscribe).toHaveBeenCalledTimes(1);
     expect(subscriptions.has('board:proj-1')).toBe(false);
+  });
+
+  describe('resumable on the board row (protocol 0.16.0)', () => {
+    beforeEach(() => {
+      swimlanesList.mockReturnValue([
+        { id: 'lane-review', role: null, auto_spawn: false },
+        { id: 'lane-todo', role: 'todo', auto_spawn: false },
+        { id: 'lane-done', role: 'done', auto_spawn: false },
+      ]);
+      // A desktop pause clears session_id, so every paused task here has none:
+      // the registry row is the only thing that says it is paused.
+      tasksList.mockReturnValue([
+        { id: 't-paused', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-paused-todo', swimlane_id: 'lane-todo', session_id: null, archived_at: null },
+        { id: 't-paused-done', swimlane_id: 'lane-done', session_id: null, archived_at: null },
+        { id: 't-paused-archived', swimlane_id: 'lane-review', session_id: null, archived_at: '2026-10-01T00:00:00.000Z' },
+        { id: 't-ended', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-running', swimlane_id: 'lane-review', session_id: 'sess-run', archived_at: null },
+        { id: 't-fresh', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+      ]);
+      registryRows = [
+        { id: 'sess-1', taskId: 't-paused', status: 'suspended' },
+        { id: 'sess-2', taskId: 't-paused-todo', status: 'suspended' },
+        { id: 'sess-3', taskId: 't-paused-done', status: 'suspended' },
+        { id: 'sess-4', taskId: 't-paused-archived', status: 'suspended' },
+        { id: 'sess-5', taskId: 't-ended', status: 'exited' },
+        { id: 'sess-run', taskId: 't-running', status: 'running' },
+        // A Command Terminal session never makes a task resumable.
+        { id: 'sess-terminal', taskId: 't-fresh', status: 'suspended', transient: true },
+      ];
+    });
+
+    it('is true only for a paused task in a column that offers Resume, and false otherwise', async () => {
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'full' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const tasks = (response.payload as { tasks: Array<{ id: string; resumable: boolean | null }> }).tasks;
+      expect(Object.fromEntries(tasks.map((task) => [task.id, task.resumable]))).toEqual({
+        't-paused': true,
+        't-paused-todo': false,
+        't-paused-done': false,
+        't-paused-archived': false,
+        't-ended': false,
+        't-running': false,
+        't-fresh': false,
+      });
+    });
+
+    it("'sessions' keeps a resumable paused task, and still drops a paused task that offers no Resume", async () => {
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'sessions' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const snapshot = response.payload as { tasks: Array<{ id: string }>; taskCountsByColumnId: Record<string, number> };
+      // t-paused stays though its session_id is null; the paused tasks in To Do
+      // and Done, the ended one, and the fresh one stay out as before. The two
+      // paused ones read `paused: true` (0.17.0) and still stay out, because
+      // they offer no Resume.
+      expect(snapshot.tasks.map((task) => task.id)).toEqual(['t-paused', 't-running']);
+      // Counts still describe the whole column, not the filtered list.
+      expect(snapshot.taskCountsByColumnId['lane-review']).toBe(5);
+    });
+
+    it('the archived page never offers Resume, and still reports a paused task as paused', async () => {
+      tasksListArchivedPage.mockReturnValue({
+        tasks: [
+          { id: 't-paused-archived', swimlane_id: 'lane-done', session_id: null, archived_at: '2026-10-01T00:00:00.000Z' },
+          { id: 't-ended', swimlane_id: 'lane-done', session_id: null, archived_at: '2026-10-01T00:00:00.000Z' },
+        ],
+        totalCount: 2,
+      });
+
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', action: 'archived' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      // tasks.list() leaves archived rows out, so this page is the only way a
+      // completed task's paused session reaches the phone.
+      const archived = (response.payload as { archivedTasks: Array<{ id: string; paused: boolean | null; resumable: boolean | null }> }).archivedTasks;
+      expect(archived.map((task) => ({ id: task.id, paused: task.paused, resumable: task.resumable }))).toEqual([
+        { id: 't-paused-archived', paused: true, resumable: false },
+        { id: 't-ended', paused: false, resumable: false },
+      ]);
+    });
+  });
+
+  describe('paused on the board row (protocol 0.17.0)', () => {
+    beforeEach(() => {
+      swimlanesList.mockReturnValue([
+        { id: 'lane-review', role: null, auto_spawn: false },
+        { id: 'lane-todo', role: 'todo', auto_spawn: false },
+        { id: 'lane-done', role: 'done', auto_spawn: false },
+      ]);
+      tasksList.mockReturnValue([
+        { id: 't-paused', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-paused-done', swimlane_id: 'lane-done', session_id: null, archived_at: null },
+        // A move into To Do removes the task's rows, so this is a leftover row:
+        // it pins that `paused` follows the row, not the column.
+        { id: 't-paused-todo', swimlane_id: 'lane-todo', session_id: null, archived_at: null },
+        { id: 't-paused-queued-successor', swimlane_id: 'lane-review', session_id: 'sess-next', archived_at: null },
+        { id: 't-queued', swimlane_id: 'lane-review', session_id: 'sess-queued', archived_at: null },
+        { id: 't-running', swimlane_id: 'lane-review', session_id: 'sess-run', archived_at: null },
+        { id: 't-ended', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-fresh', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-terminal', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+      ]);
+      registryRows = [
+        { id: 'sess-1', taskId: 't-paused', status: 'suspended' },
+        { id: 'sess-2', taskId: 't-paused-done', status: 'suspended' },
+        { id: 'sess-3', taskId: 't-paused-todo', status: 'suspended' },
+        // A respawn queued behind the concurrency limit: the desktop card shows
+        // the queued session, not Paused.
+        { id: 'sess-4', taskId: 't-paused-queued-successor', status: 'suspended' },
+        { id: 'sess-next', taskId: 't-paused-queued-successor', status: 'queued' },
+        { id: 'sess-queued', taskId: 't-queued', status: 'queued' },
+        { id: 'sess-run', taskId: 't-running', status: 'running' },
+        { id: 'sess-5', taskId: 't-ended', status: 'exited' },
+        // A Command Terminal session is never a task's paused session.
+        { id: 'sess-terminal', taskId: 't-terminal', status: 'suspended', transient: true },
+      ];
+    });
+
+    it('follows the paused session row, not the Resume gate, and is false otherwise', async () => {
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'full' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const tasks = (response.payload as { tasks: Array<{ id: string; paused: boolean | null; resumable: boolean | null }> }).tasks;
+      expect(Object.fromEntries(tasks.map((task) => [task.id, { paused: task.paused, resumable: task.resumable }]))).toEqual({
+        't-paused': { paused: true, resumable: true },
+        't-paused-done': { paused: true, resumable: false },
+        't-paused-todo': { paused: true, resumable: false },
+        't-paused-queued-successor': { paused: false, resumable: false },
+        't-queued': { paused: false, resumable: false },
+        't-running': { paused: false, resumable: false },
+        't-ended': { paused: false, resumable: false },
+        't-fresh': { paused: false, resumable: false },
+        't-terminal': { paused: false, resumable: false },
+      });
+      // The Resume gate never opens on a row that is not paused.
+      for (const task of tasks) {
+        if (task.resumable === true) expect(task.paused).toBe(true);
+      }
+    });
+  });
+
+  describe('pausable on the board row (protocol 0.18.0)', () => {
+    beforeEach(() => {
+      swimlanesList.mockReturnValue([
+        { id: 'lane-review', role: null, auto_spawn: false },
+        { id: 'lane-todo', role: 'todo', auto_spawn: false },
+        { id: 'lane-done', role: 'done', auto_spawn: false },
+      ]);
+      tasksList.mockReturnValue([
+        { id: 't-running', swimlane_id: 'lane-review', session_id: 'sess-run', archived_at: null },
+        { id: 't-queued', swimlane_id: 'lane-review', session_id: 'sess-queued', archived_at: null },
+        // A live PTY the task's pointer lost: the pause reconciles and re-links
+        // it, so it is pausable though session_id is null.
+        { id: 't-running-lost-pointer', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-paused', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-paused-queued-successor', swimlane_id: 'lane-review', session_id: 'sess-next', archived_at: null },
+        { id: 't-ended', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        { id: 't-fresh', swimlane_id: 'lane-review', session_id: null, archived_at: null },
+        // To Do hides Pause on the desktop. A move into To Do tears the session
+        // down, so this row pins the column gate, not a reachable state.
+        { id: 't-live-todo', swimlane_id: 'lane-todo', session_id: 'sess-todo', archived_at: null },
+        // Done and archived keep Pause, as the desktop does: a Done move whose
+        // suspend failed leaves exactly this, and Pause is the only stop for it.
+        { id: 't-live-done', swimlane_id: 'lane-done', session_id: 'sess-done', archived_at: null },
+        { id: 't-live-archived', swimlane_id: 'lane-done', session_id: 'sess-archived', archived_at: '2026-10-01T00:00:00.000Z' },
+      ]);
+      registryRows = [
+        { id: 'sess-run', taskId: 't-running', status: 'running' },
+        { id: 'sess-queued', taskId: 't-queued', status: 'queued' },
+        { id: 'sess-lost', taskId: 't-running-lost-pointer', status: 'running' },
+        { id: 'sess-1', taskId: 't-paused', status: 'suspended' },
+        { id: 'sess-2', taskId: 't-paused-queued-successor', status: 'suspended' },
+        { id: 'sess-next', taskId: 't-paused-queued-successor', status: 'queued' },
+        { id: 'sess-3', taskId: 't-ended', status: 'exited' },
+        { id: 'sess-todo', taskId: 't-live-todo', status: 'running' },
+        { id: 'sess-done', taskId: 't-live-done', status: 'running' },
+        { id: 'sess-archived', taskId: 't-live-archived', status: 'running' },
+      ];
+    });
+
+    it('is true for a live session outside To Do, Done and archived included, and false otherwise', async () => {
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'full' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const tasks = (response.payload as { tasks: Array<{ id: string; paused: boolean | null; pausable: boolean | null }> }).tasks;
+      expect(Object.fromEntries(tasks.map((task) => [task.id, task.pausable]))).toEqual({
+        't-running': true,
+        't-queued': true,
+        't-running-lost-pointer': true,
+        't-paused': false,
+        // The queued successor is live, so the task offers Pause and is not paused.
+        't-paused-queued-successor': true,
+        't-ended': false,
+        't-fresh': false,
+        't-live-todo': false,
+        't-live-done': true,
+        't-live-archived': true,
+      });
+      // One registry scan: a paused task has no live session to pause.
+      for (const task of tasks) {
+        if (task.paused === true) expect(task.pausable).toBe(false);
+      }
+    });
+
+    it('stays false while a spawn label is up and no session is live', async () => {
+      // The desktop card shows Pause here, but its click only cancels an
+      // in-flight resume or start; pause-session refuses a task with no live
+      // session, so the row promises nothing.
+      emitSpawnWaiting(fakeWindow(), 't-fresh', 2);
+      emitSpawnWaiting(fakeWindow(), 't-paused', 1);
+
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'full' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const tasks = (response.payload as { tasks: Array<{ id: string; spawn_progress: string | null; pausable: boolean | null }> }).tasks;
+      const byId = Object.fromEntries(tasks.map((task) => [task.id, task]));
+      expect(byId['t-fresh'].spawn_progress).not.toBeNull();
+      expect(byId['t-fresh'].pausable).toBe(false);
+      expect(byId['t-paused'].spawn_progress).not.toBeNull();
+      expect(byId['t-paused'].pausable).toBe(false);
+    });
+  });
+
+  describe('spawn progress (protocol 0.16.0)', () => {
+    beforeEach(() => {
+      tasksList.mockReturnValue([
+        { id: 't-1', swimlane_id: 'lane-1', session_id: 'sess-1' },
+        { id: 't-2', swimlane_id: 'lane-1', session_id: null },
+        { id: 't-3', swimlane_id: 'lane-2', session_id: null },
+      ]);
+    });
+
+    it('each task carries its in-flight label exactly as the card shows it, and null otherwise', async () => {
+      emitSpawnProgress(fakeWindow(), 't-2', 'creating-worktree');
+      emitSpawnWaiting(fakeWindow(), 't-3', 2);
+
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'full' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const tasks = (response.payload as { tasks: Array<{ id: string; spawn_progress: string | null }> }).tasks;
+      expect(tasks.map((task) => [task.id, task.spawn_progress])).toEqual([
+        ['t-1', null],
+        ['t-2', 'Creating worktree...'],
+        ['t-3', 'Waiting (2 ahead)'],
+      ]);
+    });
+
+    it("'sessions' keeps a session-less task while a label is in flight, and still drops one without", async () => {
+      // A respawn nulls session_id for the whole gap its label describes.
+      emitSpawnProgress(fakeWindow(), 't-2', 'switching-model');
+
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'sessions' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const snapshot = response.payload as { tasks: Array<{ id: string }>; taskCountsByColumnId: Record<string, number> };
+      expect(snapshot.tasks.map((task) => task.id)).toEqual(['t-1', 't-2']);
+      expect(snapshot.taskCountsByColumnId).toEqual({ 'lane-1': 2, 'lane-2': 1 });
+    });
+
+    it.each([
+      ['only ANSI escape codes', '\u001b[31m\u001b[0m'],
+      ['only whitespace and line breaks', ' \t\r\n '],
+      ['only invisible format characters', '​⁠﻿'],
+    ])("'sessions' drops a session-less task whose in-flight label sanitizes to nothing (%s)", async (_description, rawLabel) => {
+      // A label that is text on the desktop but nothing on the wire: the phone
+      // reads spawn_progress null as "no spawn in flight", so the card has
+      // nothing to say and the filter must judge the mapped row, not the raw
+      // label.
+      createProgressCallback(fakeWindow(), 't-2')(rawLabel);
+      emitSpawnProgress(fakeWindow(), 't-3', 'creating-worktree');
+      // Guards against a vacuous pass: the raw label really is in flight, so
+      // only the sanitizer stands between it and the phone.
+      expect(getInFlightSpawnProgress()['t-2']).toBe(rawLabel);
+
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'sessions' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const snapshot = response.payload as { tasks: Array<{ id: string; spawn_progress: string | null }>; taskCountsByColumnId: Record<string, number> };
+      // t-2 is dropped; t-3, with a real label in flight, still stays.
+      expect(snapshot.tasks.map((task) => [task.id, task.spawn_progress])).toEqual([
+        ['t-1', null],
+        ['t-3', 'Creating worktree...'],
+      ]);
+      // Counts still describe the whole column, dropped task included.
+      expect(snapshot.taskCountsByColumnId).toEqual({ 'lane-1': 2, 'lane-2': 1 });
+    });
+
+    it('the archived page carries a restore label too', async () => {
+      tasksListArchivedPage.mockReturnValue({ tasks: [{ id: 't-done', swimlane_id: 'lane-done', session_id: null }], totalCount: 1 });
+      emitSpawnProgress(fakeWindow(), 't-done', 'resuming');
+
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', action: 'archived' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      const archived = (response.payload as { archivedTasks: Array<{ spawn_progress: string | null }> }).archivedTasks;
+      expect(archived[0].spawn_progress).toBe('Resuming session...');
+    });
+
+    it("a label change for this project's task sends task-updated; another project's sends nothing", async () => {
+      const { feed, fire } = controllableSpawnProgressFeed();
+      const session = fakeSession();
+      await handleReadBoard(fakeRequest({ projectId: 'proj-1' }), session, boardContext(), new SubscriptionRegistry(), feed);
+
+      fire('proj-OTHER', 't-x');
+      expect(session.sendMessage).not.toHaveBeenCalled();
+
+      fire('proj-1', 't-2');
+      expect(session.sendMessage).toHaveBeenCalledWith({
+        type: 'event',
+        event: { kind: 'board', projectId: 'proj-1', taskId: 't-2', payload: { change: 'task-updated', ids: ['t-2'] } },
+      });
+    });
+
+    it('unsubscribe and a re-subscribe both release the feed listener', async () => {
+      const first = controllableSpawnProgressFeed();
+      const subscriptions = new SubscriptionRegistry();
+      const session = fakeSession();
+      const context = boardContext();
+      await handleReadBoard(fakeRequest({ projectId: 'proj-1' }), session, context, subscriptions, first.feed);
+
+      // The phone re-reads the board after an event, replacing the subscription.
+      const second = controllableSpawnProgressFeed();
+      await handleReadBoard(fakeRequest({ projectId: 'proj-1' }), session, context, subscriptions, second.feed);
+      expect(first.release).toHaveBeenCalledTimes(1);
+
+      await handleReadBoard(fakeRequest({ projectId: 'proj-1', action: 'unsubscribe' }), session, context, subscriptions, second.feed);
+      expect(second.release).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('Command Terminals (protocol 0.20.0)', () => {
+    beforeEach(() => {
+      registryRows = [
+        { id: 'term-2', taskId: 'uuid-2', status: 'running', transient: true, projectId: 'proj-1', commandTerminalSlot: 'slot-2', commandTerminalLabel: null },
+        { id: 'term-1', taskId: 'uuid-1', status: 'running', transient: true, projectId: 'proj-1', commandTerminalSlot: 'slot-1', commandTerminalLabel: 'Audit Unused Feature Flags' },
+        // Another project's terminal, and a task's agent: neither is listed.
+        { id: 'term-other', taskId: 'uuid-3', status: 'running', transient: true, projectId: 'proj-OTHER', commandTerminalSlot: 'slot-1', commandTerminalLabel: null },
+        { id: 'sess-1', taskId: 't-1', status: 'running', projectId: 'proj-1' },
+      ];
+      activityStates = { 'term-1': 'permission', 'term-2': 'thinking' };
+      activityReasons = { 'term-1': { kind: 'permission', since: 1234 }, 'term-2': { kind: 'tool', pendingCount: 1, currentTool: 'Bash' } };
+    });
+
+    it.each(['full', 'sessions'] as const)("the '%s' view lists the project's live terminals by slot, with name and activity", async (view) => {
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+      const snapshot = response.payload as { commandTerminals: unknown[]; commandTerminalsOffered: boolean };
+      expect(snapshot.commandTerminals).toEqual([
+        {
+          sessionId: 'term-1',
+          projectId: 'proj-1',
+          slot: 1,
+          name: 'Audit Unused Feature Flags',
+          named: true,
+          activity: { state: 'permission', reason: { kind: 'permission', since: 1234 } },
+        },
+        {
+          sessionId: 'term-2',
+          projectId: 'proj-1',
+          slot: 2,
+          name: 'Command Terminal 2',
+          named: false,
+          activity: { state: 'thinking', reason: { kind: 'tool', pendingCount: 1, currentTool: 'Bash' } },
+        },
+      ]);
+      expect(snapshot.commandTerminalsOffered).toBe(true);
+    });
+
+    it('a terminal that is not running is not listed', async () => {
+      registryRows = [{ id: 'term-1', taskId: 'uuid-1', status: 'exited', transient: true, projectId: 'proj-1', commandTerminalSlot: 'slot-1' }];
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'full' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+      expect((response.payload as { commandTerminals: unknown[] }).commandTerminals).toEqual([]);
+    });
+
+    it('a queued terminal is listed, since it already holds its slot against the cap', async () => {
+      registryRows = [{ id: 'term-3', taskId: 'uuid-3', status: 'queued', transient: true, projectId: 'proj-1', commandTerminalSlot: 'slot-3', commandTerminalLabel: null }];
+      activityStates = {};
+      activityReasons = {};
+      const response = await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'sessions' }), fakeSession(), boardContext(), new SubscriptionRegistry(), noSpawnProgressFeed);
+      expect((response.payload as { commandTerminals: unknown[] }).commandTerminals).toEqual([
+        { sessionId: 'term-3', projectId: 'proj-1', slot: 3, name: 'Command Terminal 3', named: false, activity: { state: null, reason: null } },
+      ]);
+    });
+
+    it('offers the verb only to a device that holds it', async () => {
+      const response = await handleReadBoard(
+        fakeRequest({ projectId: 'proj-1', view: 'full' }),
+        fakeSession(['read-board']),
+        boardContext(),
+        new SubscriptionRegistry(),
+        noSpawnProgressFeed,
+      );
+      expect((response.payload as { commandTerminalsOffered: boolean }).commandTerminalsOffered).toBe(false);
+    });
+
+    it('a Command Terminal change reaches the phone by session id, with no task id on the envelope', async () => {
+      let capturedListener: ((event: unknown) => void) | undefined;
+      const context = {
+        ...boardContext(),
+        boardEvents: {
+          onBoardChanged: vi.fn((listener: (event: unknown) => void) => {
+            capturedListener = listener;
+            return vi.fn();
+          }),
+        },
+      } as unknown as IpcContext;
+      const session = fakeSession();
+      await handleReadBoard(fakeRequest({ projectId: 'proj-1', view: 'sessions' }), session, context, new SubscriptionRegistry(), noSpawnProgressFeed);
+
+      capturedListener?.({ projectId: 'proj-1', change: 'command-terminals-changed', ids: ['term-1'] });
+      expect(session.sendMessage).toHaveBeenCalledWith({
+        type: 'event',
+        event: { kind: 'board', projectId: 'proj-1', payload: { change: 'command-terminals-changed', ids: ['term-1'] } },
+      });
+    });
   });
 });

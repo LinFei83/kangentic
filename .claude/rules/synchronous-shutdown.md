@@ -30,7 +30,7 @@ synchronous.
 4. Set a hard failsafe timer (`taskkill /T /F` on Windows, `SIGKILL` of the process group
    elsewhere) as a backstop.
 
-This forfeits the 2-second graceful CLI exit window (`suspendAll`) for a MATURE session. Sessions
+This forfeits a graceful CLI exit window for a MATURE session. Sessions
 stay resumable because DB records are marked `suspended` before PTYs are killed, and
 `--resume <id>` works from the saved session id. A YOUNG session (inside Claude Code's fullscreen
 boot-canary window, see [[pty-teardown-grace]]) is the one exception, and it costs the quit no
@@ -49,6 +49,12 @@ until every one is gone plus 100ms of further loop turns (deadline 1500ms, plus 
 grace when the report says a young session's kill is deferred to a timer inside the drain), then
 calls `app.quit()` again. The second `before-quit` pass is a no-op and Electron proceeds. With no
 PTY killed, the quit is the plain synchronous one.
+
+Every PTY runs in the `kangentic-pty-host` utility process ([[pty-host-out-of-process]]), so the
+exit callbacks land there. When any PTY was killed, `SessionManager.killAll()` adds the host's pid
+to the report as one more kill, and `dispose()` posts the host's `shutdown` with a wait bound of the
+drain's deadline less 200 ms: the host exits itself once its last exit callback has run, inside the
+window main is still waiting.
 
 A killed PTY whose child pid was unreadable has no probe, so the drain spends a fixed 400ms blind
 budget for it instead of waiting on liveness. `killAllSessions` therefore returns a `PtyKillReport`

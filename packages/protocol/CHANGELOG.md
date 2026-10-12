@@ -2,6 +2,210 @@
 
 <!-- releases -->
 
+## [protocol-v0.20.0] - 2026-10-11
+
+Adds Command Terminals to the bridge: a phone can start an agent at a project's
+root, stop one, list them with their activity, and read a project folder's diff.
+Additive on the wire; `PROTOCOL_VERSION` stays '3'. One TypeScript type changes
+(see Types below), which a consumer sees at its version bump.
+
+New verb `command-terminal` (the 13th in `CAPABILITY_VERBS`). The request is
+`{ action: 'start', projectId }` or `{ action: 'stop', sessionId }`, and the
+parser copies out only those fields, so a branch, model or effort never reaches
+the desktop. Start answers `{ ok: true, sessionId, slot, name }` once the spawn
+returns, with `slot` 1 to 4 and `name` the terminal's display name. Stop answers
+`{ ok: true }`. It starts an agent, never a shell, and the desktop ends the
+session when the agent exits. `parseCommandTerminalStartResponsePayload` is the
+phone-side parser. The verb rides each device's own grant like every other verb.
+
+Typed refusals, each with an exported constant: `unknown-project`,
+`unknown-session` (a stop for a terminal that already ended, which a phone treats
+as stopped), `command-terminal-limit` (the project already runs four),
+`not-command-terminal` (a stop that named a task's agent, nothing stopped),
+`agent-unavailable` (the project's agent CLI is not installed) and
+`command-terminal-start-failed` (anything else, with `error` kept for logs). A
+phone shows a generic line for a code it does not know.
+
+The `read-board` snapshot, in the full view and in `view: 'sessions'`, gains
+`commandTerminals` (`CommandTerminalWire`: `sessionId`, `projectId`, `slot`,
+`name`, `named`, and the raw `activity` state and reason for the first paint) and
+`commandTerminalsOffered`, true when the device holds the verb. Both parse through
+`parseCommandTerminalWire` and `parseReadBoardResponsePayload`.
+
+The board event gains the change `command-terminals-changed`, with `ids` set to
+`[sessionId]` and no `taskId`. It fires on a terminal's start, end and rename
+only, never on an activity change: a phone subscribes `read-stream` for each
+terminal's `sessionId` and gets live state and reason from that stream.
+
+The push envelope gains an optional `sessionKind`, `'command-terminal'`
+(`PUSH_SESSION_KINDS`, `isPushSessionKind`), with the terminal's name in
+`taskTitle`. The parser drops an unknown kind instead of throwing.
+
+`read-diff` with no `taskId` diffs the project folder against the project's
+default base branch, and its subscription pings carry `projectId`. `filePath`
+stays limited to the diff's own file list.
+
+### Types
+- `ReadDiffRequestPayload.taskId` is optional.
+- `DiffEvent` carries exactly one of `taskId` and `projectId`, and the event
+  validator rejects both or neither.
+
+### Features
+- Run Command Terminals over the bridge and end them with their agent (9e6831b4)
+
+### Fixes
+- Harden Command Terminal starts, ends and naming tests (fd92746c)
+
+## [protocol-v0.19.0] - 2026-10-08
+
+Adds the code a desktop puts on a refusal for a response that would not fit the
+frame caps, and the check that decides it. Additive; `PROTOCOL_VERSION` stays '3'.
+
+`CapabilityErrorCode` gains `response-too-large`, with
+`RESPONSE_TOO_LARGE_ERROR_CODE` beside `UNSUPPORTED_VERB_ERROR_CODE`. It means the
+request was valid and its target still exists, so a client must not read it as the
+target being gone (a session ending, a project removed). A phone should keep the
+`code` on the error it raises for a refused request and branch on it, because a
+client that reads every refusal as "session gone" shows a live session as ended.
+An older peer's decoder drops the unknown `code` and keeps the `error` text.
+
+`encodeMessageFailure(message)` returns why `encodeMessage` would throw for a
+message, or null when it would not, without keeping the frame. Raw UTF-8 JSON at or
+under `MAX_FRAME_LENGTH` returns null after one stringify, and a larger message
+runs the real encode, so the verdict is exact.
+
+The desktop build that ships this version never refuses a terminal `read-stream`
+subscribe for size. When the seed would push the response over the caps (4 MiB of
+JSON before compression, 1 MiB after), it re-takes the seed with less history,
+then the grid alone, then an empty seed, and answers ok. A verb that cannot send
+less is refused with `{ ok: false, error: 'Response too large to send', code:
+'response-too-large' }`. A desktop older than this build sends nothing for an
+oversize response, so the request times out.
+
+### Fixes
+- Shrink an over-cap terminal seed instead of refusing it (871fa89e)
+- Refuse an over-cap read-stream subscribe before subscribing (5233c173)
+- Probe a prompt that rises mid-shrink on the re-take frame (cd102e65)
+
+### Other
+- Move the encode verdict into the protocol beside encodeMessage (5031c257)
+
+## [protocol-v0.18.0] - 2026-10-07
+
+Lets a phone pause a running session the way the desktop Pause button does.
+Additive; `PROTOCOL_VERSION` stays '3'.
+
+`CAPABILITY_VERBS` appends `pause-session` after `start-session` (append only:
+the desktop mirrors the tuple index for index). The request is
+`PauseSessionRequestPayload` (`taskId` + `projectId`, keyed by task, never by
+session id), the response is `PauseSessionResponsePayload` (`{ ok }`), and
+`parsePauseSessionResponsePayload` narrows it phone-side. The desktop answers
+once the pause is recorded, while the agent's shutdown is still running, and the
+paused state reaches the phone as a `task-updated` board event whose snapshot
+reads `paused: true`. A task with no live session is refused with `ok: false`. A
+0.15.0 to 0.17.0 desktop refuses the verb with the `unsupported-verb` code, and
+an older one never answers it.
+
+`BoardTaskWire` gains `pausable`: true when the task has a `running` or `queued`
+session and is not in To Do. Done and archived do not clear it, matching the
+desktop. It is never true while `paused` is true, and it reads false while
+`spawn_progress` is up with no live session, where the verb would refuse. Gate a
+phone's Pause on it. Null or absent means a desktop older than 0.18.0, and a
+client offers no Pause then.
+
+The desktop build that ships this version also refuses a `projectId` it does not
+know on `move-task`, `start-session` and `pause-session`, with
+"No such project: <id>", as `read-board` and `read-diff` already did.
+
+### Features
+- Add a pause-session verb so the phone can pause a running session (5a448a6a)
+
+### Other
+- Say the desktop draws no Paused footer on archived cards (3ec860ce)
+
+## [protocol-v0.17.0] - 2026-10-07
+
+Sends a task's paused state to the phone apart from the Resume gate. Additive;
+`PROTOCOL_VERSION` stays '3'.
+
+`BoardTaskWire` gains `paused`. It is true when the task has a paused session (a
+`suspended` session that is not a Command Terminal) and no live one, whatever its
+column and whether or not it is archived. It is the fact the desktop card's
+"Paused" footer reads, so a paused task in Done or on the archived page now sends
+`paused: true, resumable: false`. Before, `resumable` was the only paused signal on
+the board row, and a pause clears `session_id`, so the phone had no way to know a
+suspended session existed there. `resumable` stays the Resume gate, and
+`resumable: true` always comes with `paused: true`. A respawn queued behind the
+desktop's concurrency limit reads `paused: false`, as the desktop card shows the
+queued session. A `spawn_progress` label still overrides it, as on the card.
+
+Null or absent means a desktop older than 0.17.0, and a client then reads a paused
+task from `resumable` alone, as before. `view: 'sessions'` is unchanged on
+purpose: it keeps a resumable paused task and leaves out one that offers no
+Resume, even though that row now reads `paused: true`, because an agent feed has
+nothing to act on for it.
+
+A move into To Do removes the task's session rows on the desktop, so a task paused
+before that move sends `paused: false`, which matches the desktop card.
+
+### Features
+- Send a task's paused state apart from `resumable` on the board row (7e512cc5)
+
+### Other
+- State the paused rule once and tighten its doc comments (baa3fa39)
+
+## [protocol-v0.16.0] - 2026-10-06
+
+Sends the desktop card's in-between states to the phone, and lets a phone
+resume a paused task the way the desktop Resume button does. All additive;
+`PROTOCOL_VERSION` stays '3'.
+
+`BoardTaskWire` gains `spawn_progress` and `resumable`. `spawn_progress` is the
+card's preparing label, such as "Creating worktree..." or "Switching model...",
+and the desktop announces each change with a `task-updated` board event, at most
+about once a second per task. It is untrusted display text. The desktop strips
+escape sequences and control, invisible and tag characters and caps it at 120
+characters, but a client still caps it for its own layout. A label overrides a
+`suspended` session status, never `running` or `queued`. `resumable` is true
+when the task's session is paused and the desktop would offer Resume for it.
+Both parse as null when absent, which means a pre-0.16.0 desktop. Under
+`view: 'sessions'` a task with a label, or a resumable paused task, is kept
+while its `session_id` is null.
+
+A new `status` activity payload carries `status`, `resuming` and `resumable`
+whenever one of them changes after the read-stream snapshot, for the same
+session id only. The snapshot gains `resuming` and `resumable`, and
+`isReadStreamSessionStatusWire` is exported. A resume always mints a new
+session id, so a feed held on a paused session ends with
+`session-ended { intentional: true, successorSessionId }` and the phone
+subscribes to the successor. Each new signal is an activity payload type rather
+than a new event kind, so an older phone drops just that event through
+`isBridgeEvent`.
+
+`resumable` is the desktop's promise that `start-session` resumes the paused
+session as its Resume button does: the same conversation, a "Resuming
+session..." label, and no enter automations or column message. A pre-0.16.0
+desktop starts the column instead, so a client offers no Resume when the field
+is null or absent. Gate Resume on the board row's field, not the stream's copy,
+because a pause clears `session_id` and the phone then holds no stream on the
+paused session.
+
+### Features
+- Send spawn progress, resuming and live session status to the phone (fd8c72ac)
+- Flag a paused task that `start-session` will resume like the Resume button (8d7179fa)
+- Put `resumable` on the board task row, where a phone can see a paused task (67120bcc)
+- Keep a resumable paused task in the `'sessions'` board view (a3101c6b)
+
+### Fixes
+- The `spawn_progress` doc comment says the desktop sanitizes the label for the wire (46e54c2e)
+- The `spawn_progress` doc comment names the invisible format characters the desktop strips (1bca46a2)
+- The `status` and read-stream `resumable` doc comments say that copy can stay true after a move to Done or an archive (e586550c)
+- The `spawn_progress` doc comment says the desktop strips tag characters (874d5823)
+- The `spawn_progress` doc comment says only the England, Scotland and Wales flag emoji keep their tag characters (93878e56)
+
+### Other
+- The `SessionUsageWire.toolCallCount` doc comment says it counts every run of the session (4389ef4b)
+
 ## [protocol-v0.15.0] - 2026-09-18
 
 Adds the `start-session` capability verb, so a phone can start a task's session

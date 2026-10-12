@@ -59,14 +59,32 @@
   let nextDisplayId = 1;
   let bulkDeleteProgressCallbacks = [];
   let searchHits = [];
-  // Conversation memory (Phase 2/3). `memoryStatus` feeds the palette's
-  // Smart-mode degraded notice and the Privacy tab status line. Seeded via
+  // The conversation index. `memoryStatus` feeds the Knowledge Graph
+  // settings tab's index and model status. Seeded via
   // __mockPreConfigure (mirrors searchHits).
   let memoryStatus = {
     indexingEnabled: true,
     semantic: 'disabled',
-    model: { id: 'bge-base', displayName: 'bge base', tier: 'accurate', approxSizeMb: 110, dimensions: 768, state: 'absent' },
+    model: { id: 'granite-r2', displayName: 'Granite English R2', tier: 'best', approxSizeMb: 153, dimensions: 768, state: 'absent' },
   };
+  // Knowledge Graph fixture. null means "no projection cached yet", which is the
+  // first-open state the surface must handle without looking broken. Seeded via
+  // __mockPreConfigure (mirrors searchHits).
+  let knowledgeGraphSnapshot = null;
+  // The Projects picker's list. Empty by default, which reads as a list not yet
+  // loaded and leaves the picker out (the real app always lists at least the
+  // open project); seeded via __mockPreConfigure.
+  let knowledgeGraphProjects = [];
+  // Task summaries by task id, for the selected conversation's panel. Empty by
+  // default, the same as summaries switched off.
+  let memoryTaskSummaries = {};
+  // Per-project snapshots for a multi-project scope, keyed by project id.
+  // A project missing here falls back to knowledgeGraphSnapshot.
+  let knowledgeGraphSnapshotsByProject = {};
+  let knowledgeGraphAnswerResult = null;
+  // Proactive-recall fixture for task detail; empty means the panel renders
+  // nothing at all, which is the common case and must stay silent.
+  let memoryRelatedToTask = null;
   // Conversation viewer fixtures. `transcriptSeeds` maps a sessionId to a
   // TranscriptGetResponse; `transcriptSessionsByTask` maps a taskId to the
   // ConversationSessionMeta[] the session picker offers. Both seeded via
@@ -124,7 +142,7 @@
    * mirror is only here to keep the fake API self-consistent with listOpen().
    */
   function popOutKeyOf(kind, params) {
-    if (kind === 'stats' || kind === 'monitor') return kind;
+    if (kind === 'stats' || kind === 'monitor' || kind === 'knowledge-graph') return kind;
     const taskKey = kind + ':' + (params && params.projectId) + ':' + (params && params.taskId);
     if (kind === 'changes-file') return taskKey + ':' + (params && params.filePath);
     return taskKey;
@@ -228,9 +246,8 @@
       copyFiles: [],
       initScript: null,
       linkNodeModules: true,
-      prRefreshIntervalMinutes: 5,
-      autoFetchIntervalMinutes: 5,
-      prEvaluateBranchPolicies: false,
+      prAutoRefresh: true,
+      autoFetch: true,
       prBypassCountsAsReady: true,
     },
     mcpServer: {
@@ -303,6 +320,7 @@
     skipDeleteConfirm: false,
     skipBoardConfigConfirm: false,
     autoFocusIdleSession: false,
+    stopLeftoverProcesses: true,
     // Mirrors DEFAULT_CONFIG.windowLightDismiss in src/shared/types.ts. This is an
     // independent literal, so a change there does not turn this red on its own - keep
     // them in step or every UI test silently runs under the wrong policy.
@@ -471,9 +489,8 @@
       copyFiles: git.copyFiles ? git.copyFiles.slice() : undefined,
       initScript: git.initScript,
       linkNodeModules: git.linkNodeModules,
-      prRefreshIntervalMinutes: git.prRefreshIntervalMinutes,
-      autoFetchIntervalMinutes: git.autoFetchIntervalMinutes,
-      prEvaluateBranchPolicies: git.prEvaluateBranchPolicies,
+      prAutoRefresh: git.prAutoRefresh,
+      autoFetch: git.autoFetch,
       prBypassCountsAsReady: git.prBypassCountsAsReady,
     });
     if (pickedGit) result.git = pickedGit;
@@ -538,6 +555,15 @@
   }
 
   function noop() {}
+
+  // `config.onChanged` subscribers. A REAL list rather than a stub: the
+  // Knowledge Graph re-reads its snapshot on this signal, so a no-op made that
+  // path untestable and any spec asserting live refresh would pass without
+  // exercising it. Tests fire it with `window.__mockEmitConfigChanged()`.
+  const mockConfigChangedListeners = [];
+  window.__mockEmitConfigChanged = function () {
+    mockConfigChangedListeners.slice().forEach(function (listener) { listener(); });
+  };
 
   // What config.set / setProjectOverrides / setProjectOverridesByPath resolve with.
   // Defaults to a write that reached disk; a test forces the failure path by setting
@@ -704,7 +730,12 @@
   window.electronAPI = {
     projects: {
       list: async function () {
-        return projects.slice().sort(function (a, b) { return a.position - b.position; });
+        // Row COPIES, as getCurrent returns: the store holds what this returns, and
+        // handing out the live rows would let setDefault* (which mutates in place)
+        // refresh the renderer's list behind its back, masking a stale-list bug.
+        return projects
+          .map(function (projectRow) { return Object.assign({}, projectRow); })
+          .sort(function (firstProject, secondProject) { return firstProject.position - secondProject.position; });
       },
       create: async function (input) {
         // Shift existing projects down
@@ -727,7 +758,7 @@
         projects.push(project);
         // Clone settings from the last modified project (or global defaults)
         projectConfigs[project.path] = getLastProjectDefaults(project.path);
-        return project;
+        return Object.assign({}, project);
       },
       delete: async function (id) {
         var deletedProject = projects.find(function (p) { return p.id === id; });
@@ -791,7 +822,7 @@
         var existing = projects.find(function (p) { return p.path === projectPath; });
         if (existing) {
           currentProjectId = existing.id;
-          return existing;
+          return Object.assign({}, existing);
         }
         // Shift existing projects down
         projects.forEach(function (p) { p.position = p.position + 1; });
@@ -825,7 +856,7 @@
             planLane.plan_exit_target_id = execLane.id;
           }
         }
-        return project;
+        return Object.assign({}, project);
       },
       probePath: async function (projectPath) {
         // Test hook: window.__mockProbePathOverrides merges over the defaults
@@ -1742,8 +1773,9 @@
       setRuntimeOverride: async function (input) {
         // Test hook: spec can override the response (e.g. to assert error
         // handling) by setting window.__mockSetRuntimeOverrideResult before
-        // calling. Defaults to a successful 'live' apply when the task has a
-        // session_id, otherwise 'persisted'.
+        // calling. Defaults to a successful 'restart' when the task has a
+        // session_id (the real handler restarts a task session on any model or
+        // effort change, it never types a slash), otherwise 'persisted'.
         if (typeof window !== 'undefined') {
           if (!window.__mockSetRuntimeOverrideCalls) window.__mockSetRuntimeOverrideCalls = [];
           window.__mockSetRuntimeOverrideCalls.push(input);
@@ -1757,7 +1789,7 @@
         if (input.model !== undefined) patch.model_override = input.model;
         if (input.effort !== undefined) patch.effort_override = input.effort;
         tasks[idx] = Object.assign({}, tasks[idx], patch, { updated_at: now() });
-        var mode = tasks[idx].session_id ? 'live' : 'persisted';
+        var mode = tasks[idx].session_id ? 'restart' : 'persisted';
         return { ok: true, mode: mode };
       },
       resolvePr: async function (taskId, projectId) {
@@ -2056,6 +2088,11 @@
         }
       },
       resume: async function (taskId, resumePrompt) {
+        // Main labels a resume "Resuming session..." until the session is up. The
+        // mock pushes no spawn-progress label from this or any other method (a
+        // move into a spawn column and an unarchive label in main too): it would
+        // set and clear inside this one call, so nothing would render. A spec
+        // that needs a label on screen fires it through __mockFireSpawnProgress.
         var newSession = {
           id: uuid(),
           taskId: taskId,
@@ -2383,9 +2420,25 @@
         // breakdown override this stub per-test.
         return [];
       },
+      getToolResultTokens: async function (_sessionId) {
+        // No transcript exists in the mock, which is main's null answer for an
+        // agent with no readable transcript. Specs override it per-test.
+        return null;
+      },
       spawnTransient: async function (input) {
         var id = crypto.randomUUID();
         var branch = input.branch || 'main';
+        // Mirrors main's allocation (startCommandTerminal): a requested slot is
+        // honored, and a start that names none takes the project's lowest free one.
+        var slot = input.slot || null;
+        if (!slot) {
+          var usedSlots = sessions
+            .filter(function (existing) { return existing.transient && existing.projectId === input.projectId && existing.status !== 'exited'; })
+            .map(function (existing) { return existing.commandTerminalSlot; });
+          for (var slotNumber = 1; slotNumber <= 4 && !slot; slotNumber += 1) {
+            if (usedSlots.indexOf('slot-' + slotNumber) === -1) slot = 'slot-' + slotNumber;
+          }
+        }
         var session = {
           id: id,
           taskId: id,
@@ -2402,30 +2455,19 @@
           // the renderer re-pairs a surviving PTY to its window by that slot after
           // a reload. Omitting them here would let a UI test pass against a row
           // shape production never produces.
-          commandTerminalSlot: input.slot || null,
+          commandTerminalSlot: slot,
           commandTerminalBranch: branch,
           commandTerminalLabel: null,
           isolatedSwimlaneId: null,
           agentSessionId: null,
         };
         sessions.push(session);
-        return { session: session, branch: branch };
-      },
-      setTransientLabel: async function (sessionId, label) {
-        // Mirrors main: retained on the session row (first write wins) so a
-        // recovered terminal keeps its derived name. Trims and rejects a blank
-        // for the same reason main does - the store already trims before it
-        // calls, so a mock without this guard only diverges for a test that
-        // drives the API directly, which is exactly when the divergence lies.
-        var session = sessions.find(function (session) { return session.id === sessionId; });
-        var trimmed = (label || '').trim();
-        if (trimmed && session && session.transient && !session.commandTerminalLabel) {
-          session.commandTerminalLabel = trimmed;
-        }
+        return { session: session, slot: slot, branch: branch };
       },
       setTransientBranch: async function (sessionId, branch) {
         // Mirrors main: the renderer re-derives the branch from live HEAD and
-        // main records the newest reading (LAST write wins, unlike the label).
+        // main records the newest reading (LAST write wins; main names a
+        // terminal itself, first write wins).
         // Call log for assertions: window.__mockSetTransientBranchCalls.
         if (typeof window !== 'undefined') {
           window.__mockSetTransientBranchCalls = window.__mockSetTransientBranchCalls || [];
@@ -2439,7 +2481,13 @@
       },
       killTransient: async function (sessionId) {
         var index = sessions.findIndex(function (s) { return s.id === sessionId; });
-        if (index !== -1) sessions.splice(index, 1);
+        if (index === -1) return;
+        var removed = sessions.splice(index, 1)[0];
+        // Mirrors main's endCommandTerminal, whose remove() announces the
+        // removal, so a spec sees the push a desktop Stop really produces.
+        if (typeof window !== 'undefined' && window.__mockFireRemoved) {
+          window.__mockFireRemoved(sessionId, removed, removed.projectId);
+        }
       },
       // Call log for test assertions. Each entry is the string[] of session IDs
       // passed to setFocused. Reset between tests via:
@@ -2631,7 +2679,12 @@
       __startCalls: [],
       start: async function (options) {
         window.electronAPI.dictation.__startCalls.push(options);
-        return { dictationSessionId: 'mock-dictation-1', engineId: 'stub', modelId: null, needsDownload: false };
+        // Test hook: window.__mockDictationSentenceCaseFinal, a boolean, is what
+        // main reports when the live model writes all caps and the committed text
+        // is its own (the Zipformer with no refinement). The hook recases a final
+        // only when this is true. Unset, it is false, as before.
+        var sentenceCaseFinal = typeof window !== 'undefined' && window.__mockDictationSentenceCaseFinal === true;
+        return { dictationSessionId: 'mock-dictation-1', engineId: 'stub', modelId: null, needsDownload: false, sentenceCaseFinal: sentenceCaseFinal };
       },
       __stopCalls: [],
       stop: async function (dictationSessionId, expectedFrames) {
@@ -2642,6 +2695,13 @@
         // decoding the utterance) without a real crash.
         if (typeof window !== 'undefined' && window.__mockDictationStopError) {
           throw new Error(window.__mockDictationStopError);
+        }
+        // Test hook: window.__mockDictationStopText, a string, is the transcript
+        // stop() resolves with, so a spec can feed the hook a final in the shape a
+        // given model writes (all caps, an acronym) and read back what is typed.
+        // Unset, the stock sentence below is returned, as before.
+        if (typeof window !== 'undefined' && typeof window.__mockDictationStopText === 'string') {
+          return window.__mockDictationStopText;
         }
         return 'This is a test of dictation.';
       },
@@ -2866,7 +2926,13 @@
       syncDefaultToProjects: async function () {
         return 0;
       },
-      onChanged: function (/* callback() */) { return noop; },
+      onChanged: function (callback) {
+        mockConfigChangedListeners.push(callback);
+        return function () {
+          const index = mockConfigChangedListeners.indexOf(callback);
+          if (index >= 0) mockConfigChangedListeners.splice(index, 1);
+        };
+      },
       onWriteFailed: function (callback) {
         // Tests fire this via window.__mockFireConfigWriteFailed(message).
         if (!window.__mockConfigWriteFailedListeners) window.__mockConfigWriteFailedListeners = [];
@@ -2883,6 +2949,38 @@
           var index = listeners.indexOf(callback);
           if (index !== -1) listeners.splice(index, 1);
         };
+      },
+    },
+
+    leftoverProcesses: {
+      onReport: function (callback) {
+        // Tests push a report via window.__mockFireLeftoverReport(report).
+        if (!window.__mockLeftoverReportListeners) window.__mockLeftoverReportListeners = [];
+        window.__mockLeftoverReportListeners.push(callback);
+        if (!window.__mockFireLeftoverReport) {
+          window.__mockFireLeftoverReport = function (report) {
+            var listeners = (window.__mockLeftoverReportListeners || []).slice();
+            listeners.forEach(function (listener) { listener(report); });
+          };
+        }
+        return function () {
+          var listeners = window.__mockLeftoverReportListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index !== -1) listeners.splice(index, 1);
+        };
+      },
+      // Answers 'stopped' unless a test sets window.__mockLeftoverStopOutcomes =
+      // { '<process id>': 'failed' | 'ended' }. Every call is recorded in
+      // window.__mockLeftoverStopCalls. A test may hold every answer open by setting
+      // window.__mockLeftoverStopGate to a promise, so the row's Stopping state can
+      // be observed before it settles; unset (the default, and always in the web
+      // demo) the answer comes at once and nothing here awaits.
+      stop: async function (processId) {
+        if (!window.__mockLeftoverStopCalls) window.__mockLeftoverStopCalls = [];
+        window.__mockLeftoverStopCalls.push(processId);
+        if (window.__mockLeftoverStopGate) await window.__mockLeftoverStopGate;
+        var outcomes = window.__mockLeftoverStopOutcomes || {};
+        return outcomes[processId] || 'stopped';
       },
     },
 
@@ -2943,6 +3041,13 @@
             ],
             defaultPermission: 'acceptEdits',
             supportsSummarize: true,
+            // KEEP IN SYNC with ClaudeAdapter.answerFromContext: gates the Knowledge
+            // Graph's Ask on the capability rather than on the agent's name.
+            supportsAnswerFromContext: true,
+            // KEEP IN SYNC with ClaudeAdapter.answerCapabilities. `model: true` is
+            // what makes the Answering model setting required for Claude, and
+            // `defaultEffort` is the level the Answering effort row shows unset.
+            answerCapabilities: { streaming: true, search: true, model: true, effort: true, defaultEffort: 'low' },
             // KEEP IN SYNC with ClaudeAdapter.reportsRateLimits: gates the ContextBar
             // rate-limit pill on the agent capability (account-wide snapshot).
             reportsRateLimits: true,
@@ -3118,6 +3223,11 @@
             ],
             defaultPermission: 'acceptEdits',
             supportsSummarize: true,
+            // KEEP IN SYNC with GrokAdapter.answerFromContext / answerCapabilities:
+            // a second answering agent with its own effort levels, so a spec can
+            // switch agents by marking it found.
+            supportsAnswerFromContext: true,
+            answerCapabilities: { streaming: false, search: false, model: true, effort: true, defaultEffort: 'low' },
           },
           {
             name: 'antigravity', displayName: 'Antigravity CLI', found: false, path: null, version: null,
@@ -3434,6 +3544,113 @@
           }
         }
         return { original: '', modified: '', language: 'plaintext' };
+      },
+      // Image bytes for the Changes panel's image view, mirroring
+      // DiffService.getImageContent. A fixture entry carries the bytes as
+      // `originalImageBase64` / `modifiedImageBase64`; an SVG entry with no
+      // base64 is read from its `original` / `modified` text, UTF-8 encoded,
+      // as main reads the file. `originalImageSize` / `modifiedImageSize`
+      // override the reported size, and a size over the 10 MB preview cap
+      // reports 'too-large' with no bytes, as main does. A side with neither
+      // reads 'unreadable', and bytes that start with the Git LFS pointer
+      // header read 'lfs-pointer'. Added/Untracked have no original side and
+      // Deleted has no modified side.
+      //
+      // Each side's fingerprint is derived from its bytes, so a side whose
+      // fixture bytes were swapped reads as changed, and a side matching the
+      // request's `knownFingerprints` answers 'unchanged' with no bytes, as
+      // main does. Test hooks: every call is recorded in
+      // window.__mockGitFileImageCalls ({ filePath, knownFingerprints, result },
+      // each result side reduced to its kind and fingerprint),
+      // window.__mockGitFileImageDeferred = true holds the next call until
+      // window.__mockGitFileImageResolve() is called, and every call for a
+      // path listed in window.__mockGitFileImageRejectPaths rejects, as the IPC
+      // call does when main throws (a worktree removed under the panel). The
+      // reject is keyed by path and lasts until the list is cleared, not one
+      // call: a selection can read a file twice, and with a one-shot reject
+      // whichever read landed last decided what showed. A rejected call is
+      // recorded too, with `rejected: true` and no sides.
+      fileImage: async function (request) {
+        var rejectPaths = typeof window !== 'undefined' ? window.__mockGitFileImageRejectPaths : null;
+        if (Array.isArray(rejectPaths) && rejectPaths.indexOf(request && request.filePath) !== -1) {
+          window.__mockGitFileImageCalls = window.__mockGitFileImageCalls || [];
+          window.__mockGitFileImageCalls.push({
+            filePath: request.filePath,
+            knownFingerprints: request.knownFingerprints,
+            rejected: true,
+            result: { original: null, modified: null },
+          });
+          throw new Error('Mock fileImage failure');
+        }
+        if (typeof window !== 'undefined' && window.__mockGitFileImageDeferred) {
+          window.__mockGitFileImageDeferred = false;
+          var resolveImageRef;
+          var pendingImage = new Promise(function (resolve) { resolveImageRef = resolve; });
+          window.__mockGitFileImageResolve = resolveImageRef;
+          await pendingImage;
+        }
+        var IMAGE_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
+        var LFS_POINTER_PREFIX = 'version https://git-lfs.github.com/spec/';
+        var status = (request && request.status) || 'M';
+        var filePath = (request && request.filePath) || '';
+        var knownFingerprints = (request && request.knownFingerprints) || {};
+        var fixture = resolveGitDiffFixture(request);
+        var match = fixture && Array.isArray(fixture.files)
+          ? fixture.files.find(function (entry) { return entry.path === filePath; })
+          : null;
+        function bytesOf(base64, svgText) {
+          if (base64) {
+            var binary = atob(base64);
+            var decoded = new Uint8Array(binary.length);
+            for (var byteIndex = 0; byteIndex < binary.length; byteIndex++) decoded[byteIndex] = binary.charCodeAt(byteIndex);
+            return decoded;
+          }
+          if (typeof svgText === 'string' && /\.svg$/i.test(filePath)) return new TextEncoder().encode(svgText);
+          return null;
+        }
+        function fingerprintOf(bytes) {
+          var hash = 5381;
+          for (var hashIndex = 0; hashIndex < bytes.length; hashIndex++) hash = ((hash * 33) ^ bytes[hashIndex]) >>> 0;
+          return 'mock:' + bytes.length + ':' + hash.toString(16);
+        }
+        function readSide(base64, svgText, sizeOverride, knownFingerprint) {
+          if (typeof sizeOverride === 'number' && sizeOverride > IMAGE_PREVIEW_MAX_BYTES) {
+            var tooLargeFingerprint = 'mock-size:' + sizeOverride;
+            if (tooLargeFingerprint === knownFingerprint) return { kind: 'unchanged', fingerprint: tooLargeFingerprint };
+            return { kind: 'too-large', size: sizeOverride, fingerprint: tooLargeFingerprint };
+          }
+          var bytes = bytesOf(base64, svgText);
+          if (bytes === null) return { kind: 'unreadable' };
+          var fingerprint = fingerprintOf(bytes);
+          if (fingerprint === knownFingerprint) return { kind: 'unchanged', fingerprint: fingerprint };
+          var head = String.fromCharCode.apply(null, Array.prototype.slice.call(bytes, 0, LFS_POINTER_PREFIX.length));
+          if (bytes.length <= 1024 && head === LFS_POINTER_PREFIX) {
+            return { kind: 'lfs-pointer', size: bytes.length, fingerprint: fingerprint };
+          }
+          return { kind: 'bytes', size: typeof sizeOverride === 'number' ? sizeOverride : bytes.length, bytes: bytes, fingerprint: fingerprint };
+        }
+        var needsOriginal = status !== 'A' && status !== 'U';
+        var needsModified = status !== 'D';
+        var result = {
+          original: needsOriginal
+            ? readSide(match && match.originalImageBase64, match && match.original, match && match.originalImageSize, knownFingerprints.original)
+            : null,
+          modified: needsModified
+            ? readSide(match && match.modifiedImageBase64, match && match.modified, match && match.modifiedImageSize, knownFingerprints.modified)
+            : null,
+        };
+        if (typeof window !== 'undefined') {
+          // Kinds and fingerprints only: the log outlives the call, and this
+          // mock is also the web demo's bridge, so it must not hold every image.
+          var summarize = function (side) { return side === null ? null : { kind: side.kind, fingerprint: side.fingerprint }; };
+          window.__mockGitFileImageCalls = window.__mockGitFileImageCalls || [];
+          window.__mockGitFileImageCalls.push({
+            filePath: filePath,
+            knownFingerprints: request && request.knownFingerprints,
+            result: { original: summarize(result.original), modified: summarize(result.modified) },
+          });
+        }
+        return result;
       },
       subscribeDiff: function () {},
       unsubscribeDiff: function () {},
@@ -3997,7 +4214,8 @@
       var FULL_CAPABILITY_SET = [
         'read-stream', 'read-board', 'read-diff', 'send-user-message', 'move-task',
         'answer-permission-prompt', 'interactive-terminal', 'board-tool-read',
-        'board-tool-write', 'register-push', 'start-session',
+        'board-tool-write', 'register-push', 'start-session', 'pause-session',
+        'command-terminal',
       ];
 
       if (typeof window !== 'undefined') {
@@ -4180,6 +4398,14 @@
           window.setTimeout(function () { callback(projectId); }, 0);
         }
         return noop;
+      },
+      // The project-open reconcile's warnings. The mock has no kangentic.json,
+      // so nothing ever pushes. A spec seeds `window.__mockLastConfigWarnings`
+      // (an array) and the renderer's fetch on a project becoming current reads
+      // it, which is the path a launch restore takes.
+      onWarnings: function (/* callback(projectId, warnings) */) { return noop; },
+      getLastWarnings: async function (/* projectId */) {
+        return Array.isArray(window.__mockLastConfigWarnings) ? window.__mockLastConfigWarnings.slice() : [];
       },
       onShortcutsChanged: function (/* callback(projectId) */) { return noop; },
       getBoardProfiles: async function () { return mockBoardProfiles; },
@@ -4536,25 +4762,181 @@
       },
     },
 
-    memory: {
+    knowledgeGraph: {
       getStatus: function () { return Promise.resolve(Object.assign({}, memoryStatus)); },
-      // Fire-and-forget worker warm-up on a Smart-mode Quick Find open. Recorded
-      // (one timestamp per call) so a UI test can assert it fires at least once
-      // per open, never in keyword mode, and no further as the user types. Not
-      // an exact count: StrictMode double-invokes the mount effect, and the
+      // Fire-and-forget worker warm-up on a Knowledge Graph open. Recorded (one
+      // timestamp per call) so a UI test can assert Quick Find never sends it.
+      // Not an exact count: StrictMode double-invokes a mount effect, and the
       // second send is a no-op against the worker's memoized init.
-      prewarm: function () {
+      // A prewarm that names a chat also warms that chat's answering session;
+      // those are recorded as their own list, chat ids and all.
+      prewarm: function (chat) {
         if (typeof window !== 'undefined') {
           if (!window.__mockMemoryPrewarmCalls) window.__mockMemoryPrewarmCalls = [];
           window.__mockMemoryPrewarmCalls.push(Date.now());
+          if (chat && chat.chatId) {
+            if (!window.__mockAnswerPrewarms) window.__mockAnswerPrewarms = [];
+            window.__mockAnswerPrewarms.push({ chatId: chat.chatId, projectId: chat.projectId });
+          }
         }
       },
-      rebuildIndex: function (projectId) {
+      // The chat's warm session is released; recorded so a UI test can assert
+      // X and closing the graph both let it go.
+      endChat: function (chatId) {
+        if (typeof window !== 'undefined') {
+          if (!window.__mockEndChatCalls) window.__mockEndChatCalls = [];
+          window.__mockEndChatCalls.push(chatId);
+        }
+      },
+      // The summaries Rebuild would rewrite: those in the seeded status written
+      // some other way, which is what main would count and mark.
+      rebuildPlan: function () {
+        var summaries = memoryStatus && memoryStatus.summaries;
+        var summariesToRewrite = 0;
+        if (summaries && summaries.choice && summaries.writtenWith) {
+          summaries.writtenWith.forEach(function (entry) {
+            var same = entry.agent === summaries.choice.agent && entry.model === summaries.choice.model && entry.effort === summaries.choice.effort;
+            if (!same) summariesToRewrite += entry.count;
+          });
+        }
+        return Promise.resolve({ summariesToRewrite: summariesToRewrite });
+      },
+      // Recorded for the Rebuild spec. Global, so it carries no project.
+      rebuildIndex: function () {
         if (typeof window !== 'undefined') {
           if (!window.__mockRebuildIndexCalls) window.__mockRebuildIndexCalls = [];
-          window.__mockRebuildIndexCalls.push({ projectId: projectId === undefined ? null : projectId });
+          window.__mockRebuildIndexCalls.push(Date.now());
         }
-        return Promise.resolve();
+        return this.rebuildPlan();
+      },
+      taskSummary: function (projectId, taskId) {
+        // Seeded per task id via __mockPreConfigure's memoryTaskSummaries; null
+        // otherwise, which is what main answers with summaries switched off.
+        if (typeof window !== 'undefined') {
+          if (!window.__mockTaskSummaryCalls) window.__mockTaskSummaryCalls = [];
+          window.__mockTaskSummaryCalls.push({ projectId: projectId, taskId: taskId });
+        }
+        return Promise.resolve(Object.prototype.hasOwnProperty.call(memoryTaskSummaries, taskId) ? memoryTaskSummaries[taskId] : null);
+      },
+      graphSnapshot: function (projectId) {
+        if (typeof window !== 'undefined') {
+          if (!window.__mockGraphSnapshotCalls) window.__mockGraphSnapshotCalls = [];
+          window.__mockGraphSnapshotCalls.push({ projectId: projectId === undefined ? null : projectId });
+        }
+        var keyed = projectId ? knowledgeGraphSnapshotsByProject[projectId] : undefined;
+        var source = keyed || knowledgeGraphSnapshot;
+        return Promise.resolve(source ? JSON.parse(JSON.stringify(source)) : null);
+      },
+      graphProjects: function () {
+        if (typeof window !== 'undefined') {
+          window.__mockGraphProjectsCalls = (window.__mockGraphProjectsCalls || 0) + 1;
+        }
+        return Promise.resolve(JSON.parse(JSON.stringify(knowledgeGraphProjects)));
+      },
+      refreshGraph: function (projectId) {
+        if (typeof window !== 'undefined') {
+          if (!window.__mockRefreshGraphCalls) window.__mockRefreshGraphCalls = [];
+          window.__mockRefreshGraphCalls.push({ projectId: projectId === undefined ? null : projectId });
+        }
+        // Main answers with the first build's progress when one runs, else
+        // null. A spec sets `window.__mockRefreshGraphResult` to say a first
+        // build started; by default nothing runs, as a refresh with no worker.
+        var refreshResult = typeof window !== 'undefined' ? window.__mockRefreshGraphResult : undefined;
+        return Promise.resolve(refreshResult ? JSON.parse(JSON.stringify(refreshResult)) : null);
+      },
+      answerFromGraph: function (question, projectId, granularity, requestId, context) {
+        if (typeof window !== 'undefined') {
+          if (!window.__mockGraphAnswerCalls) window.__mockGraphAnswerCalls = [];
+          window.__mockGraphAnswerCalls.push({
+            question: question,
+            projectId: projectId === undefined ? null : projectId,
+            granularity: granularity === undefined ? null : granularity,
+            requestId: requestId === undefined ? null : requestId,
+            context: context === undefined ? null : JSON.parse(JSON.stringify(context)),
+          });
+        }
+        // Defaults to a FAILURE, deliberately. Ask spawns a real CLI, so a spec
+        // that has not said what the agent returns has not set up the case it is
+        // testing, and a plausible default answer would let it pass anyway.
+        // A spec may set `window.__mockAnswerResultQueue` to answer successive
+        // questions differently (a failure, then a retry that works).
+        var queued = typeof window !== 'undefined' && Array.isArray(window.__mockAnswerResultQueue)
+          ? window.__mockAnswerResultQueue.shift()
+          : undefined;
+        var settled = queued || knowledgeGraphAnswerResult;
+        var result = settled
+          ? JSON.parse(JSON.stringify(settled))
+          : { ok: false, reason: 'no agent configured' };
+        // A spec that sets `window.__mockHoldAnswer` gets the answer held open
+        // until it calls `window.__mockReleaseAnswer()`, so it can drive the
+        // stream (the related set, searches, text) through
+        // `__mockFireAnswerStream` in between, as main does.
+        if (typeof window !== 'undefined' && window.__mockHoldAnswer) {
+          return new Promise(function (resolve) {
+            window.__mockReleaseAnswer = function () { resolve(result); };
+          });
+        }
+        return Promise.resolve(result);
+      },
+      relatedToTask: function (taskId, projectId) {
+        if (typeof window !== 'undefined') {
+          if (!window.__mockRelatedToTaskCalls) window.__mockRelatedToTaskCalls = [];
+          window.__mockRelatedToTaskCalls.push({ taskId: taskId, projectId: projectId === undefined ? null : projectId });
+        }
+        return Promise.resolve(memoryRelatedToTask ? JSON.parse(JSON.stringify(memoryRelatedToTask)) : []);
+      },
+      onGraphChanged: function (callback) {
+        if (!window.__mockGraphChangedListeners) window.__mockGraphChangedListeners = [];
+        window.__mockGraphChangedListeners.push(callback);
+        if (!window.__mockFireGraphChanged) {
+          // Drives the push path from a spec: window.__mockFireGraphChanged(id).
+          window.__mockFireGraphChanged = function (projectId) {
+            var listeners = (window.__mockGraphChangedListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) listeners[i](projectId);
+          };
+        }
+        return function () {
+          var listeners = window.__mockGraphChangedListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+      onGraphBuildProgress: function (callback) {
+        if (!window.__mockGraphBuildProgressListeners) window.__mockGraphBuildProgressListeners = [];
+        window.__mockGraphBuildProgressListeners.push(callback);
+        if (!window.__mockFireGraphBuildProgress) {
+          // Drives a first build's progress from a spec:
+          // window.__mockFireGraphBuildProgress(id, { pass, stage, percent }).
+          window.__mockFireGraphBuildProgress = function (projectId, progress) {
+            var listeners = (window.__mockGraphBuildProgressListeners || []).slice();
+            for (var listenerIndex = 0; listenerIndex < listeners.length; listenerIndex++) listeners[listenerIndex](projectId, progress);
+          };
+        }
+        return function () {
+          var listeners = window.__mockGraphBuildProgressListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+      onAnswerStream: function (callback) {
+        if (!window.__mockAnswerStreamListeners) window.__mockAnswerStreamListeners = [];
+        window.__mockAnswerStreamListeners.push(callback);
+        if (!window.__mockFireAnswerStream) {
+          // Drives the streaming path from a spec. A spec that wants to see text
+          // arrive before the answer settles fires text events, then resolves
+          // the answer: window.__mockFireAnswerStream({ requestId, kind, text }).
+          // The requestId is what the store minted; read it back off the last
+          // answerFromGraph call.
+          window.__mockFireAnswerStream = function (event) {
+            var listeners = (window.__mockAnswerStreamListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) listeners[i](event);
+          };
+        }
+        return function () {
+          var listeners = window.__mockAnswerStreamListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index >= 0) listeners.splice(index, 1);
+        };
       },
     },
 
@@ -5035,6 +5417,24 @@
     }
     if (result && result.memoryStatus && typeof result.memoryStatus === 'object') {
       memoryStatus = result.memoryStatus;
+    }
+    if (result && result.knowledgeGraphSnapshot && typeof result.knowledgeGraphSnapshot === 'object') {
+      knowledgeGraphSnapshot = result.knowledgeGraphSnapshot;
+    }
+    if (result && Array.isArray(result.knowledgeGraphProjects)) {
+      knowledgeGraphProjects = result.knowledgeGraphProjects;
+    }
+    if (result && result.memoryTaskSummaries && typeof result.memoryTaskSummaries === 'object') {
+      memoryTaskSummaries = result.memoryTaskSummaries;
+    }
+    if (result && result.knowledgeGraphSnapshotsByProject && typeof result.knowledgeGraphSnapshotsByProject === 'object') {
+      knowledgeGraphSnapshotsByProject = result.knowledgeGraphSnapshotsByProject;
+    }
+    if (result && result.knowledgeGraphAnswerResult && typeof result.knowledgeGraphAnswerResult === 'object') {
+      knowledgeGraphAnswerResult = result.knowledgeGraphAnswerResult;
+    }
+    if (result && Array.isArray(result.memoryRelatedToTask)) {
+      memoryRelatedToTask = result.memoryRelatedToTask;
     }
     if (result && result.transcriptSeeds && typeof result.transcriptSeeds === 'object') {
       Object.assign(transcriptSeeds, result.transcriptSeeds);

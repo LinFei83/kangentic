@@ -10,11 +10,14 @@ import { useMobileStore } from './stores/mobile-store';
 import { useSessionStore } from './stores/session-store';
 import { useBacklogStore } from './stores/backlog-store';
 import { useToastStore } from './stores/toast-store';
+import { useLeftoverProcessesStore } from './stores/leftover-processes-store';
+import { describeLeftoverReport } from './lib/leftover-processes';
 import { useUpdaterStore } from './stores/updater-store';
 import { useHostMemoryStore } from './stores/host-memory-store';
 import { useAnnouncementsStore } from './stores/announcements-store';
 import { useUsageDashboardStore } from './stores/usage-dashboard-store';
 import { useMonitorStore } from './stores/monitor-store';
+import { useKnowledgeGraphStore } from './stores/knowledge-graph-store';
 import { usePopOutStore } from './stores/pop-out-store';
 import { receivePopOutOpenSet } from './pop-out/pop-out-changed';
 import { useDictationStore } from './stores/dictation-store';
@@ -28,15 +31,15 @@ import { resolveGpuNotice } from './utils/gpu-notice';
 import { setSoftwareRenderingActive } from './utils/terminal-webgl';
 import { derivePanelSessions } from './utils/panel-sessions';
 import { COMMAND_TERMINAL_NOTIFICATION_TASK_ID } from '../shared/notification-constants';
+import { PTY_HOST_LOST_EXIT_CODE, PTY_HOST_LOST_NOTICE_WINDOW_MS } from '../shared/pty-host';
 import { describeAutomationFailure } from '../shared/automation-describe';
 import { bumpHmrGeneration } from './utils/hmr-generation';
 import { clearSnapPreviewDom } from './window-manager';
 import { setRebindCaptureActive } from './utils/rebind-state';
-import { useWindowStore, commandWindowManager } from './window-manager/store/window-store';
+import { useWindowStore, commandWindowManager, knowledgeGraphWindowManager } from './window-manager/store/window-store';
 import {
   autoNameTimers,
   scheduleAutoNameSuggestion,
-  maybeLabelTransientSession,
 } from './lib/auto-name-scheduler';
 import {
   enqueueUsage,
@@ -494,6 +497,9 @@ export function App() {
 
     // Session exit events
     if (sessions.onExit) {
+      // A pty host crash ends every terminal at once; its exits collapse to
+      // one notice, and the agents among them resume a moment later.
+      let lastHostLostToastAt = 0;
       cleanups.push(sessions.onExit((sessionId, exitCode, projectId, intentional) => {
         const currentSession = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
         const exitedTaskId = currentSession?.taskId;
@@ -515,13 +521,13 @@ export function App() {
         // defense-in-depth fallback. See session-spawn-flow.ts onExit.
         if (intentional || currentSession?.status === 'suspended') return;
 
-        // Transient sessions (command terminal) are ephemeral - skip toasts and notifications
+        // Transient sessions (command terminal) are ephemeral - skip toasts and
+        // notifications. Main ends the terminal right after this exit and
+        // announces the removal; the removal subscriber
+        // (useCloseCommandWindowOnRemoval) drops the (project, slot) entry and
+        // closes the window then, so the entry is left for it to find.
         if (currentSession?.transient) {
           updateSessionStatus(sessionId, { status: 'exited', exitCode });
-          // Remove this transient session's renderer state (its (project, slot)
-          // map entry + per-session dicts). Works whether the session belongs to
-          // the current project or another project's still-tracked terminal.
-          useSessionStore.getState().clearTransientSessionById(sessionId);
           return;
         }
 
@@ -529,9 +535,19 @@ export function App() {
 
         const notifyConfig = useConfigStore.getState().config.notifications;
 
-        // Only show toast if exited session belongs to current project
         const activeProjectId = useProjectStore.getState().currentProject?.id;
-        if ((projectId ?? currentSession?.projectId) === activeProjectId) {
+        if (exitCode === PTY_HOST_LOST_EXIT_CODE) {
+          // A machine-level event, not one project's, so no project gate.
+          const now = Date.now();
+          if (notifyConfig.toasts.onAgentCrash && now - lastHostLostToastAt >= PTY_HOST_LOST_NOTICE_WINDOW_MS) {
+            useToastStore.getState().addToast({
+              message: 'Terminals restarted. Running agents are resuming.',
+              variant: 'warning',
+            });
+          }
+          lastHostLostToastAt = now;
+        } else if ((projectId ?? currentSession?.projectId) === activeProjectId) {
+          // Only show toast if exited session belongs to current project
           if (notifyConfig.toasts.onAgentCrash) {
             const task = useBoardStore.getState().tasks.find((t) => t.session_id === sessionId)
               ?? useBoardStore.getState().tasks.find((t) => t.id === currentSession?.taskId);
@@ -767,7 +783,6 @@ export function App() {
         if (!projectId || !activeProjectId || projectId === activeProjectId) {
           enqueueEvent(sessionId, event);
         }
-        maybeLabelTransientSession(sessionId, event);
       }));
     }
 
@@ -823,6 +838,11 @@ export function App() {
         } else {
           useBoardStore.getState().setPendingConfigChange(changedProjectId);
         }
+      }));
+    }
+    if (boardConfig?.onWarnings) {
+      cleanups.push(boardConfig.onWarnings((warnedProjectId, warnings) => {
+        useBoardStore.getState().receiveOpenConfigWarnings(warnedProjectId, warnings);
       }));
     }
     if (boardConfig?.onShortcutsChanged) {
@@ -915,6 +935,32 @@ export function App() {
           variant: 'error',
           duration: 12000,
         });
+      }));
+    }
+
+    // What a task left running when it reached Done or To Do, or was deleted
+    // (src/main/pty/process-tag/). The toast gives counts; Review opens the
+    // list with the names. Not project-filtered: a delete or the startup sweep
+    // in a background project still leaves processes on this machine.
+    if (window.electronAPI?.leftoverProcesses?.onReport) {
+      cleanups.push(window.electronAPI.leftoverProcesses.onReport((report) => {
+        const toast = describeLeftoverReport(report);
+        if (!toast) return;
+        const toastId = useToastStore.getState().addToast({
+          message: toast.message,
+          variant: toast.variant,
+          ...(toast.sticky ? { duration: 0 } : {}),
+          since: toast.since,
+          action: {
+            label: 'Review',
+            onClick: () => useLeftoverProcessesStore.getState().openReport(report.id),
+          },
+        });
+        // A toast whose report the store no longer keeps has a Review link
+        // that opens nothing, so it closes with its report.
+        for (const evictedToastId of useLeftoverProcessesStore.getState().addReport(report, toastId)) {
+          useToastStore.getState().dismissToast(evictedToastId);
+        }
       }));
     }
 
@@ -1106,9 +1152,10 @@ export function App() {
 }
 
 // Dev-only: re-sync all IPC-backed Zustand stores after Vite HMR updates.
-// Most store modules revert to defaults when HMR replaces them (e.g. config
-// resets to DEFAULT_CONFIG); re-fetching from the main process restores them.
-// The board/backlog/project stores are instance-pinned across HMR (Pattern E in
+// A store that is not instance-pinned reverts to its defaults when HMR replaces
+// its module, and re-fetching from the main process restores it. The stores in
+// PATTERN_E_STORES (tests/unit/hmr-resync.test.ts), board, backlog, project,
+// session and config among them, are instance-pinned (Pattern E in
 // .claude/rules/hmr-patterns.md), so for them this re-sync RECONCILES the pinned
 // instance with main-process truth rather than restoring it from scratch. Keep
 // the calls either way; the unit test below enforces them.
@@ -1167,6 +1214,10 @@ if (import.meta.hot) {
     useConfigStore.getState().loadConfig();
     useConfigStore.getState().loadAgentList();
     useConfigStore.getState().detectGit();
+    // The version never changes in a session, but the store holding it can be new: an
+    // update that finds no pinned instance builds one with no version, and the status
+    // bar drops its version pill.
+    useConfigStore.getState().loadAppVersion();
     useBoardStore.getState().loadBoard();
     useBoardStore.getState().loadBoardProfiles();
     useBoardStore.getState().loadAutomations();
@@ -1180,6 +1231,22 @@ if (import.meta.hot) {
     // main-process truth (no-ops while the monitor is closed).
     if (useMonitorStore.getState().monitorOpen) {
       void useMonitorStore.getState().loadSnapshot();
+    }
+    // Knowledge Graph Pattern B: re-read the cached projection + coverage from
+    // main-process truth (no-ops while the surface is closed).
+    // The Projects list and every project in a scope are main-process truth too.
+    // Marked as pushes: a save is a refresh, not the reader acting, so it never
+    // starts a rebuild of a stale map on its own. A window following the main
+    // one re-reads with null, as its own pushes do, so it keeps following.
+    if (useKnowledgeGraphStore.getState().graphOpen) {
+      const knowledgeGraph = useKnowledgeGraphStore.getState();
+      const asRefresh = { fromPush: true };
+      void knowledgeGraph.loadSnapshot(knowledgeGraph.followsCurrentProject ? null : knowledgeGraph.projectId, asRefresh);
+      void knowledgeGraph.loadProjects();
+      // The open project's island comes from loadSnapshot above.
+      for (const scopedProjectId of knowledgeGraph.scopeProjectIds ?? []) {
+        if (scopedProjectId !== knowledgeGraph.projectId) void knowledgeGraph.loadScopeSnapshot(scopedProjectId, asRefresh);
+      }
     }
     // Pop-out windows Pattern B: re-hydrate which surfaces are currently detached.
     usePopOutStore.getState().loadOpen();
@@ -1221,7 +1288,9 @@ if (import.meta.env.DEV) {
     window: useWindowStore,
     monitor: useMonitorStore,
     commandWindow: commandWindowManager.store,
+    knowledgeGraphWindows: knowledgeGraphWindowManager.store,
     usageDashboard: useUsageDashboardStore,
+    knowledgeGraph: useKnowledgeGraphStore,
     popOut: usePopOutStore,
     dictation: useDictationStore,
     announcements: useAnnouncementsStore,

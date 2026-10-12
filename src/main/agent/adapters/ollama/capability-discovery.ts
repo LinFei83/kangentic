@@ -8,12 +8,10 @@
  * which is why the renderer falls back to a free-form text input when the
  * list is empty.
  */
-import { exec, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execAsync, execFileAsync } from '../../../utility-process/off-main-exec';
+import { quoteCmdExecutable } from '../../../../shared/shell-quote';
 import type { AgentCapabilities } from '../../../../shared/types';
 
-const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
 
 const LIST_TIMEOUT_MS = 5000;
 
@@ -24,7 +22,7 @@ const LIST_TIMEOUT_MS = 5000;
  */
 async function readModelListOutput(cliPath: string): Promise<string> {
   if (process.platform === 'win32') {
-    const { stdout } = await execAsync(`"${cliPath}" list`, {
+    const { stdout } = await execAsync(`${quoteCmdExecutable(cliPath)} list`, {
       timeout: LIST_TIMEOUT_MS,
       windowsHide: true,
       maxBuffer: 1024 * 1024,

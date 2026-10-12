@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { EventType } from '../../../../shared/types';
 import { filterKangenticHooks, buildBridgeCommand, safelyUpdateSettingsFile } from '../../shared/hook-utils';
-import { extractTool, extractToolId, extractDetail, setDetail, setTypeWhen, setTypeWhenDetailContains, setTypeWhenDetailMatches } from '../../shared/directive-builders';
+import { extractTool, extractToolId, extractSubagentId, extractDetail, setDetail, setTypeWhen, setTypeWhenDetailContains, setTypeWhenDetailMatches } from '../../shared/directive-builders';
 
 /** All Claude Code hook event names (settings.json keys). */
 export const ClaudeHookEvent = {
@@ -50,13 +50,26 @@ function settingsLocalPath(dir: string): string {
   return path.join(dir, '.claude', 'settings.local.json');
 }
 
+export interface BuildHooksOptions {
+  /**
+   * Copy UserPromptSubmit's `prompt` into the Prompt event's `detail` (the
+   * bridge caps it at `FIELD_CAP`, 2000 characters). Only a Command Terminal asks for it, to
+   * name itself; task sessions keep prompt text out of their events file.
+   */
+  capturePromptText?: boolean;
+}
+
 export function buildHooks(
   eventBridge: string,
   eventsPath: string,
   existingHooks: Record<string, ClaudeHookEntry[]>,
+  options: BuildHooksOptions = {},
 ): Record<string, ClaudeHookEntry[]> {
   const H = ClaudeHookEvent;
   const E = EventType;
+  const promptCommand = options.capturePromptText
+    ? buildBridgeCommand(eventBridge, eventsPath, E.Prompt, extractDetail(['prompt']))
+    : buildBridgeCommand(eventBridge, eventsPath, E.Prompt);
 
   // Claude Code stdin field extraction directives:
   // - tool_name: tool identifier at top level
@@ -196,7 +209,7 @@ export function buildHooks(
     ],
     [H.UserPromptSubmit]: [
       ...(existingHooks[H.UserPromptSubmit] || []),
-      { matcher: '', hooks: [{ type: 'command', command: buildBridgeCommand(eventBridge, eventsPath, E.Prompt) }] },
+      { matcher: '', hooks: [{ type: 'command', command: promptCommand }] },
       // A background-shell terminal `<task-notification>` (Incident A, session
       // f03f5e43 / shell b9wh3dhov) used to be drained here via a SECOND
       // UserPromptSubmit entry. Empirically (task #386) that notification is
@@ -257,15 +270,24 @@ export function buildHooks(
       ...(existingHooks[H.SessionEnd] || []),
       { matcher: '', hooks: [{ type: 'command', command: buildBridgeCommand(eventBridge, eventsPath, E.SessionEnd) }] },
     ],
+    // Both subagent hooks carry `agent_id` (captured on CLI 2.1.290). The
+    // engine needs it because one agent can fire two NAMED stops: a background
+    // subagent that ends its turn without calling SubagentHandback stops, gets
+    // re-prompted by the CLI's `[handback-send-enforce]` message, and stops
+    // again after the handback. Counting both took a live sibling's depth slot
+    // (task #759). A SendMessage continuation also stops twice under one id,
+    // but fires a fresh SubagentStart with that id first, which re-opens it.
     [H.SubagentStart]: [
       ...(existingHooks[H.SubagentStart] || []),
       { matcher: '', hooks: [{ type: 'command', command: buildBridgeCommand(eventBridge, eventsPath, E.SubagentStart,
-        extractDetail(['agent_type', 'subagent_type'])) }] },
+        extractDetail(['agent_type', 'subagent_type']),
+        extractSubagentId(['agent_id'])) }] },
     ],
     [H.SubagentStop]: [
       ...(existingHooks[H.SubagentStop] || []),
       { matcher: '', hooks: [{ type: 'command', command: buildBridgeCommand(eventBridge, eventsPath, E.SubagentStop,
-        extractDetail(['agent_type', 'subagent_type'])) }] },
+        extractDetail(['agent_type', 'subagent_type']),
+        extractSubagentId(['agent_id'])) }] },
     ],
     [H.Notification]: [
       ...(existingHooks[H.Notification] || []),

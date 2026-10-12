@@ -1,8 +1,10 @@
 import simpleGit from 'simple-git';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { GitDiffFilesInput, GitDiffFilesResult, GitDiffFileEntry, GitDiffScope, GitDiffStatus, GitFileContentInput, GitFileContentResult } from '../../shared/types';
+import type { GitDiffFilesInput, GitDiffFilesResult, GitDiffFileEntry, GitDiffScope, GitDiffStatus, GitFileContentInput, GitFileContentResult, GitFileImageInput, GitImageContentResult, GitImageSide } from '../../shared/types';
+import { IMAGE_PREVIEW_MAX_BYTES, isGitLfsPointer } from '../../shared/image-preview';
 import { countFileLines } from './line-count/count-lines';
+import { readGitObject } from './git-object-reader';
 import { lineCountClient } from './line-count/line-count-client';
 
 /** Above this combined untracked-file byte size, counting is delegated to the
@@ -96,6 +98,40 @@ function parseNameStatus(output: string): Map<string, { status: GitDiffStatus; o
 /** The empty tree object every git repo has - used as the "parent" of a root commit. */
 const EMPTY_TREE_HASH = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
+/**
+ * The best common ancestor of two commits, or null when they share none or a
+ * ref does not resolve. Also how ancestry is tested: A is an ancestor of B
+ * exactly when their merge-base is A. That reads an oid rather than
+ * `--is-ancestor`'s bare exit code, which a git wrapper can report as success.
+ */
+async function mergeBaseOf(git: ReturnType<typeof simpleGit>, first: string, second: string): Promise<string | null> {
+  try {
+    const oid = (await git.raw(['merge-base', first, second])).trim();
+    return oid || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The commit the current branch was created at, from the oldest entry of its
+ * reflog, when that entry is still the creation (`branch: Created from ...`).
+ * Null on a detached HEAD, with reflogs off, or once git has expired the entry
+ * (entries for commits a rebase left unreachable expire after 30 days).
+ */
+async function branchCreationPoint(git: ReturnType<typeof simpleGit>): Promise<string | null> {
+  try {
+    const branch = (await git.raw(['symbolic-ref', '-q', '--short', 'HEAD'])).trim();
+    if (!branch) return null;
+    const entries = (await git.raw(['reflog', 'show', '--format=%H %gs', `refs/heads/${branch}`])).trim().split(/\r?\n/);
+    const oldest = entries[entries.length - 1] ?? '';
+    const match = /^([0-9a-f]{40,64}) branch: Created from /.exec(oldest);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 export class DiffService {
   private readonly gitDirectory: string;
   private mergeBaseCache: Map<string, string> = new Map();
@@ -129,34 +165,51 @@ export class DiffService {
   }
 
   /**
-   * Find the merge-base between the base branch and HEAD.
-   * This is the fork point - where the task branch diverged from the base.
+   * Find the fork point: where the task branch diverged from the base.
    * Diffing against this (instead of the base branch tip) shows only changes
    * made on this branch, excluding changes merged into the base after forking.
    * Result is cached per base branch to avoid redundant git subprocess calls
    * (getDiffFiles and getFileContent both need the merge-base).
+   *
+   * The merge-base with `origin/<base>` (the local `<base>` when there is no
+   * such remote ref), unless the commit git recorded when the branch was
+   * created is NEWER - a descendant of it on HEAD's own history.
+   *
+   * That happens when the base's history is rewritten: the merge-base with the
+   * new history falls back to the last commit the two still share, far behind
+   * where the task started. Measured: three tasks branched an hour before a
+   * rewrite recorded 369 to 388 files of churn against PRs of 11 to 57 files.
+   * The creation point stays on the branch's own history, so it is still where
+   * the task started. A rebase or a merge of the base moves the merge-base past
+   * the creation point, and the merge-base is then kept, as before.
    */
   private async getMergeBase(git: ReturnType<typeof simpleGit>, baseBranch: string): Promise<string> {
     const cached = this.mergeBaseCache.get(baseBranch);
     if (cached) return cached;
 
+    // Started together: each is a git child, and the Changes panel waits on
+    // this before its first paint.
+    const [remoteBase, creationPoint] = await Promise.all([
+      mergeBaseOf(git, `origin/${baseBranch}`, 'HEAD'),
+      branchCreationPoint(git),
+    ]);
     // Try origin ref first - local branch may be stale if repo hasn't pulled recently.
     // Fall back to local ref (works for repos without a remote, or non-standard remote names).
-    for (const ref of [`origin/${baseBranch}`, baseBranch]) {
-      try {
-        const result = await git.raw(['merge-base', ref, 'HEAD']);
-        const mergeBase = result.trim();
-        this.mergeBaseCache.set(baseBranch, mergeBase);
-        return mergeBase;
-      } catch {
-        continue;
-      }
-    }
+    const refBase = remoteBase ?? await mergeBaseOf(git, baseBranch, 'HEAD');
 
-    // Neither ref exists (e.g. repo uses 'master' not 'main') - fall back to HEAD
-    // so the panel still shows uncommitted working tree changes.
-    this.mergeBaseCache.set(baseBranch, 'HEAD');
-    return 'HEAD';
+    // Neither ref exists (e.g. repo uses 'master' not 'main') - fall back to the
+    // creation point, else HEAD, so the panel still shows uncommitted changes.
+    let forkPoint = refBase ?? 'HEAD';
+    // The common case is a branch never rebased, whose creation point IS the
+    // merge-base and costs no further call. Otherwise the creation point wins
+    // only when it is on HEAD's history AND past the merge-base.
+    if (creationPoint && creationPoint !== refBase
+      && await mergeBaseOf(git, creationPoint, 'HEAD') === creationPoint
+      && (refBase === null || await mergeBaseOf(git, refBase, creationPoint) === refBase)) {
+      forkPoint = creationPoint;
+    }
+    this.mergeBaseCache.set(baseBranch, forkPoint);
+    return forkPoint;
   }
 
   /**
@@ -333,66 +386,212 @@ export class DiffService {
   }
 
   async getFileContent(input: GitFileContentInput): Promise<GitFileContentResult> {
+    const language = inferLanguage(input.filePath);
+    if (!isSafeContentInput(input)) return { original: '', modified: '', language };
     const git = simpleGit(this.gitDirectory);
-    const { baseBranch, filePath, status, oldPath, commitOid } = input;
-    const scope = input.scope ?? 'branch';
-    const language = inferLanguage(filePath);
-
-    const needsOriginal = status !== 'A' && status !== 'U';
-    const needsModified = status !== 'D';
-    const showPath = oldPath ?? filePath;
-
-    // Resolve the "original" (left) side per scope. The revision is joined with
-    // `:path`: '' yields ":path" (the staged/index blob), 'HEAD' yields
-    // "HEAD:path", and the merge-base yields "<base>:path". A commit selection
-    // overrides scope entirely: original is that commit's parent tree.
-    //   commit  -> <oid>^ (or the empty tree for a root commit)
-    //   working -> index   (vs working tree on disk)
-    //   staged  -> HEAD    (vs the index blob)
-    //   branch  -> base    (vs working tree on disk)
-    const resolveOriginalRevision = async (): Promise<string> => {
-      if (commitOid) return this.resolveParentRef(git, commitOid);
-      if (scope === 'working') return '';
-      if (scope === 'staged') return 'HEAD';
-      return this.getMergeBase(git, baseBranch);
-    };
-    // The "modified" (right) side reads from disk for working/branch, from the
-    // staged index blob for the staged scope, and from the commit tree itself
-    // (never disk) for a commit selection - history is immutable.
-    const modifiedFromIndex = !commitOid && scope === 'staged';
+    const { needsOriginal, needsModified } = sidesForStatus(input.status);
 
     // Fetch original and modified in parallel - independent I/O whose overlap
     // cuts latency for modified files (the common case) by ~30-50%.
     const [original, modified] = await Promise.all([
-      needsOriginal
-        ? (async () => {
-            try {
-              const revision = await resolveOriginalRevision();
-              return await git.show([`${revision}:${showPath}`]);
-            } catch {
-              return '';
-            }
-          })()
-        : '',
-      needsModified
-        ? (async () => {
-            try {
-              if (commitOid) {
-                return await git.show([`${commitOid}:${filePath}`]);
-              }
-              if (modifiedFromIndex) {
-                return await git.show([`:${filePath}`]);
-              }
-              const workingDirectory = input.worktreePath ?? input.projectPath;
-              const absolutePath = path.join(workingDirectory, filePath);
-              return await fs.promises.readFile(absolutePath, 'utf-8');
-            } catch {
-              return '';
-            }
-          })()
-        : '',
+      needsOriginal ? readSideAsText(git, () => this.resolveOriginalSource(git, input)) : '',
+      needsModified ? readSideAsText(git, () => resolveModifiedSource(input)) : '',
     ]);
 
     return { original, modified, language };
   }
+
+  /**
+   * Both sides of a changed image as bytes, for the Changes panel's image
+   * view. Same per-scope revisions as {@link getFileContent}; only the readers
+   * differ. A side the caller already holds is answered `unchanged` without
+   * being read, and a side over IMAGE_PREVIEW_MAX_BYTES is never read into
+   * memory or sent over IPC: a git object stops at its header (one
+   * `cat-file --batch` process, see git-object-reader.ts), a working-tree file
+   * at its `stat`.
+   */
+  async getImageContent(input: GitFileImageInput): Promise<GitImageContentResult> {
+    const { needsOriginal, needsModified } = sidesForStatus(input.status);
+    if (!isSafeContentInput(input)) {
+      return { original: needsOriginal ? { kind: 'unreadable' } : null, modified: needsModified ? { kind: 'unreadable' } : null };
+    }
+    const git = simpleGit(this.gitDirectory);
+    const known = input.knownFingerprints;
+
+    const [original, modified] = await Promise.all([
+      needsOriginal ? readSideAsImage(this.gitDirectory, () => this.resolveOriginalSource(git, input), known?.original) : null,
+      needsModified ? readSideAsImage(this.gitDirectory, () => resolveModifiedSource(input), known?.modified) : null,
+    ]);
+
+    return { original, modified };
+  }
+
+  /**
+   * Resolve the "original" (left) side per scope. The revision is joined with
+   * `:path`: '' yields ":path" (the staged/index blob), 'HEAD' yields
+   * "HEAD:path", and the merge-base yields "<base>:path". A commit selection
+   * overrides scope entirely: original is that commit's parent tree. A rename
+   * reads the left side from its old path.
+   *   commit  -> <oid>^ (or the empty tree for a root commit)
+   *   working -> index   (vs working tree on disk)
+   *   staged  -> HEAD    (vs the index blob)
+   *   branch  -> base    (vs working tree on disk)
+   */
+  private async resolveOriginalSource(git: ReturnType<typeof simpleGit>, input: GitFileContentInput): Promise<FileSideSource> {
+    const scope = input.scope ?? 'branch';
+    const showPath = input.oldPath ?? input.filePath;
+    let revision: string;
+    if (input.commitOid) revision = await this.resolveParentRef(git, input.commitOid);
+    else if (scope === 'working') revision = '';
+    else if (scope === 'staged') revision = 'HEAD';
+    else revision = await this.getMergeBase(git, input.baseBranch);
+    return { kind: 'revision', spec: `${revision}:${showPath}` };
+  }
+}
+
+/**
+ * Where one side of a changed file lives: a git object (`<rev>:<path>`, or
+ * `:<path>` for the index blob) or a file in the working tree.
+ */
+type FileSideSource =
+  | { kind: 'revision'; spec: string }
+  | { kind: 'disk'; absolutePath: string };
+
+/** Added and Untracked files have no original side; Deleted files have no modified side. */
+function sidesForStatus(status: GitDiffStatus): { needsOriginal: boolean; needsModified: boolean } {
+  return { needsOriginal: status !== 'A' && status !== 'U', needsModified: status !== 'D' };
+}
+
+/**
+ * A path from the diff list: relative, with no `..` segment, so a read can
+ * never leave the worktree. A drive-relative `C:name` is refused too: Windows
+ * cannot hold such a name, so no diff lists one. A colon later in a name is
+ * left alone, since it is a legal file name on POSIX.
+ */
+function isRepoRelativePath(filePath: string): boolean {
+  if (filePath === '' || path.posix.isAbsolute(filePath) || path.win32.isAbsolute(filePath)) return false;
+  if (/^[A-Za-z]:/.test(filePath)) return false;
+  return !filePath.split(/[\\/]/).includes('..');
+}
+
+const COMMIT_OID_PATTERN = /^[0-9a-f]{4,64}$/i;
+
+/**
+ * The content readers take their paths and commit from the caller, the
+ * renderer over IPC or the phone through the mobile bridge, and join the
+ * paths onto the worktree. Every legitimate input names a file the diff list
+ * reported and a commit from the history, so anything else is refused before
+ * any read.
+ */
+function isSafeContentInput(input: GitFileContentInput): boolean {
+  if (!isRepoRelativePath(input.filePath)) return false;
+  if (input.oldPath !== undefined && !isRepoRelativePath(input.oldPath)) return false;
+  return input.commitOid === undefined || COMMIT_OID_PATTERN.test(input.commitOid);
+}
+
+/**
+ * The "modified" (right) side reads from disk for working/branch, from the
+ * staged index blob for the staged scope, and from the commit tree itself
+ * (never disk) for a commit selection - history is immutable.
+ */
+function resolveModifiedSource(input: GitFileContentInput): FileSideSource {
+  if (input.commitOid) return { kind: 'revision', spec: `${input.commitOid}:${input.filePath}` };
+  if ((input.scope ?? 'branch') === 'staged') return { kind: 'revision', spec: `:${input.filePath}` };
+  const workingDirectory = input.worktreePath ?? input.projectPath;
+  return { kind: 'disk', absolutePath: path.join(workingDirectory, input.filePath) };
+}
+
+/** Where a side lives. The original side can need git to say (a merge base, a parent commit), so it may be async. */
+type SideSourceResolver = () => FileSideSource | Promise<FileSideSource>;
+
+/** Any failure (missing object, missing file, unresolvable merge base) reads as empty text. */
+async function readSideAsText(git: ReturnType<typeof simpleGit>, resolveSource: SideSourceResolver): Promise<string> {
+  try {
+    const source = await resolveSource();
+    if (source.kind === 'revision') return await git.show([source.spec]);
+    return await fs.promises.readFile(source.absolutePath, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * A working-tree fingerprint taken this soon after the file's last write is
+ * never trusted. Git's racy-entry rule: a second write inside the same
+ * timestamp tick (a coarse filesystem, or an agent regenerating a screenshot
+ * twice in one burst) keeps both size and modified time, so a fingerprint
+ * recorded between the two writes would match the second one and keep showing
+ * the first image for good. What counts is when the caller's copy was read,
+ * not when it is compared, so a side read inside the window carries
+ * RACY_FINGERPRINT_SUFFIX, which no fresh fingerprint ends in: the next
+ * refresh reads it again, by then outside the window.
+ */
+export const RECENT_WRITE_WINDOW_MS = 2000;
+export const RACY_FINGERPRINT_SUFFIX = ':racy';
+
+/** A blob id names its exact bytes, so a match on it is always safe to trust. */
+const BLOB_FINGERPRINT_PREFIX = 'blob:';
+
+/**
+ * One side of an image. A side that does not exist where the scope looks
+ * (no such object, no such file) reads unreadable quietly; any other failure
+ * also reads unreadable but is logged, since it means git or the disk failed.
+ */
+async function readSideAsImage(
+  gitDirectory: string,
+  resolveSource: SideSourceResolver,
+  knownFingerprint: string | undefined,
+): Promise<GitImageSide> {
+  try {
+    const source = await resolveSource();
+    return source.kind === 'revision'
+      ? await readRevisionImage(gitDirectory, source.spec, knownFingerprint)
+      : await readWorkingTreeImage(source.absolutePath, knownFingerprint);
+  } catch (error) {
+    if (!isMissingPathError(error)) console.warn('[DIFF] Could not read an image side:', error);
+    return { kind: 'unreadable' };
+  }
+}
+
+async function readRevisionImage(gitDirectory: string, spec: string, knownFingerprint: string | undefined): Promise<GitImageSide> {
+  const knownObjectId = knownFingerprint?.startsWith(BLOB_FINGERPRINT_PREFIX)
+    ? knownFingerprint.slice(BLOB_FINGERPRINT_PREFIX.length)
+    : undefined;
+  const read = await readGitObject(gitDirectory, spec, { knownObjectId, maxBytes: IMAGE_PREVIEW_MAX_BYTES });
+  if (read.kind === 'missing') return { kind: 'unreadable' };
+  const fingerprint = `${BLOB_FINGERPRINT_PREFIX}${read.objectId}`;
+  if (read.kind === 'unchanged') return { kind: 'unchanged', fingerprint };
+  if (read.kind === 'too-large') return { kind: 'too-large', size: read.size, fingerprint };
+  return imageSideFromBytes(read.bytes, fingerprint);
+}
+
+async function readWorkingTreeImage(absolutePath: string, knownFingerprint: string | undefined): Promise<GitImageSide> {
+  const stats = await fs.promises.stat(absolutePath);
+  const settledFingerprint = `file:${stats.size}:${stats.mtimeMs}`;
+  // The comparison checks the window too, which only matters if the clock
+  // stepped back since the caller's copy was read.
+  const writtenRecently = Date.now() - stats.mtimeMs < RECENT_WRITE_WINDOW_MS;
+  if (settledFingerprint === knownFingerprint && !writtenRecently) return { kind: 'unchanged', fingerprint: settledFingerprint };
+  const fingerprint = writtenRecently ? `${settledFingerprint}${RACY_FINGERPRINT_SUFFIX}` : settledFingerprint;
+  if (stats.size > IMAGE_PREVIEW_MAX_BYTES) return { kind: 'too-large', size: stats.size, fingerprint };
+  // No encoding: the bytes must arrive untouched. Electron delivers a Buffer
+  // to the renderer as a Uint8Array.
+  return imageSideFromBytes(await fs.promises.readFile(absolutePath), fingerprint);
+}
+
+function imageSideFromBytes(bytes: Buffer, fingerprint: string): GitImageSide {
+  if (isGitLfsPointer(bytes)) return { kind: 'lfs-pointer', size: bytes.length, fingerprint };
+  return { kind: 'bytes', size: bytes.length, bytes, fingerprint };
+}
+
+/**
+ * A working-tree path that is not a file any more: deleted, or turned into a
+ * directory or into a path through a file under the open panel. Every refresh
+ * meets it again, so it is not logged. Only the disk reads carry a `code`:
+ * readGitObject's rejections never do, so git failing to start is logged.
+ */
+const MISSING_PATH_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR', 'EISDIR']);
+
+function isMissingPathError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && typeof error.code === 'string' && MISSING_PATH_CODES.has(error.code);
 }

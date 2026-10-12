@@ -30,16 +30,14 @@ import { EventEmitter } from 'node:events';
 import type { RosterDeviceEntry, TransportState } from '@kangentic/protocol';
 import type { MobileDeviceConnectionState } from '../../../src/shared/types';
 
-vi.mock('electron', () => ({
-  app: { isReady: () => true, whenReady: () => Promise.resolve() },
-  safeStorage: {
-    isEncryptionAvailable: () => true,
-    encryptString: (plaintext: string) => Buffer.from(`encrypted:${plaintext}`, 'utf8'),
-    decryptString: (buffer: Buffer) => buffer.toString('utf8').replace(/^encrypted:/, ''),
-    getSelectedStorageBackend: () => 'keychain',
-  },
-  ipcMain: { handle: vi.fn(), on: vi.fn(), removeHandler: vi.fn() },
-}));
+vi.mock('electron', async () => {
+  const { createFakeSafeStorage } = await import('../helpers/fake-safe-storage');
+  return {
+    app: { isReady: () => true, whenReady: () => Promise.resolve() },
+    safeStorage: createFakeSafeStorage(),
+    ipcMain: { handle: vi.fn(), on: vi.fn(), removeHandler: vi.fn() },
+  };
+});
 
 vi.mock('../../../src/main/analytics/analytics', () => ({
   trackEvent: vi.fn(),
@@ -77,8 +75,8 @@ let rosterDevices: RosterDeviceEntry[] = [deviceA, deviceB];
 
 vi.mock('../../../src/main/mobile-bridge/identity', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../src/main/mobile-bridge/identity')>()),
-  loadBridgeIdentity: () => fakeIdentity,
-  loadOrCreateBridgeIdentity: () => fakeIdentity,
+  loadBridgeIdentity: async () => fakeIdentity,
+  loadOrCreateBridgeIdentity: async () => fakeIdentity,
 }));
 
 // revokeDevice/setDeviceCapabilities are mocked as no-op spies (not passed
@@ -176,6 +174,9 @@ async function openSessions(service: MobileBridgeServiceInstance): Promise<Map<s
   // attachContext registers the resting park's MobileTerminalProbe, so the
   // fake session manager needs the registration seam (the probe stays unused).
   service.attachContext({ sessionManager: Object.assign(new EventEmitter(), { setMobileTerminalProbe: vi.fn() }), boardEvents: { emitBoardChanged: vi.fn() } } as never);
+  // The identity and the secure-storage verdict load once, asynchronously,
+  // in the warm-up attachContext() starts; runSyncSessions() waits for it too.
+  await service.whenStorageReady();
   service.reconcile({ enabled: true, relayUrl: 'wss://relay.example.com' });
   await flushMicrotasks();
   const byDeviceId = new Map<string, FakeBridgeSession>();

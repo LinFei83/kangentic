@@ -13,15 +13,21 @@ directories:
 files:
   - ".vite/build/**"
   - "package.json"
+  # better-sqlite3 13 ships its native addon as Node-API prebuilds under
+  # prebuilds/<platform>-<arch>.node and loads them itself (lib/binding.js);
+  # build/afterPack.js strips every prebuild but the target's.
   - "node_modules/better-sqlite3/**"
   - "node_modules/node-pty/**"
-  - "node_modules/bindings/**"
-  - "node_modules/file-uri-to-path/**"
   - "node_modules/sherpa-onnx-node/**"
   - "node_modules/sherpa-onnx-*/**"
   # Terminal Font Family picker: font-list shells out to fc-list (Linux) / a
   # PowerShell script (Windows) and ships a bundled native binary for macOS.
   - "node_modules/font-list/**"
+  # The pty host reads a process's environment through koffi on Windows and macOS to find
+  # what a task left running (src/main/pty/process-tag/). koffi loads its
+  # prebuilt binary from the per-platform @koromix/koffi-* package.
+  - "node_modules/koffi/**"
+  - "node_modules/@koromix/koffi-*/**"
   # Conversation-memory retrieval: sqlite-vec loadable extension (per-platform
   # binary packages) + transformers.js. The embed worker runs on the NATIVE
   # onnxruntime-node execution providers (DirectML / WebGPU / CPU) because
@@ -51,12 +57,26 @@ files:
   - "node_modules/semver/**"
   - "!node_modules/better-sqlite3/{src,deps}/**"
   - "!node_modules/better-sqlite3/binding.gyp"
+  # Build-time C++ headers only (node-addon-api). lib/ loads the prebuilt addon and never
+  # requires anything from here; the afterPack load probe proves the shipped tree still opens.
+  - "!node_modules/better-sqlite3/node_modules/**"
   - "!node_modules/node-pty/{src,scripts,deps,third_party}/**"
   - "!**/*.map"
 
 asar: true
 asarUnpack:
-  - "node_modules/node-pty/prebuilds/**"
+  # The pty host is forked from the unpacked tree on Windows and Linux, where
+  # Node resolves modules from real directories and never looks inside the
+  # asar, so all of node-pty unpacks, not only its prebuilt binaries. That also
+  # lets its ConPTY conout worker thread load from a real directory. macOS
+  # forks the host from inside the asar instead (node-pty's spawn-helper
+  # lookup rewrites app.asar to app.asar.unpacked), and reads the same
+  # unpacked files through it.
+  - "node_modules/node-pty/**"
+  # The pty host loads koffi from the same unpacked tree, and a native addon
+  # cannot be dlopen'd from inside an asar.
+  - "node_modules/koffi/**"
+  - "node_modules/@koromix/koffi-*/**"
   - "node_modules/sherpa-onnx-*/**"
   # font-list's macOS binary is spawned via child_process, which cannot exec a
   # path inside an asar archive.
@@ -79,9 +99,16 @@ asarUnpack:
   - "node_modules/@img/**"
   - "node_modules/detect-libc/**"
   - "node_modules/semver/**"
+  # The retrieval worker opens the project databases itself, so better-sqlite3
+  # and its prebuilt addon must resolve from the unpacked tree it runs in. It
+  # takes the sqlite-vec binary's path from main, so the sqlite-vec root
+  # package can stay inside the asar.
+  - "node_modules/better-sqlite3/**"
   - ".vite/build/embed-worker.js"
   - ".vite/build/line-count-worker.js"
   - ".vite/build/dictation-worker.js"
+  - ".vite/build/retrieval-worker.js"
+  - ".vite/build/pty-host.js"
   - ".vite/build/event-bridge.js"
   - ".vite/build/status-bridge.js"
   - ".vite/build/plugins/**"
@@ -92,7 +119,8 @@ extraResources:
   - from: node_modules/@kangentic/branding/resources/desktop/icon.ico
     to: icon.ico
 
-# We rebuild better-sqlite3 manually; node-pty uses NAPI prebuilts
+# Every native module ships Node-API prebuilds (better-sqlite3, node-pty, koffi,
+# sherpa-onnx-node, onnxruntime-node, sharp), so nothing is compiled at pack time.
 npmRebuild: false
 afterPack: build/afterPack.js
 afterSign: build/afterSign.js
@@ -107,6 +135,10 @@ nsis:
   oneClick: true
   perMachine: false
   artifactName: "${productName}-Setup-${version}.${ext}"
+  # Grants ALL APPLICATION PACKAGES read access to the per-user install folder on
+  # every install and update; Electron 44.5+ aborts startup without it on machines
+  # whose folder ACL carries an AppContainer entry. See the file for why.
+  include: build/installer.nsh
 
 
 mac:
@@ -133,7 +165,8 @@ mac:
   hardenedRuntime: true
   gatekeeperAssess: false
   strictVerify: false
-  minimumSystemVersion: "10.15"
+  # Electron 44 dropped macOS 12, so 13.0 is the oldest system it starts on.
+  minimumSystemVersion: "13.0"
   entitlements: build/entitlements.plist
   entitlementsInherit: build/entitlements.plist
   extendInfo:

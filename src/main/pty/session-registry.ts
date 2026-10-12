@@ -1,7 +1,8 @@
-import type * as pty from 'node-pty';
 import { v4 as uuidv4 } from 'uuid';
+import type { PtyDisposable, PtyHandle } from './host/pty-host-client';
 import type {
   AgentParser,
+  PermissionMode,
   Session,
   SessionAttachment,
   SessionRecord,
@@ -25,7 +26,8 @@ export interface ManagedSession {
   id: string;
   taskId: string;
   projectId: string;
-  pty: pty.IPty | null;
+  /** The session's PTY, which lives in the pty host (see `host/`). */
+  pty: PtyHandle | null;
   status: SessionStatus;
   shell: string;
   cwd: string;
@@ -34,14 +36,15 @@ export interface ManagedSession {
   resuming: boolean;
   transient: boolean;
   /**
-   * For a transient (Command Terminal) session, the renderer's durable window
-   * SLOT id (`slot-1`, `slot-2`, ...). Undefined for task agents.
+   * For a transient (Command Terminal) session, its durable SLOT id (`slot-1`,
+   * `slot-2`, ...) within its project. Undefined for task agents.
    *
-   * Main has no way to derive this: slots are allocated by the Command Terminal
-   * window layer, so the renderer sends it at spawn. It exists here purely so the
-   * Agent Monitor can NAME a terminal the same way its own window title bar does.
-   * Deriving a monitor-side ordinal instead (say, by startedAt) produces a number
-   * that disagrees with the window as soon as a terminal is closed and its slot
+   * Main allocates it (`startCommandTerminal`, transient-sessions.ts), honoring a
+   * slot the desktop's window layer asks for when it is free, because a phone can
+   * start a terminal with that layer closed and the two must never share a slot.
+   * The Agent Monitor, the window title bar and the phone all NAME a terminal by
+   * it. Deriving an ordinal instead (say, by startedAt) produces a number that
+   * disagrees with the window as soon as a terminal is closed and its slot
    * reused. See src/shared/command-terminal-name.ts.
    */
   commandTerminalSlot?: string | null;
@@ -62,13 +65,33 @@ export interface ManagedSession {
    * For a transient session, the name auto-derived from its first prompt.
    * Undefined for task agents and until one is derived.
    *
-   * Main does not compute this and does not use it: the renderer derives it (via
-   * the adapter's `summarize`) and pushes it here so it OUTLIVES the renderer.
-   * The pairing map that holds it is renderer-only memory, so without this a
-   * reload loses every terminal's name, and the auto-namer then re-derives from
-   * whatever prompt comes next. Same reason the slot and branch live here.
+   * Derived here in main (`CommandTerminalNamer`, through the session's own
+   * agent's `summarize`), so a terminal a phone started, or one in a project
+   * the desktop does not have open, is named too. First write wins. The window
+   * title, the Agent Monitor row, a phone's snapshot, and the push notification
+   * all read it from here.
    */
   commandTerminalLabel?: string | null;
+  /**
+   * For a transient session, epoch ms of the agent's own SessionEnd hook (a
+   * `/exit`), cleared by a later SessionStart (a `/clear` ends and starts in
+   * one go). While it is set the agent-absence sweep may judge the session
+   * inside its spawn grace and is asked to look soon, so a terminal whose agent
+   * exited ends within seconds instead of a minute or more. Where the sweep can
+   * read the process tree it stays the judge: a set stamp never ends a terminal
+   * whose agent still runs. Where it cannot (a WSL shell, or the watcher off),
+   * a stamp that outlives the end settle with no SessionStart ends the
+   * terminal on its own (`COMMAND_TERMINAL_AGENT_END_SETTLE_MS`).
+   */
+  agentEndSignaledAt?: number | null;
+  /**
+   * For a transient session, epoch ms of the agent's first SessionStart hook.
+   * Set once and never cleared (a `/clear` starts again on a running agent).
+   * With `altScreenEnteredAt`, it is the evidence that the agent started which
+   * the agent-absence sweep waits for before it judges a Command Terminal, so
+   * a shell slow to reach the agent command is not ended as agentless.
+   */
+  agentStartObservedAt?: number | null;
   /** Swimlane this session is isolated to (null = main session). Drives the Main/Isolated badge. */
   isolatedSwimlaneId?: string | null;
   /** Agent-reported session ID (the value passed to `--resume`). Known at
@@ -86,6 +109,10 @@ export interface ManagedSession {
    *  "gemini"). Used for diagnostic logs - survives minification unlike
    *  `agentParser.constructor.name`. */
   agentName?: string;
+  /** The resolved permission mode the session spawned under (see
+   *  `SpawnSessionInput.permissionMode`). Null for a Command Terminal and any
+   *  spawn that does not pass one. */
+  permissionMode?: PermissionMode | null;
   /** Per-session telemetry parser for adapters that emit machine-readable
    *  output over the PTY (e.g. Cursor's stream-json). Built on first PTY
    *  data via `agentParser.runtime.streamOutput.createParser()`. */
@@ -96,15 +123,13 @@ export interface ManagedSession {
    *  orchestration through this; SessionManager never inspects the
    *  attachment. */
   adapterAttachment?: SessionAttachment;
-  /** Disposables for the PTY's onData / onExit listeners. Disposed by
-   *  killAllSessions (the synchronous shutdown path) so node-pty stops
-   *  invoking our callbacks on a later tick - a final ConPTY chunk would
-   *  otherwise fire onData into an already-deleted session dir, and any late
-   *  callback keeps the libuv loop referenced past a clean quit. Only set on
-   *  the normal-spawn path; left undefined for placeholder/queued sessions. */
-  ptyDisposables?: pty.IDisposable[];
+  /** Disposables for the PTY's exit listener. Disposed by killAllSessions
+   *  (the synchronous shutdown path) so a late exit cannot run the exit
+   *  handling against an already-deleted session dir. Only set on the
+   *  normal-spawn path; left undefined for placeholder/queued sessions. */
+  ptyDisposables?: PtyDisposable[];
   /** Set by kill(sessionId, true) before a deliberate force-kill that does NOT
-   *  go through suspend() (move-to-To-Do reset, task delete, move-to-Backlog).
+   *  go through suspend() (move-to-To-Do reset, task delete, backlog demote).
    *  Read by the PTY onExit handler to tag the 'exit' event intentional so the
    *  renderer suppresses the false "Session crashed" notification. Orthogonal to
    *  status: a hard reset stays 'exited', not 'suspended'. */
@@ -156,6 +181,16 @@ export interface ManagedSession {
    * set; dies with the registry entry.
    */
   altScreenEnteredAt?: number;
+  /**
+   * The grid this session's PTY last had: its spawn grid, then every resize
+   * actually applied to it except a phone's (a mobile-origin hold is the size
+   * guard's to give back, and an exit disarms the guard without restoring).
+   * Kept after `pty` is nulled (a suspend or kill)
+   * because a respawn spawns its successor under a NEW id, and the spawn flow
+   * starts that successor at this grid (SpawnFlowContext.inheritedGrid)
+   * instead of the 120x30 default. Dies with the registry entry.
+   */
+  lastPtyGrid?: { cols: number; rows: number };
 }
 
 /**
@@ -181,6 +216,9 @@ export interface ManagedSessionSummary {
   /** Branch a Command Terminal is running on, for the monitor card's eyebrow.
    *  Null for task agents. */
   commandTerminalBranch: string | null;
+  /** A Command Terminal's derived name, so the monitor row shows what the
+   *  window title shows. Null for task agents and until one is derived. */
+  commandTerminalLabel: string | null;
 }
 
 /**
@@ -430,6 +468,10 @@ export class SessionRegistry {
     return this.sessions.get(sessionId)?.agentName;
   }
 
+  getSessionPermissionMode(sessionId: string): PermissionMode | null {
+    return this.sessions.get(sessionId)?.permissionMode ?? null;
+  }
+
   getSession(sessionId: string): Session | undefined {
     const session = this.sessions.get(sessionId);
     return session ? toSession(session) : undefined;
@@ -465,6 +507,7 @@ export class SessionRegistry {
       transient: session.transient,
       commandTerminalSlot: session.commandTerminalSlot ?? null,
       commandTerminalBranch: session.commandTerminalBranch ?? null,
+      commandTerminalLabel: session.commandTerminalLabel ?? null,
     }));
   }
 
@@ -541,6 +584,8 @@ export class SessionRegistry {
       resuming: false,
       transient: false,
       exitSequence: ['\x03'],
+      // A placeholder spawned nothing, so it runs under no mode.
+      permissionMode: null,
     };
     this.sessions.set(id, session);
     return toSession(session);

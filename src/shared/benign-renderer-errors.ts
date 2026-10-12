@@ -1,11 +1,17 @@
 /**
  * Renderer errors that are known-benign and outside the app's control. The
  * single source of truth for THREE consumers: the runtime suppressor (the
- * monaco error-funnel wrapper in src/renderer/monacoConfig.ts, which reassigns
+ * monaco error funnel in src/renderer/monaco-error-funnel.ts, which
+ * src/renderer/monacoConfig.ts installs on
  * errorHandler.unexpectedErrorHandler), the test collector (collectPageErrors
  * in tests/ui/helpers.ts), and Sentry's `ignoreErrors`
  * (src/main/analytics/error-reporting.ts), which spreads this array so a
  * pattern added here cannot reach the issue stream either.
+ *
+ * NOT for an error that is real but must not be rethrown. Sentry DESKTOP-19
+ * ("Illegal value for lineNumber") goes through the same funnel, which reports
+ * it as handled (src/renderer/monaco-error-funnel.ts). Listing a pattern here
+ * would also drop it in Sentry's `ignoreErrors`, so it would never be reported.
  *
  * PATTERNS MUST STAY UNANCHORED. Monaco's default unexpectedErrorHandler
  * re-throws as `e.message + '\n\n' + e.stack` (monaco-editor
@@ -17,7 +23,8 @@
  *   disposes a DiffEditor's two TextModels before the widget, so monaco throws a
  *   self-healing BugIndicatingError and resets its own model. Non-fatal and does
  *   not leak (both models are disposed regardless of order); no stable
- *   @monaco-editor/react (4.7.0) / monaco-editor (0.56.0) release fixes the order.
+ *   @monaco-editor/react (4.7.0) release fixes the order (checked with
+ *   monaco-editor 0.56.0; the disposal UI test still passes on 0.57.0).
  *   Upstream: https://github.com/suren-atoyan/monaco-react/issues/647
  * - A Monarch grammar executing `@pop` on an empty state stack. Monaco tokenizes
  *   the VIEWPORT first, and for a diff revealed at its first hunk

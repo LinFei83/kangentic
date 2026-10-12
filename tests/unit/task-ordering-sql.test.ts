@@ -16,13 +16,12 @@
  *      untouched), and the arithmetic is only convincing when a real engine
  *      applies `move()`'s neighbour shifts on top of it.
  *
- * node:sqlite rather than better-sqlite3 on purpose, and the adapter mirrors
- * worktree-folder-migration.test.ts: better-sqlite3 is compiled for Electron's
- * Node ABI, so every suite gated on it SKIPS everywhere, CI included. A skipped
- * test is not coverage.
+ * Real better-sqlite3, the driver production uses, so the engine behavior these
+ * tests lean on (a plain index tolerating duplicate positions, `move()`'s
+ * neighbour shifts) is the shipped one.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { runProjectMigrations } from '../../src/main/db/migrations/project-schema';
 import { TaskRepository } from '../../src/main/db/repositories/task-repository';
 import { SwimlaneRepository } from '../../src/main/db/repositories/swimlane-repository';
@@ -30,37 +29,13 @@ import { handleMoveTask, handleReorderTasks } from '../../src/main/agent/command
 import type { CommandContext } from '../../src/main/agent/commands/types';
 import type DatabaseType from 'better-sqlite3';
 
-type SqliteModule = typeof import('node:sqlite');
-let sqlite: SqliteModule | null = null;
-try {
-  sqlite = await import('node:sqlite');
-} catch {
-  sqlite = null;
-}
+import { openTestDatabase } from './helpers/test-database';
 
-const describeWithSqlite = sqlite ? describe : describe.skip;
+const openDatabases: DatabaseType.Database[] = [];
 
-/** See worktree-folder-migration.test.ts - same adapter, same non-nesting caveat. */
-function adaptDatabase(database: InstanceType<SqliteModule['DatabaseSync']>): DatabaseType.Database {
-  const adapter = {
-    exec: (sql: string) => database.exec(sql),
-    prepare: (sql: string) => database.prepare(sql),
-    pragma: (statement: string) => database.prepare(`PRAGMA ${statement}`).all(),
-    transaction: <Args extends unknown[], Result>(body: (...args: Args) => Result) =>
-      (...args: Args): Result => {
-        database.exec('BEGIN');
-        try {
-          const result = body(...args);
-          database.exec('COMMIT');
-          return result;
-        } catch (error) {
-          database.exec('ROLLBACK');
-          throw error;
-        }
-      },
-  };
-  return adapter as unknown as DatabaseType.Database;
-}
+afterEach(() => {
+  for (const database of openDatabases.splice(0)) database.close();
+});
 
 interface Board {
   db: DatabaseType.Database;
@@ -73,7 +48,8 @@ interface Board {
 }
 
 function makeBoard(): Board {
-  const db = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
+  const db = openTestDatabase();
+  openDatabases.push(db);
   runProjectMigrations(db);
   const tasks = new TaskRepository(db);
 
@@ -139,7 +115,7 @@ function seedGappedLane(board: Board): string[] {
   return created.map((task) => task.id);
 }
 
-describeWithSqlite('TaskRepository.reorderWithinSwimlane', () => {
+describe('TaskRepository.reorderWithinSwimlane', () => {
   it('applies the requested order and renumbers densely', () => {
     const board = makeBoard();
     const created = seed(board, board.todoLaneId, ['a', 'b', 'c', 'd']);
@@ -206,7 +182,7 @@ describeWithSqlite('TaskRepository.reorderWithinSwimlane', () => {
   });
 });
 
-describeWithSqlite('nextPositionInSwimlane', () => {
+describe('nextPositionInSwimlane', () => {
   it('counts archived rows, so an append cannot reuse an archived position', () => {
     const board = makeBoard();
     const created = seed(board, board.todoLaneId, ['a', 'b', 'c']);
@@ -224,7 +200,7 @@ describeWithSqlite('nextPositionInSwimlane', () => {
   });
 });
 
-describeWithSqlite('handleMoveTask placement on a gapped column', () => {
+describe('handleMoveTask placement on a gapped column', () => {
   it('lands a cross-column move at the requested ordinal, not the raw value', () => {
     // Live raw positions are [0, 5, 9]. Passing the ordinal 2 straight through
     // as a raw position would sweep the task in ahead of raw 5 and land it at
@@ -298,7 +274,7 @@ describeWithSqlite('handleMoveTask placement on a gapped column', () => {
   });
 });
 
-describeWithSqlite('handleReorderTasks against a real engine', () => {
+describe('handleReorderTasks against a real engine', () => {
   it('sets the full order of a column in one call', () => {
     const board = makeBoard();
     const created = seed(board, board.todoLaneId, ['a', 'b', 'c', 'd']);

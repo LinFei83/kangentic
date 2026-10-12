@@ -4,15 +4,22 @@ import os from 'node:os';
 import fs from 'node:fs';
 import type Database from 'better-sqlite3';
 import { runSearchEverything } from '../../src/main/search/search-core';
+import { searchConversationMemory } from '../../src/main/retrieval/memory-search';
+import type { ConversationSearchRequest } from '../../src/main/retrieval/retrieval-queries';
 import type { Project } from '../../src/shared/types';
+
+/** The conversation search the worker runs, in process over the test database,
+ *  in place of the app's `searchConversations` (which calls the worker). */
+function inProcessSearch(db: Database.Database) {
+  return (request: ConversationSearchRequest) => searchConversationMemory({ ...request, getDb: () => db });
+}
 
 /**
  * Tests for the unified search core (`runSearchEverything`).
  *
- * better-sqlite3 is compiled for Electron's Node ABI and cannot load
- * under vitest's system Node, so the DB is mocked via a hand-rolled
- * `prepare(sql).all()` shim that recognises the exact SQL strings the
- * search core emits. The events.jsonl scan path uses real fs+readline
+ * The DB is mocked via a hand-rolled `prepare(sql).all()` shim that
+ * recognises the exact SQL strings the search core emits, so no database is
+ * involved. The events.jsonl scan path uses real fs+readline
  * so the test writes a real temp file at the layout the core expects:
  * `<projectPath>/.kangentic/sessions/<sessionId>/events.jsonl`.
  */
@@ -454,7 +461,7 @@ describe('runSearchEverything', () => {
       projects: [project],
       includeProjectHits: false,
       getDb: () => db,
-      conversationSearch: { enabled: true },
+      conversationSearch: { enabled: true, search: inProcessSearch(db) },
     });
 
     const conversationHits = hits.filter((hit) => hit.kind === 'conversation');
@@ -493,7 +500,7 @@ describe('runSearchEverything', () => {
       projects: [project],
       includeProjectHits: false,
       getDb: () => db,
-      conversationSearch: { enabled: true },
+      conversationSearch: { enabled: true, search: inProcessSearch(db) },
     });
 
     const conversationHits = hits.filter((hit) => hit.kind === 'conversation');

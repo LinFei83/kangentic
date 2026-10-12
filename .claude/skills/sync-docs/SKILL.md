@@ -13,15 +13,15 @@ Each doc file and the source files that are its authority:
 
 | Doc | Primary Source Files |
 |-----|---------------------|
-| `architecture.md` | `src/shared/ipc-channels.ts`, `src/preload/preload.ts`, `src/renderer/stores/`, `src/main/pty/session-manager.ts`, `src/main/transition-engine/transition-engine.ts`, `src/main/boards/board-registry.ts` |
+| `architecture.md` | `src/shared/ipc-channels.ts`, `src/preload/preload.ts`, `src/renderer/stores/`, `src/main/pty/session-manager.ts`, `src/main/transition-engine/transition-engine.ts`, `src/main/boards/board-registry.ts`, `src/main/retrieval/retrieval-service.ts` and `src/main/retrieval/graph-facade.ts` (the `knowledgeGraph:*` rows) |
 | `session-lifecycle.md` | `src/main/pty/session-manager.ts`, `src/main/pty/session-queue.ts`, `src/main/transition-engine/session-lifecycle.ts`, `src/main/transition-engine/resource-cleanup.ts` |
-| `configuration.md` | `src/shared/types.ts` (AppConfig, DEFAULT_CONFIG, BoardConfig, BoardColumnConfig), `src/main/config/config-manager.ts` (`pickOverridableSubset` - the project/global split) |
+| `configuration.md` | `src/shared/types.ts` (AppConfig, DEFAULT_CONFIG, BoardConfig, BoardColumnConfig), `src/main/config/config-manager.ts` (`pickOverridableSubset` - the project/global split), `src/main/retrieval/summary/**` and `src/main/retrieval/retrieval-service.ts` (the Knowledge Graph section: when summary passes run, their backoff, Rebuild) |
 | `agent-integration.md` | `src/main/agent/agent-adapter.ts`, `src/main/agent/agent-registry.ts`, `src/main/agent/adapters/**` (per-adapter command builders, hook managers, trust managers, capability-discovery, detectors), `src/main/transition-engine/agent-resolver.ts` |
 | `handoff.md` | `src/main/agent/handoff/**`, `src/main/db/repositories/handoff-repository.ts`, `src/main/ipc/helpers/agent-spawn.ts` (handoff path) |
-| `transition-engine.md` | `src/main/transition-engine/transition-engine.ts`, `src/main/automations/**` (the adapter registry, the runner, per-field escaping), `src/shared/automation-manifest.ts`, `src/shared/types.ts` (AutomationType, AutomationTrigger, AutomationRunStatus, AutomationConfig) |
+| `transition-engine.md` | `src/main/transition-engine/transition-engine.ts`, `src/main/automations/**` (the adapter registry, the runner, per-field escaping), `src/shared/template-escape.ts` (stripShellMetacharacters), `src/shared/automation-manifest.ts`, `src/shared/types.ts` (AutomationType, AutomationTrigger, AutomationRunStatus, AutomationConfig) |
 | `command-injection.md` | `src/main/transition-engine/injection-plan.ts`, `src/main/transition-engine/terminal-submit-scheduler.ts`, `src/main/pty/terminal-submit.ts`, `src/main/agent/adapters/claude/slash-command-verifier.ts` |
 | `database.md` | `src/main/db/migrations/**`, `src/main/db/database.ts`, `src/main/db/repositories/*.ts` |
-| `cross-platform.md` | `src/main/pty/spawn/shell-resolver.ts`, `src/shared/paths.ts` (adaptCommandForShell, convertWindowsExePath, quoteArg, isPowerShellShell; called from `src/main/pty/lifecycle/session-spawn-flow.ts`), `src/shared/shell-quote.ts` (escapeForDoubleQuotedShell and the shell predicates, shared with the renderer), `src/main/agent/shared/shim-launch.ts`, `electron-builder.yml`, `scripts/build.js` |
+| `cross-platform.md` | `src/main/pty/spawn/shell-resolver.ts`, `src/shared/paths.ts` (adaptCommandForShell, convertWindowsExePath, quoteArg, isPowerShellShell; called from `src/main/pty/lifecycle/session-spawn-flow.ts`), `src/shared/shell-quote.ts` (escapeForDoubleQuotedShell, escapePercentForCmd, quoteCmdExecutable, escapeForPowerShellSingleQuoted, and the shell predicates, shared with the renderer), `src/main/pty/spawn/pty-spawn.ts` (resolveSpawnCwd fixups), `src/main/agent/shared/cli-print.ts` (quoteForCmdShell), `src/main/agent/shared/exec-version.ts` (quoteCmdExecutable head), `src/main/agent/shared/shim-launch.ts`, `electron-builder.yml`, `scripts/build.js` |
 | `worktree-strategy.md` | `src/main/git/worktree-manager.ts`, `src/main/agent/adapters/claude/hook-manager.ts`, `src/main/agent/adapters/claude/trust-manager.ts` |
 | `activity-detection.md` | `src/main/agent/event-bridge.js`, `src/shared/types.ts` (EventType, EventTypeActivity, HookEvent), `src/main/activity-engine/engine/shapes.ts` (TransitionTrigger, default thresholds), `src/main/activity-engine/engine/watchdog.ts` (hold table) |
 | `mcp-server.md` | `src/main/agent/mcp-http-server.ts`, `src/main/agent/mcp-http/**`, `src/main/agent/commands/`, `src/main/ipc/handlers/sessions.ts`, `src/shared/types.ts` (MCP types) |
@@ -36,7 +36,7 @@ Each doc file and the source files that are its authority:
 | `installation.md` | `packages/launcher/**`, `electron-builder.yml`, `README.md` |
 | `release-checklist.md` | `.claude/skills/release/SKILL.md`, `.github/workflows/release.yml`, `scripts/verify-release-assets.js` |
 | `overview.md` | `README.md`, high-level features |
-| `user-guide.md` | `src/renderer/components/`, `src/renderer/stores/`, `src/shared/types.ts` |
+| `user-guide.md` | `src/renderer/components/`, `src/renderer/stores/`, `src/shared/types.ts`, `src/shared/index-summary.ts` (what the Index card and the map's Index panel count, and the line each source reads) |
 | `developer-guide.md` | `scripts/`, `tests/`, `electron-builder.yml`, `package.json` |
 | `docs/README.md` | All other docs (index) |
 
@@ -109,6 +109,9 @@ Anchors are enumerable source-code structures that must be exhaustively listed i
 | `AppConfig` / `DEFAULT_CONFIG` | Flattened dot-paths + defaults | configuration.md |
 | `BoardConfig` | Interface fields | configuration.md |
 | `BoardColumnConfig` | Interface fields | configuration.md |
+| `KnowledgeGraphStatus` | Interface fields | architecture.md (`knowledgeGraph:status` row) |
+| `KnowledgeGraphSummaryCounts` / `KnowledgeGraphSummaryStatus` | Interface fields | architecture.md (`knowledgeGraph:status` and `knowledgeGraph:graphSnapshot` rows), user-guide.md (the Task summaries line's states) |
+| `KnowledgeGraphIndexCounts` / `KnowledgeGraphIndexSummary` | Interface fields | architecture.md (`knowledgeGraph:graphSnapshot` row's `index`), configuration.md (what the Index card and the map's Index panel sum) |
 
 ### IPC Anchors (src/shared/ipc-channels.ts)
 
@@ -231,7 +234,7 @@ Each entry has a one-line rationale so future edits know what the entry was prot
   WHY: each automation type declares itself once here (label, icon, `status`, `needs`, fields with their per-field `escape`, `timeoutMs`, `retry`), and transition-engine.md tabulates all of it. Also holds `RETIRED_ACTION_TYPES`, `EXIT_GROUP_BUDGET_MS` and `DEFAULT_SCRIPT_TIMEOUT_MINUTES`, each of which is quoted as a number in the docs. Registry-to-manifest parity is mechanical (`tests/unit/automation-adapter-parity.test.ts`); the docs side is not, so an added type or a changed budget needs a hand pass. See .claude/rules/automation-adapters.md.
 
 - `src/main/agent/agent-adapter.ts`
-  WHY: AgentAdapter interface methods (discoverCapabilities, getInjectionSequence, getCommandInjectionVerifier, summarize, locateSessionHistoryFile, getExitSequence, detectFirstOutput) are tabulated in agent-integration.md. Catches drift that types.ts re-exports miss.
+  WHY: AgentAdapter interface methods (discoverCapabilities, getInjectionSequence, getSubmissionVerifier, summarize, answerFromContext, openAnswerSession, locateSessionHistoryFile, getExitSequence, detectFirstOutput) are tabulated in agent-integration.md. Catches drift that types.ts re-exports miss.
 
 - `src/main/agent/agent-registry.ts`
   WHY: canonical list of registered adapters; adding/removing an adapter is a docs-affecting event for agent-integration.md "Supported agents" table.
@@ -281,6 +284,12 @@ Each entry has a one-line rationale so future edits know what the entry was prot
 - `src/renderer/components/settings/settings-registry.ts`
   WHY: settings registry entries and their defaults are enumerated in configuration.md.
 
+- `src/main/retrieval/retrieval-service.ts`
+  WHY: when task summary passes are asked for (project open, board change, the once-a-launch ask of every project, a settings change that resolves a writer, Rebuild), what the Settings Index card counts (every indexed project), and Rebuild's reach are described in configuration.md's Knowledge Graph section, user-guide.md's Index card paragraphs, and architecture.md's `knowledgeGraph:status` and `knowledgeGraph:rebuildIndex` rows. None of those are enumerable, so this is a prose check: the open-project wording survived a change to all projects once before.
+
+- `src/shared/index-summary.ts`
+  WHY: one fold and one set of line rules for both Index views, the Settings card and the map's Index panel (`sumIndexCounts` and the panel's `sumIndex`, `summaryStatusOf`, `sourceStatusOf`, and `isIndexedProject`, the set "All projects" means). user-guide.md and configuration.md say what each view counts and that the two read the same; a change here changes both.
+
 - `electron-builder.yml`
   WHY: native deps allowlist, asarUnpack, signing, and packaging targets are described in cross-platform.md and developer-guide.md.
 
@@ -299,7 +308,7 @@ Each entry has a one-line rationale so future edits know what the entry was prot
   WHY: handoff orchestration (session-history-reference.ts, transcript-cleanup.ts) backs handoff.md sections. Small directory; safe to glob.
 
 - `src/main/agent/shared/**`
-  WHY: shared agent helpers (auto-name.ts, prompt-xml.ts, agent-detector.ts, bridge-utils.ts, hook-utils.ts, exec-version.ts) back multiple feature docs (configuration.md, agent-integration.md, cross-platform.md). Small directory; safe to glob.
+  WHY: shared agent helpers (cli-print.ts, cli-answer.ts, auto-name.ts, prompt-xml.ts, agent-detector.ts, bridge-utils.ts, hook-utils.ts, exec-version.ts) back multiple feature docs (configuration.md, agent-integration.md, cross-platform.md). Small directory; safe to glob.
 
 - `src/main/agent/mcp-http/**`
   WHY: MCP tool registrations (task-tools.ts, session-tools.ts, search-tools.ts, project-tools.ts, diagnostics-tools.ts, browser-tools.ts) are enumerated in mcp-server.md. Adding a new tool is a docs-affecting event. The settings panel renders the same tools from `src/shared/mcp-tool-manifest.ts` (`MCP_TOOL_MANIFEST`); `tests/unit/mcp-tool-list-parity.test.ts` asserts every registered tool is in both the manifest and mcp-server.md (see `.claude/rules/mcp-tool-list-parity.md`).
@@ -308,7 +317,10 @@ Each entry has a one-line rationale so future edits know what the entry was prot
   WHY: MCP command implementations (column-resolver.ts, handoff-commands.ts, task-commands.ts, backlog-commands.ts, search-commands.ts, etc.) are cited in mcp-server.md component table and architecture.md board-integration section. Adding or renaming a command file is a docs-affecting event. Small directory (13 files); safe to glob.
 
 - `src/main/ipc/handlers/**`
-  WHY: handler files register IPC channels, emit event payloads, and define handler-level behavior. A new handler that registers a channel without changing ipc-channels.ts (e.g., event-only ipcMain.on) would slip through the channel-constants anchor. Currently 17 files; glob avoids list-rot.
+  WHY: handler files register IPC channels, emit event payloads, and define handler-level behavior. A new handler that registers a channel without changing ipc-channels.ts (e.g., event-only ipcMain.on) would slip through the channel-constants anchor. The glob avoids list-rot as handlers are added.
+
+- `src/main/retrieval/summary/**`
+  WHY: the summary scheduler and pass (one pass at a time, three calls of ten, the gap, the app-wide backoff after a failed agent call, the per-project one after a failed read, the one-task-per-call retry of a reply with no usable label, the reply-gap log line) are described in configuration.md's `knowledgeGraph.taskSummaries` row and user-guide.md's Task summaries paragraph, with their numbers. Small directory; safe to glob.
 
 - `src/main/analytics/**`
   WHY: analytics.md tabulates every event name, every property, and the closed vocabularies behind them (usage.ts's ANALYTICS_FEATURES and ONBOARDING_MILESTONES, settings-snapshot.ts's SETTINGS_SNAPSHOT_ALLOWLIST, run-uptime.ts's exit kinds and uptime buckets). An added event or a renamed property is a docs-affecting event with no other mechanical check. The allowlist in particular is a privacy control the doc enumerates for users, so drift there is worse than stale: user-guide.md and configuration.md's Privacy paragraphs describe the same collection.

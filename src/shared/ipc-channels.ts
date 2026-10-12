@@ -24,9 +24,11 @@ export const IPC = {
   // Dev-only (preview): build-excluded from production via __KANGENTIC_DEV__.
   DEV_CREATE_EPHEMERAL_PROJECT: 'dev:createEphemeralProject',
   DEV_SEED_GIT_CHANGES: 'dev:seedGitChanges',
-  DEV_SEED_EMBEDDING_BACKLOG: 'dev:seedEmbeddingBacklog',
   DEV_SEED_LARGE_CONVERSATION: 'dev:seedLargeConversation',
   DEV_SEED_USAGE_DATA: 'dev:seedUsageData',
+  DEV_SEED_KNOWLEDGE_GRAPH: 'dev:seedKnowledgeGraph',
+  DEV_SEED_KNOWLEDGE_GRAPH_REAL: 'dev:seedKnowledgeGraphReal',
+  DEV_SEED_KNOWLEDGE_GRAPH_DEMO: 'dev:seedKnowledgeGraphDemo',
 
   // Project Groups
   PROJECT_GROUP_LIST: 'projectGroup:list',
@@ -138,9 +140,9 @@ export const IPC = {
   SESSION_GET_SUMMARY: 'session:getSummary',
   SESSION_LIST_SUMMARIES: 'session:listSummaries',
   SESSION_GET_TOOL_BREAKDOWN: 'session:getToolBreakdown',
+  SESSION_GET_TOOL_RESULT_TOKENS: 'session:getToolResultTokens',
   SESSION_SPAWN_TRANSIENT: 'session:spawnTransient',
   SESSION_KILL_TRANSIENT: 'session:killTransient',
-  SESSION_SET_TRANSIENT_LABEL: 'session:setTransientLabel',
   SESSION_SET_TRANSIENT_BRANCH: 'session:setTransientBranch',
   SESSION_SET_FOCUSED: 'session:setFocused',
   SESSION_SET_MOUNTED: 'session:setMounted',
@@ -207,6 +209,7 @@ export const IPC = {
   GIT_LIST_BRANCHES: 'git:listBranches',
   GIT_DIFF_FILES: 'git:diffFiles',
   GIT_FILE_CONTENT: 'git:fileContent',
+  GIT_FILE_IMAGE: 'git:fileImage',
   GIT_DIFF_SUBSCRIBE: 'git:diffSubscribe',
   GIT_DIFF_UNSUBSCRIBE: 'git:diffUnsubscribe',
   GIT_DIFF_CHANGED: 'git:diffChanged',
@@ -253,6 +256,8 @@ export const IPC = {
   BOARD_CONFIG_EXPORT: 'boardConfig:export',
   BOARD_CONFIG_APPLY: 'boardConfig:apply',
   BOARD_CONFIG_CHANGED: 'boardConfig:changed',
+  BOARD_CONFIG_WARNINGS: 'boardConfig:warnings',
+  BOARD_CONFIG_GET_LAST_WARNINGS: 'boardConfig:getLastWarnings',
   BOARD_CONFIG_GET_BOARD_PROFILES: 'boardConfig:getBoardProfiles',
   BOARD_CONFIG_SET_BOARD_PROFILES: 'boardConfig:setBoardProfiles',
   BOARD_CONFIG_BOARD_PROFILES_CHANGED: 'boardConfig:boardProfilesChanged',
@@ -514,6 +519,15 @@ export const IPC = {
   // Every OTHER updater failure stays silent by design - see the error handler.
   UPDATE_BLOCKED: 'updater:blocked',
 
+  // Leftover processes (src/main/pty/process-tag/; the toast and list in the
+  // renderer's leftover-processes store). REPORT is a push: what a terminal
+  // transition stopped, could not stop, and left running, one report per burst
+  // (a bulk delete is one). Main window only, like CONFIG_WRITE_FAILED: the
+  // toast host lives in AppLayout. STOP is an invoke naming one reported
+  // process by its report id; main never stops a pid it did not report.
+  LEFTOVER_PROCESSES_REPORT: 'leftoverProcesses:report',
+  LEFTOVER_PROCESSES_STOP: 'leftoverProcesses:stop',
+
   // Host memory pressure (Sentry DESKTOP-16; see src/main/diagnostics/host-memory.ts)
   HOST_MEMORY_PRESSURE: 'hostMemory:pressure',
   HOST_MEMORY_RECOVERED: 'hostMemory:recovered',
@@ -548,14 +562,51 @@ export const IPC = {
   TRANSCRIPT_GET: 'transcript:get',
   TRANSCRIPT_LIST_SESSIONS: 'transcript:listSessions',
 
-  // Conversation-memory semantic-layer status (Smart-mode palette UI).
-  MEMORY_STATUS: 'memory:status',
-  // Spawn + init the embedding worker ahead of the first Smart query (Quick
-  // Find open); fire-and-forget, embeds nothing.
-  MEMORY_PREWARM: 'memory:prewarm',
-  // Purge the current project's conversation index and re-run the backfill sweep
-  // (recovery from a corrupt/stale index; Memory settings "Rebuild index").
-  MEMORY_REBUILD_INDEX: 'memory:rebuildIndex',
+  // Conversation-memory semantic-layer status (the Knowledge Graph settings tab).
+  KNOWLEDGE_GRAPH_STATUS: 'knowledgeGraph:status',
+  // Spawn + init the embedding worker ahead of the first question (Knowledge
+  // Graph open); fire-and-forget, embeds nothing. With a chat, also starts the
+  // answering agent's warm session.
+  KNOWLEDGE_GRAPH_PREWARM: 'knowledgeGraph:prewarm',
+  /** Fire-and-forget: a chat's warm answering session is no longer needed. */
+  KNOWLEDGE_GRAPH_END_CHAT: 'knowledgeGraph:graphEndChat',
+  // The Index card's Rebuild: read every source again in every project,
+  // keeping what is indexed, and rewrite the task summaries written with
+  // another agent or model.
+  KNOWLEDGE_GRAPH_REBUILD_INDEX: 'knowledgeGraph:rebuildIndex',
+  // What that Rebuild would spend (summaries to rewrite), read before it asks.
+  KNOWLEDGE_GRAPH_REBUILD_PLAN: 'knowledgeGraph:rebuildPlan',
+  // One task's summary, for the Knowledge Graph's selected conversation. Null
+  // while summaries are switched off or the task has none.
+  KNOWLEDGE_GRAPH_TASK_SUMMARY: 'knowledgeGraph:taskSummary',
+  /** Cheap read of the cached Knowledge Graph projection plus its coverage and
+   *  index counts. Never runs the projection pass - see graph-service. */
+  KNOWLEDGE_GRAPH_SNAPSHOT: 'knowledgeGraph:graphSnapshot',
+  /** Every project with its indexed conversation count, for the Knowledge
+   *  Graph's Projects picker. An index-only count per project, so it stays in
+   *  single-digit milliseconds across a machine's projects. */
+  KNOWLEDGE_GRAPH_PROJECTS: 'knowledgeGraph:graphProjects',
+  /** Ask for a background refresh of one project's projection. Returns
+   *  immediately, with a first build's progress when one runs; completion
+   *  arrives via KNOWLEDGE_GRAPH_CHANGED. */
+  KNOWLEDGE_GRAPH_REFRESH: 'knowledgeGraph:graphRefresh',
+  /** Push: a projection pass finished for a project. Declared in that surface's
+   *  POP_OUT_SURFACES `channels` too, or a detached window never updates. */
+  KNOWLEDGE_GRAPH_CHANGED: 'knowledgeGraph:graphChanged',
+  /** Push: a first build's progress, `(projectId, KnowledgeGraphBuildProgress)`,
+   *  throttled. Carries the figure, so the bar moves without a snapshot read.
+   *  Declared in the surface's `channels` too, or a detached window's bar stalls. */
+  KNOWLEDGE_GRAPH_BUILD_PROGRESS: 'knowledgeGraph:graphBuildProgress',
+  KNOWLEDGE_GRAPH_ANSWER: 'knowledgeGraph:graphAnswer',
+  /** Push: progress on an answer in flight - text as the agent writes it, a
+   *  tool call as it starts, and a terminal `done`. Keyed by the renderer's
+   *  `requestId` so a late delta from an abandoned question is dropped.
+   *  Declared in the surface's POP_OUT_SURFACES `channels` too, or a detached
+   *  window never sees a word. */
+  KNOWLEDGE_GRAPH_ANSWER_STREAM: 'knowledgeGraph:graphAnswerStream',
+  /** Earlier conversations semantically near a task, for proactive recall in
+   *  task detail. The index finding you, rather than waiting to be searched. */
+  KNOWLEDGE_GRAPH_RELATED_TO_TASK: 'knowledgeGraph:relatedToTask',
 
   // Diagnostics (product, all builds): renderer console + window error
   // forwarding to main, where they are persisted to .kangentic/logs/.

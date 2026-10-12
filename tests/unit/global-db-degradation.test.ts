@@ -17,9 +17,9 @@
  *      module, that one mocks it.)
  *   3. Nothing told the user anything.
  *
- * Every module here is the real one. `better-sqlite3` is mocked instead, because
- * it is an Electron ABI build that cannot load under plain Node at all (see
- * dev-port-ledger-unavailable.test.ts for the CI failure that documents this).
+ * Every module here is the real one. `better-sqlite3` is mocked instead, so a
+ * test can make the driver throw a chosen SqliteError at a chosen step (a real
+ * database cannot be told to fail `journal_mode = WAL` on demand).
  * Driving the failure from the driver rather than from a mocked `getGlobalDb`
  * is what makes assertion 1 meaningful: a mocked database module would have no
  * cache to get this wrong.
@@ -67,7 +67,7 @@ const {
 
 vi.mock('better-sqlite3', () => ({
   // Returning an object from a constructor overrides `this`, so this stands in
-  // for `new Database(file)` without needing a real native binding.
+  // for `new Database(file)` without opening a real database file.
   default: function MockDatabase(file: string) {
     return openDatabase(file);
   },
@@ -239,9 +239,34 @@ describe('getGlobalDb caching', () => {
     getGlobalDb();
     getProjectDb('project-1');
 
+    // Exactly these. `synchronous` is left to better-sqlite3's build default
+    // (NORMAL in WAL, FULL if the WAL switch did not take); see the comment in
+    // getGlobalDb for why an explicit NORMAL is worse. A project connection
+    // also bounds its WAL file and takes the auto-checkpoint this process uses
+    // (SQLite's default until the retrieval worker takes checkpoints over).
     const expectedOrder = ['busy_timeout = 5000', 'journal_mode = WAL', 'foreign_keys = ON'];
     expect(globalHealthy.pragma.mock.calls.map(([sql]) => sql)).toEqual(expectedOrder);
-    expect(projectHealthy.pragma.mock.calls.map(([sql]) => sql)).toEqual(expectedOrder);
+    expect(projectHealthy.pragma.mock.calls.map(([sql]) => sql)).toEqual([
+      ...expectedOrder,
+      'journal_size_limit = 67108864',
+      'wal_autocheckpoint = 1000',
+    ]);
+  });
+
+  it('turns off the project connections\' auto-checkpoint while the retrieval worker checkpoints, and back on', async () => {
+    const first = healthyConnection();
+    const later = healthyConnection();
+    openDatabase.mockReturnValueOnce(first).mockReturnValueOnce(later);
+    const { getProjectDb, setWalAutoCheckpoint } = await freshModules();
+    getProjectDb('project-1');
+    setWalAutoCheckpoint(0);
+    expect(first.pragma).toHaveBeenLastCalledWith('wal_autocheckpoint = 0');
+    // A connection opened while the worker checkpoints starts with it off.
+    getProjectDb('project-2');
+    expect(later.pragma).toHaveBeenLastCalledWith('wal_autocheckpoint = 0');
+    setWalAutoCheckpoint(null);
+    expect(first.pragma).toHaveBeenLastCalledWith('wal_autocheckpoint = 1000');
+    expect(later.pragma).toHaveBeenLastCalledWith('wal_autocheckpoint = 1000');
   });
 
   it('does not let a close() that itself throws mask the original open failure', async () => {

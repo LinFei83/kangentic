@@ -1,9 +1,11 @@
-import { BrowserWindow, type WebContents } from 'electron';
+import { BrowserWindow, screen, type WebContents } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { browserPaneRegistry } from './browser-pane-registry';
 import { browserPartitionForTask } from '../../shared/browser-partition';
 import { syncJarFromIdentity } from './jar-seeder';
 import { applyBrowserUserAgent } from './browser-user-agent';
+import { installEmbeddedBrowserSessionPolicy } from './guest-session-policy';
+import { markBrowserGuestWebContents } from '../analytics/renderer-classification';
 
 /**
  * Browser LANES: the OFFSCREEN form of a task's one browser surface.
@@ -46,8 +48,8 @@ import { applyBrowserUserAgent } from './browser-user-agent';
  * visibility methods at all, so `show: false` never marks the WebContents
  * hidden and it keeps its own `ui::Compositor`.
  *
- * Measured on this build (Electron 41.1.1 / Chromium 146.0.7680.166) before
- * committing to it, because every one of these silently kills the design:
+ * Measured on Electron 41.1.1 (Chromium 146.0.7680.166), the build the design
+ * was committed on, because every one of these silently kills the design:
  *   - `isMinimized()` on a never-shown offscreen window is FALSE, so
  *     `withGuest`'s compositing precondition does not refuse every lane drive.
  *     (It resolves the lane window itself, since a lane guest has no
@@ -79,7 +81,8 @@ import { applyBrowserUserAgent } from './browser-user-agent';
  * CPU at 60fps for no one.
  *
  * 10 rather than a lower floor, and the difference is measured, not guessed.
- * Wheel-driven scroll takes this long to land on Electron 41.1.1:
+ * Wheel-driven scroll took this long to land on Electron 41.1.1 (not
+ * re-measured since):
  *
  *   unthrottled  100ms
  *   10fps        100ms   <- no penalty at all
@@ -338,7 +341,13 @@ export async function openLane(input: OpenLaneInput): Promise<OpenLaneResult> {
     width: DEFAULT_LANE_WIDTH,
     height: DEFAULT_LANE_HEIGHT,
     webPreferences: {
-      offscreen: true,
+      // Renders at the primary display's scale factor, as the visible pane
+      // does, so a page keeps its devicePixelRatio (its srcset picks and
+      // resolution media queries) when its surface moves between the two.
+      // Electron 42 changed the offscreen default to a fixed 1.0. Measured at
+      // a forced 2x display: Electron 41 rendered a lane at 2 (2560x1392
+      // screenshots), 44 at 1 (1280x696) until this was set.
+      offscreen: { deviceScaleFactor: screen.getPrimaryDisplay().scaleFactor },
       partition,
       // A lane renders the user's own dev server, never Kangentic UI, so it gets
       // no preload and no node integration - the same posture the <webview>
@@ -350,12 +359,22 @@ export async function openLane(input: OpenLaneInput): Promise<OpenLaneResult> {
   });
 
   const guest = window.webContents;
+  // A lane renders the user's page in a plain BrowserWindow, so crash reporting
+  // cannot tell it from our UI by `getType()`. Marked at creation, so a crash is
+  // still the user's page when the SDK asks after the lane has closed
+  // (analytics/renderer-classification.ts).
+  markBrowserGuestWebContents(guest.id);
   guest.setFrameRate(LANE_FRAME_RATE);
   // A lane is not a `<webview>`, so the guest hook in `web-contents-created`
   // never sees it, and it can open before any pane has set this task's jar in
   // this run. Without its own call it would present the `Electron/` token that
   // decision 41 removes from the pane.
   applyBrowserUserAgent(guest);
+  // Same reason: without this, a lane opened before any pane used this task's
+  // partition in this run ran with Electron's default, which GRANTS every
+  // permission request (camera, microphone, geolocation) and opens Chromium's
+  // native save dialog for a download.
+  installEmbeddedBrowserSessionPolicy(guest.session);
 
   const record: LaneRecord = {
     laneId,

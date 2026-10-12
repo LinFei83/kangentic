@@ -24,7 +24,7 @@
  * No Node imports on purpose: demo/vite.config.mts serializes this module into the static build,
  * and the capture rig reads it as well. tests/unit/scene-registry.test.ts pins the shape.
  */
-import { DEMO_COLUMN_MODELS, PROJECT_CONTOSO, SESSION_CONTOSO_TERMINAL, SESSION_EMPTY_STATES, SESSION_INTEGRATION, SESSION_MIDDLEWARE, SESSION_RATE_LIMIT, SESSION_WEBSOCKET, TASK_API_CLIENT, TASK_AUTH, TASK_MIDDLEWARE, TASK_WEBSOCKET, demoLaneId } from './helpers/demo-dataset';
+import { DEMO_COLUMN_MODELS, DEMO_KNOWLEDGE_GRAPH, DEMO_KNOWLEDGE_GRAPH_NODE_TOTAL, DEMO_KNOWLEDGE_GRAPH_STATUS, DEMO_PROJECTS, PROJECT_CONTOSO, SESSION_CONTOSO_TERMINAL, SESSION_EMPTY_STATES, SESSION_INTEGRATION, SESSION_MIDDLEWARE, SESSION_RATE_LIMIT, SESSION_WEBSOCKET, TASK_API_CLIENT, TASK_AUTH, TASK_MIDDLEWARE, TASK_WEBSOCKET, demoLaneId } from './helpers/demo-dataset';
 import { DEFAULT_CONFIG } from '../../src/shared/types';
 import { commandTerminalTitle } from '../../src/shared/command-terminal-name';
 import announcementsFeed from '../../announcements.json';
@@ -105,6 +105,16 @@ interface SceneBase extends DemoState {
   /** The element a host may crop the figure to; its rect rides the ready message as fractions. A
    *  selector list (`a, b`) names several, and the rect is the box around all of them. */
   focus?: string;
+  /**
+   * Elements the frame places on every animation frame (a selector list), for a scene whose
+   * subject moves after `ready`: the Knowledge Graph's camera flies to the projects a scene picks,
+   * and nothing in the DOM marks the end of the flight. The capture rig and the smoke tier shoot
+   * only once one of them is shown (a non-zero opacity, which the map's labels get only from a
+   * frame it actually drew) and none has moved for half a second (`waitForSettled` in
+   * helpers/scene-page.ts). demo/boot.js does not read it: a live frame plays the flight, as the
+   * desktop does, and a browser that cannot draw the map shows the app's own no-GPU card.
+   */
+  settle?: string;
   /** `empty` seeds no project at all: the welcome screen a first launch lands on. Default: the
    *  sample install. */
   install?: 'empty';
@@ -345,7 +355,7 @@ const SETTINGS_PANEL = '[data-testid="settings-panel"]';
  * Dictation switched on and nothing else changed. Nested config blocks replace the demo defaults
  * whole (boot.js merges config shallowly), so the whole block rides along with only `enabled`
  * flipped. With every other field at its default the Dictation tab reads what a user sees right
- * after turning it on: the Best accuracy preset, whose models the dataset's getInfo answer names
+ * after turning it on: the Best preset, whose models the dataset's getInfo answer names
  * (DEMO_DICTATION_INFO in demo-dataset.ts).
  */
 const DICTATION_ON = { ...DEFAULT_CONFIG.dictation, enabled: true };
@@ -376,8 +386,8 @@ const ANNOUNCEMENT_HISTORY = ANNOUNCEMENTS.map((announcement) => ({ announcement
  */
 // The settings panel docks to the right of the frame rather than centring, so each alt opens with
 // the tab and then reads the panel top to bottom. Every line below was checked against the
-// rendered tab in both themes; a row that only shows once a switch is on (the Memory tab's model
-// picker, the Mobile tab's connection test) is left out rather than described. An entry may carry
+// rendered tab in both themes; a row that only shows once a switch is on (the Mobile tab's connection
+// test) is left out rather than described. An entry may carry
 // `config` to show its tab in use: Dictation is switched on, because off it greys out every row
 // below the switch and reads as a feature that is not there.
 const SETTINGS_TABS_SCENES: Record<string, { ready: string; alt: string; config?: Record<string, unknown>; note?: string }> = {
@@ -386,9 +396,9 @@ const SETTINGS_TABS_SCENES: Record<string, { ready: string; alt: string; config?
   // figure's subject, and both rows mount in the same commit.
   theme: { ready: '[data-testid="setting-row-theme"]', alt: 'Settings on the Theme tab: a Follow system appearance switch, then twelve theme tiles in Dark and Light groups, each painted in its own colors, with the current theme outlined.' },
   agent: { ready: '[data-testid="setting-row-project.defaultAgent"]', alt: 'Settings on the Agent tab: the project\'s default agent, its model and effort, the permission mode, and the path to the agent\'s CLI.' },
-  git: { ready: '[data-testid="setting-row-git.worktreesEnabled"]', alt: 'Settings on the Git tab: worktrees on or off, automatic cleanup, the default base branch, files and a script for each new worktree, and how often PRs and the remote are refreshed.' },
+  git: { ready: '[data-testid="setting-row-git.worktreesEnabled"]', alt: 'Settings on the Git tab in three cards: Branches with the default base branch and auto-fetch, Worktrees with its switch, cleanup, node_modules linking, and files and a script for each new worktree, and Pull requests with auto-refresh and merge bypass.' },
   browser: { ready: '[data-testid="setting-row-browser.enabled"]', alt: 'Settings on the Browser tab: the Browser pane toggle, the default URL a task opens, and a control to clear the browser\'s data.' },
-  shortcuts: { ready: '[data-testid="add-shortcut"]', alt: 'Settings on the Shortcuts tab: the project\'s command shortcuts, none configured here, with Add Shortcut and Presets controls.' },
+  shortcuts: { ready: '[data-testid="add-shortcut"]', alt: 'Settings on the Shortcuts tab: the project\'s command shortcuts, none configured here, with Add shortcut and Presets controls.' },
   board: { ready: '[data-testid="setting-row-columnWidth"]', alt: 'Settings on the Board tab: column width, automatic board config sync, and switches for the terminal panel and the status bar.' },
   task: { ready: '[data-testid="setting-row-cardDensity"]', alt: 'Settings on the Task tab: card density, card preview, ticket numbers, and a switch for each pill the context bar shows.' },
   changes: { ready: '[data-testid="setting-row-diffViewMode"]', alt: 'Settings on the Changes tab: the diff layout, the default scope a Changes panel opens on, the whitespace, folding, wrapping, and narrow-pane options, and file sorting.' },
@@ -399,18 +409,23 @@ const SETTINGS_TABS_SCENES: Record<string, { ready: string; alt: string; config?
   performance: { ready: '[data-testid="setting-row-graphicsAccelerationEnabled"]', alt: 'Settings on the Performance tab: switches for graphics acceleration and for animations.' },
   hotkeys: { ready: '[data-testid="hotkeys-tab"]', alt: 'Settings on the Hotkeys tab: every keyboard shortcut with its current binding and a Rebind control, with a reset to defaults above the list.' },
   notifications: { ready: '[data-testid="setting-row-notifications.onAgentIdle"]', alt: 'Settings on the Notifications tab: for each event, whether it raises a desktop notification, a toast, or both, and how toasts are delivered.' },
-  // `ready` is the model status row, which mounts only once getInfo has answered, so the frame is
-  // never shot on the empty model selects of the first render.
+  // `ready` is the model list, which mounts only once getInfo has answered, so the frame is never
+  // shot before its lines name their models.
   dictation: {
-    ready: '[data-testid="dictation-model-ready"]',
-    alt: 'Settings on the Dictation tab with voice dictation on: English, the Best accuracy mode with Streaming Zipformer as the live model and Parakeet TDT 0.6B to refine, marked Ready, then punctuation, the push-to-talk key, and the release buffer.',
+    ready: '[data-testid="dictation-model-lines"]',
+    alt: 'Settings on the Dictation tab with voice dictation on: the push-to-talk key, release buffer, and auto-submit, then a Transcription card with English, the Best mode, the live and refinement models each with a check, and their licenses.',
     config: { dictation: DICTATION_ON },
     note: 'Dictation is switched on, with every other setting at its default, so the models are the ones the dataset\'s getInfo answer selects (DEMO_DICTATION_INFO).',
   },
-  memory: { ready: '[data-testid="setting-row-memory.indexingEnabled"]', alt: 'Settings on the Memory tab: conversation indexing for search, semantic search, and a control to rebuild the index.' },
-  mcpServer: { ready: '[data-testid="setting-row-mcpServer.enabled"]', alt: 'Settings on the MCP Server tab: the server toggle and the available tools as pills grouped by area: tasks, board, sessions, and more.' },
-  browserAutomation: { ready: '[data-testid="setting-row-browserAutomation.enabled"]', alt: 'Settings on the Agent Browser tab: whether agents may drive the embedded browser, and which actions they get: interaction, navigation, eval, and a localhost restriction.' },
-  mobile: { ready: '[data-testid="setting-row-mobileBridge.enabled"]', alt: 'Settings on the Mobile Devices tab: the Mobile Bridge toggle, the relay it connects through, the Pair a device button, and the paired devices list, empty here.' },
+  // The sample install has the Knowledge Graph on, as its maps were built (DEMO_KNOWLEDGE_GRAPH_CONFIG),
+  // so the card shows the rows a switched-on graph has. The Index counts are the derived status's.
+  knowledgeGraph: {
+    ready: '[data-testid="setting-row-knowledgeGraph.indexingEnabled"]',
+    alt: `Settings on the Knowledge Graph tab, switched on: search quality, the downloaded local model, acceleration, and no Ask agent yet, then an Index card counting ${DEMO_KNOWLEDGE_GRAPH_STATUS.sources?.conversations.count} conversations, ${DEMO_KNOWLEDGE_GRAPH_STATUS.sources?.tasks.count} tasks and ${DEMO_KNOWLEDGE_GRAPH_STATUS.sources?.commits.count} commits, with summaries and source code waiting on an agent.`,
+  },
+  mcpServer: { ready: '[data-testid="setting-row-mcpServer.enabled"]', alt: 'Settings on the MCP Server tab: one card with the server switch and, inside it, a Documentation row and the available tools in collapsible groups by area: tasks, board, sessions, and more.' },
+  browserAutomation: { ready: '[data-testid="setting-row-browserAutomation.enabled"]', alt: 'Settings on the Agent Browser tab: one card with the browser automation switch and the actions agents get: interaction, navigation with a localhost restriction under it, and eval.' },
+  mobile: { ready: '[data-testid="setting-row-mobileBridge.enabled"]', alt: 'Settings on the Mobile Devices tab: the Mobile bridge switch, off here, with links to how the relay works and how to install and pair.' },
   privacy: { ready: '[data-testid="privacy-contact-email"]', alt: 'Settings on the Privacy tab: what anonymous analytics are collected and what is not, how they work, and how to opt out.' },
   developer: { ready: '[data-testid="developer-tab"]', alt: 'Settings on the Developer tab: the activity debug overlay, persistent console logs, crash reports, and IPC recording.' },
 };
@@ -431,6 +446,48 @@ function settingsScenes(): Record<string, SceneDefinition> {
         { click: '[data-testid="settings-button"]', waitFor: SETTINGS_PANEL },
         { click: `[data-testid="settings-tab-${tab}"]`, waitFor: entry.ready },
       ],
+    };
+  }
+  return scenes;
+}
+
+/**
+ * One Knowledge Graph scene per sample project, `knowledge-graph-<project name>`, beside
+ * `knowledge-graph` for all three, so a figure can show the whole install or one project's map.
+ * A single map frames close enough for each conversation's task title to show beside its point,
+ * which the three-island frame is too far out for. The scope is renderer store state, so it is
+ * clicks: the graph opens on the open project (contoso-web), and any other is scoped the way a
+ * visitor would, ticking its row in the Projects picker and then unticking the open project's
+ * (the picker never lets the scope go empty, so the order matters).
+ */
+function knowledgeGraphProjectScenes(): Record<string, SceneDefinition> {
+  const scenes: Record<string, SceneDefinition> = {};
+  const row = (projectId: string): string => `[data-testid="knowledge-graph-projects-row"][data-project-id="${projectId}"]`;
+  const open: DemoBootStep = { click: '[data-testid="knowledge-graph-button"]', waitFor: '[data-testid="knowledge-graph-projects"]' };
+  for (const project of DEMO_PROJECTS) {
+    const graph = DEMO_KNOWLEDGE_GRAPH.projects[project.id];
+    if (!graph) continue;
+    const name = `knowledge-graph-${project.name}`;
+    scenes[name] = {
+      name,
+      reach: 'boot',
+      description: project.id === PROJECT_CONTOSO
+        ? `The Knowledge Graph on ${project.name} alone, the open project, which is where a graph opens: one click on the title-bar button.`
+        : `The Knowledge Graph on ${project.name} alone: the title-bar button, then the Projects picker, ${project.name}'s row, the open project's row to untick it, and the picker again to close its menu.`,
+      alt: `The Knowledge Graph for ${project.name} alone: each conversation a point labelled with its task title, joined by links, the named regions over them, and the Filter, Regions and Display cards on the left.`,
+      // That project's nodes alone drawn: the scope has landed on it.
+      ready: `[data-testid="knowledge-graph-canvas"][data-drawn-count="${graph.projection.nodes.length}"]`,
+      settle: '[data-testid="knowledge-graph-cluster-label"], [data-testid="knowledge-graph-node-title"]',
+      focus: '[data-testid="knowledge-graph-page"]',
+      steps: project.id === PROJECT_CONTOSO
+        ? [open]
+        : [
+          open,
+          { click: '[data-testid="knowledge-graph-projects"]', waitFor: row(project.id) },
+          { click: row(project.id) },
+          { click: row(PROJECT_CONTOSO) },
+          { click: '[data-testid="knowledge-graph-projects"]' },
+        ],
     };
   }
   return scenes;
@@ -656,7 +713,7 @@ export const SCENES: Record<string, SceneDefinition> = {
     name: 'dictation-field',
     reach: 'boot',
     description: 'Push-to-talk held with the caret in the Settings search box, the live chip anchored under the field and the Dictation tab\'s options around it. Dictation types into any text field, not only a terminal. The click on the search box focuses it (boot.js focuses a text field it clicks), and the target is resolved from that focus on the press. A bottom-panel terminal cannot take the focus back once a field holds it (arrival focus denies it as occupied). No transcript lands on release: the dataset answers stop with nothing, which is what a silent microphone transcribes to.',
-    alt: 'The Settings panel on the Dictation tab with its search box focused and the dictation chip under it: a live dot beside Listening, a hint that releasing the key sends the words, and a Clear control, over dictation settings in Best accuracy mode.',
+    alt: 'The Settings panel on the Dictation tab with its search box focused and the dictation chip under it: a live dot beside Listening, a hint that releasing the key sends the words, and a Clear control, over dictation settings in Best mode.',
     config: { dictation: DICTATION_ON },
     // Below the field, which fails on the fallback: had the search box not held focus, the press
     // would resolve to the bottom panel's terminal and the chip would mount above that instead.
@@ -669,7 +726,7 @@ export const SCENES: Record<string, SceneDefinition> = {
     // live frame, the frame posted a rect 220px right of where the chip settles.
     steps: [
       { click: '[data-testid="settings-button"]', waitFor: `${SETTINGS_PANEL}:not(.overlay-panel-in)` },
-      { click: '[data-testid="settings-tab-dictation"]', waitFor: '[data-testid="dictation-model-ready"]' },
+      { click: '[data-testid="settings-tab-dictation"]', waitFor: '[data-testid="dictation-model-lines"]' },
       { click: '[data-testid="settings-search"]' },
       { press: 'Mouse:Back', waitFor: '[data-testid="dictation-live-chip"]' },
     ],
@@ -809,6 +866,24 @@ export const SCENES: Record<string, SceneDefinition> = {
     ready: '[data-testid="stats-filter-row"]',
     steps: [{ click: '[data-testid="usage-stats-button"]', waitFor: '[data-testid="stats-page"]' }],
   },
+  'knowledge-graph': {
+    name: 'knowledge-graph',
+    reach: 'boot',
+    description: 'The Knowledge Graph over all three projects, each an island of the conversations main\'s own pipeline indexed, embedded, laid out, and named (DEMO_KNOWLEDGE_GRAPH). Its open flag and its project scope are renderer store state, so it is clicks: the title-bar button, the Projects picker, All, and the picker again to close its menu. Choosing projects flies the camera, so the rig waits for the labels to settle, which also proves the map drew in a 3D context.',
+    alt: 'The Knowledge Graph across three projects: contoso-web, spring-petclinic and online-boutique as islands of conversation points joined by links, regions named over them, the Filter, Regions and Display cards on the left, and an Ask box above.',
+    // Every node of all three islands drawn: the scope has landed, rather than the open project alone.
+    ready: `[data-testid="knowledge-graph-canvas"][data-drawn-count="${DEMO_KNOWLEDGE_GRAPH_NODE_TOTAL}"]`,
+    settle: '[data-testid="knowledge-graph-island-label"], [data-testid="knowledge-graph-cluster-label"]',
+    focus: '[data-testid="knowledge-graph-page"]',
+    steps: [
+      { click: '[data-testid="knowledge-graph-button"]', waitFor: '[data-testid="knowledge-graph-projects"]' },
+      { click: '[data-testid="knowledge-graph-projects"]', waitFor: '[data-testid="knowledge-graph-projects-all"]' },
+      { click: '[data-testid="knowledge-graph-projects-all"]' },
+      // The picker's menu stays open after All; a second click on its trigger closes it.
+      { click: '[data-testid="knowledge-graph-projects"]' },
+    ],
+  },
+  ...knowledgeGraphProjectScenes(),
   backlog: {
     name: 'backlog',
     reach: 'boot',

@@ -20,8 +20,9 @@ import type {
   WorkerRequest,
 } from './dictation-worker';
 
-/** Cold model load (the 631 MB Parakeet ONNX can take several seconds on a
- *  slow disk). Generous like EmbedClient's INIT_TIMEOUT_MS. */
+/** Cold model load (a 600 MB NeMo model takes 1.5 s from a warm disk, and
+ *  Cohere Transcribe's 2.7 GB far longer from a slow one). Generous like
+ *  EmbedClient's INIT_TIMEOUT_MS. */
 const ENSURE_ENGINE_TIMEOUT_MS = 120_000;
 /** A decode pass on a long utterance; generous but bounded. */
 const FINALIZE_TIMEOUT_MS = 30_000;
@@ -32,9 +33,22 @@ const FINALIZE_TIMEOUT_MS = 30_000;
  *  first session), and onnxruntime never returns that arena to the OS
  *  in-process, so the recycle is a process exit: 3 GB of commit for an idle
  *  631 MB model was what fired the low-memory warning (#706). A worker that
- *  has only been pre-warmed holds the ~70 MB live model and is never
- *  recycled - it IS the instant first press. TranscriptionService re-warms a
- *  recycled worker straight back to that baseline.
+ *  has only been pre-warmed holds the live model alone and is not
+ *  recycled while under the ceiling - it IS the instant first press.
+ *  TranscriptionService re-warms a recycled worker straight back to that
+ *  baseline.
+ *
+ *  The worker's commit, measured on 2026-10-05. The other comments that reason
+ *  about dictation memory (armIdleShutdown, HybridEngine, TranscriptionService's
+ *  warmCap) point here rather than repeat the figures:
+ *    - the live model alone: 160 MB for the Zipformer (Light), 780 MB for
+ *      Nemotron or a chunked Parakeet v3 (Best, Balanced)
+ *    - Best with its refinement model loaded: 1.5 GB (Parakeet v3 adds
+ *      740 MB), at the commit ceiling
+ *    - Best switched English to French and back with a warm cap of 1: 716,
+ *      1,409, then 2,083 MB, since a disposed engine's arena stays reserved;
+ *      a cap of 2 serves the switch back from the warm engine
+ *    - that worker recycled: 716 MB, the one engine in use
  *
  *  The timer never runs while a session is open. A session's frames travel
  *  fire-and-forget and would not touch it, so `activeSessions` gates both the
@@ -63,7 +77,8 @@ interface PendingRequest {
  * dictation-worker.ts for the wire protocol and DESKTOP-X for why the engine
  * runs there at all). Spawns lazily on first demand, recycles a worker that
  * has served a session once it has been idle for IDLE_SHUTDOWN_MS (a short
- * HEAVY_IDLE_SHUTDOWN_MS once its commit passes the ceiling), emitting
+ * HEAVY_IDLE_SHUTDOWN_MS once its commit passes the ceiling, which also
+ * recycles a prewarm-only worker that settings switches have grown), emitting
  * `'recycled'` so the service can warm a fresh, small one, and restarts it
  * (with a crash cap) after an unexpected exit.
  *
@@ -81,9 +96,10 @@ export class DictationClient extends EventEmitter {
   private disposed = false;
   private idleTimer: NodeJS.Timeout | null = null;
   /** True once the current child has created a session, which is what makes
-   *  it load the accurate model. Only such a child is worth recycling; a
-   *  prewarm-only child is the resident baseline. Per child: cleared on every
-   *  kill and exit. */
+   *  it load the refinement model. Such a child is worth recycling; a
+   *  prewarm-only child is the resident baseline unless it has passed the
+   *  commit ceiling (armIdleShutdown). Per child: cleared on every kill and
+   *  exit. */
   private servedSession = false;
   /** Sessions created and not yet finalized or cancelled. A recycle never
    *  fires while one is open. Every path that ends a session (finalize,
@@ -245,7 +261,7 @@ export class DictationClient extends EventEmitter {
       // policy rather than latching the cap directly - otherwise one transient
       // fork failure disabled dictation permanently, with no decay.
       console.warn('[transcription] dictation worker fork failed:', error);
-      this.restartPolicy.recordCrash(null);
+      this.restartPolicy.recordCrash(null, undefined, { cause: 'fork_failed' });
       return null;
     }
     this.child = child;
@@ -346,12 +362,19 @@ export class DictationClient extends EventEmitter {
   }
 
   /** Arm the idle recycle, but only for a child worth recycling: one that has
-   *  served a session and so holds the accurate model. A prewarm-only child
-   *  is left resident on purpose. */
+   *  served a session and so holds the refinement model, or a prewarm-only
+   *  one past the commit ceiling. A prewarm-only child under it is left
+   *  resident on purpose. The second case is a settings switch: each language
+   *  or preset change pre-warms another engine, and a disposed one's arena
+   *  stays reserved, so a few switches leave an idle worker holding several
+   *  engines' commit. Recycled, it re-warms only the one in use (figures in
+   *  IDLE_SHUTDOWN_MS's note). */
   private armIdleShutdown(): void {
-    if (this.disposed || !this.child || !this.servedSession || this.idleTimer) return;
+    if (this.disposed || !this.child || this.idleTimer) return;
     if (this.pending.size > 0 || this.activeSessions.size > 0) return;
-    const delayMs = this.overCommitCeiling() ? HEAVY_IDLE_SHUTDOWN_MS : IDLE_SHUTDOWN_MS;
+    const overCeiling = this.overCommitCeiling();
+    if (!this.servedSession && !overCeiling) return;
+    const delayMs = overCeiling ? HEAVY_IDLE_SHUTDOWN_MS : IDLE_SHUTDOWN_MS;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
       if (!this.child || this.pending.size > 0 || this.activeSessions.size > 0) return;

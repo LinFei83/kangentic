@@ -20,8 +20,7 @@ vi.mock('../../src/main/ipc/helpers', () => ({
   autoSpawnForTask: vi.fn(() => Promise.resolve()),
   // The MCP delete path reaps what the session left running before it removes
   // the worktree. Inert here: the ordering is pinned in the reap wiring tests.
-  captureSessionLeftovers: vi.fn(() => null),
-  reapSessionLeftovers: vi.fn(() => Promise.resolve()),
+  reapTaskLeftovers: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock('../../src/main/ipc/handlers/task-move', () => ({
@@ -68,6 +67,27 @@ vi.mock('../../src/main/ipc/handlers/strategy-propagation', () => ({
   buildColumnStrategyChanges: vi.fn(() => []),
 }));
 
+// The apply step is tested where it lives (task-runtime-override-handler.test.ts);
+// here only the host's wiring around it is: the lock, the fields, the resync.
+const applySettingsSpy = vi.hoisted(() => vi.fn());
+vi.mock('../../src/main/ipc/handlers/task-runtime-override', () => ({
+  applyTaskSettingsToLiveSession: applySettingsSpy,
+}));
+const withTaskLockSpy = vi.hoisted(() => vi.fn((_taskId: string, work: () => Promise<unknown>) => work()));
+vi.mock('../../src/main/ipc/task-lifecycle-lock', () => ({
+  withTaskLock: withTaskLockSpy,
+}));
+
+// The task reads' Knowledge Graph lookup is tested where it lives
+// (task-knowledge-store.test.ts, against a real database). Here only the
+// context's gate around it is: the index switch, the summaries switch, and a
+// read that fails.
+// The read itself runs in the retrieval worker ('task.knowledge').
+const workerCallSpy = vi.hoisted(() => vi.fn());
+vi.mock('../../src/main/retrieval/retrieval-client', () => ({
+  retrievalClient: { call: workerCallSpy },
+}));
+
 // RequestResolver is imported by mcp-project-context and called with `new`.
 // Track constructor calls via a hoisted spy variable that the test body can
 // inspect after each call.
@@ -86,7 +106,7 @@ import {
   propagateStrategyToLiveSessions,
   buildColumnStrategyChanges,
 } from '../../src/main/ipc/handlers/strategy-propagation';
-import { reapSessionLeftovers } from '../../src/main/ipc/helpers';
+import { reapTaskLeftovers } from '../../src/main/ipc/helpers';
 import { WorktreeManager } from '../../src/main/git/worktree-manager';
 import type { IpcContext } from '../../src/main/ipc/ipc-context';
 import type { Project, Swimlane } from '../../src/shared/types';
@@ -324,26 +344,20 @@ describe('buildCommandContextForProject - getPrResolveOptions', () => {
     return { ipcContext, getEffectiveConfig };
   }
 
-  it('reads evaluateBranchPolicies from the target project path', () => {
-    const { ipcContext, getEffectiveConfig } = makeOptionsContext({ prEvaluateBranchPolicies: true });
+  it('reads bypassCountsAsReady from the target project path', () => {
+    const { ipcContext, getEffectiveConfig } = makeOptionsContext({ prBypassCountsAsReady: true });
     const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
     // Exact shape: the same mapper the linker's own sweep uses
     // (`prResolveOptionsFromGitConfig`), so a tool-triggered resolve and the
     // background sweep can never write different verdicts for one PR.
-    expect(context!.getPrResolveOptions!()).toEqual({ evaluateBranchPolicies: true, bypassCountsAsReady: false });
+    expect(context!.getPrResolveOptions!()).toEqual({ bypassCountsAsReady: true });
     expect(getEffectiveConfig).toHaveBeenCalledWith(PROJECT_PATH);
-  });
-
-  it('reads bypassCountsAsReady from the target project path', () => {
-    const { ipcContext } = makeOptionsContext({ prBypassCountsAsReady: true });
-    const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
-    expect(context!.getPrResolveOptions!()).toEqual({ evaluateBranchPolicies: false, bypassCountsAsReady: true });
   });
 
   it('reads an explicit false for the default-on bypass setting as off', () => {
     const { ipcContext } = makeOptionsContext({ prBypassCountsAsReady: false });
     const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
-    expect(context!.getPrResolveOptions!()).toEqual({ evaluateBranchPolicies: false, bypassCountsAsReady: false });
+    expect(context!.getPrResolveOptions!()).toEqual({ bypassCountsAsReady: false });
   });
 
   it('reads an absent key as off, never as undefined', () => {
@@ -352,7 +366,7 @@ describe('buildCommandContextForProject - getPrResolveOptions', () => {
     // default through `getEffectiveConfig`'s merge.
     const { ipcContext } = makeOptionsContext({ defaultBaseBranch: 'main' });
     const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
-    expect(context!.getPrResolveOptions!()).toEqual({ evaluateBranchPolicies: false, bypassCountsAsReady: false });
+    expect(context!.getPrResolveOptions!()).toEqual({ bypassCountsAsReady: false });
   });
 
   it('returns every option off instead of throwing when the config is unreadable', () => {
@@ -366,8 +380,8 @@ describe('buildCommandContextForProject - getPrResolveOptions', () => {
   // write has to start the 30 s re-poll, since during `/pull-request` it waits
   // on CI inside one turn and no idle arrives to start it.
   it.each([
-    [{ prRefreshIntervalMinutes: 5 }, true],
-    [{ prRefreshIntervalMinutes: null }, false],
+    [{ prAutoRefresh: true }, true],
+    [{ prAutoRefresh: false }, false],
     [{}, false],
   ] as Array<[Record<string, unknown>, boolean]>)('getPrRepollInFlight reads %j as %s from the target project path', (gitConfig, expected) => {
     const { ipcContext, getEffectiveConfig } = makeOptionsContext(gitConfig);
@@ -380,6 +394,82 @@ describe('buildCommandContextForProject - getPrResolveOptions', () => {
     const { ipcContext } = makeOptionsContext(() => { throw new Error('config unreadable'); });
     const context = buildCommandContextForProject(ipcContext, DEFAULT_ID);
     expect(context!.getPrRepollInFlight!()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readTaskKnowledge
+//
+// What `kangentic_find_task` and `kangentic_get_current_task` print under a
+// task comes through this gate. The index switch decides whether the index may
+// be read at all. The Task summaries switch only stops NEW summaries, so a
+// written one is still shown: it is reported to the printer, never applied
+// here. A failed read must never fail the task lookup it decorates.
+// ---------------------------------------------------------------------------
+
+describe('buildCommandContextForProject - readTaskKnowledge', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeKnowledgeContext(config: (() => unknown) | unknown) {
+    const project = makeProject({ id: DEFAULT_ID });
+    const load = vi.fn(() => (typeof config === 'function' ? (config as () => unknown)() : config));
+    const ipcContext = {
+      projectRepo: { getById: vi.fn(() => project), list: vi.fn(() => [project]) },
+      configManager: { load },
+    } as unknown as IpcContext;
+    return buildCommandContextForProject(ipcContext, DEFAULT_ID)!;
+  }
+
+  it('reads the index of the target project, and reports the summaries switch as on by default', async () => {
+    const byTask = new Map([['task-a', { summary: null, commits: [], commitCount: 0, changedFiles: [], changedFileCount: 0 }]]);
+    workerCallSpy.mockResolvedValue(byTask);
+    const context = makeKnowledgeContext({ knowledgeGraph: undefined });
+
+    const read = await context.readTaskKnowledge!(['task-a']);
+
+    expect(workerCallSpy).toHaveBeenCalledWith('task.knowledge', { projectId: DEFAULT_ID, taskIds: ['task-a'] });
+    expect(read).toEqual({ indexOn: true, summariesOn: true, byTask });
+  });
+
+  it('does not read the index at all when indexing is off', async () => {
+    const context = makeKnowledgeContext({ knowledgeGraph: { indexingEnabled: false } });
+
+    expect(await context.readTaskKnowledge!(['task-a'])).toEqual({ indexOn: false });
+    expect(workerCallSpy).not.toHaveBeenCalled();
+  });
+
+  it('reads the index while only the Task summaries switch is off, and reports it off', async () => {
+    workerCallSpy.mockResolvedValue(new Map());
+    const context = makeKnowledgeContext({ knowledgeGraph: { indexingEnabled: true, taskSummaries: false } });
+
+    const read = await context.readTaskKnowledge!(['task-a']);
+
+    expect(workerCallSpy).toHaveBeenCalledOnce();
+    expect(read).toMatchObject({ indexOn: true, summariesOn: false });
+  });
+
+  it('treats a config that cannot be read as the defaults: index on, summaries on', async () => {
+    workerCallSpy.mockResolvedValue(new Map());
+    const context = makeKnowledgeContext(() => { throw new Error('config unreadable'); });
+
+    expect(await context.readTaskKnowledge!(['task-a'])).toMatchObject({ indexOn: true, summariesOn: true });
+  });
+
+  it('answers with no knowledge, and does not throw, when the index read fails or the worker is down', async () => {
+    workerCallSpy.mockRejectedValue(new Error('no such table: memory_chunks'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const context = makeKnowledgeContext({ knowledgeGraph: undefined });
+
+      const read = await context.readTaskKnowledge!(['task-a']);
+
+      expect(read).toEqual({ indexOn: true, summariesOn: true, byTask: new Map() });
+      expect(warn).toHaveBeenCalledOnce();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -756,12 +846,128 @@ describe('buildCommandContextForProject - onTasksReordered', () => {
 });
 
 // ---------------------------------------------------------------------------
+// onTaskSettingsChanged - an agent or phone pin reaches the live session
+// ---------------------------------------------------------------------------
+
+describe('buildCommandContextForProject - onTaskSettingsChanged', () => {
+  const PROJECT_PATH = '/projects/example';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeSettingsContext() {
+    const project = makeProject({ id: DEFAULT_ID, path: PROJECT_PATH });
+    const send = vi.fn();
+    const ipcContext = {
+      projectRepo: { getById: vi.fn(() => project), list: vi.fn(() => [project]) },
+      mainWindow: { isDestroyed: () => false, webContents: { send } },
+      boardEvents: { emitBoardChanged: vi.fn() },
+    } as unknown as IpcContext;
+    return { ipcContext, send, context: buildCommandContextForProject(ipcContext, DEFAULT_ID)! };
+  }
+
+  const liveTask = { id: 'task-1', title: 'T', session_id: 'session-1' } as never;
+  const effortOnly = { model: false, effort: true };
+
+  /** Lets the deferred apply and its `.then` / `.catch` settle. */
+  async function settleDeferredApply(): Promise<void> {
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it('applies the fields the write moved, under the task lock, for this project', async () => {
+    applySettingsSpy.mockResolvedValue({ ok: true, mode: 'persisted' });
+    const { ipcContext, context } = makeSettingsContext();
+
+    context.onTaskSettingsChanged?.(liveTask, effortOnly);
+
+    await vi.waitFor(() => expect(applySettingsSpy).toHaveBeenCalledOnce());
+    expect(withTaskLockSpy).toHaveBeenCalledWith('task-1', expect.any(Function));
+    expect(applySettingsSpy).toHaveBeenCalledWith(
+      ipcContext, DEFAULT_ID, PROJECT_PATH, 'task-1', effortOnly,
+    );
+  });
+
+  // The restart writes the agent's exit sequence into its PTY. Run inside the
+  // tool call, that lands before the reply, so an agent updating its own task
+  // never learns its turn is ending.
+  it('starts the apply only after the call that triggered it has returned', async () => {
+    applySettingsSpy.mockResolvedValue({ ok: true, mode: 'persisted' });
+    const { context } = makeSettingsContext();
+
+    context.onTaskSettingsChanged?.(liveTask, effortOnly);
+    await Promise.resolve();
+
+    expect(withTaskLockSpy).not.toHaveBeenCalled();
+    expect(applySettingsSpy).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(applySettingsSpy).toHaveBeenCalledOnce());
+  });
+
+  it('re-syncs the board quietly after a restart, which cleared the task session id', async () => {
+    applySettingsSpy.mockResolvedValue({ ok: true, mode: 'restart' });
+    const { send, context } = makeSettingsContext();
+
+    context.onTaskSettingsChanged?.(liveTask, effortOnly);
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledWith('TASK_SESSION_RESYNC', DEFAULT_ID));
+  });
+
+  it('sends no re-sync when nothing restarted', async () => {
+    applySettingsSpy.mockResolvedValue({ ok: true, mode: 'persisted' });
+    const { send, context } = makeSettingsContext();
+
+    context.onTaskSettingsChanged?.(liveTask, effortOnly);
+
+    await vi.waitFor(() => expect(applySettingsSpy).toHaveBeenCalledOnce());
+    await settleDeferredApply();
+    expect(send).not.toHaveBeenCalledWith('TASK_SESSION_RESYNC', DEFAULT_ID);
+  });
+
+  it('re-syncs and warns when the restart failed after clearing the session id', async () => {
+    applySettingsSpy.mockResolvedValue({ ok: false, reason: 'respawn failed: boom' });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { send, context } = makeSettingsContext();
+
+    context.onTaskSettingsChanged?.(liveTask, effortOnly);
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledWith('TASK_SESSION_RESYNC', DEFAULT_ID));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('respawn failed: boom'));
+    warnSpy.mockRestore();
+  });
+
+  it('logs a thrown apply instead of leaving an unhandled rejection', async () => {
+    applySettingsSpy.mockRejectedValue(new Error('task vanished'));
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { send, context } = makeSettingsContext();
+
+    context.onTaskSettingsChanged?.(liveTask, effortOnly);
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Settings apply failed'), expect.objectContaining({ message: 'task vanished' }),
+    ));
+    expect(send).not.toHaveBeenCalledWith('TASK_SESSION_RESYNC', DEFAULT_ID);
+    errorSpy.mockRestore();
+  });
+
+  it('does nothing for a task with no live session', async () => {
+    const { context } = makeSettingsContext();
+
+    context.onTaskSettingsChanged?.({ id: 'task-1', title: 'T', session_id: null } as never, effortOnly);
+    await settleDeferredApply();
+
+    expect(withTaskLockSpy).not.toHaveBeenCalled();
+    expect(applySettingsSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // onTaskDeleted - worktree teardown ordering (pty-teardown-grace)
 //
 // The exit promise is captured BETWEEN the kill and the remove: `remove()`
 // itself does not wait (the deferred PTY lives outside the registry row, so
 // deleting the row cannot cut its grace short), but the filesystem-touching
-// work that follows - reapSessionLeftovers and the worktree removal inside
+// work that follows - reapTaskLeftovers and the worktree removal inside
 // worktreeManager.withLock - must wait for the real process exit, not for
 // the kill() call. The wait happens BEFORE the per-project git lock is
 // entered, so a young session's grace never head-of-line-blocks every other
@@ -801,8 +1007,8 @@ describe('buildCommandContextForProject - onTaskDeleted worktree teardown orderi
       };
     } as unknown as typeof WorktreeManager);
 
-    vi.mocked(reapSessionLeftovers).mockImplementationOnce(async () => {
-      timeline.push('reapSessionLeftovers');
+    vi.mocked(reapTaskLeftovers).mockImplementationOnce(async () => {
+      timeline.push('reapTaskLeftovers');
     });
 
     const project = makeProject({ id: DEFAULT_ID, path: PROJECT_PATH });
@@ -843,7 +1049,7 @@ describe('buildCommandContextForProject - onTaskDeleted worktree teardown orderi
     await Promise.resolve();
     await Promise.resolve();
     expect(timeline).toEqual(['kill:session-1', 'awaitExit:session-1', 'remove:session-1']);
-    expect(reapSessionLeftovers).not.toHaveBeenCalled();
+    expect(reapTaskLeftovers).not.toHaveBeenCalled();
     expect(withLockMock).not.toHaveBeenCalled();
 
     exitDeferred.resolve();
@@ -855,10 +1061,135 @@ describe('buildCommandContextForProject - onTaskDeleted worktree teardown orderi
       'kill:session-1',
       'awaitExit:session-1',
       'remove:session-1',
-      'reapSessionLeftovers',
+      'reapTaskLeftovers',
       'withLock:enter',
       'removeWorktree',
       'withLock:exit',
     ]);
+  });
+
+  // Pins the `await spawnsSettled` in onTaskDeleted. `removeByTaskId` resolves
+  // once a spawn of the task that is still in its host round trip has settled:
+  // the PTY the host may already have started holds the worktree as its cwd
+  // until it exits, and the task row does not name that session yet, so
+  // `task.session_id` (null here) has nothing for the kill and awaitExit above
+  // to wait on. Drop the await and the reap and the removal run at once, which
+  // is the Windows delete failure this ordering exists to prevent.
+  it('waits for a spawn of the task still in flight before reaping leftovers or removing the worktree', async () => {
+    const timeline: string[] = [];
+    const spawnsSettled = createDeferred();
+
+    const withLockMock = vi.fn(async (fn: () => Promise<void>) => {
+      timeline.push('withLock:enter');
+      await fn();
+      timeline.push('withLock:exit');
+    });
+    const removeWorktreeMock = vi.fn(async () => {
+      timeline.push('removeWorktree');
+      return false;
+    });
+    // A plain function expression for the same reason as above: `new` on an
+    // arrow function throws.
+    vi.mocked(WorktreeManager).mockImplementationOnce(function mockWorktreeManager() {
+      return {
+        withLock: withLockMock,
+        removeWorktree: removeWorktreeMock,
+        pruneWorktrees: vi.fn(async () => {}),
+        removeBranch: vi.fn(async () => {}),
+      };
+    } as unknown as typeof WorktreeManager);
+
+    vi.mocked(reapTaskLeftovers).mockImplementationOnce(async () => {
+      timeline.push('reapTaskLeftovers');
+    });
+
+    const project = makeProject({ id: DEFAULT_ID, path: PROJECT_PATH });
+    const emitBoardChanged = vi.fn();
+    const removeByTaskId = vi.fn((taskId: string) => {
+      timeline.push(`removeByTaskId:${taskId}`);
+      return spawnsSettled.promise;
+    });
+    const ipcContext = {
+      projectRepo: { getById: vi.fn(() => project), list: vi.fn(() => [project]) },
+      mainWindow: { isDestroyed: () => false, webContents: { send: vi.fn() } },
+      boardConfigManager: { writeBackForProject: vi.fn() },
+      boardEvents: { emitBoardChanged },
+      configManager: { getEffectiveConfig: vi.fn(() => ({ git: { autoCleanup: false } })) },
+      sessionManager: {
+        kill: vi.fn(),
+        awaitExit: vi.fn(() => Promise.resolve()),
+        remove: vi.fn(),
+        removeByTaskId,
+      },
+    } as unknown as IpcContext;
+
+    const context = buildCommandContextForProject(ipcContext, DEFAULT_ID)!;
+
+    context.onTaskDeleted({
+      id: 'task-1',
+      title: 'Task One',
+      session_id: null,
+      worktree_path: '/projects/example/.kangentic/worktrees/task-1',
+      branch_name: null,
+    } as never);
+
+    // The teardown asked for the spawns' settle, and the delete itself is not
+    // held back by the wait: the board event fires on the same tick.
+    expect(removeByTaskId).toHaveBeenCalledWith('task-1');
+    expect(emitBoardChanged).toHaveBeenCalledWith({ projectId: DEFAULT_ID, change: 'task-deleted', ids: ['task-1'] });
+
+    // A whole macrotask, not a couple of microtask ticks: the reverted code (no
+    // await on the spawns) reaches the reap, the lock and the removal through
+    // several awaited steps, which a short drain would not carry it through.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(timeline).toEqual(['removeByTaskId:task-1']);
+    expect(reapTaskLeftovers).not.toHaveBeenCalled();
+    expect(withLockMock).not.toHaveBeenCalled();
+    expect(removeWorktreeMock).not.toHaveBeenCalled();
+
+    spawnsSettled.resolve();
+    await vi.waitFor(() => {
+      expect(timeline).toContain('withLock:exit');
+    });
+
+    expect(timeline).toEqual([
+      'removeByTaskId:task-1',
+      'reapTaskLeftovers',
+      'withLock:enter',
+      'removeWorktree',
+      'withLock:exit',
+    ]);
+  });
+
+  it('reaps a deleted task that has no worktree: a project-folder task leaves processes behind too', async () => {
+    const project = makeProject({ id: DEFAULT_ID, path: PROJECT_PATH });
+    const ipcContext = {
+      projectRepo: { getById: vi.fn(() => project), list: vi.fn(() => [project]) },
+      mainWindow: { isDestroyed: () => false, webContents: { send: vi.fn() } },
+      boardConfigManager: { writeBackForProject: vi.fn() },
+      boardEvents: { emitBoardChanged: vi.fn() },
+      configManager: { getEffectiveConfig: vi.fn(() => ({ git: { autoCleanup: false } })) },
+      sessionManager: {
+        kill: vi.fn(),
+        awaitExit: vi.fn(() => Promise.resolve()),
+        remove: vi.fn(),
+        removeByTaskId: vi.fn(() => Promise.resolve()),
+      },
+    } as unknown as IpcContext;
+
+    const context = buildCommandContextForProject(ipcContext, DEFAULT_ID)!;
+    context.onTaskDeleted({
+      id: 'task-3',
+      title: 'Task Three',
+      session_id: 'session-3',
+      worktree_path: null,
+      branch_name: null,
+    } as never);
+
+    await vi.waitFor(() => {
+      // The title travels with it, for the leftover-process toast.
+      expect(reapTaskLeftovers).toHaveBeenCalledWith(ipcContext, PROJECT_PATH, [{ id: 'task-3', worktree_path: null, title: 'Task Three' }]);
+    });
+    expect(WorktreeManager).not.toHaveBeenCalled();
   });
 });

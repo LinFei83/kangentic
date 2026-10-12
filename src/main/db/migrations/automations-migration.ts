@@ -4,15 +4,15 @@ import { DEFAULT_SPAWN_PROMPT_TEMPLATE } from '../../../shared/task-template-var
 import { isRetiredActionType } from '../../../shared/automation-manifest';
 import type { AutomationConfig, AutomationTrigger, AutomationType, AutoCommandMode } from '../../../shared/types';
 import { migrateSpawnAgentConfig } from './spawn-agent-config-migration';
+import { writeTransaction } from '../transaction';
 
 /**
  * One-way migration from named actions plus transitions to per-column
  * automations.
  *
  * Split into a pure planner and a thin DB runner, the same way
- * `spawn-agent-config-migration.ts` is: the native `better-sqlite3` binding is
- * rebuilt for Electron, so DB-level tests skip under plain Node vitest, and the
- * decisions worth testing are all in the planner.
+ * `spawn-agent-config-migration.ts` is: the decisions worth testing are all in
+ * the planner.
  *
  * Three things happen, and the second is the one worth reading:
  *
@@ -301,7 +301,7 @@ export function runAutomationsMigration(db: Database.Database): AutomationsMigra
   );
   const flag = db.prepare('INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)');
 
-  db.transaction(() => {
+  writeTransaction(db, () => {
     for (const automation of plan.automations) {
       insert.run(
         randomUUID(),

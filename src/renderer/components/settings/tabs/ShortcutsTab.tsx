@@ -4,12 +4,16 @@ import { SortableContext, verticalListSortingStrategy, useSortable, arrayMove, s
 import { CSS } from '@dnd-kit/utilities';
 import { Plus, Trash2, GripVertical, ChevronDown, ChevronRight, Info, Zap } from 'lucide-react';
 import { useBoardStore } from '../../../stores/board-store';
+import { useToastStore } from '../../../stores/toast-store';
+import { describeIpcError } from '../../../lib/ipc-error';
 import { IconPickerDialog } from '../../dialogs/IconPickerDialog';
 import { RegistryIcon } from '../../../utils/swimlane-icons';
 import { useHmrGeneration } from '../../../utils/hmr-generation';
 import { IntentKeyboardSensor } from '../../../utils/intent-keyboard-sensor';
-import { SectionHeader, Select, INPUT_CLASS } from '../shared';
+import { INPUT_CLASS } from '../shared';
+import { SettingsCard, CardTile } from '../settings-card';
 import { Pill } from '../../Pill';
+import { SegmentedControl } from '../../SegmentedControl';
 import { OverlayPopover } from '../../OverlayPopover';
 import { usePopoverPosition } from '../../../hooks/usePopoverPosition';
 import type { ShortcutConfig, ShortcutDisplay } from '../../../../shared/types';
@@ -113,14 +117,12 @@ function SortableActionItem({
 
 
   return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className="border border-edge-input rounded-lg bg-surface-hover/30"
-    >
-      {/* Summary row */}
+    <CardTile ref={setNodeRef} style={style} className="flex flex-col">
+      {/* Summary row. The tile draws the fill and insets, so the row adds none.
+          The grip leads the row, starting under the card's icon like every
+          tile's content. */}
       <div
-        className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none hover:bg-surface-hover/50 rounded-lg transition-colors"
+        className="flex items-center gap-2 cursor-pointer select-none"
         onClick={onToggleEdit}
       >
         {/* light-dismiss-ok: the settings panel mounts as a SIBLING of AppLayout's marked shell
@@ -130,7 +132,7 @@ function SortableActionItem({
         {/* select-none-ok: the handle draws a grip icon and no text, and it
             inherits the summary row's `select-none` anyway. */}
         <div
-          className="flex-shrink-0 cursor-grab active:cursor-grabbing text-fg-disabled hover:text-fg-muted"
+          className="flex flex-shrink-0 cursor-grab active:cursor-grabbing text-fg-disabled hover:text-fg-muted"
           {...attributes}
           {...listeners}
           onClick={(event) => event.stopPropagation()}
@@ -172,7 +174,7 @@ function SortableActionItem({
 
       {/* Edit form */}
       {isEditing && (
-        <div className="px-3 pb-3 space-y-3 border-t border-edge-input/50 pt-3">
+        <div className="mt-3 space-y-3 border-t border-edge-input/50 pt-3">
           {/* Icon + Label on same row */}
           <div className="flex gap-3">
             <div className="flex-shrink-0">
@@ -235,32 +237,39 @@ function SortableActionItem({
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="text-xs text-fg-muted mb-1 block">Display</label>
-              <Select
+              <SegmentedControl<ShortcutDisplay>
+                options={[
+                  { value: 'both', label: 'Both', title: 'In the task window header and its menu' },
+                  { value: 'header', label: 'Header', title: 'In the task window header only' },
+                  { value: 'menu', label: 'Menu', title: 'In the task window menu only' },
+                ]}
                 value={action.display ?? 'both'}
-                onChange={(event) => onUpdateAndSave({ display: event.target.value as ShortcutDisplay })}
-              >
-                <option value="both">Both</option>
-                <option value="header">Header only</option>
-                <option value="menu">Menu only</option>
-              </Select>
+                onChange={(display) => onUpdateAndSave({ display })}
+                ariaLabel="Display"
+                testId="shortcut-display"
+                quiet
+                fullWidth
+              />
             </div>
             <div>
               <label className="text-xs text-fg-muted mb-1 block">Scope</label>
-              <Select
+              <SegmentedControl
+                options={[
+                  { value: 'team', label: 'Team', title: 'Shared with the team in kangentic.json' },
+                  { value: 'local', label: 'Personal', title: 'Only yours, in kangentic.local.json' },
+                ]}
                 value={action.source}
-                onChange={(event) => {
-                  const newSource = event.target.value as 'team' | 'local';
-                  onUpdateAndSave({ source: newSource });
-                }}
-              >
-                <option value="team">Team (kangentic.json)</option>
-                <option value="local">Personal (kangentic.local.json)</option>
-              </Select>
+                onChange={(newSource) => onUpdateAndSave({ source: newSource })}
+                ariaLabel="Scope"
+                testId="shortcut-scope"
+                quiet
+                fullWidth
+              />
             </div>
           </div>
         </div>
       )}
-    </div>
+    </CardTile>
   );
 }
 
@@ -323,12 +332,21 @@ export function ShortcutsTab() {
     const teamActions = actions.filter((action) => action.source === 'team').map(stripSource);
     const personalActions = actions.filter((action) => action.source === 'local').map(stripSource);
 
-    // Save team and local actions separately
-    if (teamActions.length > 0 || shortcuts.some((action) => action.source === 'team')) {
-      await window.electronAPI.boardConfig.setShortcuts(teamActions, 'team');
-    }
-    if (personalActions.length > 0 || shortcuts.some((action) => action.source === 'local')) {
-      await window.electronAPI.boardConfig.setShortcuts(personalActions, 'local');
+    // Save team and local actions separately. A save is refused when its file
+    // exists but cannot be read (merge conflict markers, say), rather than
+    // replaced; say so, then reload below so the list shows what is saved.
+    try {
+      if (teamActions.length > 0 || shortcuts.some((action) => action.source === 'team')) {
+        await window.electronAPI.boardConfig.setShortcuts(teamActions, 'team');
+      }
+      if (personalActions.length > 0 || shortcuts.some((action) => action.source === 'local')) {
+        await window.electronAPI.boardConfig.setShortcuts(personalActions, 'local');
+      }
+    } catch (error) {
+      useToastStore.getState().addToast({
+        message: `Could not save shortcuts. ${describeIpcError(error)}`,
+        variant: 'error',
+      });
     }
 
     // Reload directly instead of waiting for boardConfig:changed event
@@ -413,15 +431,18 @@ export function ShortcutsTab() {
 
   return (
     <div className="space-y-4">
-      <SectionHeader label="Shortcuts" description="Custom commands that appear in the task detail dialog header and menu." />
-
+      <SettingsCard
+        icon={<Zap size={16} />}
+        label="Shortcuts"
+        description="Custom commands in the task window's header and menu."
+        searchIds={['shortcuts']}
+      >
       {localActions.length === 0 && (
-        <p className="text-sm text-fg-faint">No shortcuts configured. Add one below or choose a preset.</p>
+        <CardTile className="text-sm text-fg-faint">No shortcuts configured. Add one below or choose a preset.</CardTile>
       )}
 
       <DndContext key={hmrGeneration} sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
         <SortableContext items={sortableIds} strategy={verticalListSortingStrategy}>
-          <div className="space-y-2">
             {localActions.map((action, index) => {
               const sortableId = getSortableId(action, index);
               return (
@@ -447,12 +468,11 @@ export function ShortcutsTab() {
                 />
               );
             })}
-          </div>
         </SortableContext>
       </DndContext>
 
       {/* Add action button + presets */}
-      <div className="flex items-center gap-2">
+      <CardTile className="flex items-center gap-2">
         <Pill
           size="lg"
           shape="square"
@@ -461,7 +481,7 @@ export function ShortcutsTab() {
           data-testid="add-shortcut"
         >
           <Plus size={14} />
-          Add Shortcut
+          Add shortcut
         </Pill>
 
         <div className="relative" ref={presetsRef}>
@@ -511,7 +531,8 @@ export function ShortcutsTab() {
             })()}
           </OverlayPopover>
         </div>
-      </div>
+      </CardTile>
+      </SettingsCard>
     </div>
   );
 }

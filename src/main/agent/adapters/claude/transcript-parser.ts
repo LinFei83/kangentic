@@ -11,6 +11,9 @@ import type {
 } from '../../../../shared/types';
 import { readJsonlWindow, streamJsonlRecords } from '../../shared/history-scan';
 import { touchBounded, heldBytes } from '../../shared/bounded-lru';
+import { timeSyncWork } from '../../../diagnostics/event-loop-lag';
+import { estimateToolResultTokens } from './tool-result-tokens';
+import { isNarrationSignature, reportUnrecognizedTextThinking } from './thinking-signature';
 import {
   parseWindowBytes,
   prependTruncationMarker,
@@ -194,17 +197,28 @@ function parseTranscriptLine(
         if (block.type === 'text' && typeof block.text === 'string') {
           blocks.push({ type: 'text', text: block.text });
         } else if (block.type === 'thinking') {
-          // Claude Code persists thinking text SOMETIMES, so both shapes are
-          // live and this branch is load-bearing rather than speculative.
-          // Measured across the transcripts on a dev machine: 1,979 thinking
-          // blocks carry text against 16,879 that hold only an encrypted
-          // `signature`, and both forms appear on the same day - so this is a
-          // per-turn difference, not a version cutover to wait out. An empty
-          // one would render as a useless empty disclosure, so it is skipped;
-          // a text-bearing one becomes a real block, which also makes it the
-          // line that claims the message's usage below.
-          if (typeof block.thinking === 'string' && block.thinking.length > 0) {
-            blocks.push({ type: 'thinking', text: block.thinking });
+          // Real thinking is persisted empty, with only an encrypted
+          // `signature`, and would render as a useless empty disclosure, so it
+          // is skipped. The thinking blocks that DO carry text are narration:
+          // the server's summaries of the prose between tool calls, tagged
+          // `narration` inside the signature. Claude Code decodes that tag and
+          // prints them as ordinary `●` messages, so they become `text` here,
+          // or the board trail and the viewer would miss lines the terminal
+          // shows (see `thinking-signature.ts`). A text-bearing block whose
+          // signature does not decode as narration stays `thinking`, and is
+          // logged once, since on current models that means the format moved.
+          // Whitespace-only text also stays `thinking` and is not logged:
+          // Claude Code prints narration only when its text is non-blank.
+          //
+          // Either way, exactly the lines that carry text emit a block, so a
+          // narration line still claims the message's usage below, the same
+          // line it claimed before narration was told apart.
+          const thinkingText = typeof block.thinking === 'string' ? block.thinking : '';
+          if (thinkingText.length > 0) {
+            const hasVisibleText = thinkingText.trim().length > 0;
+            const shownAsText = hasVisibleText && isNarrationSignature(block.signature);
+            if (hasVisibleText && !shownAsText) reportUnrecognizedTextThinking(block.signature);
+            blocks.push(shownAsText ? { type: 'text', text: thinkingText } : { type: 'thinking', text: thinkingText });
           }
         } else if (block.type === 'tool_use') {
           blocks.push({
@@ -225,8 +239,11 @@ function parseTranscriptLine(
     // "attributed" so the following text entry (same id) is deduped out of its
     // own usage, silently losing the whole turn's per-turn tokens. Claiming
     // usage only when an entry is actually emitted keeps it on the first
-    // VISIBLE line of each message id - which, when the thinking text IS
-    // persisted, is that thinking line itself.
+    // VISIBLE line of each message id - which, for a narration block, is that
+    // narration line itself. Which line that is must not change between
+    // versions: the turn-usage ledger is keyed by line and never purged, so
+    // moving the claim counts a message twice on the next re-walk (see
+    // `ConversationUsageStore`).
     if (blocks.length === 0) return;
 
     // Attribute this turn's usage to exactly one emitted entry per message id
@@ -293,15 +310,19 @@ const INCREMENTAL_STATE_LIMIT = 32;
  * budget is the backstop against many large sessions accumulating, not the
  * primary fix.
  *
- * Both bounds are live and neither is decorative: with `MAX_PARSE_SOURCE_BYTES`
- * capping any single record at 16MB of source, the COUNT binds for the common
- * working set of many small sessions and these BYTES bind for a few large ones
- * (at least 4 max-size records fit).
+ * Both bounds are live and neither is decorative: with a record holding at most
+ * `MAX_RETAINED_WINDOWS` windows of source (32MB), the COUNT binds for the
+ * common working set of many small sessions and these BYTES bind for a few
+ * large ones (at least 2 max-size records fit).
  *
  * Mutable only so tests can exercise eviction against a few KB instead of
  * writing 64MB of temp files.
  */
 const INCREMENTAL_STATE_BYTE_BUDGET = 64 * 1024 * 1024;
+
+/** Parse windows of source a record may retain before an append re-windows it:
+ *  a full parse keeps one, and appends grow it to two. */
+const MAX_RETAINED_WINDOWS = 2;
 let incrementalStateByteBudget = INCREMENTAL_STATE_BYTE_BUDGET;
 
 /** Source bytes this state's retained entries were parsed from. */
@@ -317,10 +338,10 @@ function touchIncrementalState(filePath: string, state: IncrementalParseState): 
     limit: INCREMENTAL_STATE_LIMIT,
     byteBudget: incrementalStateByteBudget,
     sizeOf: retainedSourceBytes,
-    // A lone record cannot exceed the budget on its own, because
-    // MAX_PARSE_SOURCE_BYTES (16MB) is a quarter of it. So this floor never has
-    // to rescue anything, and the "retain one oversized record forever" versus
-    // "evict it and re-parse every tick" dilemma simply does not arise.
+    // A lone record cannot exceed the budget on its own, because it holds at
+    // most MAX_RETAINED_WINDOWS windows (32MB), half of it. So this floor never
+    // has to rescue anything, and the "retain one oversized record forever"
+    // versus "evict it and re-parse every tick" dilemma simply does not arise.
     minRetained: 1,
   });
 }
@@ -410,13 +431,16 @@ export async function parseClaudeTranscript(filePath: string): Promise<Transcrip
     && stat.size > previous.size
     && stat.mtimeMs >= previous.mtimeMs
     // Appending forever would grow `entries` without bound even though each
-    // increment is small, so a session that has outgrown the window falls
-    // through to a full re-window below. That costs one re-read per
-    // MAX_PARSE_SOURCE_BYTES of growth, and during it the replacement array is
-    // built while the old one is still reachable from the file cache and the
-    // stitch memo - a transient of roughly two windows, which the byte budget
+    // increment is small, so a session whose retained span passes TWO windows
+    // falls through to a full re-window below: one re-read per
+    // MAX_PARSE_SOURCE_BYTES of growth. The bound used to be one window, which
+    // a full parse of a large file already fills (it keeps exactly the last
+    // window), so every poll of a live session past 16 MB re-read and
+    // re-parsed its whole 16 MB tail. During a re-window the replacement array
+    // is built while the old one is still reachable from the file cache and the
+    // stitch memo, a transient of about three windows, which the byte budget
     // above is sized to absorb.
-    && stat.size - previous.windowStartByte <= parseWindowBytes();
+    && stat.size - previous.windowStartByte <= MAX_RETAINED_WINDOWS * parseWindowBytes();
 
   if (canIncrement && previous) {
     try {
@@ -429,10 +453,12 @@ export async function parseClaudeTranscript(filePath: string): Promise<Transcrip
       const combined = Buffer.concat([previous.carry, appended]);
       const { completeLinesText, carry } = splitCompleteLines(combined);
       if (completeLinesText.length > 0) {
-        for (const line of completeLinesText.split('\n')) {
-          if (line.length === 0) continue;
-          parseTranscriptLine(line, previous.entries, previous.usageAttributedMessageIds);
-        }
+        timeSyncWork('transcript:parse-append', () => {
+          for (const line of completeLinesText.split('\n')) {
+            if (line.length === 0) continue;
+            parseTranscriptLine(line, previous.entries, previous.usageAttributedMessageIds);
+          }
+        });
       }
       previous.mtimeMs = stat.mtimeMs;
       previous.size = stat.size;
@@ -459,10 +485,12 @@ export async function parseClaudeTranscript(filePath: string): Promise<Transcrip
 
   const entries: TranscriptEntry[] = [];
   const usageAttributedMessageIds = new Set<string>();
-  for (const line of window.text.split(/\r?\n/)) {
-    if (line.length === 0) continue;
-    parseTranscriptLine(line, entries, usageAttributedMessageIds);
-  }
+  timeSyncWork('transcript:parse-tail', () => {
+    for (const line of window.text.split(/\r?\n/)) {
+      if (line.length === 0) continue;
+      parseTranscriptLine(line, entries, usageAttributedMessageIds);
+    }
+  });
 
   // Report the omission in-band rather than dropping turns silently. The
   // viewer already renders `system` entries, so this needs no new response
@@ -549,10 +577,12 @@ export async function parseClaudeTranscriptWindow(
 ): Promise<{ entries: TranscriptEntry[]; nextByteOffset: number; totalBytes: number }> {
   const window = await readJsonlWindow(filePath, { startByte, maxBytes });
   const entries: TranscriptEntry[] = [];
-  for (const line of window.text.split(/\r?\n/)) {
-    if (line.length === 0) continue;
-    parseTranscriptLine(line, entries, attributedMessageIds);
-  }
+  timeSyncWork('transcript:parse-walk', () => {
+    for (const line of window.text.split(/\r?\n/)) {
+      if (line.length === 0) continue;
+      parseTranscriptLine(line, entries, attributedMessageIds);
+    }
+  });
   // Prune to the most recent ids. A Set iterates in insertion order, so the
   // front is the oldest - and the oldest is the safest to drop, because a
   // message id is only ever at risk of straddling the seam that immediately
@@ -647,11 +677,80 @@ export async function parseClaudeTranscriptUsage(filePath: string): Promise<Tran
   return { inputTokens, outputTokens };
 }
 
+/** One distinct tool call in a transcript, as the tool-call cursor holds it. */
+interface ToolCallEntry {
+  /** The assistant line's timestamp; +Infinity when it carried none, so the
+   *  call counts under any `sinceMs` rather than vanishing. */
+  ts: number;
+  toolName: string;
+  /** Sidechain calls fill a subagent's context, not the main one. */
+  sidechain: boolean;
+  /** Set once its result arrives; undefined while it is still pending. */
+  resultTokens: number | undefined;
+}
+
 /**
- * Parse Claude's native session JSONL into a cumulative tool-call count + a
- * callCount-only per-tool breakdown. Backfills `UsageAccumulator.getToolCallCount`
- * for sessions whose ToolStart/ToolEnd hook events never reached the live
- * accumulator (e.g. a suspended/parked session reports 0 despite real work).
+ * Per-path state behind `parseClaudeTranscriptToolCounts` and
+ * `parseClaudeTranscriptToolResultTokens`. It keeps one small entry per call,
+ * not the transcript, so it can resume from `offset` on the next call and read
+ * only what the session appended since, and so a query can be scoped to one
+ * run: Claude appends every `--resume` of a conversation to the same file,
+ * while a Kangentic session (and its record) covers a single run.
+ */
+interface ToolCallCursor {
+  /** File identity at the last read; a different inode is a replaced file. */
+  ino: number;
+  mtimeMs: number;
+  /** First byte not yet consumed: always just past a complete line. */
+  offset: number;
+  /**
+   * The bytes just before `offset` at the last read. A resume first checks
+   * they are unchanged, which catches what size, mtime and inode miss: a file
+   * rewritten in place to at least its old length, or a replacement whose
+   * inode reads the same (NTFS file ids past 2^53 lose precision as numbers,
+   * and some filesystems report 0).
+   */
+  tail: Buffer;
+  calls: ToolCallEntry[];
+  /** Calls by `tool_use` id: dedupes re-emitted messages and finds a result's call. */
+  callById: Map<string, ToolCallEntry>;
+}
+
+const toolCallCursorByPath = new Map<string, ToolCallCursor>();
+/** Each path's latest read. A new call chains onto it rather than starting a
+ *  second read of the same file, so overlapping popover refetches never stream
+ *  a long transcript twice: the second one reads only the bytes appended since. */
+const toolCallReadByPath = new Map<string, Promise<void>>();
+
+/** Paths whose cursor is retained (the live popover's session, plus run-end
+ *  backfills of recently ended sessions). */
+const TOOL_CALL_CURSOR_LIMIT = 16;
+/** Retained bytes per call (the entry plus its id's Map slot). Measured at
+ *  about 88 in Node without pointer compression, so this leaves headroom. */
+const TOOL_CALL_BYTES_PER_CALL = 128;
+const TOOL_CALL_CURSOR_BYTE_BUDGET = 32 * 1024 * 1024;
+/** Bytes read per positioned read: bounds the peak to a chunk plus one line. */
+const TOOL_CALL_READ_CHUNK_BYTES = 4 * 1024 * 1024;
+/** Length of `ToolCallCursor.tail`. */
+const TOOL_CALL_TAIL_BYTES = 64;
+
+function toolCallCursorBytes(cursor: ToolCallCursor): number {
+  return cursor.calls.length * TOOL_CALL_BYTES_PER_CALL;
+}
+
+/** Test-only: drop every tool-call cursor between cases. */
+export function resetToolCallCursorsForTests(): void {
+  toolCallCursorByPath.clear();
+  toolCallReadByPath.clear();
+}
+
+/**
+ * Parse Claude's native session JSONL into a tool-call count + a per-tool
+ * breakdown carrying call counts and estimated result tokens. Backfills
+ * `UsageAccumulator.getToolCallCount` for sessions whose ToolStart/ToolEnd hook
+ * events never reached the live accumulator (e.g. a suspended/parked session
+ * reports 0 despite real work), and supplies the `resultTokens` the run-end
+ * backfill merges onto the live breakdown.
  *
  * Counts DISTINCT `tool_use.id` values, not raw blocks: parallel tool calls in
  * one assistant message have distinct ids and are all counted, but a single
@@ -659,48 +758,307 @@ export async function parseClaudeTranscriptUsage(filePath: string): Promise<Tran
  * `parseClaudeTranscriptUsage` dedups by `message.id` for) carries the same
  * `tool_use.id` on each re-emission and must not be double-counted. MCP tools
  * and `TodoWrite` are ordinary `tool_use` blocks and are counted like any other
- * tool. Returns null when the file is missing/unreadable or the transcript has
- * no tool_use blocks, so the caller keeps the live count.
+ * tool. Each `tool_result` is matched to its `tool_use` by id and sized by
+ * `estimateToolResultTokens`; sidechain calls add no result tokens, since they
+ * fill a subagent's context, not the main one.
+ *
+ * `sinceMs` scopes the answer to calls made at or after it (a run's start).
+ * Without it the whole file counts, every `--resume` of the conversation
+ * included. `untilMs` closes the window before it (the next run's start), so a
+ * finished run read after a later run began counts only its own calls; see
+ * `callsInWindow` for calls with no timestamp.
+ *
+ * RESUMABLE. A per-path cursor keeps one entry per call and the byte offset of
+ * the last complete line, so a repeat call reads only what was appended. Not
+ * `parseClaudeTranscript`'s incremental cache, which is tail-windowed at 16 MB
+ * and cannot see a whole session. A shrink, an mtime going backwards, a new
+ * inode, or changed bytes just before the offset resets to a full re-read; a
+ * failed read drops the cursor. Reads go in fixed-size chunks, so the peak is
+ * one chunk plus the longest line, never the whole file.
+ *
+ * Returns null when the file is missing/unreadable, a read failed partway, or
+ * no tool_use falls in scope, so the caller keeps the live count. A partial
+ * read is rejected because an undercount here is written to the session row as
+ * the run's tool-call total.
  */
-export async function parseClaudeTranscriptToolCounts(filePath: string): Promise<TranscriptToolCounts | null> {
-  const countByTool = new Map<string, number>();
-  const seenToolUseIds = new Set<string>();
-  let toolCallCount = 0;
+export function parseClaudeTranscriptToolCounts(
+  filePath: string,
+  sinceMs?: number | null,
+  untilMs?: number | null,
+): Promise<TranscriptToolCounts | null> {
+  return withToolCallCursor(filePath, (cursor) => {
+    const countByTool = new Map<string, number>();
+    const resultTokensByTool = new Map<string, number>();
+    let toolCallCount = 0;
+    for (const call of callsInWindow(cursor, sinceMs, untilMs)) {
+      toolCallCount += 1;
+      countByTool.set(call.toolName, (countByTool.get(call.toolName) ?? 0) + 1);
+      if (call.resultTokens !== undefined) {
+        resultTokensByTool.set(call.toolName, (resultTokensByTool.get(call.toolName) ?? 0) + call.resultTokens);
+      }
+    }
+    if (toolCallCount === 0) return null;
+    const toolBreakdown: PerToolStat[] = Array.from(countByTool, ([toolName, callCount]) => {
+      const stat: PerToolStat = { toolName, callCount, totalDurationMs: 0, interruptedCount: 0 };
+      const resultTokens = resultTokensByTool.get(toolName);
+      if (resultTokens !== undefined) stat.resultTokens = resultTokens;
+      return stat;
+    });
+    return { toolCallCount, toolBreakdown };
+  });
+}
 
-  // Streamed for the same reason as `parseClaudeTranscriptUsage`, and it
-  // matters doubly here: these two run back to back on every run-ending path,
-  // so the pair used to put TWO whole copies of the same transcript on the heap
-  // at once.
-  const readWholeFile = await streamJsonlRecords(filePath, (raw) => {
-    if (raw.type !== 'assistant') return;
-    const message = raw.message;
-    if (!isRecord(message) || !Array.isArray(message.content)) return;
+/**
+ * Estimated result tokens per tool name for the calls made at or after
+ * `sinceMs` and, when given, before `untilMs`, from the same resumable cursor
+ * as `parseClaudeTranscriptToolCounts`. The live tool-call popover calls this
+ * on every tool call, which the cursor makes cheap: each call reads only the
+ * bytes appended since the last. A closed window is how an earlier run's
+ * estimates are read after a later run began. A tool with no result yet in
+ * scope is absent. Null when the file cannot be read.
+ */
+export function parseClaudeTranscriptToolResultTokens(
+  filePath: string,
+  sinceMs?: number | null,
+  untilMs?: number | null,
+): Promise<Record<string, number> | null> {
+  return withToolCallCursor(filePath, (cursor) => {
+    const resultTokensByTool: Record<string, number> = {};
+    for (const call of callsInWindow(cursor, sinceMs, untilMs)) {
+      if (call.resultTokens === undefined) continue;
+      resultTokensByTool[call.toolName] = (resultTokensByTool[call.toolName] ?? 0) + call.resultTokens;
+    }
+    return resultTokensByTool;
+  });
+}
 
+/**
+ * The calls with `sinceMs <= ts < untilMs`; a missing bound is open. A call
+ * whose line carried no timestamp has `ts` = +Infinity: it counts under any
+ * open-ended window rather than vanishing, and is left out of a closed one,
+ * which cannot claim a call it cannot place.
+ */
+function* callsInWindow(
+  cursor: ToolCallCursor,
+  sinceMs: number | null | undefined,
+  untilMs: number | null | undefined,
+): Generator<ToolCallEntry> {
+  const since = typeof sinceMs === 'number' && Number.isFinite(sinceMs) ? sinceMs : Number.NEGATIVE_INFINITY;
+  const until = typeof untilMs === 'number' && Number.isFinite(untilMs) ? untilMs : Number.POSITIVE_INFINITY;
+  const closed = until !== Number.POSITIVE_INFINITY;
+  for (const call of cursor.calls) {
+    if (call.ts < since) continue;
+    if (closed && !(call.ts < until)) continue;
+    yield call;
+  }
+}
+
+/**
+ * Advance `filePath`'s cursor to the end of the file, then answer `view` from
+ * it, inside the same step so no later read can move the cursor in between.
+ * Steps for one path run one after another. Null when the read failed.
+ */
+function withToolCallCursor<T>(filePath: string, view: (cursor: ToolCallCursor) => T | null): Promise<T | null> {
+  const previous = toolCallReadByPath.get(filePath) ?? Promise.resolve();
+  const step = async (): Promise<T | null> => {
+    const cursor = await advanceToolCallCursor(filePath);
+    return cursor ? view(cursor) : null;
+  };
+  // Run after the previous read either way: a failure there must not fail this one.
+  const next = previous.then(step, step);
+  const settled = next.then(() => undefined, () => undefined);
+  toolCallReadByPath.set(filePath, settled);
+  void settled.then(() => {
+    if (toolCallReadByPath.get(filePath) === settled) toolCallReadByPath.delete(filePath);
+  });
+  return next;
+}
+
+async function advanceToolCallCursor(filePath: string): Promise<ToolCallCursor | null> {
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    stat = await fs.stat(filePath);
+  } catch {
+    toolCallCursorByPath.delete(filePath);
+    return null;
+  }
+  const size = Number(stat.size);
+  const mtimeMs = Number(stat.mtimeMs);
+  const ino = Number(stat.ino);
+  const existing = toolCallCursorByPath.get(filePath);
+  // Nothing changed since the last read: answer without opening the file,
+  // which is the common case for a popover refetch.
+  if (existing && size === existing.offset && mtimeMs === existing.mtimeMs && ino === existing.ino) {
+    retainToolCallCursor(filePath, existing);
+    return existing;
+  }
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(filePath, 'r');
+    let cursor = existing;
+    if (!cursor || size < cursor.offset || mtimeMs < cursor.mtimeMs || ino !== cursor.ino
+        || !(await readTail(handle, cursor.offset)).equals(cursor.tail)) {
+      cursor = { ino, mtimeMs, offset: 0, tail: Buffer.alloc(0), calls: [], callById: new Map() };
+    }
+    const advancing = cursor;
+    advancing.offset = await forEachCompleteLine(handle, filePath, advancing.offset, size, (line) => {
+      applyToolCallLine(advancing, line);
+    });
+    advancing.tail = await readTail(handle, advancing.offset);
+    advancing.ino = ino;
+    advancing.mtimeMs = mtimeMs;
+    retainToolCallCursor(filePath, advancing);
+    return advancing;
+  } catch {
+    toolCallCursorByPath.delete(filePath);
+    return null;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function retainToolCallCursor(filePath: string, cursor: ToolCallCursor): void {
+  touchBounded(toolCallCursorByPath, filePath, cursor, {
+    limit: TOOL_CALL_CURSOR_LIMIT,
+    byteBudget: TOOL_CALL_CURSOR_BYTE_BUDGET,
+    sizeOf: toolCallCursorBytes,
+    // A session big enough to pass the budget alone is the one being polled
+    // live; evicting it would re-read the whole file on the next refetch.
+    minRetained: 1,
+  });
+}
+
+/** The up to `TOOL_CALL_TAIL_BYTES` bytes that end at `offset`. A short read returns fewer. */
+async function readTail(handle: Awaited<ReturnType<typeof fs.open>>, offset: number): Promise<Buffer> {
+  const length = Math.min(TOOL_CALL_TAIL_BYTES, offset);
+  if (length === 0) return Buffer.alloc(0);
+  const buffer = Buffer.alloc(length);
+  const { bytesRead } = await handle.read(buffer, 0, length, offset - length);
+  return buffer.subarray(0, bytesRead);
+}
+
+function applyToolCallLine(cursor: ToolCallCursor, line: string): void {
+  // Most lines carry neither block; skip their JSON.parse entirely.
+  const mayHoldToolUse = line.includes('"tool_use"');
+  if (!mayHoldToolUse && !line.includes('"tool_result"')) return;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (!isRecord(raw)) return;
+  const message = raw.message;
+  if (!isRecord(message) || !Array.isArray(message.content)) return;
+
+  if (raw.type === 'assistant' && mayHoldToolUse) {
+    const parsedTs = typeof raw.timestamp === 'string' ? Date.parse(raw.timestamp) : Number.NaN;
+    const ts = Number.isFinite(parsedTs) ? parsedTs : Number.POSITIVE_INFINITY;
     for (const block of message.content) {
       if (!isRecord(block) || block.type !== 'tool_use') continue;
       const toolUseId = typeof block.id === 'string' ? block.id : '';
-      if (toolUseId.length > 0) {
-        if (seenToolUseIds.has(toolUseId)) continue;
-        seenToolUseIds.add(toolUseId);
-      }
-      const toolName = typeof block.name === 'string' && block.name.length > 0 ? block.name : 'tool';
-      countByTool.set(toolName, (countByTool.get(toolName) ?? 0) + 1);
-      toolCallCount += 1;
+      if (toolUseId.length > 0 && cursor.callById.has(toolUseId)) continue;
+      const call: ToolCallEntry = {
+        ts,
+        toolName: typeof block.name === 'string' && block.name.length > 0 ? block.name : 'tool',
+        sidechain: raw.isSidechain === true,
+        resultTokens: undefined,
+      };
+      cursor.calls.push(call);
+      if (toolUseId.length > 0) cursor.callById.set(toolUseId, call);
     }
-  });
+    return;
+  }
 
-  // Missing/unreadable file streams zero records -> null, matching the old
-  // read-failure behavior (caller keeps the live count). A partial read is
-  // rejected for the same reason as the usage totals above: an undercount here
-  // is written to the session row as the run's tool-call total.
-  if (!readWholeFile || toolCallCount === 0) return null;
-  const toolBreakdown: PerToolStat[] = Array.from(countByTool, ([toolName, callCount]) => ({
-    toolName,
-    callCount,
-    totalDurationMs: 0,
-    interruptedCount: 0,
-  }));
-  return { toolCallCount, toolBreakdown };
+  if (raw.type !== 'user') return;
+  for (const block of message.content) {
+    if (!isRecord(block) || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const call = cursor.callById.get(block.tool_use_id);
+    // Unknown id, a sidechain call, or a result already counted.
+    if (!call || call.sidechain || call.resultTokens !== undefined) continue;
+    call.resultTokens = estimateToolResultTokens(block.content);
+  }
+}
+
+/**
+ * Call `onLine` for every complete line in `[startByte, endByte)`, reading in
+ * fixed-size positioned chunks. Returns the offset just past the last line it
+ * consumed, so a partial trailing line (an append still being written) is left
+ * for the next read. A final line with no newline is consumed only when it
+ * parses as JSON, which a half-written record cannot. Throws on a short read
+ * (the file was truncated mid-read), so the caller can drop its state.
+ *
+ * A line longer than a chunk is kept as a list of its pieces and joined once,
+ * when its newline arrives, so its bytes are copied once rather than once per
+ * chunk it spans.
+ */
+async function forEachCompleteLine(
+  handle: Awaited<ReturnType<typeof fs.open>>,
+  filePath: string,
+  startByte: number,
+  endByte: number,
+  onLine: (line: string) => void,
+): Promise<number> {
+  let position = startByte;
+  let consumedTo = startByte;
+  // The bytes from `consumedTo` to `position`: the start of a line whose
+  // newline has not been read yet.
+  let pending: Buffer[] = [];
+  let pendingBytes = 0;
+  while (position < endByte) {
+    const length = Math.min(TOOL_CALL_READ_CHUNK_BYTES, endByte - position);
+    const chunk = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(chunk, 0, length, position);
+    if (bytesRead < length) {
+      throw new Error(`short read on ${filePath}: expected ${length} bytes, got ${bytesRead}`);
+    }
+    const chunkStart = position;
+    position += bytesRead;
+    let newlineIndex = chunk.indexOf(0x0a);
+    if (newlineIndex === -1) {
+      pending.push(chunk);
+      pendingBytes += chunk.length;
+      continue;
+    }
+    if (pendingBytes > 0) {
+      onLine(Buffer.concat([...pending, chunk.subarray(0, newlineIndex)]).toString('utf-8'));
+      pending = [];
+      pendingBytes = 0;
+    } else if (newlineIndex > 0) {
+      onLine(chunk.toString('utf-8', 0, newlineIndex));
+    }
+    let lineStart = newlineIndex + 1;
+    newlineIndex = chunk.indexOf(0x0a, lineStart);
+    while (newlineIndex !== -1) {
+      if (newlineIndex > lineStart) onLine(chunk.toString('utf-8', lineStart, newlineIndex));
+      lineStart = newlineIndex + 1;
+      newlineIndex = chunk.indexOf(0x0a, lineStart);
+    }
+    consumedTo = chunkStart + lineStart;
+    if (lineStart < chunk.length) {
+      // A copy, so the rest of the 4 MB chunk can be collected.
+      const remainder = Buffer.from(chunk.subarray(lineStart));
+      pending.push(remainder);
+      pendingBytes += remainder.length;
+    }
+  }
+  if (pendingBytes > 0) {
+    const tail = Buffer.concat(pending).toString('utf-8');
+    if (isCompleteJsonLine(tail)) {
+      onLine(tail);
+      consumedTo += pendingBytes;
+    }
+  }
+  return consumedTo;
+}
+
+function isCompleteJsonLine(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

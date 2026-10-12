@@ -1,8 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PATHS } from '../config/paths';
-import { decryptSecret, encryptSecret, isGenuineEncryptionAvailable } from '../boards/shared/auth';
-import { safeWriteJson } from '../safe-write';
+import { isGenuineEncryptionAvailable } from '../boards/shared/auth';
+import {
+  readEncryptedSecretFile,
+  rewriteEncryptedSecretFile,
+  writeEncryptedSecretFile,
+  type EncryptedSecretFile,
+} from '../boards/shared/encrypted-secret-file';
 import {
   bytesToHex,
   generateEd25519KeyPair,
@@ -19,18 +24,22 @@ import {
  * persisted globally (machine-wide, not per-project - the identity
  * represents this desktop installation, like the Asana credential).
  *
- * Mirrors src/main/boards/adapters/asana/credential-store.ts's
- * file-in-PATHS.configDir pattern: a JSON envelope whose single
- * `encrypted` field is encryptSecret(JSON.stringify(secretMaterial)).
- * Reuses encryptSecret/decryptSecret/isGenuineEncryptionAvailable from
- * src/main/boards/shared/auth.ts verbatim - they are generic string-in/
- * string-out helpers despite living under boards/.
+ * Stored like the Asana credential (src/main/boards/adapters/asana/credential-store.ts),
+ * through the same file helper in src/main/boards/shared/encrypted-secret-file.ts:
+ * a JSON envelope in PATHS.configDir whose single `encrypted` field is
+ * encryptSecret(JSON.stringify(secretMaterial)). That helper and
+ * isGenuineEncryptionAvailable (boards/shared/auth.ts) are generic despite living
+ * under boards/.
  *
  * Unlike the Asana credential, the private key material here MUST be
  * genuinely protected: refuses to persist when isGenuineEncryptionAvailable()
- * is false (Linux basic_text backend), rather than falling back to
- * encryptSecret's own plaintext degradation. A mobile bridge identity
- * that can't be protected shouldn't silently exist on disk.
+ * is false (no Linux secret store, so only the hardcoded fallback key), rather
+ * than falling back to encryptSecret's own degradation. A mobile bridge
+ * identity that can't be protected shouldn't silently exist on disk.
+ *
+ * Load, save and create are async because safeStorage's async API is
+ * (src/main/boards/shared/auth.ts). MobileBridgeService loads the identity once
+ * when it warms up and serves its synchronous readers from that cache.
  */
 export interface BridgeIdentity {
   staticKeyPair: X25519KeyPair;
@@ -46,14 +55,19 @@ interface StoredIdentity {
   createdAt: string;
 }
 
-interface StoredShape {
-  encrypted: string;
-}
-
 const IDENTITY_FILENAME = 'mobile-bridge-identity.json';
 
 function identityPath(): string {
   return path.join(PATHS.configDir, IDENTITY_FILENAME);
+}
+
+function identityFile(): EncryptedSecretFile {
+  return {
+    filePath: identityPath(),
+    writeSource: 'mobile_bridge_identity',
+    logPrefix: '[mobile-bridge/identity]',
+    noun: 'identity',
+  };
 }
 
 function toStored(identity: BridgeIdentity): StoredIdentity {
@@ -74,49 +88,44 @@ function fromStored(stored: StoredIdentity): BridgeIdentity {
   };
 }
 
-export function loadBridgeIdentity(): BridgeIdentity | null {
-  const filePath = identityPath();
-  if (!fs.existsSync(filePath)) return null;
-  try {
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const parsed = JSON.parse(raw) as StoredShape;
-    if (!parsed.encrypted) return null;
-    const decrypted = decryptSecret(parsed.encrypted);
-    const stored = JSON.parse(decrypted) as StoredIdentity;
-    if (typeof stored?.staticSecretKeyHex !== 'string' || stored.staticSecretKeyHex.length === 0) return null;
-    return fromStored(stored);
-  } catch (error) {
-    console.warn('[mobile-bridge/identity] failed to load identity:', error);
-    return null;
-  }
+function parseIdentity(plaintext: string): BridgeIdentity | null {
+  const stored = JSON.parse(plaintext) as StoredIdentity;
+  if (typeof stored?.staticSecretKeyHex !== 'string' || stored.staticSecretKeyHex.length === 0) return null;
+  return fromStored(stored);
 }
 
-function saveBridgeIdentity(identity: BridgeIdentity): void {
-  const encrypted = encryptSecret(JSON.stringify(toStored(identity)));
-  const payload: StoredShape = { encrypted };
-  // mode 0o600: best-effort defense-in-depth for the file holding the
-  // encrypted private-key material (no-op on Windows, honored on POSIX at
-  // create time). The payload is already safeStorage-encrypted; this just
-  // narrows who can read the ciphertext at rest. Degrades rather than throws
-  // (see safe-write.ts) - an unwritable config directory must not reject
-  // pairing, and the shared write-failure-notice latch tells the user once.
-  safeWriteJson(identityPath(), payload, 'mobile_bridge_identity', { mode: 0o600 });
+export async function loadBridgeIdentity(): Promise<BridgeIdentity | null> {
+  const file = identityFile();
+  const read = await readEncryptedSecretFile(file, parseIdentity);
+  if (!read) return null;
+  // Written by the sync API under a key the async one does not hold, or flagged
+  // for re-encryption (see decryptSecret). Only ever rewritten under GENUINE
+  // encryption, the same bar creating an identity has to clear.
+  if (read.shouldRewrite && (await isGenuineEncryptionAvailable())) {
+    await rewriteEncryptedSecretFile(file, read);
+  }
+  return read.value;
+}
+
+async function saveBridgeIdentity(identity: BridgeIdentity): Promise<void> {
+  await writeEncryptedSecretFile(identityFile(), JSON.stringify(toStored(identity)));
 }
 
 /**
  * Loads the existing identity, or generates and persists a new one.
  * Throws rather than persisting unprotected private key material when
- * genuine encryption is unavailable (Linux basic_text backend) - callers
- * should check isGenuineEncryptionAvailable() first and surface a clear
- * "secure storage unavailable" status instead of calling this blindly.
+ * genuine encryption is unavailable (no Linux secret store, or safeStorage
+ * disabled) - callers should check isGenuineEncryptionAvailable() first and
+ * surface a clear "secure storage unavailable" status instead of calling this
+ * blindly.
  */
-export function loadOrCreateBridgeIdentity(): BridgeIdentity {
-  const existing = loadBridgeIdentity();
+export async function loadOrCreateBridgeIdentity(): Promise<BridgeIdentity> {
+  const existing = await loadBridgeIdentity();
   if (existing) return existing;
 
-  if (!isGenuineEncryptionAvailable()) {
+  if (!(await isGenuineEncryptionAvailable())) {
     throw new Error(
-      'Cannot create a mobile bridge identity: secure storage is unavailable (Linux basic_text backend or safeStorage disabled). Refusing to persist an unprotected private key.',
+      'Cannot create a mobile bridge identity: secure storage is unavailable (no Linux secret store, or safeStorage disabled). Refusing to persist an unprotected private key.',
     );
   }
 
@@ -125,7 +134,7 @@ export function loadOrCreateBridgeIdentity(): BridgeIdentity {
     masterSigningKeyPair: generateEd25519KeyPair(),
     createdAt: new Date().toISOString(),
   };
-  saveBridgeIdentity(identity);
+  await saveBridgeIdentity(identity);
   return identity;
 }
 

@@ -84,12 +84,14 @@ module's `resolveEffectivePermissionMode` (a lane forcing `plan` always wins, el
 | MCP create (`kangentic_create_task`) | `autoSpawnForTask` | `spawnAgent` |
 | Column auto-spawn switched on | a column edit or a Board Profile edit, from either the Board Manager or the MCP `update_column` / profile tools, via `reconcileAutoSpawnChange` | `autoSpawnForTask` -> `spawnAgent` (sequential, skips user-paused, active project only) |
 | Unarchive (single + bulk) | Completed Tasks restore / `TASK_UNARCHIVE` | `spawnAgent`, `skipPromptTemplate` + `suppressAutoCommand` (recovery move) |
-| Phone Start (`start-session` verb) | "Start again" from the phone's ended state, via `startTaskSession` (`handlers/session-start.ts`) | `autoSpawnForTask` -> `spawnAgent`, `explicitStart` (lifts the column's `auto_spawn` default and a user pause, as the desktop Resume button does; the role gate stays) |
+| Phone Start (`start-session` verb) | "Start again" from the phone's ended state, via `startTaskSession` (`handlers/session-start.ts`), for a task with no session or an exited one | `autoSpawnForTask` -> `spawnAgent`, `explicitStart` (lifts the column's `auto_spawn` default and a user pause, as the desktop Resume button does; the role gate stays) |
+| Phone Resume (`start-session` verb) | the same verb for a PAUSED task (a `suspended` registry row), via `startTaskSession` | `resumeTaskSession` (`handlers/session-resume.ts`), the Resume button's own path: no enter automations, no column message |
 | Startup crash recovery | project open, `resumeSuspendedSessions` | `prepareAgentSpawn` (`session-startup/prepare-spawn.ts`) |
 | Startup reconcile | project open, `autoSpawnTasks` | `prepareAgentSpawn` |
 
-In-place restarts of an existing session (`SESSION_RESUME`, `restartSessionForSettingsChange`)
-call the engine directly; they are not first-spawn entry points. Transient Command Terminal
+In-place restarts of an existing session (`resumeTaskSession`, which `SESSION_RESUME` and a phone
+Resume share, and `restartSessionForSettingsChange`) call the engine directly; they are not
+first-spawn entry points. Transient Command Terminal
 sessions bypass all of this (not task agents).
 
 ### Engine spawn (board-driven path)
@@ -120,10 +122,12 @@ sessions bypass all of this (not task agents).
    - If under limit, call `doSpawn()`:
      - Drain EVERY existing registry row for the task, not just the first match (`SessionRegistry.listByTaskId`): kill each PTY, detach its files while preserving them on disk, clear its per-session caches, then carry scrollback and geometry over from the most recently started row that is not the id being reused (a queued placeholder being promoted reuses its own id and has no scrollback). This is what keeps the in-memory registry at one row per task; a spawn that evicted only the first match left a second stale row listed ahead of the live PTY.
      - Resolve shell and arguments (platform-specific)
-     - Spawn PTY via `node-pty`
+     - Spawn the PTY in the `kangentic-pty-host` utility process (`PtyHostClient.spawn`; node-pty
+       runs only there, see [PTY host](#pty-host)). The host reads the carry-over before it drops
+       the task's earlier sessions.
      - Start status file watcher (100ms debounce)
      - Start events file watcher (50ms debounce)
-     - Set up output handler (16ms batched flush, 512KB scrollback)
+     - The host runs the output handler (16ms batched flush, 512KB scrollback)
      - After 100ms delay, write CLI command to PTY stdin (agent spawns prefixed with the shell's own clear via `buildSpawnClearPrelude`; transient Command Terminals exempt)
 
 ## Queue
@@ -138,19 +142,19 @@ sessions bypass all of this (not task agents).
 Session teardown varies by target column:
 
 - **To Do** (role=`todo`), via `TASK_MOVE` - full cleanup via `cleanupTaskResources()`: kills the PTY (via `SessionManager.remove()`), deletes session files from disk, deletes all session DB records for the task, and then removes the worktree and (when `git.autoCleanup` is on) force-deletes the branch. Destructive, which is why the drop is gated behind a pending-changes confirmation. Moving back to an active column spawns a fresh session.
-- **To Do** (role=`todo`), via `TASK_UNARCHIVE` / `TASK_BULK_UNARCHIVE` (restore from Done) - the SESSION-only half, `cleanupTaskSession()`. The worktree and branch are left alone. Without this the task keeps the session Done deliberately suspended, and since `listSessions()` has no status filter the restored card renders "Paused" for the rest of the app session. It is not the full `cleanupTaskResources()` on purpose: `deleteTaskWorktree` nulls `worktree_path` only when the Done-time removal SUCCEEDED, so a task whose worktree was pinned at Done time (routine on Windows) still carries both fields, and the full helper would re-attempt the removal and force-delete the branch holding its committed work with no confirmation on this route.
+- **To Do** (role=`todo`), via `TASK_UNARCHIVE` / `TASK_BULK_UNARCHIVE` (restore from Done) - the SESSION-only half, `cleanupTaskSession()`, which also reaps what the task's agents left running (`reapTaskLeftovers`). The worktree and branch are left alone. Without this the task keeps the session Done deliberately suspended, and since `listSessions()` has no status filter the restored card renders "Paused" for the rest of the app session. It is not the full `cleanupTaskResources()` on purpose: `deleteTaskWorktree` nulls `worktree_path` only when the Done-time removal SUCCEEDED, so a task whose worktree was pinned at Done time (routine on Windows) still carries both fields, and the full helper would re-attempt the removal and force-delete the branch holding its committed work with no confirmation on this route.
 - **Done** (role=`done`) - suspends session (preserves for resume via `SessionManager.suspend()`), archives task, and deletes the worktree to reclaim disk while preserving `branch_name` and the session records. The DB record is marked `suspended` so the session can be resumed if the task is later unarchived into an auto-spawn column. That unarchive is the ONLY route back: resuming in place is refused for a Done or archived task (see [Where resume is refused](#where-resume-is-refused)), since it would recreate the worktree this move deleted.
 - **Any column with `auto_spawn=false`** - suspends session (same as Done, but without archiving). A restore into such a column keeps the suspended session and its Resume affordance; only a `role=todo` target resets it.
 
 ### Reaping what the session left running
 
-On the TERMINAL transitions above (move to To Do or Backlog, move to Done, and task delete), the teardown also kills processes the session left running inside the worktree. An agent that backgrounds a dev server leaves it running when the session ends; on Windows it then holds the worktree directory as its current directory and blocks the removal.
+On the TERMINAL transitions above (move to To Do or Backlog, move to Done, unarchive into To Do, task delete, and project delete), the teardown also kills every process the task's agents left running. An agent that backgrounds a dev server leaves it running when the session ends; on Windows it then holds the worktree directory as its current directory and blocks the removal.
 
-The mechanism is `captureSessionLeftovers()` before the kill or suspend, then `reapSessionLeftovers()` after it and before any worktree delete (both in `src/main/ipc/helpers/task-cleanup.ts`). The capture must come first: the bg-shell watcher stops publishing once the session ends, and on POSIX the children are reparented to init at once, so there is no tree to walk afterwards.
+Every task session's PTY is spawned with `KANGENTIC_TASK_ID=<taskId>` (`src/main/pty/process-tag/`), and every process the agent starts inherits it however it detached. The teardown calls `reapTaskLeftovers()` (`src/main/ipc/helpers/task-cleanup.ts`) AFTER every session of the task has exited and before any worktree delete; the pty host then kills every process carrying the task's tag AND working inside the task's project or worktree, except what is shared (something under it is not the task's, or other Kangentic work holds a TCP connection to a port it listens on), a launcher whose every child is kept (unless it listens itself), a visible app (read only for the task's tagged processes and what runs under them, never an ancestor such as a terminal), a tmux server, Kangentic's own process tree, and any PTY it still holds. The order matters because the reap force-kills, and a young agent must get its exit grace (`.claude/rules/pty-teardown-grace.md`). A Command Terminal carries its own made-up tag and is reaped the same way 12 s after it ends (see [command-terminal.md](command-terminal.md#leftover-processes)).
 
-The capture reads a snapshot the watcher already computed for its own counting, so it costs nothing on the drag-to-Done path. Nothing here enumerates processes; a cold `powershell` spawn measures ~670ms even for a pid-only projection. See [worktree-strategy.md](worktree-strategy.md) for the removal-time backstop and why Windows needs the parent-chain route at all.
+The tag is the same across every session the task ran, so a dev server started by an agent that a Code Review entry suspended long before is still reaped at Done, and it lives in the processes themselves, so a task parked across an app restart is reaped at its later terminal transition too. A startup sweep, once per project per launch, reaps archived and To Do tasks whose transition's reap was cut short by a crash. To keep one process past Done, start it with the tag cleared (`KANGENTIC_TASK_ID= npm run dev`). See [worktree-strategy.md](worktree-strategy.md) for what the reap kills and spares (measured on Linux, macOS and Windows), the per-platform readers, what the tag cannot see, and the removal-time backstop.
 
-`auto_spawn=false` columns and a user-pressed Stop are deliberately NOT terminal: the task is parked rather than finished, so its dev server stays up for manual testing.
+`auto_spawn=false` columns (including a Code Review entry), a user-pressed Pause or Stop, an idle-timeout suspend, and quitting the app are deliberately NOT terminal: the task is parked rather than finished, so its dev server stays up for manual testing until the task's own terminal transition.
 
 ### What is preserved on suspend (Done / auto_spawn=false)
 
@@ -162,6 +166,7 @@ The capture reads a snapshot the watcher already computed for its own counting, 
 ### What is destroyed on To Do cleanup
 
 - PTY process (force-killed, after the exit-sequence grace when the session is young; see below)
+- What the task's agents left running in its folders, once that PTY has exited (`reapTaskLeftovers`; see [worktree-strategy.md](worktree-strategy.md#reaping-processes-that-pin-a-worktree))
 - Session files on disk (deleted)
 - All session DB records for the task (deleted)
 - In-memory caches (usage, activity, events) for the session
@@ -227,7 +232,7 @@ gone.
 
 A caller that touches the cwd or process tree after a kill therefore waits for the PROCESS: `kill`,
 capture `awaitExit` (the row must still exist), then `remove`, then await before any `rmSync`,
-`removeWorktree`, or `reapSessionLeftovers`. `cleanupTaskSession`, `executeCleanupWorktree`, project
+`removeWorktree`, or `reapTaskLeftovers`. `cleanupTaskSession`, `executeCleanupWorktree`, project
 delete, project relocate, the MCP task delete, and `SESSION_KILL_TRANSIENT` all do. The rule and its
 scan: `.claude/rules/pty-teardown-grace.md`.
 
@@ -267,7 +272,12 @@ them on exactly the slow path where the later read matters most.
 ### Where resume is refused
 
 `SESSION_RESUME` (the task detail's Pause/Resume toggle) restarts a suspended session **in
-place**, in the task's current column. It is refused for three states, resolved by one shared
+place**, in the task's current column. Its body is `resumeTaskSession`
+(`handlers/session-resume.ts`), which the phone's `start-session` verb also calls for a paused
+task, so a phone Resume is the same resume: it cancels a resume already in flight for the task,
+labels the task "Resuming session...", resumes the conversation idle, and runs no enter
+automations or column message. The read-stream feed tells the phone when that promise holds
+(`resumable`, see [Mobile Bridge](mobile-bridge.md)). It is refused for three states, resolved by one shared
 predicate (`src/shared/session-resume-eligibility.ts`) that the main-process handler, the task
 detail, and the phone's `startTaskSession` (`handlers/session-start.ts`, the `start-session` verb)
 all read, and whose role set startup recovery shares:
@@ -371,12 +381,102 @@ capability and no agent-name branching. Two things make it correct rather than m
   past a 30s spawn grace; and the session being a `SessionManager`-approved candidate.
 
 `SessionManager.isAgentAbsenceCandidate` owns every session-shaped arm, so the watcher needs no
-session knowledge. It requires a `running`, non-transient session with a live PTY, an agent adapter,
-a non-WSL shell, and an elapsed spawn grace. The **transient exclusion is load-bearing**: a Command Terminal is a
-bare shell BY DESIGN and is registered with the watcher like any task agent, so without it the sweep
-would retire every Command Terminal the moment it opened. A slow-STARTING agent is not excluded by
-the grace and does not need to be - its process exists, it just has not drawn yet, which is exactly
-why the process tree is a safer signal than a first-output timeout.
+session knowledge. It requires a `running` session with a live PTY, an agent adapter, a non-WSL
+shell (`parseWslShellSpec`, which also matches a bare `wsl` spec), and an elapsed spawn grace. A
+slow-STARTING agent is not excluded by the grace and does not need to be - its process exists, it
+just has not drawn yet, which is exactly why the process tree is a safer signal than a first-output
+timeout. A slow-starting SHELL is another matter, and only a Command Terminal pays for it (below).
+
+**Command Terminals are judged too, and ended rather than kept.** A Command Terminal runs the
+project's agent CLI in a shell at the project root, the same shape as a task session, so the tree
+signal reads it the same way. Its row used to be excluded, which left a bare shell at the project
+root after `/exit` for anyone holding the session's input, a paired phone included. Now
+`retireAgentlessSession` emits `agent-absent` for it and then calls
+`SessionManager.endCommandTerminal(id, { immediate: true })`: the PTY is killed, the row is removed
+(a `session-removed` push, which closes the desktop window), and the session directory is deleted
+after the exit. `remove()` would delete it at once through `SessionFileManager.detachAndDelete`, so
+`endCommandTerminal` detaches the files first (`detachPreservingFiles`) and leaves its own
+post-exit delete as the only one. A terminal has no task to resume into, so there is nothing to
+keep.
+
+Because a terminal is ended rather than kept, being judged too early costs it everything. A shell
+slower than the 30s grace to reach the agent command (a heavy profile, a cold machine) shows the
+same empty tree as an agent that exited, so a Command Terminal also waits for evidence that its
+agent started: its first SessionStart (`agentStartObservedAt`, sticky across `/clear`) or its
+first alt-screen entry (`altScreenEnteredAt`), which no shell emits. The first-output latch is not
+evidence, because a pwsh preamble trips it. With neither, the sweep judges the terminal once
+`COMMAND_TERMINAL_AGENT_START_CEILING_MS` (2 minutes) has passed. That ceiling is what still ends
+a launch that failed and an agent with no hooks and no alt screen. Either stays up to two minutes
+instead of 30 seconds. A task keeps the plain grace, since its retirement leaves a resumable row.
+
+The sweep's cadence alone would leave the shell for 1 to 2.5 minutes, so a Command Terminal has a
+fast path. The agent's SessionEnd hook (`onEvent` in `session-manager.ts`) stamps
+`agentEndSignaledAt` on the row and calls `requestAgentAbsenceCheck`, which makes the watcher
+enumerate for that session on its next base-cadence cycles regardless of the sweep interval, and
+the stamp waives the 30s spawn grace. The process tree still decides and the two-observation
+confirm still holds, so the end lands about 4s after `/exit`. `/clear` fires SessionEnd too, but its
+process stays alive, and the SessionStart that follows clears the stamp and withdraws the request
+(`cancelAgentAbsenceCheck`), so the terminal is kept and the remaining fast looks are not spent. An
+agent with no SessionEnd hook falls back to the plain sweep.
+
+Where the tree cannot judge, the SessionEnd is the only signal. That is a WSL shell, and any shell
+while the bg-shell watcher is off (`SessionTelemetry.hasAgentAbsenceSweep`). There the SessionEnd
+arms `COMMAND_TERMINAL_AGENT_END_SETTLE_MS` (5s) instead of asking the sweep. A SessionStart inside
+it cancels the end; otherwise the terminal emits `agent-absent` and is ended through
+`endCommandTerminal` without `immediate`, since nothing saw the agent's process gone, so `kill()`
+still gives a young session its exit sequence and grace. This path has no tree backstop: a SessionStart that landed after the
+settle would end a live agent. Measured with `scripts/probe-claude-exit-paths.js --mode clear` on
+Claude Code 2.1.294, `/clear` ran SessionEnd (reason `clear`) at 574 ms and SessionStart (source
+`clear`) at 722 ms, 148 ms apart, with Claude still running. In a preview on 2.1.296 under
+`wsl -d Ubuntu`, main received the two events 240 ms apart and kept the terminal, and a later
+`/exit` ended it through the settle. `--mode resume` on 2.1.294 measured the other live pair: a
+`/resume` picker left open for 8 s ran no hook, and choosing a session ran SessionEnd (reason
+`resume`) and SessionStart (source `resume`) 116 ms apart. Gemini CLI's hooks reference documents
+a SessionEnd and a SessionStart for `/clear` as well, with no stated gap.
+
+An agent with no SessionEnd hook, under WSL or with the watcher off, still outlives its agent
+until its PTY exits.
+
+A Command Terminal whose PTY exits on its own (a crash, or the shell killed) also ends: after the
+`exit` emit, the spawn flow's `onPtyExited` hook removes the row and deletes the directory, so a
+transient registry row exists exactly while its PTY runs. That removal is skipped while
+SessionManager is shutting down, which keeps it out of the bounded quit drain.
+
+The inverse case, a shell that exits while its agent keeps running, is the pty host's to clean up,
+for task sessions and Command Terminals alike. On Windows node-pty never closes the pseudoconsole
+after a natural exit (microsoft/node-pty#965), so nothing ended the agent: measured in a preview, a
+killed shell's `claude.exe` was still running a minute later.
+
+How Claude Code itself takes each way of ending it, measured on 2.1.294 (Windows 11 build 26200,
+node-pty 1.1.0, a mature idle session, a SessionEnd hook recording when it ran; reproduce with
+`scripts/probe-claude-exit-paths.js`):
+
+- `/exit` written while the shell lives: hook at 191 ms (`prompt_input_exit`), exit at 622 ms,
+  three exit records added to the transcript, every line whole.
+- The console closed (`kill()` on a mature session): hook at 131 ms (`other`), exit at 585 ms,
+  transcript whole.
+- `suspend()` (the exit sequence, then the close at 1500 ms): hook at 169 ms
+  (`prompt_input_exit`), Claude gone before the close.
+- Shell dead, `/exit` written to the dead shell's console input: hook ran (`prompt_input_exit`),
+  exit about 600 ms after the write, three exit records, transcript whole.
+- Shell dead, then TerminateProcess: no hook and no exit records; the transcript up to the last
+  finished message intact.
+- Shell dead, then `IPty.write()`, `kill()`, or terminating the console host: Claude kept running.
+
+So the host asks first (`src/main/pty/host/dead-root-orphans.ts`): it writes the session's exit
+sequence into the dead shell's console, waits up to 10 s for the processes it found to exit, and
+terminates only what is left, each through a handle whose creation time is re-checked (see
+`.claude/rules/pty-teardown-grace.md` and `.claude/rules/task-process-tag.md`). What outlives the
+grace, a dev server the agent started included, is terminated, as a crashed pty host's tree stop
+does. On POSIX the kernel hangs up the terminal's foreground process group when the shell exits,
+which should end a foreground agent; that has not been observed on a real PTY here.
+
+The dead shell's `conhost.exe` stays until the pty host exits, one per PTY that exits on its own
+(about 1.5 MB private each). That is the same node-pty bug: its native exit path drops its record
+of the pseudoconsole without closing it, so a later `kill()` finds nothing to close. It needs the
+upstream fix, microsoft/node-pty#990. With that fix the console's close also sends a still-attached
+agent `CTRL_CLOSE_EVENT`, which Claude Code 2.1.294 handles gracefully (the console-close row
+above), so the host's ask and the close then work together rather than against each other.
 
 The **WSL exclusion covers a different failure than the others**: there the tree signal is
 UNREADABLE, not empty. A WSL session's PTY root is `wsl.exe`, and the agent is not a Win32
@@ -391,7 +491,8 @@ absence can be concluded) would close the whole class of structurally invisible 
 
 **Cadence.** The sweep runs on its own 60s clock (`AGENT_ABSENCE_SWEEP_INTERVAL_MS`), decoupled from
 the watcher's 2s/4s/6s poll backoff, and evaluates for free on any cycle that already enumerated for
-bg-shell work. `listAllProcesses` is a ~200ms PowerShell CIM query on Windows and the watcher
+bg-shell work. `listAllProcesses` is a pty host round trip that lists every process (a Toolhelp
+snapshot on Windows, about 8 ms, which replaced a ~200ms PowerShell CIM query), and the watcher
 deliberately skips it on idle cycles, so a per-session-per-cycle check would defeat that
 optimization exactly when the machine is saturated. A sweep-only cycle neither increments nor resets
 the bg-shell backoff counter. The counter counts consecutive OBSERVATIONS, not poll cycles: a
@@ -442,12 +543,19 @@ sweep` block in `tests/unit/bg-shell-watcher.test.ts` and by
 
 Restoring from Done is slow (the worktree is recreated from the preserved branch, then the CLI
 boots) and the task's suspended record survives that whole window, so the UI used to advertise a
-manual "Resume session" button while the engine was already restoring the conversation. Two things
+manual "Resume session" button while the engine was already restoring the conversation. Three things
 now prevent that:
 
 - `TASK_UNARCHIVE` / `TASK_BULK_UNARCHIVE` thread `onProgress` into their git helpers exactly as
   `task-move` does, and emit `resuming` immediately so the card is never silent while the lane is
   resolved and the git op queues.
+- The Resume button's own handler (`SESSION_RESUME`) does the same once it knows it will spawn
+  (its self-heal return spawns nothing): it emits `resuming`, threads `onProgress` into
+  `ensureTaskWorktree`, and releases the label in one `finally`, so a paused card stops reading
+  "Paused" while its resume runs. It labels through `claimSpawnProgress`, whose release clears
+  only while no other path has labelled the task since. The label slot is per task, and a phone
+  Start or a newer resume can be labelling the same task when this one unwinds. Every other spawn
+  path still clears unconditionally.
 - `getTaskProgress` lets an in-flight spawn label outrank a `suspended` session (only `suspended`;
   a running or queued session owns its own display). An emitted label means main is spawning right
   now, which is newer than a record suspended earlier.
@@ -459,7 +567,7 @@ The same mechanism generalizes to a **same-column respawn**: a live session forc
 restart in place, not because the task moved to Done and back but because the destination column
 needs new CLI flags on a resumed process. `suspendLiveSessionForRespawn`
 (`src/main/ipc/handlers/task-move.ts`) is the shared helper behind all four triggers - a model
-change, a cross-agent handoff, an effort delta with no live `/effort` swap, and a session-track
+change, a cross-agent handoff, an effort change to a concrete value, and a session-track
 switch (isolated-column entry/exit, or `always_spawn_new`) - and it emits its phase label
 (`switching-model` / `switching-agent` / `applying-settings` / `new-session`) as its first
 statement, before the record is even marked suspended. Without this, the suspend that begins the
@@ -468,9 +576,10 @@ whole unlocked worktree/branch-checkout window between the suspend and the event
 `starting-agent` label.
 
 The in-place restart, `restartSessionForSettingsChange` (`src/main/ipc/handlers/session-reconcile.ts`),
-follows the same contract with a required `phase`: the ContextBar model pick and a Board Profile
-propagation emit `switching-model` (or `applying-settings` for an effort-only restart), and the
-auto_command escalation emits `resending-command` ("Re-sending command..."). It emits before its
+follows the same contract with a required `phase`: the ContextBar model/effort pick, an MCP
+`kangentic_update_task` settings write, and a column or Board Profile propagation emit `switching-model` (or `applying-settings` for an effort-only
+restart), and the auto_command escalation emits `resending-command` ("Re-sending command...").
+It emits before its
 suspend and clears the label in a `finally` once the resume has returned or failed, the ordering
 task-move's Phase 3 uses. The emit is what lets the mobile bridge tell this respawn from a park
 (see [Mobile Bridge](mobile-bridge.md)); until #682 this path emitted nothing, and the phone showed
@@ -484,7 +593,9 @@ label within milliseconds of it being set. `upsertSession` now skips the clear s
 the arriving row's status is `suspended`, since that row is the respawn's own suspend landing, not
 a genuine park. `clearSpawnProgress` remains the only way a label actually retires, but only two
 park paths in `task-move.ts` call it explicitly (move to Done, move into an `auto_spawn=false`
-column). Five other genuine parks - `SESSION_SUSPEND` (a manual pause), the idle-timeout suspend,
+column). Five other genuine parks - a manual pause (`pauseTaskSession` in
+`handlers/session-pause.ts`, which the desktop's `SESSION_SUSPEND` and the phone's `pause-session`
+verb share), the idle-timeout suspend,
 the `kill_session` action, project-relocate, and auto-spawn-reconcile - suspend through
 `applySuspendDbWrites` or `executeKillSession` and never clear a label explicitly; this is a
 known gap, not fixed here, and a label still in flight when one of those fires survives until the
@@ -506,15 +617,29 @@ When a suspended task moves to an active column:
 - New session DB record inserted, old record marked `exited`
 - The destination column's settings are re-applied as CLI flags on the resume
   command: `--permission-mode` (lane override, else global default), `--model`,
-  and `--effort`. A column move that changes the effective permission mode
-  forces this suspend + respawn cycle, because no adapter can switch
-  permission mode on a live session.
+  and `--effort`. A move into a column that changes the model or effort to a
+  concrete value forces this suspend + respawn cycle on a live session; neither
+  is ever typed into the PTY as `/model` or `/effort`. A permission-mode change
+  alone never restarts a live session: in the Planning -> Executing flow Claude
+  already left plan mode in-session, so the recorded spawn-time mode is stale.
 - A plan-exit auto-move (Planning -> Executing), triggered when the user
   approves the plan (the `ExitPlanMode` tool completes, not when the agent
   merely invokes it), passes a continuation prompt
-  ("Proceed with implementing the approved plan.") delivered as the resumed
-  session's first message when the destination column has no `auto_command`;
-  the `auto_command` wins when present.
+  ("The session restarted to apply the <column> column's settings. Proceed
+  with implementing the approved plan.", naming the destination column)
+  delivered as the resumed session's first message only when neither the
+  destination column's message (its first enabled `send_message` enter
+  automation) nor the task's own `auto_command` is set. Either one takes the
+  prompt slot instead. It names the restart because the suspend lands right after approval and Claude
+  Code records it as `[Request interrupted by user]`. Without the reason, the
+  resumed turn reads as the user stopping the agent and typing a new
+  instruction. A plan exit that switches session track (into an isolated
+  column, or out of one back to main) or lands in an always-new column sends
+  no continuation, and neither does one into a column that runs a different
+  agent. Each of those moves lands in a different conversation, which never
+  saw the plan. A handoff drops it whether or not the target agent has an
+  older conversation on the task; when it has one, `spawnAgent` resumes that
+  conversation.
 - The resume prompt is also how **auto_command escalation** lands. When a live
   session's keystroke injection cannot be confirmed in the agent's transcript,
   `restartSessionForSettingsChange` suspends and resumes with the command as the
@@ -568,7 +693,75 @@ On project open (`src/main/transition-engine/session-startup/`):
 7. **Resume or respawn** (isolation-scoped via `getLatestForTaskByTypeAndIsolation`):
    - Suspended/orphaned/interrupted-exited with `agent_session_id` -- use `--resume` (attempts to restore conversation; the id is first reconciled against the record's own `status.json`, see [Resume](#resume))
    - No session ID -- fresh `--session-id` with prompt from matching `spawn_agent` action
+   - A resume that cannot be prepared (an unknown agent, a missing CLI, a detection or trust write that throws) keeps its conversation: the record is CAS-upgraded to `suspended` (system) and registered as a placeholder, so the card shows Resume, step 8 skips the task, and the next launch tries the resume again. Retiring it used to let step 8 start a fresh agent over it. A record with no conversation to resume (no agent session id yet) is still retired, so step 8 starts the task fresh, which is all a resume of it could have done.
+   - The spawn starts at the grid recorded on the record it replaces (`last_pty_cols` / `last_pty_rows`, passed as `SpawnSessionInput.restoredGrid`). The registry is empty after a restart, so the in-memory respawn grid (see Repaint-settled scrollback sampling) cannot apply here, and every resume used to come up at 120x30, making a phone that opened the task pay a park mid-boot. A grid under 20 rows (the bottom panel's strip) is not restored. The same holds for a Resume or a move after a restart: `resolveSpawnIntent` carries the retired record's grid into `executeSpawnAgent`.
 8. **Reconcile** -- spawn fresh agents for tasks in auto_spawn columns with no session at all (skips user-paused tasks); fresh rows are tagged with the column's `isolated_swimlane_id`
+
+The same pipeline recovers what a [pty host](#pty-host) crash takes down, mid-run, scoped to
+exactly those sessions: `recoverSessionsAfterPtyHostLoss` passes the lost session ids, so step 3's
+gather is filtered to them and step 2 orphans nothing. Without the scope, an agent that exited
+non-zero on its own earlier in the run, or one suspended this run, would be woken with them.
+Step 8 runs scoped too, to the lost sessions' tasks. A lost session with no `agent_session_id` yet
+has nothing to resume (the interrupted-exited gather requires one), so its task starts a fresh
+agent there, as it would at startup. Its lost row is still in the registry, exited, so in this pass
+every row but the lost ones counts as the task having a session: a resumed session, a paused
+placeholder that keeps its Resume, and a resume whose spawn failed, whose exited row a fresh agent
+must not replace.
+
+Both passes spawn each task under its lifecycle lock (`withTaskLock`), after reading the task again,
+because their preparation awaits the shell and every agent's detection. A task is skipped when its
+column changed or its `session_id` changed (a Reset clears it). A resume is also skipped when the
+task gained a live session, its record is gone, or its record's status moved (a user's Resume retires
+it). A fresh agent is also skipped when the task gained any session row (in the crash path, any row
+but the lost ones), or when its worktree is no longer the one it was prepared in (a move to To Do and
+back removes it). A resume skipped because the task moved into a custom column that starts no agent
+keeps its record resumable with a placeholder, as step 6 does for a record it finds there: that move
+had no session to suspend, so the card would otherwise offer no Resume until the next launch. A resume
+whose preparation failed is kept resumable (step 7) under the same lock and the same re-check, since
+its preparation awaited too: a record a Resume retired meanwhile is exited, and an unlocked CAS would
+have taken it back to suspended under the live agent and cleared that agent's `session_id`.
+
+## PTY host
+
+Every PTY runs in the `kangentic-pty-host` utility process (`src/main/pty/host/`), as VS Code runs
+its terminals, so terminal output never crosses main's event loop. The host core
+(`pty-host-core.ts`) owns node-pty, the headless buffer and scrollback ring, backpressure, the raw
+transcript writer and the adapters' output detectors. `SessionManager` stays the facade and talks to
+it through `PtyHostClient`: ordered commands, id-matched requests, ordered events (`protocol.ts`).
+
+- **What main keeps.** The session registry, the activity engine and every push to the renderer.
+  It mirrors the alt-screen state and buffer width from host events, and reads scrollback, the
+  serialized frame, the phone's seed frame (`getSeedFrame`: that frame, the parser offset it
+  covers, and the time its settle and serialize took), raw scrollback, the output peek and
+  diagnostics by request.
+- **Which output reaches main.** `data` for the focused union (`setFocused`), `tap` for the
+  sessions a phone streams (`subscribeDataTap`, reference counted, so a reader that needs raw output
+  briefly subscribes for that long; each `tap` chunk carries its cumulative parser offset,
+  `endOffset`, and `SessionManager` re-emits it with no focus gate as
+  `data-tap(sessionId, data, endOffset)`), and otherwise only a coalesced `outputSeen` with no
+  bytes.
+- **A host crash.** Main first stops the process tree each PTY left behind, by pid
+  (`stopLostPtyTree`): a closed pseudo console or a hangup usually ends the agent, but nothing
+  guarantees it, and one still running would edit its worktree beside the session that resumes. Each
+  PTY is then reported through its own exit listener with
+  `PTY_HOST_LOST_EXIT_CODE` (-2), so the session ends exactly as a PTY exit ends it. The renderer and
+  the desktop notifier fold those exits into one "Terminals restarted" notice. The host restarts at
+  once (then after 1, 5 and 15 s), main replays its focus and tap sets, and the lost agent sessions
+  resume (see Crash Recovery above). After five crashes the same core runs in main for the rest of
+  the run, which is how terminals ran before the host existed.
+- **Off-main spawns.** One-shot child processes (`off-main-exec.ts`), the probes' raw PTYs
+  (`off-main-pty.ts`), the agent CLIs' headless runs (`off-main-cli.ts`) and the background-shell
+  watcher's process table run in the host too, since a Windows spawn's CreateProcess is synchronous
+  on the calling thread. A CLI run is a command, so `spawnCli` gets its handle at once; a host crash
+  fails a running one (it is never rerun, which would be a second paid answer) and main stops the
+  orphaned CLI's tree. At quit both sides stop every run still going: the host in its shutdown, and
+  main by pid, since with no terminal open the quit does not wait for the host.
+- **Task leftover reap.** The host also scans for and stops what a task's agents left running
+  (`reapTaggedProcesses`) and stops one reported process when the user asks (`stopReportedProcess`).
+  It reads the `KANGENTIC_TASK_ID` tag through koffi on Windows and macOS and `/proc` on Linux. See
+  [worktree-strategy.md](worktree-strategy.md#reaping-processes-that-pin-a-worktree).
+
+See `.claude/rules/pty-host-out-of-process.md`.
 
 ## Isolated Sessions (Per-Column Session Model)
 
@@ -605,23 +798,23 @@ Lifecycle on task move (`task-move.ts`, the session switch branch inside Priorit
 
 ## Shutdown
 
-On app close, the `before-quit` handler (`createBeforeQuitHandler` in `src/main/pty/shutdown/before-quit-handler.ts`, wired in `src/main/index.ts`) calls `syncShutdownCleanup()` (`src/main/shutdown.ts`), which is fully synchronous. The `suspendAll()` method exists in `SessionManager` but is **never called during shutdown**: it is async and would break the synchronous requirement.
+On app close, the `before-quit` handler (`createBeforeQuitHandler` in `src/main/pty/shutdown/before-quit-handler.ts`, wired in `src/main/index.ts`) calls `syncShutdownCleanup()` (`src/main/shutdown.ts`), which is fully synchronous. There is no async "suspend everything" step: one would break the synchronous requirement, so the quit marks records `suspended` and kills the PTYs instead.
 
 The actual shutdown sequence (`syncShutdownCleanup()` in `src/main/shutdown.ts`):
 
 1. Cancel all pending command injections
 2. List all in-memory sessions with `running` or `queued` status
-3. For each running record, call `captureSessionMetrics()` (synchronous: in-memory cache read + better-sqlite3 writes) so cost / tokens / duration / `tool_breakdown` / `compaction_count` are flushed to the DB before the PTY is killed. The function writes to BOTH the `sessions` row (`SessionRepository.updateMetrics`) and, when `usage` is defined, to a `usage_history` row (`UsageHistoryRepository.recordSessionUsage`) so lifetime period totals survive any subsequent task deletion. Without this step every clean app close loses in-flight metrics for any session that had not yet checkpointed. (The shutdown path uses the synchronous snapshot only; the async transcript-token refinement, `refineTranscriptTokens`, runs only on the exit/suspend/move paths, never here.) A periodic snapshot timer (`startMetricsSnapshotTimer`, ~45s) also runs this same capture for live sessions during normal operation so an app/OS kill bounds the loss to one interval; it is stopped synchronously at the top of `syncShutdownCleanup`.
+3. For each such session whose OWN record (looked up by the session's id, which is the record id, never the task's newest record) is running, call `captureSessionMetrics()` (synchronous: in-memory cache read + better-sqlite3 writes) so cost / tokens / duration / `tool_breakdown` / `compaction_count` are flushed to the DB before the PTY is killed. The function writes to BOTH the `sessions` row (`SessionRepository.updateMetrics`) and, when `usage` is defined, to a `usage_history` row (`UsageHistoryRepository.recordSessionUsage`) so lifetime period totals survive any subsequent task deletion. Without this step every clean app close loses in-flight metrics for any session that had not yet checkpointed. (The shutdown path uses the synchronous snapshot only; the async transcript refinements, `refineTranscriptTokens` and `refineTranscriptToolCounts`, run only on the exit/suspend/move paths, never here, so a run ended by quitting the app keeps no per-tool `resultTokens` until the next run of its session spawns and `fillEarlierRunResultTokens` reads them from that run's own transcript window; see [database.md](database.md).) A periodic snapshot timer (`startMetricsSnapshotTimer`, ~45s) also runs this same capture for live sessions during normal operation, into each session's own record the same way, so an app/OS kill bounds the loss to one interval; it is stopped synchronously at the top of `syncShutdownCleanup`. Writing into the task's newest record instead could put one session's numbers on another session of the same task (a main and an isolated one), which the context bar's merged tool totals would then count twice. The suspend (`applySuspendDbWrites`), the move to Done, the move into an `auto_spawn=false` column, and the queued-to-running promotion read the session's own record the same way, through one helper (`resolveOwnSessionRecord`, `src/main/db/repositories/session-own-record.ts`), and fall back to the task's newest only for a spawn whose record is not inserted yet. The Done move's git churn capture uses the same helper, and for a task with no live session it takes the task's newest record.
 4. Mark each running record `suspended` (with `suspended_at` timestamp and `suspended_by = 'system'`) so sessions can resume on next launch. Queued records are marked `exited` since there is nothing to resume.
-5. Call `SessionManager.killAll({ allowGrace })` which writes each PTY's exit sequence and force-kills it immediately (no waiting), except that a YOUNG session (see the `kill()` grace above) is parked on the deferred registry's 1500 ms timer when `allowGrace` is set, which it is only on a route the drain follows (a user quit, the powerMonitor shutdown; never a Windows `session-end` or a signal, which flush every parked PTY at once). Then `sessionManager.dispose()`, which leaves the parked PTYs alone
+5. Call `SessionManager.killAll({ allowGrace })` which writes each PTY's exit sequence and force-kills it immediately (no waiting), except that a YOUNG session (see the `kill()` grace above) is parked on the deferred registry's 1500 ms timer when `allowGrace` is set, which it is only on a route the drain follows (a user quit, the powerMonitor shutdown; never a Windows `session-end` or a signal, which flush every parked PTY at once). The kills are commands to the pty host, which carries them out. When any PTY was killed, `killAll` adds the host's own pid to the report, counted as one more kill. Then `sessionManager.dispose()`, which leaves the parked PTYs alone and posts the host's `shutdown`: the host flushes the transcripts, ends any probe PTY, waits for every exit callback, and exits itself, within the drain's deadline less 200 ms
 6. Clean up session files and clear in-memory session maps
-7. Delete ephemeral project from index (if applicable)
+7. Delete ephemeral project from index (if applicable), except on a restart the app asked for (`isRestartRequested` in `app-relaunch.ts`): dev.js then respawns Electron on the same data dir, the boot adopts the project row by path, and the sessions suspended in step 4 resume into it. The boot's working-tree fill also runs once per clone (a marker in the clone's `.git`), so the restart does not reset a resumed agent's uncommitted work
 8. Close all database connections via `closeAll()`
 9. Return the `PtyKillReport` for the PTYs `killAll()` killed: the probe-able child pids, the total kill count, and `deferredCount` (how many ride the grace timer)
 
 Every cleanup step before the kill runs through `runCleanupStep`, which logs `[SHUTDOWN] cleanup:step-failed <name>` and continues. A throwing handle-closer used to abort the whole `try` and leave every PTY alive, which hangs Electron's teardown until the 6 second failsafe, because node-pty's ThreadSafeFunction finalizer joins the thread waiting on the child. The one bare call in that region is the `getSessionManager()` read, which is not a cleanup step: a throw there leaves no manager to kill PTYs with either way. Steps 7 and 8 are wrapped too, so a read-only global index DB cannot skip `closeAll()` and leak SQLite handles into the quit.
 
-Then, only when at least one PTY was killed, the handler calls `event.preventDefault()` and runs the bounded PTY exit-callback drain (`drainPtyExitCallbacks` in `src/main/pty/shutdown/exit-callback-drain.ts`): it polls the killed pids every 25 ms until every one is gone, allows 100 ms of further loop turns, gives up at 1500 ms (plus the 1500 ms kill grace when `deferredCount` is above zero, since a deferred kill lands exactly at the grace), and then calls `app.quit()` again. A kill whose child pid was unreadable has no probe, so the drain spends a fixed 400 ms blind budget for it instead. The second `before-quit` pass is a no-op and Electron's normal quit proceeds (tearing down Chromium child processes). The drain logs `[SHUTDOWN] pty-drain:start n=<probed> blind=<unprobed>` (with ` deferred=<n>` appended when a kill rides the grace timer) and `pty-drain:done <ms>` (or `pty-drain:timeout <ms> lingering=<pids> blind=<n>`). It exists because node-pty delivers a PTY's exit through a native ThreadSafeFunction, and an exit callback first dispatched after Electron has stopped Node kills the process with an unhandled C++ exception (Sentry DESKTOP-C); the drain makes sure those callbacks land while JS is still callable.
+Then, only when at least one PTY was killed, the handler calls `event.preventDefault()` and runs the bounded PTY exit-callback drain (`drainPtyExitCallbacks` in `src/main/pty/shutdown/exit-callback-drain.ts`): it polls the killed pids every 25 ms until every one is gone, allows 100 ms of further loop turns, gives up at 1500 ms (plus the 1500 ms kill grace when `deferredCount` is above zero, since a deferred kill lands exactly at the grace), and then calls `app.quit()` again. A kill whose child pid was unreadable has no probe, so the drain spends a fixed 400 ms blind budget for it instead. The second `before-quit` pass is a no-op and Electron's normal quit proceeds (tearing down Chromium child processes). The drain logs `[SHUTDOWN] pty-drain:start n=<probed> blind=<unprobed>` (with ` deferred=<n>` appended when a kill rides the grace timer) and `pty-drain:done <ms>` (or `pty-drain:timeout <ms> lingering=<pids> blind=<n>`). It exists because node-pty delivers a PTY's exit through a native ThreadSafeFunction, and an exit callback first dispatched after Electron has stopped Node kills the process with an unhandled C++ exception (Sentry DESKTOP-C); the drain makes sure those callbacks land while JS is still callable. With the PTYs in the pty host, those callbacks land in the host, which is why the host's pid is in the drain: the quit waits for the host to exit on its own, after its last exit callback, rather than tearing it down mid-callback.
 
 The count, not just the pid list, is what arms the drain: an empty pid list must never read as "no PTY was killed" when one was killed and could not be named.
 
@@ -693,7 +886,7 @@ Sessions from non-active projects must not interfere with the active project's t
 
 PTY output is captured for two purposes: terminal display (via the scrollback buffer) and persistent transcript storage (via `TranscriptWriter`).
 
-`TranscriptWriter` (`src/main/pty/buffer/transcript-writer.ts`) receives raw PTY data, strips ANSI escape sequences, and debounces writes to the `session_transcripts` table every 30 seconds, flushing early if a session's pending buffer exceeds 256KB. This provides a clean, searchable text transcript of the session without terminal formatting noise.
+`TranscriptWriter` (`src/main/pty/buffer/transcript-writer.ts`) runs in the pty host. It receives raw PTY data, strips ANSI escape sequences, and flushes every 30 seconds, early if a session's pending buffer exceeds 64KB. Each flush is one INSERT into `session_transcript_chunks` (1 to 2 ms) in the database of the session's own project, over the host's own connection (opened after main migrated the file, with its auto-checkpoint off, since the retrieval worker runs the checkpoints). The project id comes with the spawn, and the writer keeps it for its final flush after removal. A project whose database is not open drops the flush rather than writing it elsewhere. This provides a clean, searchable text transcript of the session without terminal formatting noise, kept whole after the session row is gone.
 
 The transcript is used during cross-agent handoff: when a task moves to a column with a different agent, the `HandoffOrchestrator` reads the transcript from the database, combines it with git diff and session metrics, and packages it as handoff context for the new agent.
 
@@ -702,7 +895,7 @@ The transcript is used during cross-agent handoff: when a task moves to a column
 When a task moves to a column where `resolveTargetAgent()` returns a different agent than the current session:
 
 1. The current session is suspended (Priority 3a in the [Transition Engine](transition-engine.md))
-2. The `HandoffOrchestrator` packages context: session transcript (from `session_transcripts`), git diff (changed files), and session metrics (tokens, cost, duration)
+2. The `HandoffOrchestrator` packages context: session transcript (from `session_transcript_chunks`), git diff (changed files), and session metrics (tokens, cost, duration)
 3. A new session is spawned with the target agent, receiving a `handoffPromptPrefix` summarizing the previous agent's work
 4. A `handoff-context.md` file is written to the new session directory for reference
 5. A `handoffs` record is inserted in the database tracking the from/to agents, sessions, and the full context packet
@@ -711,8 +904,13 @@ The handoff is transparent to the user - the task card shows spawn progress phas
 
 ## Output Streaming
 
+Everything in this section runs in the [pty host](#pty-host); main relays what a renderer or a
+phone needs and reads the rest by request.
+
 - PTY `onData` accumulates into a per-session buffer.
-- A 16ms flush interval (~60fps) emits buffered data via IPC `session:data`.
+- A 16ms flush interval (~60fps) sends buffered data to main for a session in the focused union,
+  which main forwards via IPC `session:data`. A phone's stream gets every flushed byte as `tap`, for
+  as long as it holds a `subscribeDataTap` subscription.
 - A 512KB scrollback ring buffer per session supports terminal restoration.
 - **Alt-screen sessions - and non-alt sessions whose byte ring spans an effective geometry
   change - replay the parsed grid, not the byte tail.** A raw byte replay is not a
@@ -724,7 +922,7 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   per-geometry, and Windows ConPTY re-emits even plain shell output the same way, so replaying
   bytes drawn at one grid into an xterm at another lands stale CUP writes mid-history and
   interleaves two frames' text on one row. `PtyBufferManager.getReplaySnapshot` therefore
-  serves the headless PARSED grid (the same serialized frame `getSerializedFrame` gives the
+  serves the headless PARSED grid (the same serialized frame `getSeedFrame` gives the
   mobile seed) when the session is in the alt screen or its ring is geometry-suspect, and the
   raw byte replay for stable-geometry non-alt sessions - a plain shell's scrollback IS the
   bytes, and truncation there only loses old history. The gate
@@ -821,7 +1019,7 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   resume), and `handleRendererChange` answers it: an unheld terminal re-measures, while a held one
   rescales its remembered natural cell by how far its conformed cell moved across the swap and
   re-conforms the held grid for the new metrics.
-- **A session nobody is showing goes back to the spawn grid (the resting grid).** A PTY has ONE
+- **A session nobody is showing goes to the resting grid.** A PTY has ONE
   grid and every surface fits it to its own box, so a session last shown in the bottom panel was
   left at that panel's strip - measured live at 306x14 - with nothing to give it back. The agent
   then kept working in a 14-row window, and a paired phone (which mirrors the desktop grid 1:1 and
@@ -833,28 +1031,57 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   boxes are drawn for a wide frame) after `RESTING_GRID_DELAY_MS` (1s). The park is a MOBILE
   feature and is gated on mobile interest: it fires only for a session a paired phone is actually
   streaming (`MobileTerminalProbe.hasStreamSubscriber`, answered from the bridge's per-device
-  subscription registries), and a phone subscribing to a session that went unheld earlier gets an
+  subscription registries), and a phone subscribing to a session that went unheld earlier, or
+  whose only hold is a focus claim with no xterm mounted or a grid under the 20-row floor, gets an
   immediate park instead (`parkRestingGridForMobileSubscriber`, called by the read-stream
   subscribe handler BEFORE it serializes the seed, so the one snapshot already carries the
   resting grid). A desktop that never pairs never parks at all - no probe, no bridge registries,
-  byte-for-byte the pre-park behavior. Three further guards make a firing park safe: it fires
-  only when NOTHING holds the session - unfocused AND no renderer has an xterm mounted for it
-  (`session:setMounted`, published by `terminal-mount-registry` from each terminal's own mount
-  effect); it never touches a grid a phone is holding (the armed size guard consulted through
+  byte-for-byte the pre-park behavior. Three further guards make a firing park safe: the
+  background park fires only when NOTHING holds the session - unfocused AND no renderer has an
+  xterm mounted for it (`session:setMounted`, published by `terminal-mount-registry` from each
+  terminal's own mount effect; the subscribe-time park overrides two holds, see path 3 below and
+  the row floor in the next bullet); it never touches a grid a phone is holding (the armed size guard consulted through
   `MobileTerminalProbe.isSizeHeld` - the guard registry, never a last-writer origin, which a
   desktop resize overwrites while the hold stays armed); and it no-ops when the PTY is already at
-  the spawn grid. The park resizes with origin `'park'`, which deliberately does NOT update
+  the resting grid. The park resizes with origin `'park'`, which deliberately does NOT update
   `lastDesktopDimensions`: that map is the restore target for a phone's `release-size`, and a
-  park recording itself there made release "restore" the phone straight back to 120x30. After a
-  release the guard teardown asks for the park decision to re-run
+  park recording itself there made release "restore" the phone to the park instead of the
+  desktop's grid. After a release the guard teardown asks for the park decision to re-run
   (`reconsiderRestingGridAfterMobileRelease`), so an unheld session returns to the resting grid
   and the phone's next visit finds park dims again. The mounted set is the load-bearing hold: a
   PARKED terminal (Backlog view, occluded window) is unfocused but still mounted, and xterm
   re-sends dimensions only when its OWN size changes, so a PTY reshaped underneath one would
   disagree with it permanently - and the reveal deliberately skips its resize. Cost when it does
   fire: the next open of that session pays the marker settle (~20-40ms) because the grid changed
-  while it was away, which is what any surface switch already pays. Gated by the `Resting grid
-  restore` block in `tests/unit/session-manager.test.ts`,
+  while it was away, which is what any surface switch already pays.
+
+  The park also reaches a session nothing has laid out. A PTY with no grid to inherit or restore
+  spawns at the 120x30 default (`DEFAULT_PTY_COLS/ROWS`), and only a focus or mount change used to
+  re-run the park decision,
+  so a phone could open an Executing task and mirror 120x30. Three paths close that:
+  1. `doSpawn` re-runs the decision when a PTY comes up (`reconsiderRestingGrid`), so a PTY born
+     unheld while a phone streams its id parks after the usual delay.
+  2. A full queue hands back a `queued` placeholder with no PTY, and the task row (so the phone)
+     learns that id. The promotion keeps the id, so the phone's subscription survives into the
+     real spawn. The park stashes the resting grid for such a placeholder in `pendingResizes`, so
+     the promotion spawns there with no reflow mid-boot, and the seed served at subscribe already
+     reports 210x48. A suspended row is left alone: its resume spawns under a NEW id, and that
+     spawn drops the grids kept for the row it replaces (`forgetSessionGrid`). A resize that
+     reaches the placeholder during the promotion's own host round trip is stashed after the
+     spawn read its stash, so the spawn drops it once the new row is registered
+     (`discardPendingResize`); left behind, it would outrank the PTY's real grid at a later
+     respawn. Path 1 still re-runs the park decision for the new PTY.
+  3. The subscribe-time park also overrides a focus claim with no xterm mounted anywhere (a
+     minimized pop-out monitor, a detail window whose Changes view unmounted its terminal). Such
+     a claim holds no grid, so nothing can disagree with the reshape, and the surface fits the PTY
+     to itself when its terminal does mount. The background park still treats a focus claim as a
+     hold.
+
+  A respawn of a session the phone was watching starts at its predecessor's grid, normally the
+  resting grid (see Repaint-settled scrollback sampling below), so the phone's re-subscribe on the
+  new id finds nothing to park and the agent is not reshaped mid-boot.
+
+  Gated by the `Resting grid restore` block in `tests/unit/session-manager.test.ts`,
   `tests/unit/terminal-mount-registry.test.ts`, and the park assertions in
   `tests/unit/mobile-bridge/{interactive-terminal,read-stream}.test.ts`.
 - **A phone-streamed session is never rendered by the bottom panel, and never drops below the
@@ -884,7 +1111,8 @@ The handoff is transparent to the user - the task card shows spawn progress phas
      `bufferManager.onResize`, so the headless parser never diverges from the real PTY; the
      refused grid still records `lastDesktopDimensions` as the restore target), and
      `parkRestingGridForMobileSubscriber` overrides a desktop HOLD below the floor, rescuing a
-     phone that subscribes to a session the strip captured before the phone arrived.
+     phone that subscribes to a session the strip captured before the phone arrived (and a focus
+     claim with no xterm mounted, path 3 above).
   A desktop with no terminal-streaming phone never hits any layer: the panel renders and owns
   grids exactly as before the park existed. Gated by the floor tests in the `Resting grid
   restore` block of `tests/unit/session-manager.test.ts`, the terminal-marker tests in
@@ -949,16 +1177,16 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   `kangentic_devtools_terminal_state`'s merged trace
   names the trigger if a divergence ever recurs. A resize for a queued or suspended session
   stashes (including suspend's marked-but-alive teardown window, where the PTY is still
-  non-null but must not be reshaped or re-echoed); one for a missing or exited session is
-  ignored. Gated by `tests/unit/pty-resize-echo-reassert.test.ts` (the guard
+  non-null but must not be reshaped or re-echoed; never a phone's grid, see the respawn
+  paragraph below); one for a missing or exited session is ignored. Gated by `tests/unit/pty-resize-echo-reassert.test.ts` (the guard
   matrix), the emit/refusal pins in `tests/unit/session-manager.test.ts`,
   `tests/ui/terminal-resize-echo-reassert.spec.ts` (real xterm wiring: re-assert, repair,
   self-echo no-op, budget bound), and `tests/e2e/terminal-width-drift-selfheal.spec.ts` (a real
   PTY driven to the incident by a rogue `sessions.resize`, healed back to the owner grid).
 - **Post-boot geometry re-assert (the spawn-window race).** ConPTY only delivers a
   resize to a connected client, so a resize applied while the agent is still booting (the fit
-  lands ~140ms after `pty.spawn`) can be lost, leaving the child composing at the 120-column
-  spawn width inside the fitted grid while `ptyMatchesGrid`/`colsDrift` read healthy. `resize()`
+  lands ~140ms after `pty.spawn`) can be lost, leaving the child composing at the spawn width
+  inside the fitted grid while `ptyMatchesGrid`/`colsDrift` read healthy. `resize()`
   arms `ManagedSession.resizeAppliedBeforeTuiReady` when it applies a resize while the stream is
   not in the alt buffer - NOT keyed on the first-output latch, which a shell preamble can
   trip seconds before the agent exists (pwsh 7.6's preamble carries the cursor-hide escape the
@@ -980,8 +1208,10 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   block in `tests/unit/session-manager.test.ts` and the respawn latch-cleanup tests in
   `tests/unit/session-spawn-flow.test.ts`; the diagnostic is exercised by
   `tests/unit/composed-width.test.ts` and `tests/unit/devtools-terminal-state.test.ts`.
-- **Repaint-settled scrollback sampling.** A session spawns at a default 120x30; on a cold launch
-  an auto-resumed PTY sits at that size until a card opens and the renderer fits it wider. When a
+- **Repaint-settled scrollback sampling.** A session with no better grid spawns at a default
+  120x30 (a respawn takes its predecessor's grid and a resume takes its recorded one, see below).
+  A PTY that does start at the default, such as an auto-resume whose record carries no grid, sits
+  at that size on a cold launch until a card opens and the renderer fits it wider. When a
   geometry-changing resize fires (cols OR rows), a full-screen agent TUI repaints its frame
   asynchronously in response to SIGWINCH. So `getScrollback` waits for that repaint to land and
   quiesce before sampling (`PtyBufferManager.waitForResizeRepaint`), so a terminal restored right
@@ -1033,7 +1263,33 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   state that the other's early-settle scan offset points at, so the loser could never settle early
   and rode the full ceiling out - a deterministic ~415ms added to that open. A resize that arrives
   before the PTY exists (the renderer mounts before the auto-resume spawn lands) is stashed and
-  applied at spawn, so the PTY starts at the fitted size and no corrective resize is needed.
+  applied at spawn, so the PTY starts at the fitted size and no corrective resize is needed. A
+  respawn needs a second source, because every board respawn (a column move, a model switch, a
+  resume) mints a NEW session id, so a stash under the old id never reaches it. The successor
+  therefore starts at the grid of the row it replaces (`SessionManager.successorGridFor`, read
+  through `SpawnFlowContext.inheritedGrid`). That is a resize stashed while the old row was
+  suspended, else `ManagedSession.lastPtyGrid` (its spawn grid, then every applied resize except a
+  phone's, which the size guard owns and an exit disarms without restoring). The stash keeps the
+  same exclusion: `resize()` never stashes a phone's grid, so a phone resizing a row in suspend's
+  marked-but-alive window cannot hand its grid on that way either. Before
+  this, a respawn spawned at 120x30 and whatever showed the old session reshaped it mid-boot: the
+  surface's mount fit, or a streaming phone's resting-grid park. Each one was a resize plus two
+  boot-time geometry re-asserts. Only a running or suspended in-memory predecessor hands its grid
+  on; a killed or crashed row does not (though a resume of its conversation can still take its
+  grid from the record, below). A sub-floor grid (the bottom panel's strip) carries over only
+  while a surface still holds the old session, so a successor nothing shows never starts in that
+  letterbox. A caller-supplied grid (`input.cols/rows`) and a same-id stash both win over it. Below
+  it sits one more source, the grid recorded on the replaced session record
+  (`SpawnSessionInput.restoredGrid`, see Crash Recovery step 7). It covers the resumes no in-memory
+  row can speak for: after a desktop restart the registry is empty, and after a pty host crash the
+  lost row is exited, which `successorGridFor` refuses. The record is written at every grid change
+  by the `pty-resize` listener (`session-grid-persistence.ts`); the spawn's own announcement fires
+  before the caller inserts the record, so that one write waits for `setImmediate`, and a desktop
+  or park write that lands first cancels it. Gated by the `Respawn grid` block in
+  `tests/unit/session-manager.test.ts`, the inherited and restored precedence cases in
+  `tests/unit/session-spawn-flow.test.ts`, `tests/unit/session-pty-grid-persistence.test.ts`, and
+  `tests/unit/session-pty-grid-migration.test.ts` (real SQLite through better-sqlite3, which loads
+  under the unit tier's plain Node since its Node-API rewrite in 13).
   One reader deliberately OPTS OUT of this settle: `SessionManager.getOutputPeek`, which backs the
   Agent Monitor's live output peek. The settle exists so a captured frame becomes the terminal the
   user then looks at; a peek is a few throwaway lines resampled twice a second, so a mid-repaint
@@ -1219,7 +1475,9 @@ The handoff is transparent to the user - the task card shows spawn progress phas
 | Status debounce | 100 ms | Usage file watch |
 | Event debounce | 50 ms | Event log + activity state watch |
 | Hard shutdown deadline | 6000 ms | Failsafe timer before force-killing process tree |
-| PTY exit-callback drain | 25 ms poll, 100 ms settle (400 ms blind), 1500 ms deadline (+ 1500 ms with a deferred kill) | `before-quit` holds the quit until the killed PTY children are gone, so node-pty's native exit callback lands while JS is still callable. A kill whose child pid was unreadable has no probe and is waited out on the blind budget (see Shutdown above) |
+| PTY exit-callback drain | 25 ms poll, 100 ms settle (400 ms blind), 1500 ms deadline (+ 1500 ms with a deferred kill) | `before-quit` holds the quit until the killed PTY children and the pty host are gone, so node-pty's native exit callback lands while JS is still callable. A kill whose child pid was unreadable has no probe and is waited out on the blind budget (see Shutdown above) |
+| Pty host exit wait | drain deadline less 200 ms | After `shutdown`, the host exits once every PTY's exit callback has run, or at this bound |
+| Pty host restart | at once, then 1, 5, 15 s; 5 crashes per 5 min | Past the cap the host core runs in main for the rest of the run |
 | KILL_GRACE_MS | 1500 ms | `kill()` on a young session: exit sequence written, force-kill deferred this long (`src/main/pty/lifecycle/deferred-kill.ts`) |
 | YOUNG_AFTER_ALT_SCREEN_MS | 12000 ms | A session is young this long after its first alt-screen frame (Claude's 10 s canary window plus margin) |
 | YOUNG_SINCE_SPAWN_MS | 60000 ms | A session with no alt-screen frame yet is young this long after spawn |
@@ -1229,12 +1487,12 @@ The handoff is transparent to the user - the task card shows spawn progress phas
 
 ## Transient Sessions
 
-Transient sessions are ephemeral Claude Code terminals spawned from the command bar (Ctrl+Shift+P). They differ from task-bound sessions in several ways:
+Transient sessions are ephemeral agent terminals spawned from the command bar (Ctrl+Shift+P) or by a paired phone's `command-terminal` start. They differ from task-bound sessions in several ways:
 
 - **No task association** - run at the project root with no Kanban task
 - **No DB persistence** - no session record in the database
-- **No resume capability** - killed on close, not suspendable
-- **No queue** - spawned immediately regardless of concurrency limits
+- **No resume capability** - killed on close; a suspend ends the terminal, since there is nothing to resume
+- **Queued like any spawn** - at the concurrency limit the row starts `queued` and already holds its slot
 
 ### Identity survives a renderer reload
 
@@ -1251,8 +1509,8 @@ session row. `planTransientRecovery`
 (`src/renderer/stores/session-store/transient-recovery.ts`) rebuilds the map from that on every
 `syncSessions`, for every project:
 
-1. An entry already pointing at a running session is kept verbatim, which preserves the
-   first-prompt-wins label.
+1. An entry already pointing at a running session is kept verbatim, which preserves the branch
+   the HEAD tracker corrected. The name needs no recovery: main holds it on the session row.
 2. Every other survivor claims the slot main recorded for it.
 3. A survivor whose slot is taken, or that carries none, takes the lowest free slot, so no live
    PTY is left unreachable.
@@ -1262,7 +1520,14 @@ Step 3 is the one case where a terminal is renumbered; see
 mounts before recovery runs adopts an unpaired live PTY for its slot rather than spawning
 (`findAdoptableTransientSession`), so the duplicate cannot be recreated by a race.
 
-### Spawn Flow (`SESSION_SPAWN_TRANSIENT`)
+### Spawn Flow (`startCommandTerminal`)
+
+`SESSION_SPAWN_TRANSIENT` and the phone's `command-terminal` start both run `startCommandTerminal`
+(`src/main/ipc/handlers/transient-sessions.ts`). It first claims a slot: the window's requested
+one (`slot-1` to `slot-4`) when it is free, else the lowest free one. The project's non-exited
+transient rows and every in-flight start's reservation count as occupied, and a start past
+`MAX_COMMAND_TERMINALS` is refused (`command-terminal-limit`). The reservation is taken before the
+first await and released once the spawn has registered its row or the start has failed.
 
 1. Resolve the target branch: the picker's choice, else the project default base
    (`resolveProjectDefaultBaseBranch`: board default for the path, then `git.defaultBaseBranch`,
@@ -1279,13 +1544,21 @@ mounts before recovery runs adopts an unpaired live PTY for its slot rather than
    [Global Config Writes](agent-integration.md#global-config-writes-claudejson)). The Command
    Terminal bypasses the two spawn chokepoints, but not this: every path that builds an agent
    command applies the adapter's pre-spawn global-config state first
-4. Build Claude CLI command via `CommandBuilder` (with MCP server if enabled)
-5. Call `SessionManager.spawn()` with `transient: true`
+4. Build the agent command (with MCP server if enabled), passing `capturePromptText` so the
+   prompt hook reports the first prompt's text for `CommandTerminalNamer`, and the terminal's own
+   made-up task id as `taskProcessTag`
+5. Call `SessionManager.spawn()` with `transient: true` and the claimed slot
+
+An unattended (phone) start runs the same steps with a non-interactive 5 s fetch, one 6 s git
+budget, and no checkout while another running or queued session's cwd is the project root.
 
 ### Kill Flow (`SESSION_KILL_TRANSIENT`)
 
-1. `kill()` the session (a young one gets its exit sequence and the 1500 ms grace), capture `awaitExit`, then `remove()` it from `SessionManager`; the handler returns at once, so the window closes immediately
-2. Once the process has exited, delete the session directory from disk (best-effort cleanup). Deleting it under a still-exiting Claude made its SessionEnd hook write into a missing directory
+The handler calls `SessionManager.endCommandTerminal`, as a phone's stop, the agent-absence sweep
+and the end settle do, and throws for a session that is not a Command Terminal.
+
+1. `kill()` the session (a young one gets its exit sequence and the 1500 ms grace) and capture `awaitExit`, then detach the session files without deleting them (`detachPreservingFiles`) and `remove()` the row from `SessionManager`, which announces `session-removed`; the handler returns at once, so the window closes immediately
+2. Once the process has exited, delete the session directory from disk (best-effort). This is the only delete, so the agent's SessionEnd hook still has a directory to write into
 
 Transient sessions are counted by the `session_spawn` analytics event with `isTransient: true`
 (volume) and by `feature_used: command_terminal` (adoption); see [analytics.md](analytics.md).
@@ -1302,7 +1575,9 @@ When a task moves rapidly between columns (e.g. drag-and-drop corrections), spaw
 
 The `isAbortError()` utility in `src/shared/abort-utils.ts` provides a type guard for distinguishing abort errors from real errors in catch blocks.
 
-The board-driven spawn chokepoint `autoSpawnForTask` (`src/main/ipc/helpers/agent-spawn.ts`: the MCP create, the auto-spawn reconcile, and the phone's `start-session` verb) is cancellable the same way. It registers an `AbortController` on the per-task registry `SESSION_RESUME` uses (`handlers/session-resume-controllers.ts`), so `SESSION_SUSPEND`, `SESSION_RESET`, a newer `SESSION_RESUME`, and a project relocation cancel its in-flight git phase through `abortInFlightResume`, and the signal reaches `ensureTaskWorktree`, `ensureTaskBranchCheckout`, and `spawnAgent`. It registers WITHOUT aborting an existing controller first, unlike `SESSION_RESUME`: a phone Start never cancels desktop work, and two starts converge on one session through the gates below. The registry holds every in-flight controller per task (a `Set`, not one slot), so that second registration does not displace the desktop resume's controller: the next Pause reaches both. `tests/unit/session-resume-controllers.test.ts` pins that. Its lock is split the way `SESSION_RESUME`'s is: Phase 1 runs the gates (column re-check, live-session check, profile fold, `auto_spawn`, role) under `withTaskLock`, Phase 2 releases it for the worktree ensure and branch checkout (serialized per project by `WorktreeManager.projectQueues`), and Phase 3 re-acquires it, re-runs the same gates as the compare-and-swap, and spawns. Holding the lock across the fetch used to make a desktop Pause or move on the same task wait behind a phone Start. An abort is logged and swallowed, never counted as a spawn failure, and cleans up no session state: the engine's last abort checkpoint precedes the PTY spawn, and the `session_id` write follows it with no further checkpoint, so an abort never leaves a half-written session for the aborter to trip over.
+A phone Resume of a paused task (`start-session` through `resumeTaskSession`) is a `SESSION_RESUME` in every respect, including the abort: it cancels an in-flight resume for the task exactly as a second desktop Resume click does, by decision, so the phone mirrors the desktop. The one difference is how a failure shows. The desktop's invoke rejects and the renderer toasts it. The phone was answered on acceptance, so its `startTaskSession` passes an `onFailed` hook that sends the desktop spawn-blocked notice for a worktree or engine failure, as a failed phone Start does. A cancelled resume cleans up no session state, for the reason `autoSpawnForTask`'s abort gives below, and each canceller settles the task under its own lock. It used to call `removeByTaskId`, which dropped the task's paused row while the newer resume was still in its git phase: a paired phone's feed on that row ended with no `successorSessionId`, and a Pause that cancelled the resume lost the row it meant to keep.
+
+The board-driven spawn chokepoint `autoSpawnForTask` (`src/main/ipc/helpers/agent-spawn.ts`: the MCP create, the auto-spawn reconcile, and the phone's `start-session` verb for a task with no session or an exited one) is cancellable the same way. It registers an `AbortController` on the per-task registry `SESSION_RESUME` uses (`handlers/session-resume-controllers.ts`), so `SESSION_SUSPEND`, `SESSION_RESET`, a newer `SESSION_RESUME`, and a project relocation cancel its in-flight git phase through `abortInFlightResume`, and the signal reaches `ensureTaskWorktree`, `ensureTaskBranchCheckout`, and `spawnAgent`. It registers WITHOUT aborting an existing controller first, unlike `SESSION_RESUME`: a phone Start never cancels desktop work, and two starts converge on one session through the gates below. The registry holds every in-flight controller per task (a `Set`, not one slot), so that second registration does not displace the desktop resume's controller: the next Pause reaches both. `tests/unit/session-resume-controllers.test.ts` pins that. Its lock is split the way `SESSION_RESUME`'s is: Phase 1 runs the gates (column re-check, live-session check, profile fold, `auto_spawn`, role) under `withTaskLock`, Phase 2 releases it for the worktree ensure and branch checkout (serialized per project by `WorktreeManager.projectQueues`), and Phase 3 re-acquires it, re-runs the same gates as the compare-and-swap, and spawns. Holding the lock across the fetch used to make a desktop Pause or move on the same task wait behind a phone Start. An abort is logged and swallowed, never counted as a spawn failure, and cleans up no session state: the engine's last abort checkpoint precedes the PTY spawn, and the `session_id` write follows it with no further checkpoint, so an abort never leaves a half-written session for the aborter to trip over.
 
 ## Terminal Paste Strategy
 
@@ -1319,7 +1594,7 @@ The bracketing is load-bearing for images: Claude Code scans a paste packet for 
 ## Terminal Copy Strategy
 
 Terminal copy operations write to the OS clipboard through the main process
-(`clipboard:writeText`), which is synchronous and focus- and permission-independent.
+(`clipboard:writeText`), which is focus- and permission-independent.
 `navigator.clipboard.writeText()` is deliberately not used: it rejects with `NotAllowedError`
 when the document lacks focus, which is exactly the state during a native context-menu click and
 when a TUI app emits its copy sequence. The copy paths are:

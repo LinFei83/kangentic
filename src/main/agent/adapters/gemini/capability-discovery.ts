@@ -11,8 +11,8 @@
  * 2. Session history in ~/.gemini/tmp directory (JSON files with chat content)
  */
 
-import { exec, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execAsync, execFileAsync } from '../../../utility-process/off-main-exec';
+import { quoteCmdExecutable } from '../../../../shared/shell-quote';
 import path from 'node:path';
 import os from 'node:os';
 import {
@@ -25,8 +25,6 @@ import {
 } from '../../shared/history-scan';
 import type { AgentCapabilities } from '../../../../shared/types';
 
-const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
 
 const HELP_TIMEOUT_MS = 5000;
 
@@ -36,7 +34,7 @@ const HELP_TIMEOUT_MS = 5000;
  */
 async function readHelpText(cliPath: string): Promise<string> {
   if (process.platform === 'win32') {
-    const { stdout } = await execAsync(`"${cliPath}" --help`, {
+    const { stdout } = await execAsync(`${quoteCmdExecutable(cliPath)} --help`, {
       timeout: HELP_TIMEOUT_MS,
       windowsHide: true,
       maxBuffer: 1024 * 1024,

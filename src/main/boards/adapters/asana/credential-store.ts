@@ -1,8 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PATHS } from '../../../config/paths';
-import { decryptSecret, encryptSecret } from '../../shared';
-import { safeWriteJson } from '../../../safe-write';
+import {
+  readEncryptedSecretFile,
+  rewriteEncryptedSecretFile,
+  writeEncryptedSecretFile,
+  type EncryptedSecretFile,
+} from '../../shared/encrypted-secret-file';
 
 /**
  * Personal Access Token persisted for the Asana integration. Stored globally
@@ -11,19 +15,16 @@ import { safeWriteJson } from '../../../safe-write';
  * project.
  *
  * On disk the JSON file contains only an `encrypted` field whose value is the
- * output of `encryptSecret(JSON.stringify(AsanaCredential))`. If safeStorage
- * is unavailable the credential is persisted in plaintext (per the sentinel
- * contract in `src/main/boards/shared/auth.ts`), so the caller must trust the
- * local filesystem in that degraded mode.
+ * output of `encryptSecret(JSON.stringify(AsanaCredential))`
+ * (boards/shared/encrypted-secret-file.ts). If safeStorage is unavailable the
+ * credential is persisted in plaintext (per the sentinel contract in
+ * `src/main/boards/shared/auth.ts`), so the caller must trust the local
+ * filesystem in that degraded mode.
  */
 export interface AsanaCredential {
   accessToken: string;
   userEmail: string;
   savedAt: string;
-}
-
-interface StoredShape {
-  encrypted: string;
 }
 
 const STORE_FILENAME = 'asana-credentials.json';
@@ -32,38 +33,39 @@ function storePath(): string {
   return path.join(PATHS.configDir, STORE_FILENAME);
 }
 
-export function loadAsanaCredential(): AsanaCredential | null {
-  const filePath = storePath();
-  if (!fs.existsSync(filePath)) return null;
-  try {
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const parsed = JSON.parse(raw) as StoredShape;
-    if (!parsed.encrypted) return null;
-    const decrypted = decryptSecret(parsed.encrypted);
-    const credential = JSON.parse(decrypted) as AsanaCredential;
-    // Guard against legacy or malformed stored data. accessToken must be a
-    // non-empty string, otherwise sending it as a Bearer header would silently
-    // fail on the first Asana API call instead of surfacing "not connected".
-    if (typeof credential?.accessToken !== 'string' || credential.accessToken.length === 0) {
-      return null;
-    }
-    return credential;
-  } catch (error) {
-    console.warn('[asana/credential-store] failed to load credential:', error);
-    return null;
-  }
+function credentialFile(): EncryptedSecretFile {
+  return {
+    filePath: storePath(),
+    writeSource: 'asana_credential',
+    logPrefix: '[asana/credential-store]',
+    noun: 'credential',
+  };
 }
 
-export function saveAsanaCredential(credential: AsanaCredential): void {
-  const encrypted = encryptSecret(JSON.stringify(credential));
-  const payload: StoredShape = { encrypted };
-  // mode 0o600 matches saveBridgeIdentity: the payload is already
-  // safeStorage-encrypted, and this narrows who can read the ciphertext at
-  // rest (no-op on Windows, honored on POSIX at create time). Degrades rather
-  // than throws (see safe-write.ts) - an unwritable config directory must not
-  // reject "Connect Asana", and the shared write-failure-notice latch tells
-  // the user once.
-  safeWriteJson(storePath(), payload, 'asana_credential', { mode: 0o600 });
+function parseCredential(plaintext: string): AsanaCredential | null {
+  const credential = JSON.parse(plaintext) as AsanaCredential;
+  // Guard against legacy or malformed stored data. accessToken must be a
+  // non-empty string, otherwise sending it as a Bearer header would silently
+  // fail on the first Asana API call instead of surfacing "not connected".
+  if (typeof credential?.accessToken !== 'string' || credential.accessToken.length === 0) return null;
+  return credential;
+}
+
+export async function loadAsanaCredential(): Promise<AsanaCredential | null> {
+  const file = credentialFile();
+  const read = await readEncryptedSecretFile(file, parseCredential);
+  if (!read) return null;
+  // Written by the sync API under a key the async one does not hold, flagged
+  // for re-encryption, or stored in plaintext before encryption was available
+  // here (see decryptSecret). The credential in hand is good either way. The
+  // rewrite skips a file a Disconnect, a 401 clear, or a new token changed
+  // while this load awaited.
+  if (read.shouldRewrite) await rewriteEncryptedSecretFile(file, read);
+  return read.value;
+}
+
+export async function saveAsanaCredential(credential: AsanaCredential): Promise<void> {
+  await writeEncryptedSecretFile(credentialFile(), JSON.stringify(credential));
 }
 
 export function clearAsanaCredential(): void {

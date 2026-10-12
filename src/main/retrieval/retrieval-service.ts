@@ -25,18 +25,32 @@
  * boundary.
  */
 
-import { getProjectDb } from '../db/database';
-import { RetrievalStore } from './retrieval-store';
-import { hasVecSupport } from './vec-support';
-import { lastVecLoadError } from './vec-extension';
-import { ConversationIndexer } from './conversation/conversation-indexer';
+import fs from 'node:fs';
+import { retrievalClient } from './retrieval-client';
+import type { IndexAllStatus, ProjectIndexRead } from './worker/index-status';
+import type { IndexSweepResult, IndexSweepSteps } from './worker/index-methods';
+import { collectRemoteTargets } from './remote-targets';
+import { agentRegistry } from '../agent/agent-registry';
+import { codeStatus, createBranchSizes } from './code/code-status';
+import { resolveProjectDefaultBaseBranch } from '../ipc/helpers/default-base-branch';
+import { graphService } from './graph-facade';
+import {
+  NO_SOURCE, sourceStatusOf, sumIndexCounts, summaryStatusOf, waitingCorporaOf, type SummaryActivity,
+} from '../../shared/index-summary';
+import { createSummaryScheduler } from './summary/summary-scheduler';
+import { resolveAnswerRun } from './answer-run';
+import { codeSweepPlan, taskSummariesOn, type CodeSweepPlan } from '../../shared/answer-agent';
+import { withAnswerRunDirectory } from '../agent/shared/answer-run-directory';
 import { embedEngine } from './embedder/embed-engine';
 import { resolveEmbeddingModel, type EmbeddingModelDef } from './embedder/embedding-config';
 import { isEmbeddingModelPresent, downloadEmbeddingModel } from './embedder/embedding-model';
 import { requiresUserInteraction } from '../../shared/activity-state';
 import type { IpcContext } from '../ipc/ipc-context';
 import type { Embedder } from './types';
-import type { MemoryStatus, MemorySemanticState, MemoryModelState, Project, ActivityState } from '../../shared/types';
+import type {
+  KnowledgeGraphStatus, KnowledgeGraphSemanticState, KnowledgeGraphModelState, KnowledgeGraphSummaryStatus, KnowledgeGraphCodeStatus, SummaryChoice, Project, ActivityState,
+  KnowledgeGraphRebuildPlan, KnowledgeGraphSourcesStatus, KnowledgeGraphIndexCounts, KnowledgeGraphIndexCorpus,
+} from '../../shared/types';
 
 /** Grace period after a finalize event before indexing, so the agent CLI has
  *  flushed its native history file.
@@ -54,12 +68,23 @@ const FINALIZE_DEBOUNCE_MS = 3500;
  *  before a live re-index, so a burst of activity transitions within a turn
  *  coalesces into one index and the CLI has flushed the new turn to disk. */
 const LIVE_INDEX_DEBOUNCE_MS = 1500;
-
-const indexer = new ConversationIndexer();
+/** Grace after a board change before its task records are re-read, so a drag
+ *  or a burst of agent edits settles into one sweep. */
+const TASK_RECORD_DEBOUNCE_MS = 2000;
+/** How long after launch a read of a project's WHOLE default branch waits
+ *  (`CommitSweepOptions.allowFullRead`, and a first code fill): past the
+ *  startup's own disk and CPU load, where the same commit read stalled main
+ *  for up to 1.5 s. */
+const BRANCH_FULL_READ_DELAY_MS = 60_000;
+/** When whole-branch reads may start. This module loads at launch. */
+const branchFullReadsFrom = Date.now() + BRANCH_FULL_READ_DELAY_MS;
 
 let attached = false;
 let disposed = false;
 let activeSweepProjectId: string | null = null;
+/** The project-open sweep running in the worker, so a switch can stop it. */
+let activeSweepJobId: string | null = null;
+let sweepJobCounter = 0;
 /** Serial job chain: one INDEXING job runs at a time. Embedding is no longer
  *  chained here - it is owned entirely by embedEngine's own drain loop. */
 let jobChain: Promise<void> = Promise.resolve();
@@ -68,6 +93,10 @@ const pendingTimers = new Set<NodeJS.Timeout>();
 const liveIndexTimers = new Map<string, NodeJS.Timeout>();
 /** Per-session trailing-debounce timers for finalize (suspend / exit) indexing. */
 const finalizeIndexTimers = new Map<string, NodeJS.Timeout>();
+/** Per-project trailing-debounce timers for task-record re-reads. */
+const taskRecordTimers = new Map<string, NodeJS.Timeout>();
+/** Per-project timers for a whole-branch commit read put off past startup. */
+const deferredBranchTimers = new Map<string, NodeJS.Timeout>();
 
 // Model-file download state (downloading the local embedding model to disk).
 // The embed WORKER and its warm-hold / crash / device state live in
@@ -77,31 +106,9 @@ let modelDownloadProgress = 0;
 /** Which model id is currently downloading (a switch mid-download retriggers). */
 let downloadingModelId: string | null = null;
 
-/**
- * True when the currently open project's DB has sqlite-vec loaded. Read LIVE from
- * the connection - the extension is loaded by the project-DB initializer on every
- * `getProjectDb` open (see `setProjectDbInitializer(loadVecExtension)` in
- * index.ts) - rather than from a cached flag. A cached flag was wrong: it was only
- * set by `startForProject`, which runs from the `project:open` IPC handler but NOT
- * from `openProjectByPath` (the lighter path used by cold start and the ephemeral
- * dev preview). On those paths the DB is vec-capable yet the flag stayed false, so
- * the status reported "unavailable" while the model downloaded fine. embedEngine's
- * drain and query paths already gate on the live `hasVecSupport(db)`; this aligns
- * the status surface with them.
- */
-function currentProjectHasVec(context: IpcContext): boolean {
-  const projectId = context.currentProjectId;
-  if (!projectId) return false;
-  try {
-    return hasVecSupport(getProjectDb(projectId));
-  } catch {
-    return false;
-  }
-}
-
 function isIndexingEnabled(context: IpcContext): boolean {
   try {
-    return context.configManager.load().memory?.indexingEnabled !== false;
+    return context.configManager.load().knowledgeGraph?.indexingEnabled !== false;
   } catch {
     return true;
   }
@@ -109,7 +116,7 @@ function isIndexingEnabled(context: IpcContext): boolean {
 
 function isSemanticEnabled(context: IpcContext): boolean {
   try {
-    return context.configManager.load().memory?.semanticEnabled === true;
+    return context.configManager.load().knowledgeGraph?.enabled === true;
   } catch {
     return false;
   }
@@ -118,7 +125,7 @@ function isSemanticEnabled(context: IpcContext): boolean {
 /** The user-selected embedding model (or the default). */
 function selectedModel(context: IpcContext): EmbeddingModelDef {
   try {
-    return resolveEmbeddingModel(context.configManager.load().memory?.embeddingModel);
+    return resolveEmbeddingModel(context.configManager.load().knowledgeGraph?.localModel);
   } catch {
     return resolveEmbeddingModel(undefined);
   }
@@ -141,6 +148,104 @@ function chain(job: () => Promise<unknown>): void {
       console.warn('[retrieval] job failed:', error);
     },
   );
+}
+
+/** `chain`, for a caller that waits on the job and handles its failure. */
+function onChain(job: () => Promise<unknown>): Promise<void> {
+  const run = jobChain.then(() => job()).then(() => undefined);
+  jobChain = run.catch(() => undefined);
+  return run;
+}
+
+/**
+ * Some of a project's sweeps, run by the retrieval worker (`index.sweep`).
+ * Always awaited on the job chain, so two sweeps of one project never
+ * interleave: a commit sweep that did would delete what a newer one wrote.
+ * A background job, so it has no call budget.
+ */
+function sweepInWorker(projectId: string, steps: IndexSweepSteps, jobId?: string): Promise<IndexSweepResult> {
+  return retrievalClient.call(
+    'index.sweep',
+    { ...steps, projectId, jobId, remoteTargets: collectRemoteTargets(agentRegistry) },
+    { timeoutMs: null },
+  );
+}
+
+/** One session's conversation re-read by the worker (`index.session`). */
+function indexSessionInWorker(
+  context: IpcContext,
+  projectId: string,
+  sessionId: string,
+  finished: boolean,
+): Promise<unknown> {
+  return retrievalClient.call('index.session', {
+    projectId,
+    sessionId,
+    subagents: finished,
+    changes: finished ? { projectPath: projectPathFor(context, projectId) } : null,
+    remoteTargets: collectRemoteTargets(agentRegistry),
+  }, { timeoutMs: null });
+}
+
+/** Stop the project-open sweep the worker is running, if any. */
+function cancelActiveSweep(): void {
+  if (!activeSweepJobId) return;
+  retrievalClient.notifyRunning('job.cancel', { jobId: activeSweepJobId });
+  activeSweepJobId = null;
+}
+
+/** The storage upkeep running in the worker, if any, and its current job. */
+let storageUpkeep: { projectId: string; jobId: string } | null = null;
+
+/**
+ * One-time storage work for databases older releases wrote, in the worker:
+ * legacy raw transcripts into pieces, misfiled ones into their own project
+ * (`transcripts.convertLegacy`), the conversation vectors into a vec0 table at
+ * chunk size 128 (`vec.migrateLayout`), then the index's own indexes, each in
+ * a quiet moment (`index.buildWhenQuiet`). Off the job chain: they touch only
+ * their own tables, and on a large install they run for minutes the indexing
+ * should not wait behind. One project at a time; a project switch stops it,
+ * and the next open carries on where it stopped.
+ *
+ * This is the permanent upgrade path, not a temporary one: an install can skip
+ * releases, and a project can stay unopened for any length of time, so a
+ * database older releases wrote can arrive at any later version. Once a
+ * project is upgraded every step finds nothing to do and returns at once.
+ */
+function upgradeProjectStorage(context: IpcContext, projectId: string): void {
+  if (storageUpkeep?.projectId === projectId) return;
+  if (storageUpkeep) retrievalClient.notifyRunning('job.cancel', { jobId: storageUpkeep.jobId });
+  sweepJobCounter += 1;
+  const upkeep = { projectId, jobId: `upkeep-${sweepJobCounter}` };
+  storageUpkeep = upkeep;
+  let otherProjectIds: string[] = [];
+  try {
+    otherProjectIds = context.projectRepo.list().map((project) => project.id).filter((id) => id !== projectId);
+  } catch {
+    // Converted in place, then: a misfiled transcript stays where it is.
+  }
+  void (async () => {
+    const converted = await retrievalClient.call(
+      'transcripts.convertLegacy',
+      { projectId, otherProjectIds, jobId: upkeep.jobId },
+      { timeoutMs: null },
+    );
+    if (converted.converted > 0) {
+      console.log(`[retrieval] converted ${converted.converted} legacy transcripts (${Math.round(converted.bytes / 1024 / 1024)} MB), ${converted.moved} moved to their own project`);
+    }
+    if (storageUpkeep !== upkeep) return;
+    sweepJobCounter += 1;
+    upkeep.jobId = `upkeep-${sweepJobCounter}`;
+    await retrievalClient.call('vec.migrateLayout', { projectId, jobId: upkeep.jobId }, { timeoutMs: null });
+    if (storageUpkeep !== upkeep) return;
+    sweepJobCounter += 1;
+    upkeep.jobId = `upkeep-${sweepJobCounter}`;
+    await retrievalClient.call('index.buildWhenQuiet', { projectId, jobId: upkeep.jobId }, { timeoutMs: null });
+  })().catch((error) => {
+    console.warn('[retrieval] storage upkeep stopped:', error instanceof Error ? error.message : error);
+  }).finally(() => {
+    if (storageUpkeep === upkeep) storageUpkeep = null;
+  });
 }
 
 function scheduleFinalizeIndex(context: IpcContext, sessionId: string): void {
@@ -166,13 +271,12 @@ function scheduleFinalizeIndex(context: IpcContext, sessionId: string): void {
     const projectId = context.sessionManager.getSessionProjectId(sessionId);
     if (!projectId) return;
     chain(async () => {
-      await indexer.indexSession(projectId, sessionId);
-      // Subagent token usage is walked HERE and in the project-open sweep, never
-      // on the live turn-boundary path: a running fan-out rewrites its subagent
-      // directory on every driver turn, so doing it there would re-walk on each
-      // one. The session has just finished, so this is the walk that actually
-      // captures the whole fan-out.
-      await indexer.indexSubagentUsage(projectId, sessionId);
+      // Finished: the worker also walks the subagents' token usage, which
+      // happens HERE and in the project-open sweep, never on the live
+      // turn-boundary path (a running fan-out rewrites its subagent directory
+      // on every driver turn, so doing it there would re-walk on each one),
+      // and reads the files the session changed from what it just indexed.
+      await indexSessionInWorker(context, projectId, sessionId, true);
       // Flag the project dirty; embedEngine's own drain loop embeds the
       // freshly indexed chunks in the background, duty-cycle throttled. This
       // does NOT embed inline - that is the whole point of the split.
@@ -213,12 +317,506 @@ function scheduleLiveIndex(context: IpcContext, sessionId: string): void {
     const projectId = context.sessionManager.getSessionProjectId(sessionId);
     if (!projectId) return;
     chain(async () => {
-      await indexer.indexSession(projectId, sessionId);
+      await indexSessionInWorker(context, projectId, sessionId, false);
       embedEngine.markDirty(projectId);
     });
   }, LIVE_INDEX_DEBOUNCE_MS);
   timer.unref();
   liveIndexTimers.set(sessionId, timer);
+}
+
+/** False once a project is deleted. A context that cannot say counts it as
+ *  present, so a missing repository never silently stops indexing. */
+function projectStillExists(context: IpcContext, projectId: string): boolean {
+  try {
+    return context.projectRepo.getById(projectId) != null;
+  } catch {
+    return true;
+  }
+}
+
+/** A project's root, so a changed file in its main checkout reads repo-relative. */
+function projectPathFor(context: IpcContext, projectId: string): string | null {
+  try {
+    return context.projectRepo.getById(projectId)?.path ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The commit sweep's step: a project's commits on its default branch, brought
+ * up to date. The branch is the one a task's worktree branches from (board
+ * default, config default, `main`). One `git rev-parse` when the branch has
+ * not moved. A read of the whole branch waits until a minute after launch
+ * (decided here, since a restarted worker would start that minute again),
+ * then runs on its own (`afterSweep`).
+ */
+function commitStep(context: IpcContext, projectPath: string | null): IndexSweepSteps['commits'] {
+  if (!projectPath) return undefined;
+  return { projectPath, baseBranch: baseBranchFor(context, projectPath), allowFullRead: Date.now() >= branchFullReadsFrom };
+}
+
+/** What a sweep does with the source code index (`codeSweepPlan`). */
+function codePlan(context: IpcContext): CodeSweepPlan {
+  return codeSweepPlan(() => context.configManager.load().knowledgeGraph);
+}
+
+/**
+ * The source code sweep's step: brought up to date with the default branch
+ * while source code is switched on, and cleared when it is switched off. One
+ * `git rev-parse` when the branch has not moved; the first fill waits until a
+ * minute after launch, like a whole-branch commit read.
+ */
+function codeStep(context: IpcContext, projectPath: string | null): IndexSweepSteps['code'] {
+  const plan = codePlan(context);
+  return {
+    plan,
+    projectPath,
+    baseBranch: plan === 'index' && projectPath ? baseBranchFor(context, projectPath) : 'main',
+    allowFullRead: Date.now() >= branchFullReadsFrom,
+  };
+}
+
+/** A whole-branch read the sweep put off runs once it may. */
+function afterSweep(context: IpcContext, projectId: string, result: IndexSweepResult): void {
+  if (result.commits?.deferred || result.code?.deferred) sweepAgainAfterStartup(context, projectId);
+}
+
+/** The branch a project's commits and code are read from: the one a task's
+ *  worktree branches from (board default, config default, `main`). */
+function baseBranchFor(context: IpcContext, projectPath: string): string {
+  try {
+    return resolveProjectDefaultBaseBranch(context, projectPath);
+  } catch {
+    // An unreadable config keeps the `main` default, as a worktree would.
+    return 'main';
+  }
+}
+
+/** Queue the record sweeps again once whole-branch reads may run: a read put
+ *  off at startup then happens on its own. */
+function sweepAgainAfterStartup(context: IpcContext, projectId: string): void {
+  if (deferredBranchTimers.has(projectId) || disposed) return;
+  const timer = setTimeout(() => {
+    pendingTimers.delete(timer);
+    deferredBranchTimers.delete(projectId);
+    queueRecordSweeps(context, projectId);
+  }, Math.max(0, branchFullReadsFrom - Date.now()));
+  timer.unref();
+  pendingTimers.add(timer);
+  deferredBranchTimers.set(projectId, timer);
+}
+
+/** Resolves once whole-branch reads may run. The summary pass waits on it, so
+ *  the first summaries after launch are written with their commits rather than
+ *  written without and rewritten a minute later. */
+function untilBranchFullReads(): Promise<void> {
+  const waitMs = branchFullReadsFrom - Date.now();
+  if (waitMs <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, waitMs);
+    timer.unref();
+  });
+}
+
+/**
+ * Re-read a project's task records, session changes, commits and source code
+ * on the serial job chain, and flag the project for the embedding drain when
+ * anything changed. A sweep with nothing to do reads a few small tables and
+ * writes nothing (the commits and code cost a `git rev-parse` each), so this
+ * is safe to ask for whenever the board or a conversation may have moved.
+ */
+function queueRecordSweeps(context: IpcContext, projectId: string): void {
+  if (disposed || !isIndexingEnabled(context)) return;
+  chain(async () => {
+    // Checked when the job runs, not when it was queued: a board-change or
+    // startup timer can fire after the project was deleted, and opening its
+    // database would create an empty one again.
+    if (!projectStillExists(context, projectId)) return;
+    const projectPath = projectPathFor(context, projectId);
+    const result = await sweepInWorker(projectId, {
+      // A deleted task or session leaves its documents in the index until
+      // here; the delete itself touches no index row.
+      purge: 'state',
+      tasks: true,
+      changes: { projectPath },
+      commits: commitStep(context, projectPath),
+      code: codeStep(context, projectPath),
+    });
+    afterSweep(context, projectId, result);
+    const { purged, tasks, changes, commits, code } = result;
+    if ((tasks?.indexed ?? 0) > 0 || (tasks?.removed ?? 0) > 0 || (changes?.indexed ?? 0) > 0 || (code?.indexed ?? 0) > 0) {
+      embedEngine.markDirty(projectId);
+    }
+    if (purged > 0 || (tasks?.indexed ?? 0) > 0 || (tasks?.removed ?? 0) > 0 || (changes?.indexed ?? 0) > 0
+      || (commits?.indexed ?? 0) > 0 || (commits?.removed ?? 0) > 0 || (commits?.relinked ?? 0) > 0
+      || (code?.indexed ?? 0) > 0 || (code?.removed ?? 0) > 0) {
+      // An open Knowledge Graph re-reads its snapshot, so the Index panel
+      // counts what was just indexed. The map itself does not move.
+      graphService.notifyChanged(projectId);
+    }
+  });
+}
+
+/** Task summaries are wanted: switched on (the default, `taskSummariesOn`),
+ *  with indexing and semantic search on, since the Knowledge Graph needs both.
+ *  With no agent chosen the pass resolves no writer, so nothing is spent. */
+function summariesEnabled(context: IpcContext): boolean {
+  try {
+    const config = context.configManager.load().knowledgeGraph;
+    return config?.indexingEnabled !== false && config?.enabled === true && taskSummariesOn(config);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Writes task summaries in the background with the Knowledge Graph's agent and its model,
+ * at the adapter's recommended effort whatever the chosen one (`agentJobChoice`).
+ * With no agent chosen it resolves no writer and does nothing. A summary batch
+ * runs with no tool at all; it summarizes what it is handed.
+ */
+const summaryScheduler = createSummaryScheduler<IpcContext>({
+  isEnabled: summariesEnabled,
+  // A deleted project reads no fingerprint and gets no writer, so its pass does
+  // nothing: a board-change timer or a retry can fire after the delete, and
+  // opening its database would create an empty one again.
+  readFingerprint: (context, projectId) => (
+    projectStillExists(context, projectId)
+      ? retrievalClient.call('summary.fingerprint', { projectId }, { timeoutMs: null })
+      : null
+  ),
+  resolveWriter: async (context, projectId) => {
+    if (!projectStillExists(context, projectId)) return null;
+    const resolved = await resolveAnswerRun(context, projectId, 'summary', { withSearch: false, job: 'summary' });
+    summaryChoice = resolved.ok ? { agent: resolved.run.agentName, model: resolved.run.model, effort: resolved.run.effort } : null;
+    if (!resolved.ok) return null;
+    const run = resolved.run;
+    return {
+      agent: run.agentName,
+      model: run.model,
+      effort: run.effort,
+      write: (prompt) => withAnswerRunDirectory((runDirectory) => (
+        run.answerFromContext(prompt, run.cliPath, run.answerHome, run.model, { effort: run.effort, runDirectory })
+      )),
+    };
+  },
+  // A summary is part of its task's record, so the record re-reads, and the
+  // map's region names read summaries. Renamed at once when the backfill has
+  // caught up, and otherwise at most every few minutes.
+  onWritten: (context, projectId, caughtUp) => {
+    queueRecordSweeps(context, projectId);
+    graphService.requestRegionNames(projectId, caughtUp);
+  },
+  // An open Knowledge Graph re-reads the project's snapshot, which carries what
+  // the scheduler is doing, so its Index panel never shows a pass that ended.
+  onStatusChanged: (projectId) => pushSummaryActivity(projectId),
+  // The files a task changed and its commits are part of what its summary is
+  // written from. Cheap once caught up; on a cold start (which skips the
+  // project-open sweep) it is what keeps the first summaries from being written
+  // without them.
+  //
+  // On the job chain, like every other sweep: two commit sweeps of one project
+  // interleaving at their awaits let the older one delete what the newer one
+  // wrote. The startup wait sits between the two, off the chain, so it holds
+  // up no other indexing.
+  beforePass: async (context, projectId) => {
+    const projectPath = projectPathFor(context, projectId);
+    await onChain(() => sweepInWorker(projectId, { changes: { projectPath } }));
+    await untilBranchFullReads();
+    await onChain(async () => afterSweep(context, projectId, await sweepInWorker(projectId, { commits: commitStep(context, projectPath) })));
+  },
+});
+
+/**
+ * What a summary would be written with now: the Knowledge Graph's agent, its model and the
+ * recommended effort main resolves for a summary, or null while summaries are off
+ * or wait for a choice. Kept
+ * here because a caught-up board never resolves a writer (the fingerprint skip),
+ * so a settings change refreshes it (`refreshSummaryChoice`) rather than waiting
+ * for a pass. The status poll reads it without resolving anything.
+ */
+let summaryChoice: SummaryChoice | null = null;
+let summaryChoiceRefresh: Promise<void> | null = null;
+/** Bumped by each refresh, so one started under older settings cannot land
+ *  after a newer one and leave its stale choice in place. */
+let summaryChoiceGeneration = 0;
+/** The writer a refresh last resolved, by project: what a settings change is
+ *  compared with to decide whether it may end a failure backoff. Not
+ *  `summaryChoice`, which a reconcile nulls before its refresh lands, and which
+ *  holds whichever project was open last. Only a writer is kept: summaries
+ *  switched off or a resolve that failed says nothing about which one runs next. */
+const resolvedSummaryChoices = new Map<string, SummaryChoice>();
+
+/**
+ * What a summary would be written with now, for Rebuild and its plan, or null
+ * while summaries are off or wait for a choice (nothing to rewrite then).
+ * Resolved through the writer's own rule so the two can never disagree.
+ */
+async function resolveRewriteChoice(context: IpcContext): Promise<SummaryChoice | null> {
+  if (disposed || !summariesEnabled(context)) return null;
+  const homeProjectId = context.currentProjectId ?? context.projectRepo.list()[0]?.id;
+  if (!homeProjectId) return null;
+  const resolved = await resolveAnswerRun(context, homeProjectId, 'summary', { withSearch: false, job: 'summary' }).catch(() => null);
+  if (!resolved?.ok) return null;
+  const choice = { agent: resolved.run.agentName, model: resolved.run.model, effort: resolved.run.effort };
+  summaryChoice = choice;
+  return choice;
+}
+
+function sameSummaryChoice(left: SummaryChoice | null, right: SummaryChoice | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.agent === right.agent && left.model === right.model && left.effort === right.effort;
+}
+
+/**
+ * Re-resolve `summaryChoice` from the current settings. One at a time, except
+ * after a settings change (`force`): a refresh already in flight read the old
+ * settings, so a new one starts and the old one's result is dropped.
+ */
+function refreshSummaryChoice(context: IpcContext, options: { force?: boolean } = {}): void {
+  if (disposed || (summaryChoiceRefresh && !options.force)) return;
+  summaryChoiceGeneration += 1;
+  const generation = summaryChoiceGeneration;
+  const projectId = context.currentProjectId;
+  const enabled = summariesEnabled(context);
+  if (!projectId || !enabled) {
+    summaryChoice = null;
+    summaryChoiceRefresh = null;
+    if (!enabled) refreshFoundWriter = false;
+    return;
+  }
+  summaryChoiceRefresh = resolveAnswerRun(context, projectId, 'summary', { withSearch: false, job: 'summary' })
+    .then((resolved) => {
+      if (generation !== summaryChoiceGeneration) return;
+      summaryChoice = resolved.ok ? { agent: resolved.run.agentName, model: resolved.run.model, effort: resolved.run.effort } : null;
+      if (summaryChoice) resolvedSummaryChoices.set(projectId, summaryChoice);
+      noteRefreshedWriter(context, summaryChoice !== null);
+    })
+    .catch(() => {
+      if (generation !== summaryChoiceGeneration) return;
+      summaryChoice = null;
+      // Read as a refresh that found no writer, so the next one that finds a
+      // writer asks every project.
+      noteRefreshedWriter(context, false);
+    })
+    .finally(() => {
+      if (generation === summaryChoiceGeneration) summaryChoiceRefresh = null;
+    });
+}
+
+/**
+ * What the summary scheduler is doing for a project, as the map's Index panel
+ * (through its snapshot, `graph-facade.ts`) and the Settings card read it.
+ */
+function summaryActivityFor(projectId: string): SummaryActivity {
+  const scheduler = summaryScheduler.status(projectId);
+  return {
+    skipped: summaryScheduler.skipped(projectId),
+    state: scheduler.state,
+    retryInMs: scheduler.retryAtMs === null ? null : Math.max(0, scheduler.retryAtMs - Date.now()),
+    choice: summaryChoice,
+  };
+}
+
+/**
+ * How long a project's summary state must hold before an open Knowledge Graph
+ * is told. Every board change asks for a pass, and on a caught-up board that
+ * pass is writing for about 5 ms before the fingerprint skips it: without the
+ * wait, each drag would push two snapshot re-reads for nothing.
+ */
+const SUMMARY_PUSH_DEBOUNCE_MS = 250;
+/** Projects with a push timer armed; `pendingTimers` holds the timers. */
+const summaryPushTimers = new Set<string>();
+/**
+ * What each project's last snapshot carried, as the Index line reads it. Set on
+ * every snapshot read, not only on a push: a map read mid-pass shows `writing`,
+ * and a pass that ends before the push timer must still be pushed to clear it.
+ * A project with no entry is on no map, so nothing is pushed for it: the
+ * launch's ask of every project would otherwise push twice per project, and
+ * an open map re-reads its own snapshot on a push for any project.
+ */
+const shownSummaryActivity = new Map<string, string>();
+
+/** What the map's line changes on. The retry time is left out: the line's
+ *  countdown is read with each snapshot, and a new time alone is no reason to
+ *  push one, unlike the scheduler's own change report. */
+function summaryActivityKey(activity: SummaryActivity): string {
+  return `${activity.state}|${activity.skipped}`;
+}
+
+/** Tell an open Knowledge Graph that a project's summary state settled on something new. */
+function pushSummaryActivity(projectId: string): void {
+  if (disposed || summaryPushTimers.has(projectId)) return;
+  const timer = setTimeout(() => {
+    pendingTimers.delete(timer);
+    summaryPushTimers.delete(projectId);
+    const shown = shownSummaryActivity.get(projectId);
+    // No snapshot has read it, so no map shows it.
+    if (shown === undefined) return;
+    const key = summaryActivityKey(summaryActivityFor(projectId));
+    if (shown === key) return;
+    shownSummaryActivity.set(projectId, key);
+    graphService.notifyChanged(projectId);
+  }, SUMMARY_PUSH_DEBOUNCE_MS);
+  timer.unref();
+  pendingTimers.add(timer);
+  summaryPushTimers.add(projectId);
+}
+
+/** One indexed project as the map's panel counts it: the worker's counts, and
+ *  what the summary scheduler is doing. */
+function indexCountsOf(read: ProjectIndexRead): KnowledgeGraphIndexCounts {
+  return {
+    corpora: read.corpora,
+    summaries: { ...read.summaries, ...summaryActivityFor(read.projectId) },
+  };
+}
+
+/**
+ * Every indexed project's summaries for the Index card's Task summaries line,
+ * the time left at the app's measured rate. Read on the Knowledge Graph tab's
+ * status poll while semantic search is on, with the switch off too: switching
+ * summaries on starts writing at once, so the line gives the backfill's size
+ * before it is on.
+ */
+function summaryStatusFor(context: IpcContext, summed: KnowledgeGraphIndexCounts): KnowledgeGraphSummaryStatus {
+  // Never resolved yet this run (or waiting on a choice): resolve it for the
+  // next poll. A settings change refreshes it too.
+  if (summaryChoice === null) refreshSummaryChoice(context);
+  return summaryStatusOf(summed.summaries, summaryScheduler.writtenPerMinute());
+}
+
+/**
+ * Every indexed project's always-indexed sources for their lines in the Index
+ * card: conversations, tasks, commits, the time left at the embed engine's rate.
+ * An embedded source waits while any passage lacks a vector for the selected
+ * model; a keyword-only one never does.
+ */
+function sourcesStatusFor(summed: KnowledgeGraphIndexCounts, semanticAvailable: boolean): KnowledgeGraphSourcesStatus {
+  const sourceOf = (corpus: KnowledgeGraphIndexCorpus) => (
+    sourceStatusOf(summed, corpus, semanticAvailable, embedEngine.chunksPerMinute) ?? NO_SOURCE
+  );
+  return { conversations: sourceOf('conversation'), tasks: sourceOf('task'), commits: sourceOf('commit') };
+}
+
+/** Default branch sizes for the Index card's Source code line, read in the background. */
+const codeBranchSizes = createBranchSizes();
+
+/**
+ * The Index card's Source code line. On, how far every indexed project's code
+ * index has got. While no project holds code (or code is off), the open
+ * project's default branch size and how long embedding it would take here: one
+ * background branch reading at most once a minute, for the open project only,
+ * never a git read across every project on each poll. Read on the Knowledge
+ * Graph tab's status poll, only while semantic search is on and the worker
+ * answered: a worker that is down has no line, as the other sources do.
+ */
+function codeStatusFor(context: IpcContext, summed: KnowledgeGraphIndexCounts): KnowledgeGraphCodeStatus | undefined {
+  try {
+    const on = codePlan(context) === 'index';
+    const code = on ? summed.corpora.find((entry) => entry.corpus === 'code') : undefined;
+    const progress = code
+      ? { documents: code.documents, chunks: code.chunks, embedded: code.embeddedChunks }
+      : { documents: 0, chunks: 0, embedded: 0 };
+    const projectId = context.currentProjectId;
+    const projectPath = projectId ? projectPathFor(context, projectId) : null;
+    // With no project open there is no branch to size, and nothing to say yet.
+    if (progress.documents === 0 && (!projectId || !projectPath)) return undefined;
+    // Git only while nothing is indexed: the index knows its own size after.
+    const branchSize = progress.documents === 0 && projectId && projectPath
+      ? codeBranchSizes.get(projectId, projectPath, baseBranchFor(context, projectPath))
+      : undefined;
+    return codeStatus({ on, progress, branchSize, chunksPerMinute: embedEngine.chunksPerMinute });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Every registered project, or none while the registry cannot be read. */
+function registeredProjects(context: IpcContext): Project[] {
+  try {
+    return context.projectRepo.list();
+  } catch {
+    return [];
+  }
+}
+
+function registeredProjectIds(context: IpcContext): string[] {
+  return registeredProjects(context).map((project) => project.id);
+}
+
+/**
+ * Whether any of these waiting corpora is worth draining now. Source code only
+ * while it is switched on: off, a project's code index is cleared on its next
+ * open, and embedding it first would spend the drain on code the user turned off.
+ */
+function worthDraining(context: IpcContext, waitingCorpora: ReadonlyArray<KnowledgeGraphIndexCorpus>): boolean {
+  return waitingCorpora.some((corpus) => corpus !== 'code' || codePlan(context) === 'index');
+}
+
+/**
+ * Ask every project for a summary pass, the open one first. The scheduler runs
+ * one pass at a time for the whole app, and a project already caught up this
+ * launch answers from its fingerprint. A project nobody opens and nothing on
+ * its board moves was otherwise never summarized, and the tasks the agent
+ * passed over (kept for this launch only) were never asked about again.
+ *
+ * Not free on the launch's first ask: `caughtUpAt` is kept in memory, so every
+ * project runs its writer resolve, its change and commit sweeps, and a read of
+ * every Done task's input. One project after another, in the background.
+ *
+ * A project whose folder is gone is left out, as `activateAllProjects` leaves
+ * it out: its database is not opened, so not migrated, this launch, and a pass
+ * that cannot read it would retry on the failure backoff all launch.
+ */
+function requestEveryProject(context: IpcContext): void {
+  if (disposed || !summariesEnabled(context)) return;
+  const projects = registeredProjects(context);
+  const openProjectId = context.currentProjectId;
+  const ordered = [
+    ...projects.filter((project) => project.id === openProjectId),
+    ...projects.filter((project) => project.id !== openProjectId),
+  ];
+  for (const project of ordered) {
+    if (!fs.existsSync(project.path)) continue;
+    summaryScheduler.request(context, project.id);
+  }
+}
+
+/**
+ * Whether the last refresh resolved a writer. A refresh that resolves one where
+ * the last did not (summaries switched on, or the agent or model chosen) asks
+ * every project, since every pass before it resolved no writer and wrote nothing.
+ */
+let refreshFoundWriter = false;
+
+function noteRefreshedWriter(context: IpcContext, found: boolean): void {
+  const newlyFound = found && !refreshFoundWriter;
+  refreshFoundWriter = found;
+  // Before the launch's ask, that ask covers every project.
+  if (newlyFound && Date.now() >= branchFullReadsFrom) requestEveryProject(context);
+}
+
+/** A board change re-reads its project's records once the burst settles. */
+function scheduleTaskRecordSweep(context: IpcContext, projectId: string): void {
+  if (disposed) return;
+  const existing = taskRecordTimers.get(projectId);
+  if (existing) {
+    clearTimeout(existing);
+    pendingTimers.delete(existing);
+  }
+  const timer = setTimeout(() => {
+    pendingTimers.delete(timer);
+    taskRecordTimers.delete(projectId);
+    queueRecordSweeps(context, projectId);
+    // A task that just reached Done gets its summary.
+    summaryScheduler.request(context, projectId);
+  }, TASK_RECORD_DEBOUNCE_MS);
+  timer.unref();
+  pendingTimers.add(timer);
+  taskRecordTimers.set(projectId, timer);
 }
 
 /** Ensure the selected model is downloaded when semantic is enabled. Runs the
@@ -256,8 +854,57 @@ export const retrievalService = {
    *  central embedding engine's drain loop. Idempotent; call once at startup. */
   attach(context: IpcContext): void {
     embedEngine.attach(context);
+    // Embedded task records move the Index's embedded shares, which an open
+    // graph only learns by re-reading its snapshot.
+    embedEngine.setOnRecordsEmbedded((projectId) => graphService.notifyChanged(projectId));
+    // The Index says what the summary scheduler is doing for each project and
+    // how many finished tasks the agent passed over, which only it knows.
+    graphService.setSummaryActivity((projectId) => {
+      const activity = summaryActivityFor(projectId);
+      shownSummaryActivity.set(projectId, summaryActivityKey(activity));
+      return activity;
+    });
+    // A snapshot that finds passages waiting for the selected model's vectors
+    // has them drained, so the panel's track moves for a project nobody opens.
+    graphService.setOnEmbeddingsWaiting((projectId, waitingCorpora) => {
+      if (worthDraining(context, waitingCorpora)) embedEngine.markDirty(projectId);
+    });
+    // Region names read summaries only while they are switched on; off, the
+    // map's names are its titles' alone.
+    graphService.setSummaryNamesOn(() => {
+      try {
+        return taskSummariesOn(context.configManager.load().knowledgeGraph);
+      } catch {
+        return false;
+      }
+    });
+    // A restarted worker has lost any pass it was running, so every
+    // registered project's map is read again.
+    graphService.setProjectIds(() => registeredProjectIds(context));
     if (attached) return;
     attached = true;
+    // Every project is asked for its summaries once a launch, after the
+    // launch's own disk and CPU load, when a pass may read whole branches. Not
+    // only the projects opened or moved on: one nothing touches was otherwise
+    // never summarized.
+    const askEveryProject = setTimeout(() => {
+      pendingTimers.delete(askEveryProject);
+      requestEveryProject(context);
+    }, Math.max(0, branchFullReadsFrom - Date.now()));
+    askEveryProject.unref();
+    pendingTimers.add(askEveryProject);
+    // A restarted retrieval worker lost the job it was running and every
+    // index event while it was down: the open project is swept again, which
+    // replays from the sources' signatures and writes only what changed.
+    retrievalClient.on('respawned', () => {
+      if (disposed || !context.currentProjectId) return;
+      try {
+        const project = context.projectRepo.getById(context.currentProjectId);
+        if (project) retrievalService.startForProject(context, project);
+      } catch (error) {
+        console.warn('[retrieval] could not sweep the open project after a worker restart:', error);
+      }
+    });
     context.sessionManager.on('exit', (sessionId: string) => {
       scheduleFinalizeIndex(context, sessionId);
     });
@@ -271,6 +918,14 @@ export const retrievalService = {
       // so the ongoing conversation is searchable without waiting for it to end.
       if (requiresUserInteraction(activity)) scheduleLiveIndex(context, sessionId);
     });
+    // Task records follow the board. The bus hears agent and MCP edits and
+    // every move; a plain desktop edit of a task's text is caught by the
+    // refresh a question asks for (`refreshTaskRecords`).
+    context.boardEvents.onBoardChanged((event) => {
+      // A column change touches no task record, and a Command Terminal has none.
+      if (event.change === 'swimlane-updated' || event.change === 'command-terminals-changed') return;
+      scheduleTaskRecordSweep(context, event.projectId);
+    });
   },
 
   /** Run a deferred, project-switch-guarded backfill sweep for a project, then
@@ -280,34 +935,60 @@ export const retrievalService = {
   startForProject(context: IpcContext, project: Project): void {
     if (disposed) return;
     this.attach(context);
+    // Only one project's open sweep runs: another project's stops.
+    if (activeSweepProjectId !== project.id) cancelActiveSweep();
     activeSweepProjectId = project.id;
     setImmediate(() => {
       if (disposed) return;
       if (context.currentProjectId !== project.id) return;
-      if (!isIndexingEnabled(context)) return;
-
-      // Reconcile any vec rows orphaned while the extension was unavailable.
-      try {
-        const db = getProjectDb(project.id);
-        if (hasVecSupport(db)) new RetrievalStore(db).reconcileVecOrphans();
-      } catch {
-        // sqlite-vec unavailable for this DB; the engine runs lexical-only.
+      // Storage upkeep (transcripts, vectors, the index's own indexes), not
+      // indexing: it runs whatever the indexing switch says.
+      if (!isIndexingEnabled(context)) {
+        upgradeProjectStorage(context, project.id);
+        return;
       }
 
       if (isSemanticEnabled(context)) ensureModelDownload(context);
 
       chain(async () => {
-        await indexer.sweepProject(
-          project.id,
-          () => !disposed && context.currentProjectId === project.id && activeSweepProjectId === project.id,
-        );
+        if (disposed || context.currentProjectId !== project.id || activeSweepProjectId !== project.id) return;
+        sweepJobCounter += 1;
+        const jobId = `open-${sweepJobCounter}`;
+        activeSweepJobId = jobId;
+        const result = await sweepInWorker(project.id, {
+          // Vectors orphaned while the extension was unavailable.
+          reconcileVec: true,
+          // Deleted sessions' documents, found by their chunks too.
+          purge: 'chunks',
+          conversations: true,
+          // The board's own records, the files each conversation changed,
+          // the default branch's commits and its code: each cheap once
+          // caught up, and complete on the first open.
+          tasks: true,
+          changes: { projectPath: project.path },
+          commits: commitStep(context, project.path),
+          code: codeStep(context, project.path),
+        }, jobId);
+        if (activeSweepJobId === jobId) activeSweepJobId = null;
+        afterSweep(context, project.id, result);
+        if (!disposed && context.currentProjectId === project.id) upgradeProjectStorage(context, project.id);
         // Covers project open, the startup backlog, AND crash-resume: the
         // sweep re-indexed whatever changed, and this flags it for the
         // background drain regardless of whether anything actually changed
         // (markDirty is cheap and idempotent).
         embedEngine.markDirty(project.id);
+        // Summaries read the changes just indexed; the first open backfills.
+        summaryScheduler.request(context, project.id);
       });
     });
+  },
+
+  /** Re-read a project's task records and session changes now (queued behind
+   *  any indexing job). Asked for when a question starts, which catches a
+   *  desktop edit the board event bus does not carry and a conversation the
+   *  turn-boundary index just re-read; nothing waits on it. */
+  refreshRecords(context: IpcContext, projectId: string): void {
+    queueRecordSweeps(context, projectId);
   },
 
   /** The embedder for the search path, or null for lexical-only. Consulted by
@@ -320,14 +1001,114 @@ export const retrievalService = {
 
   /** Re-evaluate the embed-worker warm-hold, and (when semantic just became
    *  viable) flag the current project dirty. Call after a change to
-   *  `memory.semanticEnabled`/model/acceleration or to the current project
+   *  `knowledgeGraph.enabled`/model/acceleration or to the current project
    *  (open/close), since those paths have no embed() call of their own to
    *  piggyback the gate on. */
   reconcileEmbedWorker(context: IpcContext): void {
     embedEngine.reconcile(context);
+    // The same Knowledge Graph settings decide summaries: choosing the Knowledge Graph's agent, or
+    // turning summaries on, starts the backfill without a re-open, and what a
+    // summary is written with may have changed.
+    const projectId = context.currentProjectId;
+    // Compared within the project: a first resolve for it (an open or a
+    // switch) has nothing to compare with and is not a settings change.
+    const hasBaseline = projectId !== null && resolvedSummaryChoices.has(projectId);
+    const previousChoice = projectId !== null ? resolvedSummaryChoices.get(projectId) ?? null : null;
+    summaryChoice = null;
+    refreshSummaryChoice(context, { force: true });
+    const generation = summaryChoiceGeneration;
+    if (projectId) summaryScheduler.request(context, projectId);
+    // A new agent, model or effort may be what fixes a failed call, so that
+    // change does not wait out the failure backoff. Anything else that lands
+    // here (a project open or switch, another Knowledge Graph setting) does:
+    // the same failing call would only run again.
+    if (projectId) {
+      void (summaryChoiceRefresh ?? Promise.resolve()).then(() => {
+        // A later reconcile superseded this refresh, whose result was dropped,
+        // and makes the comparison itself.
+        if (disposed || generation !== summaryChoiceGeneration) return;
+        // No writer now (summaries off, or the resolve failed) is no new writer:
+        // switching summaries off and on again would otherwise end the backoff.
+        if (!hasBaseline || summaryChoice === null || sameSummaryChoice(previousChoice, summaryChoice)) return;
+        summaryScheduler.endBackoff(projectId);
+        summaryScheduler.request(context, projectId);
+      });
+    }
+    // Switching source code on fills the code index, and off clears it.
+    if (projectId) queueRecordSweeps(context, projectId);
   },
 
-  /** Spawn + init the embed worker ahead of a Smart query (Quick Find open),
+  /**
+   * What the Index card's Rebuild would spend: the task summaries in every
+   * project written with anything but what a summary would be written with
+   * now. Resolved here, as Rebuild resolves it, so the count the confirm names
+   * is exactly what Rebuild marks. One small read per project.
+   */
+  async rebuildPlan(context: IpcContext): Promise<KnowledgeGraphRebuildPlan> {
+    const choice = await resolveRewriteChoice(context);
+    if (!choice) return { summariesToRewrite: 0 };
+    return retrievalClient.call('index.rebuildPlan', {
+      projectIds: context.projectRepo.list().map((project) => project.id),
+      choice,
+    });
+  },
+
+  /**
+   * The Index card's Rebuild: everything, in every project. Each project
+   * forgets what its sources were read from (`resetIndexState`: never the
+   * chunks or their vectors, so nothing indexed is lost and unchanged text
+   * keeps its vector), and its summaries written with another agent or model
+   * are marked for rewriting, each keeping its text until the new one lands.
+   *
+   * Only the open project is read again now. A sweep runs for the open project
+   * alone (`startForProject` stops any other), so the rest are read again on
+   * their next open, from the state cleared here. Their rewrites wait for their
+   * next summary pass: a board change there, or the next launch's ask of every
+   * project. Asking every project now would run each one's change and commit
+   * sweeps against the state cleared here, a whole-branch read in each, back to
+   * back.
+   */
+  async rebuildEverything(context: IpcContext): Promise<KnowledgeGraphRebuildPlan> {
+    if (disposed) return { summariesToRewrite: 0 };
+    const choice = await resolveRewriteChoice(context);
+    const projectIds = context.projectRepo.list().map((project) => project.id);
+    // On the job chain: a sweep mid-write would put back the state this clears.
+    // A running open sweep stops at its next step rather than hold Rebuild up;
+    // the open project is swept again below.
+    cancelActiveSweep();
+    let summariesToRewrite = 0;
+    let reset: string[] = [];
+    await onChain(async () => {
+      ({ summariesToRewrite, reset } = await retrievalClient.call('index.rebuild', { projectIds, choice }, { timeoutMs: null }));
+    });
+    // Nothing on the board moved, so the fingerprint would call it caught up.
+    for (const projectId of reset) summaryScheduler.invalidate(projectId);
+    console.log(`[retrieval] rebuild projects=${projectIds.length} summaries marked for rewrite=${summariesToRewrite}`);
+    const openProjectId = context.currentProjectId;
+    const openProject = openProjectId ? context.projectRepo.getById(openProjectId) : null;
+    if (openProject) {
+      this.stop(openProject.id);
+      this.startForProject(context, openProject);
+      summaryScheduler.request(context, openProject.id);
+    }
+    return { summariesToRewrite };
+  },
+
+  /**
+   * One task's summary, for the Knowledge Graph's selected conversation. Null
+   * while task summaries are switched off, so the panel reads as it did before
+   * summaries, and null when the task has none. One indexed read.
+   */
+  async taskSummary(context: IpcContext, projectId: string, taskId: string): Promise<string | null> {
+    try {
+      if (!taskSummariesOn(context.configManager.load().knowledgeGraph)) return null;
+      return await retrievalClient.call('summary.forTask', { projectId, taskId });
+    } catch {
+      return null;
+    }
+  },
+
+  /** Spawn + init the embed worker ahead of a question (Knowledge Graph open),
    *  embedding nothing. A no-op when semantic is off, the model is absent, or
    *  the worker has crashed past its cap. */
   prewarmEmbedWorker(context: IpcContext): void {
@@ -335,17 +1116,16 @@ export const retrievalService = {
     embedEngine.prewarm(context);
   },
 
-  /** Current conversation-memory status for the renderer's Smart-mode UI and
-   *  the settings model card. */
-  getStatus(context: IpcContext): MemoryStatus {
+  /** Current conversation-memory status for the Search settings
+   *  tab's index progress and model status line. */
+  async getStatus(context: IpcContext): Promise<KnowledgeGraphStatus> {
     const indexingEnabled = isIndexingEnabled(context);
     const semanticOn = isSemanticEnabled(context);
     const model = selectedModel(context);
 
     // Self-heal: when semantic is enabled but the model isn't present, make sure
     // its download is running. This is what actually kicks the download after
-    // the user flips the toggle, since both the Memory tab and the palette poll
-    // getStatus. Skipped while already downloading (guarded inside) and after an
+    // the user flips the toggle, since the Knowledge Graph tab polls getStatus. Skipped while already downloading (guarded inside) and after an
     // error (no retry spam - the user re-toggles to retry).
     if (indexingEnabled && semanticOn && !isEmbeddingModelPresent(model) && modelDownloadState !== 'error') {
       ensureModelDownload(context);
@@ -363,7 +1143,38 @@ export const retrievalService = {
     const modelPresent = isEmbeddingModelPresent(model);
     const isDownloadingThis = modelDownloadState === 'downloading' && downloadingModelId === model.id;
 
-    let semantic: MemorySemanticState;
+    // The index's half, read in the retrieval worker: every indexed project,
+    // counted as the map's snapshot counts it, so this card and the map's
+    // All projects panel read the same figures. Null while the worker is down,
+    // which reads as keywords only, with the worker's own reason. A System tab,
+    // so it reads with no project open too.
+    let index: (IndexAllStatus & { vecError: string | null }) | null = null;
+    const projectIds = registeredProjectIds(context);
+    if (indexingEnabled && projectIds.length > 0) {
+      try {
+        index = await retrievalClient.call('status.indexAll', {
+          projectIds,
+          modelTag: model.modelTag,
+          semantic: semanticOn,
+          summaries: semanticOn,
+        });
+      } catch {
+        index = null;
+      }
+    }
+    // A project nobody opens after a model change has its passages drained
+    // too, so a running line here is one that moves (the same rule the map's
+    // snapshot applies).
+    if (index && indexingEnabled && semanticOn && modelPresent && !embedEngine.workerCrashed) {
+      for (const read of index.projects) {
+        if (worthDraining(context, waitingCorporaOf(read.corpora))) embedEngine.markDirty(read.projectId);
+      }
+    }
+    // Summed whenever the worker answered, none indexed included, so an empty
+    // index reads "Not yet indexed" and "No Done tasks yet" rather than nothing.
+    const summed = index ? sumIndexCounts(index.projects.map(indexCountsOf)) : null;
+
+    let semantic: KnowledgeGraphSemanticState;
     let workerError: string | undefined;
     if (!indexingEnabled || !semanticOn) {
       // Genuinely off: the user has not enabled semantic search.
@@ -374,17 +1185,17 @@ export const retrievalService = {
       // Enabled, but the model is still downloading / not ready yet.
       semantic = 'downloading';
     } else if (embedEngine.workerCrashed) {
-      // The restart policy gave up. Carry its reason so the Memory tab can say
+      // The restart policy gave up. Carry its reason so the Knowledge Graph tab can say
       // why instead of only that it failed.
       semantic = 'error';
       workerError = embedEngine.workerCrashReason ?? undefined;
-    } else if (!currentProjectHasVec(context)) {
+    } else if (!index?.hasVec) {
       semantic = 'lexical';
     } else {
       semantic = 'hybrid';
     }
 
-    let modelState: MemoryModelState;
+    let modelState: KnowledgeGraphModelState;
     if (modelDownloadState === 'error') modelState = 'error';
     else if (modelPresent) modelState = 'ready';
     else if (isDownloadingThis || semanticOn) modelState = 'downloading';
@@ -396,7 +1207,9 @@ export const retrievalService = {
       semantic,
       activeBackend: humanizeBackend(embedEngine.activeDevice),
       modelProgress: showProgress ? modelDownloadProgress : undefined,
-      vecError: semantic === 'lexical' ? lastVecLoadError() ?? undefined : undefined,
+      vecError: semantic === 'lexical'
+        ? (index ? index.vecError : retrievalClient.unavailableReason) ?? undefined
+        : undefined,
       workerError,
       model: {
         id: model.id,
@@ -407,6 +1220,9 @@ export const retrievalService = {
         state: modelState,
         progress: showProgress ? modelDownloadProgress : undefined,
       },
+      summaries: semanticOn && summed ? summaryStatusFor(context, summed) : undefined,
+      code: indexingEnabled && semanticOn && summed ? codeStatusFor(context, summed) : undefined,
+      sources: summed ? sourcesStatusFor(summed, semanticOn && index !== null && index.hasVec) : undefined,
     };
   },
 
@@ -415,34 +1231,7 @@ export const retrievalService = {
   stop(projectId?: string): void {
     if (projectId != null && projectId !== activeSweepProjectId) return;
     activeSweepProjectId = null;
-  },
-
-  /** Clear one project's entire conversation index (Privacy "clear index"). */
-  purgeProjectIndex(projectId: string): void {
-    try {
-      new RetrievalStore(getProjectDb(projectId)).purgeAll();
-    } catch (error) {
-      console.warn('[retrieval] purge failed:', error);
-    }
-  },
-
-  /** Non-destructively rebuild a project's index (the Memory settings "Rebuild
-   *  index" recovery action). Clears ONLY the per-session index-state signatures -
-   *  never the chunks - so the fresh sweep re-indexes every session from its
-   *  transcript while keeping the existing chunks as a fallback. A session whose
-   *  transcript is gone or unparseable keeps its chunks (indexSession replaces a
-   *  session's chunks only on a successful parse), so a rebuild can never drop a
-   *  past conversation. The re-sweep runs via `startForProject`, which flags the
-   *  project dirty so embedEngine's background drain embeds it afterward. */
-  rebuildProjectIndex(context: IpcContext, project: Project): void {
-    if (disposed) return;
-    this.stop(project.id);
-    try {
-      new RetrievalStore(getProjectDb(project.id)).resetIndexState();
-    } catch (error) {
-      console.warn('[retrieval] rebuild index-state reset failed:', error);
-    }
-    this.startForProject(context, project);
+    cancelActiveSweep();
   },
 
   /** Synchronous shutdown: stop scheduling, drop pending timers, dispose the
@@ -457,6 +1246,11 @@ export const retrievalService = {
     liveIndexTimers.clear();
     for (const timer of finalizeIndexTimers.values()) clearTimeout(timer);
     finalizeIndexTimers.clear();
+    for (const timer of taskRecordTimers.values()) clearTimeout(timer);
+    taskRecordTimers.clear();
+    deferredBranchTimers.clear();
+    summaryPushTimers.clear();
+    summaryScheduler.dispose();
     embedEngine.dispose();
   },
 };

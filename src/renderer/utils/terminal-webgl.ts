@@ -88,7 +88,8 @@ interface AttachWebglOptions {
  * against the GPU process relaunch (which takes about a second).
  *
  * Chromium (content/browser/gpu/gpu_data_manager_impl_private.cc, read at
- * 146.0.7680.166, the Chromium inside Electron 41.1.1) records one block entry
+ * 146.0.7680.166 for Electron 41.1.1 and unchanged at 152.0.7977.130, the
+ * Chromium inside Electron 44.5.1) records one block entry
  * for the page's domain every time a live WebGL context is lost to a GPU
  * process crash or a driver reset, and answers `getContext('webgl2')` with null
  * while TWO or more entries are younger than `kBlockedDomainExpirationPeriod`
@@ -124,14 +125,20 @@ const DEFAULT_RETRY_DELAYS_MS = [2_000, 10_000, 30_000, 30_000, 60_000, 120_000]
 
 /**
  * Max simultaneous live WebGL attachments on this page. Chromium's own cap is
- * ~16 per page; terminals are the page's only WebGL consumers (the changes
- * panel is Monaco). A pop-out is a separate page with its own cap and its own
- * instance of this module: the Agent Monitor pop-out can host a task detail
- * terminal, and it counts against that page's budget, not this one's. 8 covers
- * every realistic fully-visible layout (task-detail windows + max 4 command
- * terminals + the bottom panel's single collapsed xterm) while leaving half of
- * Chromium's budget as headroom for suspend/resume transitions, so Chromium's
- * silent oldest-context eviction never engages.
+ * ~16 per page. 8 covers every realistic fully-visible layout (task-detail
+ * windows + max 4 command terminals + the bottom panel's single collapsed xterm)
+ * while leaving half of Chromium's budget as headroom for suspend/resume
+ * transitions, so Chromium's silent oldest-context eviction never engages. The
+ * changes panel is Monaco and takes none.
+ *
+ * Terminals are not the page's only consumer: the Knowledge Graph's three.js canvas
+ * takes one via `reserveWebglContext`, and reservations count against this same
+ * number (see `countLiveWebgl`), so terminals get 8 minus whatever is reserved.
+ *
+ * A pop-out is a separate page with its own cap and its own instance of this
+ * module. The Agent Monitor pop-out can host a task-detail terminal, and a
+ * detached graph reserves its context there; both count against that page's
+ * budget, not this one's.
  */
 export const WEBGL_ATTACH_BUDGET = 8;
 
@@ -191,6 +198,12 @@ const rendererStatusByKey: Map<string, TerminalRendererStatus> = import.meta.hot
 const attachmentControllersByKey: Map<string, WebglAttachmentController> = import.meta.hot?.data?.attachmentControllersByKey ?? new Map();
 // @ts-expect-error -- Vite handles import.meta.hot
 const webglAttachmentListeners: Set<() => void> = import.meta.hot?.data?.webglAttachmentListeners ?? new Set();
+/**
+ * Contexts held by NON-terminal consumers (today: the Knowledge Graph's three.js
+ * canvas). See `reserveWebglContext`.
+ */
+// @ts-expect-error -- Vite handles import.meta.hot
+const reservedWebglKeys: Set<string> = import.meta.hot?.data?.reservedWebglKeys ?? new Set();
 
 // @ts-expect-error -- Vite handles import.meta.hot
 if (import.meta.hot) {
@@ -199,15 +212,56 @@ if (import.meta.hot) {
     data.rendererStatusByKey = rendererStatusByKey;
     data.attachmentControllersByKey = attachmentControllersByKey;
     data.webglAttachmentListeners = webglAttachmentListeners;
+    data.reservedWebglKeys = reservedWebglKeys;
   });
 }
 
+/** Live terminal attachments PLUS non-terminal reservations - the true count of
+ *  contexts this page holds, which is what the cap is about. */
 function countLiveWebgl(): number {
-  let liveCount = 0;
+  let liveCount = reservedWebglKeys.size;
   for (const status of rendererStatusByKey.values()) {
     if (status.renderer === 'webgl') liveCount += 1;
   }
   return liveCount;
+}
+
+/**
+ * Claim one context in this page's budget for something that is not a terminal.
+ *
+ * The budget exists because Chromium silently evicts the OLDEST context past its
+ * per-page cap, which lands on some terminal as a context loss. Terminals were
+ * the page's only WebGL consumers until the Knowledge Graph's three.js canvas; an
+ * unaccounted second consumer is exactly the eviction this module exists to
+ * prevent.
+ *
+ * A reservation is PINNED, never suspended, which is why this is a plain counter
+ * rather than another `WebglAttachmentController`. A terminal suspended by the
+ * budget degrades to xterm's DOM renderer and keeps working; a 3D canvas has no
+ * equivalent fallback, so suspending it would just blank the surface the user is
+ * looking at. Reserving instead means terminals share what is left (8 -> 7 while
+ * the graph is open), which is a degradation they are already built to absorb.
+ *
+ * `clearTextureAtlas` deliberately has no analogue here: it is an xterm glyph
+ * cache concern and means nothing to any other consumer.
+ *
+ * Returns a release function. Idempotent.
+ */
+export function reserveWebglContext(key: string): () => void {
+  reservedWebglKeys.add(key);
+  // The coordinator subscribes to this and re-plans, so a reservation
+  // immediately squeezes the terminals rather than waiting for the next
+  // unrelated window change.
+  notifyWebglAttachmentsChanged();
+  return () => {
+    if (!reservedWebglKeys.delete(key)) return;
+    notifyWebglAttachmentsChanged();
+  };
+}
+
+/** How many contexts non-terminal consumers currently hold. */
+export function getWebglReservationCount(): number {
+  return reservedWebglKeys.size;
 }
 
 function notifyWebglAttachmentsChanged(): void {
@@ -252,12 +306,15 @@ export function applyWebglAttachmentPlan(plan: WebglAttachmentPlan): void {
 
 /**
  * Force the WebGL renderer to re-rasterize every glyph from scratch. Call this
- * after a live font change: xterm's char-size measurement re-runs as soon as
- * `terminal.options.fontFamily` is assigned, and a glyph rasterized against a
- * measurement taken mid-font-swap can read back a 0-width cell, which throws
- * `IndexSizeError` in `TextureAtlas._drawToCache`'s `getImageData` call. A
- * no-op if the terminal has no live WebGL attachment (DOM fallback, or no
- * entry for this key).
+ * after a live font change, so no glyph cached under the previous font's
+ * metrics is reused. A no-op if the terminal has no live WebGL attachment (DOM
+ * fallback, or no entry for this key).
+ *
+ * This does not guard against `IndexSizeError` ("source width is 0") in
+ * `TextureAtlas._drawToCache`. A clear re-rasterizes through the same atlas
+ * config, so a cell that is 0 device pixels wide stays 0. That cell comes from
+ * a sub-pixel font size, and `resolveTerminalFontSize` keeps one out of xterm
+ * (DESKTOP-1J/1K).
  */
 export function notifyFontChanged(rendererKey: string): void {
   attachmentControllersByKey.get(rendererKey)?.clearTextureAtlas();

@@ -22,7 +22,7 @@
  * Harness modeled on task-move-git-churn-wiring.test.ts (closest existing
  * pattern already covering both the agent-handoff and model-change respawn
  * branches with an overridable resolveTargetAgent / prepareInjectionPlan, and
- * the Priority 2 Done branch's captureSessionLeftovers / reapSessionLeftovers
+ * the Priority 2 Done branch's reapTaskLeftovers
  * mocks) and task-move-isolation-switch.test.ts (the session-switch branch).
  */
 
@@ -46,6 +46,8 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/task-repository', () => ({ TaskRepository: class {} }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    // No own-record row, so the capture sites fall back to getLatestForTask.
+    findByAnyId = vi.fn(() => undefined);
     getLatestForTask = vi.fn(() => hoisted.activeRecord);
     getLatestForTaskByTypeAndIsolation = vi.fn(() => hoisted.activeRecord);
     // Read by Priority 2's completion-analytics tracking (move to Done).
@@ -98,7 +100,7 @@ vi.mock('../../src/main/transition-engine/agent-resolver', () => ({
   resolveTargetAgent: (...args: unknown[]) => mockResolveTargetAgent(...args),
 }));
 
-const mockPrepareInjectionPlan = vi.fn(() => null as { needsRestartForModel: boolean; sequence: unknown[]; verifier: null } | null);
+const mockPrepareInjectionPlan = vi.fn(() => null as { restartReason: 'model' | 'effort' | null; sequence: unknown[]; verifier: null } | null);
 vi.mock('../../src/main/transition-engine/injection-plan', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/main/transition-engine/injection-plan')>()),
   prepareInjectionPlan: (...args: unknown[]) => mockPrepareInjectionPlan(...args),
@@ -121,7 +123,9 @@ const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
 const mockSpawnAgent = vi.fn(async () => {});
-const mockCreateTransitionEngine = vi.fn(() => ({}));
+// Phase 1 runs the source column's exit automations on every move. An empty
+// summary keeps it quiet instead of logging a TypeError per test.
+const mockCreateTransitionEngine = vi.fn(() => ({ executeTransition: vi.fn(async () => ({ failures: [] })) }));
 
 vi.mock('../../src/main/ipc/helpers/index', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
@@ -132,11 +136,10 @@ vi.mock('../../src/main/ipc/helpers/index', () => ({
   cleanupTaskResources: vi.fn(async () => {}),
   deleteTaskWorktree: vi.fn(async () => true),
   autoSpawnForTask: vi.fn(async () => {}),
-  // The Done branch snapshots the session's process tree before suspending and
-  // reaps it before the worktree delete. Inert here (no background shells in
-  // these fixtures); covered for real by session-tree-reap.test.ts.
-  captureSessionLeftovers: vi.fn(() => null),
-  reapSessionLeftovers: vi.fn(async () => {}),
+  // The Done branch reaps what the task left running after its session exits
+  // and before the worktree delete. Inert here; covered for real by
+  // session-reap-real-processes.test.ts.
+  reapTaskLeftovers: vi.fn(async () => {}),
 }));
 vi.mock('../../src/main/pr/pr-linking', () => ({
   autoLinkPRForTask: vi.fn(),
@@ -209,9 +212,10 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     // on the respawn branches they exercise.
     getSession: vi.fn((id: string) => ({ id, taskId: TASK_ID, status: 'running' })),
     findLiveSessionByTaskId: vi.fn(() => null),
-    // Read by resolveLiveEffort; empty means the agent reports no effort, so
-    // the effort-delta test sources from the session record as intended.
+    // Read by resolveReportedEffort; empty means the agent reports no effort,
+    // so the effort-delta test sources from the session record as intended.
     getUsageCache: vi.fn((): Record<string, unknown> => ({})),
+    getFirstReportedEffort: vi.fn((): string | null => null),
   };
   const context = {
     currentProjectId: 'proj-test',
@@ -310,7 +314,7 @@ describe('handleTaskMove respawn branches emit a spawn-progress label before sus
       list: vi.fn(() => [planningLane, execLane]),
     };
     setActiveRecord();
-    mockPrepareInjectionPlan.mockReturnValue({ sequence: [], verifier: null, needsRestartForModel: true });
+    mockPrepareInjectionPlan.mockReturnValue({ sequence: [], verifier: null, restartReason: 'model' });
     const taskRepo = makeTaskRepo('lane-planning', EXEC_LANE_ID);
     const context = makeContext(taskRepo, swimlaneRepo);
 
@@ -320,17 +324,18 @@ describe('handleTaskMove respawn branches emit a spawn-progress label before sus
     expect(mockSpawnAgent).toHaveBeenCalledTimes(1);
   });
 
-  it('effort-only respawn (no live swap): emits "applying-settings" before suspending', async () => {
+  it('effort-only restart: emits "applying-settings" before suspending', async () => {
     const fromLane = makeSwimlane('lane-from');
     const toLane = makeSwimlane(EXEC_LANE_ID, { effort_override: 'xhigh' });
     const swimlaneRepo = {
       getById: vi.fn((id: string) => (id === 'lane-from' ? fromLane : id === EXEC_LANE_ID ? toLane : null)),
       list: vi.fn(() => [fromLane, toLane]),
     };
-    // Session already running at 'low'; destination wants 'xhigh'. No adapter
-    // live-swap plan (mockPrepareInjectionPlan returns null), so this is the
-    // no-live-swap CLI-flag respawn (Priority 3d step 2b), not a live inject.
+    // Session already running at 'low'; destination wants 'xhigh'. The plan
+    // reports an effort restart, which reads as "Applying new settings...",
+    // never as "Switching model...".
     setActiveRecord({ applied_effort: 'low' });
+    mockPrepareInjectionPlan.mockReturnValue({ sequence: [], verifier: null, restartReason: 'effort' });
     const taskRepo = makeTaskRepo('lane-from', EXEC_LANE_ID);
     const context = makeContext(taskRepo, swimlaneRepo);
 
@@ -457,7 +462,7 @@ describe('handleTaskMove respawn branches emit a spawn-progress label before sus
       list: vi.fn(() => [planningLane, execLane]),
     };
     setActiveRecord();
-    mockPrepareInjectionPlan.mockReturnValue({ sequence: [], verifier: null, needsRestartForModel: true });
+    mockPrepareInjectionPlan.mockReturnValue({ sequence: [], verifier: null, restartReason: 'model' });
     const taskRepo = makeTaskRepo('lane-planning', EXEC_LANE_ID);
     const context = makeContext(taskRepo, swimlaneRepo);
     context.sessionManager.suspend.mockRejectedValue(new Error('pty suspend failed'));
@@ -500,7 +505,7 @@ describe('handleTaskMove respawn branches during shutdown', () => {
       list: vi.fn(() => [planningLane, execLane]),
     };
     setActiveRecord();
-    mockPrepareInjectionPlan.mockReturnValue({ sequence: [], verifier: null, needsRestartForModel: true });
+    mockPrepareInjectionPlan.mockReturnValue({ sequence: [], verifier: null, restartReason: 'model' });
     const taskRepo = makeTaskRepo('lane-planning', EXEC_LANE_ID);
     const context = makeContext(taskRepo, swimlaneRepo);
     return { swimlaneRepo, taskRepo, context };

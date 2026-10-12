@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
-import { execFile, exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execAsync, execFileAsync } from '../../../utility-process/off-main-exec';
+import { quoteCmdExecutable } from '../../../../shared/shell-quote';
 import { getCachedModelPickerModels, probeModelPickerModels, type ModelPickerScan } from './model-picker-probe';
 import { buildModelCapabilityFields } from './model-display-name';
 import {
@@ -13,8 +13,6 @@ import {
 } from '../../shared/history-scan';
 import type { AgentCapabilities } from '../../../../shared/types';
 
-const execFileAsync = promisify(execFile);
-const execAsync = promisify(exec);
 
 const HELP_TIMEOUT_MS = 5000;
 
@@ -25,7 +23,7 @@ const HELP_TIMEOUT_MS = 5000;
  */
 async function readHelpText(cliPath: string): Promise<string> {
   if (process.platform === 'win32') {
-    const { stdout } = await execAsync(`"${cliPath}" --help`, {
+    const { stdout } = await execAsync(`${quoteCmdExecutable(cliPath)} --help`, {
       timeout: HELP_TIMEOUT_MS,
       windowsHide: true,
       maxBuffer: 1024 * 1024,

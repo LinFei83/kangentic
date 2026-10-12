@@ -40,7 +40,7 @@
 - **Project & global settings** - every project carries its own agent, model, effort, permission mode, base branch, and worktree defaults, separate from machine-wide ones, in a searchable settings panel.
 - **Backlog, labels & priorities** - stage work before it hits the board, tag it with custom labels and a fully-customizable priority scale, and batch-promote in one move. The tags keep working as board filters afterward.
 - **Agent-to-board tools** - every session gets MCP tools to create tasks, move cards, add columns, search prior sessions, and even message another task's running agent, so agents self-organize.
-- **Quick Find & memory** - Ctrl+Shift+F / Cmd+Shift+F searches tasks, backlog, session events, projects, and every past agent conversation, by keyword or on-device semantic memory. No API key.
+- **Quick Find & Knowledge Graph** - Ctrl+Shift+F / Cmd+Shift+F searches tasks, backlog, session events, projects, and every past agent conversation by keyword. The Knowledge Graph maps that history by meaning with an on-device model and answers questions about it through the agent you already use. No API key.
 - **Terminal & activity log** - a real xterm.js terminal per session with WebGL rendering, scrollback that survives restarts, and clipboard image paste, plus an Activity tab that distills output into a structured event feed.
 - **Command Terminal** - Ctrl+Shift+P / Cmd+Shift+P opens an ephemeral agent session over any board, no task card needed. Run up to four tiled side by side, with a layout that persists across projects and restarts.
 - **Context Bar** - a live strip under every terminal: model, cost, tokens, tool calls, elapsed time, context-window fraction, and Claude rate-limit meters. The profile, model, and effort pills double as pickers.
@@ -93,7 +93,8 @@ Bring your own backlog. Pull tasks in from the tools your team already uses, inc
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) 20+ (for npx)
-- [Git 2.25+](https://git-scm.com/)
+- [Git 2.26+](https://git-scm.com/)
+- On a Mac, macOS 13 or later
 - At least one supported agent CLI (see [Supported Agents](#supported-agents))
 
 ## Setup
@@ -112,8 +113,8 @@ Get started at [kangentic.com/getting-started](https://www.kangentic.com/getting
 
 ## Development
 
-Building from source requires Node.js 22+ (the npx floor above is for end users running the
-launcher).
+Building from source requires Node.js 22.14+ or 24+ (the npx floor above is for end users running
+the launcher).
 
 ```bash
 git clone https://github.com/Kangentic/kangentic.git

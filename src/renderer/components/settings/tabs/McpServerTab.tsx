@@ -1,57 +1,106 @@
-import { ExternalLink, Plug } from 'lucide-react';
+import { useState } from 'react';
+import { Plug } from 'lucide-react';
 import type { AppConfig } from '../../../../shared/types';
-import { MCP_TOOL_CATEGORIES, MCP_TOOL_MANIFEST, mcpToolDocsUrl } from '../../../../shared/mcp-tool-manifest';
-import { SectionHeader, SettingToggleRow, useScopedUpdate } from '../shared';
+import {
+  MCP_SERVER_DOCS_URL,
+  MCP_TOOL_CATEGORIES,
+  MCP_TOOL_MANIFEST,
+  mcpToolDocsUrl,
+  type McpToolCategoryId,
+} from '../../../../shared/mcp-tool-manifest';
+import { useScopedUpdate } from '../shared';
+import { SettingsCard, CardTile, CardGroupTile } from '../settings-card';
 import { settingProps } from '../settings-registry';
+import { SETTING_LABEL_CLASS, SETTING_DESCRIPTION_CLASS } from '../../SettingText';
+import { ExternalLinkButton } from '../../ExternalLinkButton';
 
+/** What turning the server on does, behind the card's info icon. */
+const HOW_IT_WORKS = 'Each agent session gets a local MCP server and discovers these tools on its own. '
+  + 'Tasks an agent creates appear on the board with a toast.';
+
+/** The groups every visit opens with closed: the ones the manifest marks `startsClosed`. */
+const GROUPS_CLOSED_ON_ARRIVAL: ReadonlySet<McpToolCategoryId> = new Set(
+  MCP_TOOL_CATEGORIES.filter((category) => category.startsClosed).map((category) => category.id),
+);
+
+/**
+ * One card: the server's switch, then the docs and the tools it gives agents,
+ * shown only while it is on. The docs row comes first, as a row of its own:
+ * at the end of the list it read as one more tool. Each tool group is a tile
+ * that collapses. A collapse is not remembered: every visit opens with every
+ * group open except the dev-leaning Diagnostics, so the everyday tools are
+ * what a reader meets. Each tool is a cell that opens its docs entry; the
+ * tooltip says what the tool does.
+ *
+ * The list renders from `MCP_TOOL_MANIFEST`, so a registered tool appears here
+ * with no edit to this file (mcp-tool-list-parity.md).
+ */
 export function McpServerTab({ globalConfig }: { globalConfig: AppConfig }) {
   const updateGlobal = useScopedUpdate('global');
   const enabled = globalConfig.mcpServer?.enabled ?? true;
+  // For this visit only: the tab remounts on every open, which restores these defaults.
+  const [closedGroups, setClosedGroups] = useState<ReadonlySet<McpToolCategoryId>>(GROUPS_CLOSED_ON_ARRIVAL);
+  const toggleGroup = (categoryId: McpToolCategoryId) => {
+    setClosedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(categoryId)) next.delete(categoryId);
+      else next.add(categoryId);
+      return next;
+    });
+  };
   return (
-    <div className="space-y-4">
-      <SettingToggleRow
-        {...settingProps('mcpServer.enabled')}
-        icon={<Plug className="size-5" />}
-        checked={enabled}
-        onChange={(value) => updateGlobal({ mcpServer: { enabled: value } })}
-      />
-
-      <div className={enabled ? '' : 'opacity-40 pointer-events-none'}>
-        <SectionHeader label="Available Tools" searchIds={['mcpServer.enabled']} />
-        {MCP_TOOL_CATEGORIES.map((category) => {
-          const tools = MCP_TOOL_MANIFEST.filter((tool) => tool.category === category.id);
-          if (tools.length === 0) return null;
-          return (
-            <div key={category.id} className="mt-3 first:mt-1">
-              <h4 className="text-[11px] font-semibold uppercase tracking-wider text-fg-faint mb-1">{category.label}</h4>
-              <ul className="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-1.5 ml-1">
-                {tools.map((tool) => (
-                  <li key={tool.name}>
-                    <button
-                      type="button"
-                      data-testid="mcp-tool-pill"
-                      title={`${tool.label} - ${tool.blurb}. Opens the docs page.`}
-                      onClick={() => void window.electronAPI.shell.openExternal(mcpToolDocsUrl(tool.name))}
-                      className="w-full flex items-center gap-1 rounded-md border border-edge/50 bg-surface-hover/30 px-2.5 py-1 text-xs text-fg-secondary hover:bg-surface-hover hover:text-fg hover:border-edge transition-colors cursor-pointer"
-                    >
-                      <span className="truncate">{tool.label}</span>
-                      <ExternalLink size={11} className="ml-auto shrink-0 opacity-60" />
-                    </button>
-                  </li>
-                ))}
-              </ul>
+    <SettingsCard
+      icon={<Plug size={16} />}
+      {...settingProps('mcpServer.enabled')}
+      info={HOW_IT_WORKS}
+      checked={enabled}
+      onChange={(value) => updateGlobal({ mcpServer: { enabled: value } })}
+    >
+      {enabled ? (
+        <>
+          <CardTile className="flex items-center justify-between gap-3" testId="mcp-docs-row">
+            <div className="min-w-0">
+              <div className={SETTING_LABEL_CLASS}>Documentation</div>
+              <p className={`${SETTING_DESCRIPTION_CLASS} mt-0.5`}>How the server works and what each tool takes.</p>
             </div>
-          );
-        })}
-
-        <SectionHeader label="How It Works" searchIds={['mcpServer.enabled']} />
-        <p className="text-sm text-fg-muted leading-relaxed">
-          When enabled, Kangentic injects a local MCP server into each agent session.
-          The agent discovers the tools automatically and can call them at any time during its work.
-          Tasks created by agents appear on the board with a toast notification.
-          If a task is created in a column with auto-spawn enabled, a new agent session starts for it automatically.
-        </p>
-      </div>
-    </div>
+            {/* A wrapper, because the link sizes itself with `self-start`,
+                which would lift it off this row's centre line. */}
+            <div className="flex-shrink-0">
+              <ExternalLinkButton label="Open docs" url={MCP_SERVER_DOCS_URL} testId="mcp-docs-link" />
+            </div>
+          </CardTile>
+          {MCP_TOOL_CATEGORIES.map((category) => {
+            const tools = MCP_TOOL_MANIFEST.filter((tool) => tool.category === category.id);
+            if (tools.length === 0) return null;
+            return (
+              <CardGroupTile
+                key={category.id}
+                label={category.label}
+                count={tools.length}
+                open={!closedGroups.has(category.id)}
+                onToggle={() => toggleGroup(category.id)}
+                testId={`mcp-tool-group-${category.id}`}
+              >
+                <ul className="grid grid-cols-3 gap-1">
+                  {tools.map((tool) => (
+                    <li key={tool.name} className="min-w-0">
+                      <button
+                        type="button"
+                        data-testid="mcp-tool-cell"
+                        title={`${tool.label} - ${tool.blurb}. Opens the docs page.`}
+                        onClick={() => void window.electronAPI.shell.openExternal(mcpToolDocsUrl(tool.name))}
+                        className="block w-full cursor-pointer truncate rounded bg-edge-input/35 px-1.5 py-1 text-left text-xs text-fg-secondary transition-colors hover:bg-edge-input/70 hover:text-fg"
+                      >
+                        {tool.label}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </CardGroupTile>
+            );
+          })}
+        </>
+      ) : null}
+    </SettingsCard>
   );
 }

@@ -37,7 +37,7 @@
       "autoSpawn": true,
       "permissionMode": "auto",
       "modelOverride": "opus",
-      "effortOverride": "high",
+      "effortOverride": "xhigh",
       "sessionTarget": "isolated",
       "sessionSpawnStrategy": "always_spawn_new",
       "automations": {
@@ -98,7 +98,7 @@
       "name": "Done",
       "role": "done",
       "icon": "circle-check-big",
-      "color": "#64748B"
+      "color": "#10b981"
     }
   ],
   "_modifiedBy": "bbb843c69b13"

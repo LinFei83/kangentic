@@ -1,27 +1,35 @@
 import {
+  encodeMessageFailure,
+  MAX_DECODED_LENGTH,
+  MAX_FRAME_LENGTH,
   parseCapabilityRequestPayload,
   type CapabilityRequestMessage,
   type CapabilityResponseMessage,
   type ReadStreamResponsePayload,
   type TranscriptWindowResponsePayload,
 } from '@kangentic/protocol';
-import type { ActivityReason, ActivityState, SessionEvent, SessionUsage, TranscriptEntry } from '../../../shared/types';
-import { lastAssistantPreview } from '../../agent/shared/message-preview';
+import type { ActivityReason, ActivityState, Session, SessionEvent, SessionStatus, SessionUsage } from '../../../shared/types';
 import { getProjectDb } from '../../db/database';
 import { SessionRepository } from '../../db/repositories/session-repository';
-import { resolveTaskTranscript } from '../../agent/transcript-service';
+import { getProjectRepos } from '../../ipc/helpers/project-repos';
+import { isPausedTaskSession, isResumeOffered, isTaskPaused } from '../../../shared/session-resume-eligibility';
+import { agentRegistry } from '../../agent/agent-registry';
+import { retrievalClient } from '../../retrieval/retrieval-client';
+import { collectRemoteTargets } from '../../retrieval/remote-targets';
 import type { IpcContext } from '../../ipc/ipc-context';
 import type { BridgeSession } from '../session/bridge-session';
+import { SERIALIZED_SCROLLBACK_LINES } from '../../pty/host/protocol';
 import type { SubscriptionRegistry } from '../session/subscription-registry';
 import { sendEvent } from './send-event';
 import { buildPermissionPromptId } from './permission-prompt-id';
 import { extractPromptOptions } from '../prompt-options-probe';
-import { sliceTranscriptWindow, TranscriptSync } from './transcript-sync';
+import { noteRequestSpan } from '../request-spans';
 import {
   toActivityReasonWire,
   toReadStreamSessionStatusWire,
   toSessionEventWire,
   toSessionUsageWire,
+  toSpawnProgressLabelWire,
   toTerminalDimensionsWire,
   toWireJson,
 } from './wire-mappers';
@@ -53,6 +61,18 @@ const PROMPT_OPTIONS_RETRY_MS = 400;
  * ever showing a number a user would call wrong.
  */
 const USAGE_COALESCE_MS = 2000;
+
+/**
+ * Trailing window for transcript pushes. Every hook event used to re-read
+ * and diff the task's whole stitched transcript, once per event per phone
+ * subscription, and a tool burst fires several a second. A burst now costs one
+ * read at its end, a quarter second later, which a phone reading a live turn
+ * does not notice.
+ */
+const TRANSCRIPT_COALESCE_MS = 250;
+
+/** Distinguishes one subscription's transcript sync from another's in the worker. */
+let nextSyncNumber = 1;
 
 export function subscriptionKeyFor(sessionId: string): string {
   return `stream:${sessionId}`;
@@ -102,6 +122,39 @@ function resolveProjectIdForSession(context: IpcContext, sessionId: string): str
   return null;
 }
 
+/**
+ * Whether the desktop's own task view would offer Resume for this session
+ * (`isResumeOffered`). The streamed session's copy of the board row's
+ * `resumable`: a pause clears the task's `session_id`, so a phone holds no
+ * stream on a paused session for long, and the board row is the copy it
+ * gates Resume on. This one keeps an open session screen current through
+ * the suspend itself.
+ *
+ * Reads the task only for a suspended session, so a running feed costs no
+ * lookup. A Command Terminal session belongs to no task and is never
+ * resumable. A task or project that cannot be read answers false, which hides
+ * Resume rather than offering one start-session would refuse.
+ */
+function isSessionResumable(context: IpcContext, session: Session): boolean {
+  // This session first: the stream's copy answers for the session it carries.
+  // Decided before any lookup, which it gates.
+  if (!isPausedTaskSession(session) || !session.taskId || !session.projectId) return false;
+  try {
+    const { tasks, swimlanes } = getProjectRepos(context, session.projectId);
+    const task = tasks.getById(session.taskId);
+    if (!task) return false;
+    const lane = swimlanes.getById(task.swimlane_id);
+    // Then the board row's own scan, so a paused row whose task already holds
+    // a queued or running successor answers false here as it does there.
+    const hasPausedSession = isTaskPaused(context.sessionManager.listSessions(), session.taskId);
+    return isResumeOffered({ hasPausedSession, task, laneRole: lane?.role });
+  } catch (error) {
+    // Logged because the false is silent on the phone: Resume just never shows.
+    console.warn(`[mobile-bridge] could not read task ${session.taskId.slice(0, 8)} for resumable:`, error);
+    return false;
+  }
+}
+
 function currentAwaitedPromptId(context: IpcContext, sessionId: string): string | null {
   const statsSnapshot = context.sessionManager.getActivityStatsSnapshot(sessionId);
   return statsSnapshot?.permissionPending && statsSnapshot.permissionAwaitedToolId
@@ -124,22 +177,60 @@ async function probePromptOptions(context: IpcContext, sessionId: string): Promi
   }
 }
 
+/** A tap chunk as the pty host stamped it: the bytes and the cumulative parser offset just past them. */
+interface StampedTapChunk {
+  data: string;
+  endOffset: number | undefined;
+}
+
+/**
+ * What the seed covers, for exactly-once delivery around it: the parser
+ * offset its snapshot holds (getSeedFrame's barrierOffset) and the tap chunks
+ * that arrived while it was being taken.
+ */
+interface SeedCoverage {
+  barrierOffset: number;
+  racedChunks: StampedTapChunk[];
+}
+
 function subscribeReadStream(
   sessionId: string,
-  taskId: string,
+  snapshotSession: Session,
+  snapshotResumable: boolean,
   initialAwaitedPromptId: string | null,
   session: BridgeSession,
   context: IpcContext,
   subscriptions: SubscriptionRegistry,
   wantsTerminal: boolean,
+  seedCoverage: SeedCoverage | null = null,
 ): void {
-  const db = getProjectDb(context.sessionManager.getSessionProjectId(sessionId) ?? '');
-  const transcriptSync = new TranscriptSync();
+  const taskId = snapshotSession.taskId;
+  // A session with no owning project has no transcript to stream; reading
+  // one used to open the database named '' instead, which creates a stray
+  // `projects/.db` file. Every live session has a project, a Command Terminal
+  // included (its spawn stamps the project it runs in), so this guards only a
+  // row that has already gone. A Command Terminal's transcript read still finds
+  // nothing: its made-up task id has no session record, so the worker returns
+  // an empty window and the phone's Chat tab draws from the live terminal.
+  const ownerProjectId = resolveProjectIdForSession(context, sessionId);
+  // The transcript diff runs in the retrieval worker, which keeps this
+  // subscription's sync state under this id (`transcript.mobileSync`).
+  const syncId = `${sessionId}:${nextSyncNumber++}`;
+  let transcriptReadInFlight = false;
+  let transcriptRereadWanted = false;
+  let transcriptTimer: ReturnType<typeof setTimeout> | null = null;
   let lastAwaitedPromptId = initialAwaitedPromptId;
   let lastMessagePreview: string | null = null;
   let pendingUsage: SessionUsage | null = null;
   let usageFlushTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
+  // The snapshot already told the phone these; only a change is pushed.
+  let lastSentStatus: SessionStatus = snapshotSession.status;
+  let lastSentResuming = snapshotSession.resuming;
+  let lastSentResumable = snapshotResumable;
+  // A Command Terminal session belongs to no task, so no other session can
+  // be its successor.
+  const tracksSuccessor = taskId !== '' && snapshotSession.transient !== true;
 
   const flushUsage = (): void => {
     usageFlushTimer = null;
@@ -164,26 +255,53 @@ function subscribeReadStream(
     sendEvent(session, { kind: 'terminal', sessionId, taskId, payload: { data } });
   };
 
-  const pushTranscriptIfChanged = async (): Promise<void> => {
+  const readTranscriptChanges = async (): Promise<void> => {
+    if (!ownerProjectId || disposed) return;
+    transcriptReadInFlight = true;
     try {
-      const resolved = await resolveTaskTranscript(db, sessionId);
-      if (!resolved) return;
-      // Delta chunks stream the moment a turn's content changes - usually
-      // just the mutating tail entry, so each frame is small and immediate.
-      for (const payload of transcriptSync.diff(resolved)) {
+      const { payloads, preview } = await retrievalClient.call('transcript.mobileSync', {
+        syncId,
+        projectId: ownerProjectId,
+        sessionId,
+        mode: 'diff',
+        remoteTargets: collectRemoteTargets(agentRegistry),
+      });
+      if (disposed) return;
+      // Delta chunks carry only what changed - usually just the mutating tail
+      // entry, so each frame is small.
+      for (const payload of payloads) {
         sendEvent(session, { kind: 'transcript', sessionId, taskId, payload });
       }
-      pushMessagePreviewIfChanged(resolved.entries);
+      pushMessagePreviewIfChanged(preview);
     } catch {
       // Best-effort; a transcript-read failure should not tear down the subscription.
+    } finally {
+      transcriptReadInFlight = false;
+      if (transcriptRereadWanted && !disposed) {
+        transcriptRereadWanted = false;
+        pushTranscriptIfChanged();
+      }
     }
   };
 
+  // Coalesced: a burst of events becomes one read at its end, and an event
+  // during a read asks for one more after it.
+  const pushTranscriptIfChanged = (): void => {
+    if (transcriptReadInFlight) {
+      transcriptRereadWanted = true;
+      return;
+    }
+    if (transcriptTimer) return;
+    transcriptTimer = setTimeout(() => {
+      transcriptTimer = null;
+      void readTranscriptChanges();
+    }, TRANSCRIPT_COALESCE_MS);
+  };
+
   // The one line a phone's session list renders. Derived from the transcript
-  // we just resolved anyway, so the list costs no request of its own; sent
-  // only when the text actually changes, so an idle session is silent.
-  const pushMessagePreviewIfChanged = (entries: TranscriptEntry[]): void => {
-    const text = lastAssistantPreview(entries);
+  // read anyway, so the list costs no request of its own; sent only when the
+  // text actually changes, so an idle session is silent.
+  const pushMessagePreviewIfChanged = (text: string | null): void => {
     if (text === null || text === lastMessagePreview) return;
     lastMessagePreview = text;
     sendEvent(session, { kind: 'activity', sessionId, taskId, payload: { type: 'message-preview', text } });
@@ -224,8 +342,27 @@ function subscribeReadStream(
     }
   };
 
-  const onDataTap = (tappedSessionId: string, data: string): void => {
+  // Exactly-once around the seed: a chunk ending at or before the barrier is
+  // already in the seed, the one straddling it is sliced, and the first chunk
+  // past it retires the filter (every later chunk is new). The offsets never
+  // restart under a held barrier: a session id is minted once per spawn, and
+  // the one id reused (a queued placeholder's, at promotion) has no host
+  // buffer when it is seeded, so its barrier is 0. A chunk with no offset (a
+  // test double, an older host) passes through unfiltered.
+  let seedBarrierOffset: number | null = seedCoverage?.barrierOffset ?? null;
+  const trimToSeed = (data: string, endOffset: number | undefined): string => {
+    if (seedBarrierOffset === null || endOffset === undefined) return data;
+    if (endOffset <= seedBarrierOffset) return '';
+    const startOffset = endOffset - data.length;
+    const fresh = startOffset < seedBarrierOffset ? data.slice(seedBarrierOffset - startOffset) : data;
+    seedBarrierOffset = null;
+    return fresh;
+  };
+
+  const onDataTap = (tappedSessionId: string, rawData: string, endOffset?: number): void => {
     if (tappedSessionId !== sessionId) return;
+    const data = trimToSeed(rawData, endOffset);
+    if (!data) return;
     // Once suspend()/kill() has begun tearing this session down, drop
     // further bytes instead of queuing them: they are the adapter's own
     // exit sequence (Ctrl+C, `/exit`) and the fullscreen TUI's repaint as it
@@ -236,10 +373,11 @@ function subscribeReadStream(
     // kill() has no such race - it deliberately leaves status at 'running'
     // (a hard reset is 'exited', not resumable) and emits no flip before
     // writeExitSequence, so the desktop pane does render kill()'s exit
-    // sequence. Either way this subscription has no listener on
-    // session-changed at all, so it must check explicitly, and it covers
-    // both paths. Whatever was already queued before teardown began
-    // still flushes normally - only NEW bytes are dropped.
+    // sequence. Either way this tap must check explicitly: the
+    // session-changed listener below pushes status only and never stops the
+    // tap, and this check covers both paths. Whatever was already queued
+    // before teardown began still flushes normally - only NEW bytes are
+    // dropped.
     if (context.sessionManager.isSessionTeardownInFlight(sessionId)) return;
     pendingTerminalChunks.push(data);
     pendingTerminalChars += data.length;
@@ -289,14 +427,14 @@ function subscribeReadStream(
     if (eventSessionId !== sessionId) return;
     sendEvent(session, { kind: 'activity', sessionId, taskId, payload: { type: 'event', event: toSessionEventWire(event) } });
     pushPermissionIfChanged();
-    void pushTranscriptIfChanged();
+    pushTranscriptIfChanged();
   };
 
-  // When the session exits, tear our own subscription down: nothing else
+  // When the session ends, tear our own subscription down: nothing else
   // removes these listeners until the device disconnects, so without this a
-  // long-lived phone connection would leak four listeners per session it ever
-  // streamed onto the singleton SessionManager. Before tearing down, tell the
-  // phone the session ended (with the deliberate-stop flag the session
+  // long-lived phone connection would leak its listeners for every session it
+  // ever streamed onto the singleton SessionManager. Before tearing down, tell
+  // the phone the session ended (with the deliberate-stop flag the session
   // manager's exit event carries) - the feed's last word, so the phone never
   // has to infer "over" from silence. The queued-removal exit path emits the
   // flag explicitly; the spawn-failure path emits no flag, and a spawn
@@ -316,8 +454,15 @@ function subscribeReadStream(
   // the 120s TTL sweeps it, so the label is a strong hint, not proof. See
   // the doc comment on ActivityEventPayload's session-ended variant in
   // @kangentic/protocol.
-  const onExit = (exitedSessionId: string, _exitCode: number, intentional?: boolean): void => {
-    if (exitedSessionId !== sessionId) return;
+  //
+  // A PTY exit is not the only end. A feed held on a session with no PTY (a
+  // paused row, which the phone's session list subscribes to like any other)
+  // never sees an 'exit': a resume spawns a NEW session id and the spawn flow
+  // drops the paused row without any event, and a removed paused row emits
+  // only 'session-removed'. Those paths end the feed here too, so it is not
+  // left silent with its listeners attached until the phone disconnects.
+  const endFeed = (ending: { intentional: boolean; successorSessionId?: string }): void => {
+    if (disposed) return;
     flushTerminal(); // push any last coalesced output before we stop listening
     // Same for the coalesced usage: the final token count of a finished turn
     // is the one number a user is most likely to look at.
@@ -326,18 +471,99 @@ function subscribeReadStream(
     // Annotated, not inferred: getInFlightSpawnProgress()'s Record<string,
     // string> index signature erases the missing-key case, which is the
     // common one here (a park with no respawn in flight).
-    const spawnProgressLabel: string | undefined = getInFlightSpawnProgress()[taskId];
+    const inFlightLabel: string | undefined = getInFlightSpawnProgress()[taskId];
+    const spawnProgressLabel = toSpawnProgressLabelWire(inFlightLabel ?? null);
     sendEvent(session, {
       kind: 'activity',
       sessionId,
       taskId,
       payload: {
         type: 'session-ended',
-        intentional: intentional === true,
+        intentional: ending.intentional,
         ...(spawnProgressLabel ? { spawnProgressLabel } : {}),
+        ...(ending.successorSessionId ? { successorSessionId: ending.successorSessionId } : {}),
       },
     });
     subscriptions.remove(subscriptionKeyFor(sessionId));
+  };
+
+  const ownRowGone = (): boolean => context.sessionManager.getSession(sessionId) === undefined;
+
+  const onExit = (exitedSessionId: string, _exitCode: number, intentional?: boolean): void => {
+    if (exitedSessionId === sessionId) {
+      endFeed({ intentional: intentional === true });
+      return;
+    }
+    // A successor whose own spawn failed after the spawn flow dropped this
+    // row reports only 'exit' (spawn-failure-handler.ts), never a
+    // 'session-changed'. There is no live successor to name, but this feed's
+    // session is gone all the same.
+    if (tracksSuccessor && context.sessionManager.getSessionTaskId(exitedSessionId) === taskId && ownRowGone()) {
+      endFeed({ intentional: true });
+    }
+  };
+
+  // `resumable` is recomputed on every edge, so a status edge that changes
+  // nothing but it (the task's column was read again after a suspend) still
+  // reaches the phone.
+  const pushStatusIfChanged = (current: Session): void => {
+    const resumable = isSessionResumable(context, current);
+    if (current.status === lastSentStatus && current.resuming === lastSentResuming && resumable === lastSentResumable) return;
+    lastSentStatus = current.status;
+    lastSentResuming = current.resuming;
+    lastSentResumable = resumable;
+    sendEvent(session, {
+      kind: 'activity',
+      sessionId,
+      taskId,
+      payload: { type: 'status', status: toReadStreamSessionStatusWire(current.status), resuming: current.resuming, resumable },
+    });
+  };
+
+  // 'session-changed' carries every status edge that keeps the session id:
+  // a queue promotion, a suspend (pushed before the PTY's exit, which then
+  // ends the feed), and the agent-absence sweep's 'exited'. It also fires
+  // with no status change (an agent session id captured, suspend's trailing
+  // emit), hence the dedupe. An 'exited' status does NOT end the feed: the
+  // PTY's 'exit' follows on every path that sets it (the exit handler emits
+  // it whatever the status already says), and onExit stays the one place
+  // session-ended is sent from for a PTY. The exception is
+  // announceSessionEnded after awaitExit gave up waiting, which emits no
+  // 'exit'; that feed keeps its listeners until the phone unsubscribes.
+  //
+  // Another session of the same task arriving while this feed's row is gone
+  // is a resume replacing a paused row (the spawn flow drops the paused
+  // sibling silently, then announces the new session). Keyed on "this row is
+  // gone" rather than on the newcomer's status: with the concurrency limit
+  // full, the newcomer first appears as 'queued' while the paused row still
+  // exists, and the row is only dropped when the newcomer is promoted.
+  const onSessionChanged = (changedSessionId: string, changedSession: Session): void => {
+    if (changedSessionId === sessionId) {
+      pushStatusIfChanged(changedSession);
+      return;
+    }
+    if (!tracksSuccessor || changedSession.taskId !== taskId || changedSession.transient === true) return;
+    if (!ownRowGone()) return;
+    endFeed({
+      intentional: true,
+      ...(changedSession.status !== 'exited' ? { successorSessionId: changedSessionId } : {}),
+    });
+  };
+
+  // A row removed outright (a paused task moved to To Do) announces itself
+  // only here. A running session's removal also lands here before its PTY's
+  // asynchronous 'exit', and every removal is a deliberate teardown.
+  //
+  // Coupling: the successor hop above depends on the spawn flow's sibling
+  // drain (session-spawn-flow.ts) dropping the paused row WITHOUT a
+  // 'session-removed', and before the new session's 'session-changed'. If
+  // that drain starts emitting one, this listener ends the feed before the
+  // successor is registered, and the hop silently loses its
+  // successorSessionId. session-spawn-flow.test.ts pins the drain's side
+  // ("guards the mobile read-stream successor hop: ...").
+  const onSessionRemoved = (removedSessionId: string): void => {
+    if (removedSessionId !== sessionId) return;
+    endFeed({ intentional: true });
   };
 
   // A list-only subscriber (a phone showing its session feed) discards PTY
@@ -346,25 +572,48 @@ function subscribeReadStream(
   // for. The grid-size event goes too: it only explains bytes we are not
   // sending, and the phone re-subscribes with terminal:true the moment a
   // terminal opens, which delivers a fresh frame and its dimensions together.
+  // The pty host forwards a session's raw bytes to main only while someone
+  // holds a tap on it.
+  const releaseDataTap = wantsTerminal ? context.sessionManager.subscribeDataTap(sessionId) : null;
   if (wantsTerminal) {
     context.sessionManager.on('data-tap', onDataTap);
     context.sessionManager.on('pty-resize', onPtyResize);
+  }
+  // Output that raced the seed rides the coalesce timer, never an inline
+  // flush: the seed's response is sent after this handler returns, and no
+  // terminal byte may reach the phone ahead of it.
+  if (wantsTerminal && seedCoverage) {
+    for (const chunk of seedCoverage.racedChunks) {
+      const fresh = trimToSeed(chunk.data, chunk.endOffset);
+      if (!fresh || context.sessionManager.isSessionTeardownInFlight(sessionId)) continue;
+      pendingTerminalChunks.push(fresh);
+      pendingTerminalChars += fresh.length;
+    }
+    if (pendingTerminalChunks.length > 0 && !terminalFlushTimer) terminalFlushTimer = setTimeout(flushTerminal, TERMINAL_COALESCE_MS);
   }
   context.sessionManager.on('activity', onActivity);
   context.sessionManager.on('usage', onUsage);
   context.sessionManager.on('event', onSessionEvent);
   context.sessionManager.on('exit', onExit);
+  context.sessionManager.on('session-changed', onSessionChanged);
+  context.sessionManager.on('session-removed', onSessionRemoved);
 
   subscriptions.set(subscriptionKeyFor(sessionId), () => {
     disposed = true; // parks any in-flight prompt-options probe so it never sends after teardown
     context.sessionManager.off('data-tap', onDataTap);
+    releaseDataTap?.();
     context.sessionManager.off('pty-resize', onPtyResize);
     context.sessionManager.off('activity', onActivity);
     context.sessionManager.off('usage', onUsage);
     context.sessionManager.off('event', onSessionEvent);
     context.sessionManager.off('exit', onExit);
+    context.sessionManager.off('session-changed', onSessionChanged);
+    context.sessionManager.off('session-removed', onSessionRemoved);
     if (terminalFlushTimer) clearTimeout(terminalFlushTimer);
     if (usageFlushTimer) clearTimeout(usageFlushTimer);
+    if (transcriptTimer) clearTimeout(transcriptTimer);
+    // The worker's sync state for this subscription goes with it.
+    retrievalClient.notifyRunning('transcript.mobileRelease', { syncId });
     // The terminal marker lives and dies with THIS subscription: a list-only
     // re-subscribe replaces this teardown, which runs it, which drops the
     // marker before the new registration decides whether to re-add it.
@@ -382,19 +631,58 @@ function subscribeReadStream(
   // redundant - and for long sessions impossible within the frame cap.
   // Deltas cover only what changes from this point on.
   void (async (): Promise<void> => {
+    if (!ownerProjectId) return;
     try {
-      const resolved = await resolveTaskTranscript(db, sessionId);
-      if (!resolved) return;
-      transcriptSync.seed(resolved);
+      const { preview } = await retrievalClient.call('transcript.mobileSync', {
+        syncId,
+        projectId: ownerProjectId,
+        sessionId,
+        mode: 'seed',
+        remoteTargets: collectRemoteTargets(agentRegistry),
+      });
       // The list's one line, delivered at subscribe rather than waiting for
       // the session's next change: an idle session may never change again,
       // and its card would otherwise have nothing to show.
-      if (!disposed) pushMessagePreviewIfChanged(resolved.entries);
+      if (!disposed) pushMessagePreviewIfChanged(preview);
     } catch {
       // Best-effort: an unseeded sync just means the first post-subscribe
       // change diffs against nothing and streams as plain appends.
     }
   })();
+}
+
+/**
+ * A seed shrink keeps this fraction of what a straight proportion allows. The
+ * viewport does not shrink with the history, so a frame cut by exactly its
+ * overshoot would still be a little over; the margin makes the first retry
+ * usually the last. It only has to be close: each rung is verified.
+ */
+const SEED_SHRINK_FIT_MARGIN = 0.8;
+
+/** Floor on the overshoot a shrink scales by, so a frame barely over the cap still loses history. */
+const SEED_SHRINK_MIN_OVERSHOOT = 1.25;
+
+/**
+ * History rows to re-take a seed with after `response` (carrying the full
+ * seed) did not fit the frame caps. Scaled from how far the response overshot
+ * the cap that refused it: the pre-compression cap when the raw JSON is over
+ * that one, else the wire cap, which raw JSON approximates from above (deflate
+ * only helps), so a compressible frame loses a little more history than it
+ * strictly had to. Zero or less means no scaled retry is worth taking.
+ */
+function scaledSeedHistoryLines(response: CapabilityResponseMessage): number {
+  const rawBytes = Buffer.byteLength(JSON.stringify(response), 'utf8');
+  const limit = rawBytes > MAX_DECODED_LENGTH ? MAX_DECODED_LENGTH : MAX_FRAME_LENGTH;
+  const overshoot = Math.max(rawBytes / limit, SEED_SHRINK_MIN_OVERSHOOT);
+  return Math.floor((SERIALIZED_SCROLLBACK_LINES * SEED_SHRINK_FIT_MARGIN) / overshoot);
+}
+
+/** One build of the subscribe response, plus the registry reads the subscription is registered with. */
+interface BuiltReadStreamResponse {
+  response: CapabilityResponseMessage;
+  snapshotSession: Session;
+  resumable: boolean;
+  awaitedPromptId: string | null;
 }
 
 export async function handleReadStream(
@@ -426,10 +714,14 @@ export async function handleReadStream(
     if (!projectId) {
       return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such session: ${payload.sessionId}` };
     }
-    const resolved = await resolveTaskTranscript(getProjectDb(projectId), payload.sessionId);
-    const windowPayload: TranscriptWindowResponsePayload = resolved
-      ? sliceTranscriptWindow(resolved, payload.beforeIndex, payload.limit)
-      : { revision: 0, totalEntries: 0, startIndex: 0, entries: [] };
+    // Parsed, stitched and paged in the retrieval worker.
+    const windowPayload: TranscriptWindowResponsePayload = await retrievalClient.call('transcript.window', {
+      projectId,
+      sessionId: payload.sessionId,
+      beforeIndex: payload.beforeIndex,
+      limit: payload.limit,
+      remoteTargets: collectRemoteTargets(agentRegistry),
+    });
     return { type: 'capability-response', requestId: request.requestId, ok: true, payload: toWireJson(windowPayload) };
   }
 
@@ -448,6 +740,9 @@ export async function handleReadStream(
   // field in this response, and it was being sent once per live session on
   // every cold start.
   const wantsTerminal = payload.terminal !== false;
+  // A re-subscribe over a live terminal stream finds the marker already up,
+  // and a failed re-subscribe must leave it for that stream.
+  const terminalMarkerAlreadyHeld = subscriptions.has(terminalStreamKeyFor(payload.sessionId));
   // A terminal-wanting subscribe IS the mobile interest the resting park
   // exists for: park an unheld session NOW, before the frame below is
   // serialized, so the phone's one seed already carries the resting grid
@@ -464,49 +759,170 @@ export async function handleReadStream(
       // Marker only - see subscribeReadStream.
     });
   }
+  // The frame the response carries. It starts as the full-depth seed and is
+  // replaced by a shorter one when that does not fit the wire (see below).
   let scrollback = '';
-  if (wantsTerminal) {
-    try {
-      scrollback = await context.sessionManager.getSerializedFrame(payload.sessionId);
-    } catch (serializeError) {
-      subscriptions.remove(terminalStreamKeyFor(payload.sessionId));
-      throw serializeError;
-    }
-    // The session can exit DURING that await. Registering the subscription
-    // then would be post-mortem: its own onExit teardown never fires (the
-    // exit already happened), so the listeners and the marker above would
-    // leak until the device disconnects - and the dead id would ride the
-    // terminal-streamed set into the renderer indefinitely.
-    if (!context.sessionManager.getSession(payload.sessionId)) {
-      subscriptions.remove(terminalStreamKeyFor(payload.sessionId));
-      return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such session: ${payload.sessionId}` };
-    }
-  }
-  const activityState = context.sessionManager.getActivityCache()[payload.sessionId] ?? null;
-  const activityReason = context.sessionManager.getActivityReason(payload.sessionId);
-  const usage = context.sessionManager.getUsageCache()[payload.sessionId] ?? null;
-  const awaitedPromptId = currentAwaitedPromptId(context, payload.sessionId);
-
-  const ptyDimensions = toTerminalDimensionsWire(context.sessionManager.getDimensions(payload.sessionId));
-  // The prompt was outstanding before this subscribe, so its dialog is
-  // already painted into the frame we just serialized - probe that frame
-  // directly instead of a second read. Null = no numbered dialog parsed;
-  // the phone falls back to its blind approve/deny keystrokes.
-  const awaitedPromptOptions = awaitedPromptId ? extractPromptOptions(scrollback, ptyDimensions) : null;
-  const responsePayload: ReadStreamResponsePayload = {
-    scrollback,
-    activity: {
-      state: activityState,
-      reason: activityReason ? toActivityReasonWire(activityReason) : null,
-    },
-    usage: usage ? toSessionUsageWire(usage) : null,
-    awaitedPromptId,
-    ...(awaitedPromptId ? { awaitedPromptOptions } : {}),
-    ...(ptyDimensions ? { ptyDimensions } : {}),
-    sessionStatus: toReadStreamSessionStatusWire(liveSession.status),
+  // The most recent snapshot taken, kept for the prompt-option probe. The
+  // empty-seed rung sends no frame, so the probe still has a grid to read.
+  let latestTakenFrame = '';
+  let seedCoverage: SeedCoverage | null = null;
+  // Tapped BEFORE the seed is asked for, and held until subscribeReadStream
+  // holds its own tap. The host forwards a session's bytes only while a tap
+  // is held, so without this, output produced while the seed is taken would
+  // reach neither the seed nor the stream. Every chunk carries its parser
+  // offset, and subscribeReadStream drops what the seed's barrier already
+  // covers, so a byte still pending at the snapshot is not sent twice.
+  const racedChunks: StampedTapChunk[] = [];
+  const captureRacedChunk = (tappedSessionId: string, data: string, endOffset?: number): void => {
+    if (tappedSessionId === payload.sessionId) racedChunks.push({ data, endOffset });
   };
+  const releaseSeedTap = wantsTerminal ? context.sessionManager.subscribeDataTap(payload.sessionId) : null;
+  let subscribed = false;
+  try {
+    if (wantsTerminal) {
+      context.sessionManager.on('data-tap', captureRacedChunk);
+      // The seed's own span (the pty host's repaint settle plus the serialize)
+      // rides the service's slow-request line, so a slow open says whether the
+      // time went here or on the wire.
+      const seedStartedAt = performance.now();
+      const seed = await context.sessionManager.getSeedFrame(payload.sessionId);
+      scrollback = seed.frame;
+      latestTakenFrame = seed.frame;
+      seedCoverage = { barrierOffset: seed.barrierOffset, racedChunks };
+      noteRequestSpan(
+        session.deviceId,
+        request.requestId,
+        `seed ${Math.round(performance.now() - seedStartedAt)} ms (settle ${seed.settleMs} ms, serialize ${seed.serializeMs} ms), ${Math.round(scrollback.length / 1024)}k chars`,
+      );
+    }
 
-  subscribeReadStream(payload.sessionId, liveSession.taskId, awaitedPromptId, session, context, subscriptions, wantsTerminal);
+    // The prompt-option probe reads the snapshot that was latest when a build
+    // first saw the prompt. That is the full-depth frame when the prompt was
+    // already up, and the re-take after it when the prompt rose during a shrink.
+    // The probe reads the grid's bottom rows, which every taken frame carries
+    // whole. Read once per prompt: a later build reuses it.
+    let probedPromptOptions: string[] | null | undefined;
+    // Everything in the response but the seed, read fresh from the registry on
+    // every build. Null when the session is gone.
+    //
+    // Re-read the row now rather than trusting `liveSession`. The session can
+    // exit DURING the awaits above or below. Registering the subscription then
+    // would be post-mortem: its own onExit teardown never fires (the exit
+    // already happened), so the listeners and the marker above would leak until
+    // the device disconnects - and the dead id would ride the terminal-streamed
+    // set into the renderer indefinitely. And a queue promotion inside an await
+    // replaces the registry row (session-spawn-flow.ts), so `liveSession` can
+    // still say 'queued' while the registry says 'running'. The snapshot's
+    // status, and the baseline the live `status` push dedupes against, both
+    // come from this read. A list-only subscribe has no await, so this reads
+    // the same row it already had. A shrink re-takes the seed, which is another
+    // await, so it builds again afterwards.
+    const buildResponse = (): BuiltReadStreamResponse | null => {
+      const snapshotSession = context.sessionManager.getSession(payload.sessionId);
+      if (!snapshotSession) return null;
+      const activityState = context.sessionManager.getActivityCache()[payload.sessionId] ?? null;
+      const activityReason = context.sessionManager.getActivityReason(payload.sessionId);
+      const usage = context.sessionManager.getUsageCache()[payload.sessionId] ?? null;
+      const awaitedPromptId = currentAwaitedPromptId(context, payload.sessionId);
 
-  return { type: 'capability-response', requestId: request.requestId, ok: true, payload: toWireJson(responsePayload) };
+      const ptyDimensions = toTerminalDimensionsWire(context.sessionManager.getDimensions(payload.sessionId));
+      // The prompt was outstanding before this subscribe, so its dialog is
+      // already painted into the frame we serialized - probe that frame
+      // directly instead of a second read. Null = no numbered dialog parsed;
+      // the phone falls back to its blind approve/deny keystrokes.
+      let awaitedPromptOptions: string[] | null = null;
+      if (awaitedPromptId) {
+        if (probedPromptOptions === undefined) probedPromptOptions = extractPromptOptions(latestTakenFrame, ptyDimensions);
+        awaitedPromptOptions = probedPromptOptions;
+      }
+      const resumable = isSessionResumable(context, snapshotSession);
+      const responsePayload: ReadStreamResponsePayload = {
+        scrollback,
+        activity: {
+          state: activityState,
+          reason: activityReason ? toActivityReasonWire(activityReason) : null,
+        },
+        usage: usage ? toSessionUsageWire(usage) : null,
+        awaitedPromptId,
+        ...(awaitedPromptId ? { awaitedPromptOptions } : {}),
+        ...(ptyDimensions ? { ptyDimensions } : {}),
+        sessionStatus: toReadStreamSessionStatusWire(snapshotSession.status),
+        resuming: snapshotSession.resuming,
+        resumable,
+      };
+      const response: CapabilityResponseMessage = { type: 'capability-response', requestId: request.requestId, ok: true, payload: toWireJson(responsePayload) };
+      return { response, snapshotSession, resumable, awaitedPromptId };
+    };
+    const sessionGone = (): CapabilityResponseMessage =>
+      ({ type: 'capability-response', requestId: request.requestId, ok: false, error: `No such session: ${payload.sessionId}` });
+
+    let built = buildResponse();
+    if (!built) return sessionGone();
+
+    // A phone always gets a terminal. A response over the frame caps is
+    // answered with a shorter seed, never a refusal. A user who opens a session
+    // is there to watch or work with an agent, and a refusal reads to the phone
+    // as the session being gone. The size is checked BEFORE subscribing for the
+    // same reason it is shrunk here and not later. subscribeReadStream's set()
+    // runs the prior teardown on this key, which would take the phone's
+    // list-only feed down, and nothing after it can put that back.
+    //
+    // Three rungs, each verified with the exact check: the history scaled down
+    // by how far the frame overshot, then the grid alone, then no seed at all.
+    // The grid is always whole at the first two, so a shorter seed is a shorter
+    // history and never a broken screen. The empty seed cannot overflow, since
+    // the rest of the payload is a few hundred bytes. Each re-take is its own
+    // snapshot with its own barrier, and the barrier of the frame that is sent
+    // is the one subscribeReadStream filters the tap by. The seed tap and the
+    // capture listener stay up across every rung, so nothing is lost between
+    // snapshots. The empty seed keeps the last snapshot's barrier.
+    let encodeFailure = wantsTerminal ? encodeMessageFailure(built.response) : null;
+    if (encodeFailure !== null) {
+      const shrinkStartedAt = performance.now();
+      const originalChars = scrollback.length;
+      const scaledLines = scaledSeedHistoryLines(built.response);
+      const historyRungs = scaledLines > 0 ? [scaledLines, 0] : [0];
+      let heldRung: string | null = null;
+      for (const historyLines of historyRungs) {
+        const retake = await context.sessionManager.getSeedFrame(payload.sessionId, historyLines);
+        scrollback = retake.frame;
+        latestTakenFrame = retake.frame;
+        seedCoverage = { barrierOffset: retake.barrierOffset, racedChunks };
+        built = buildResponse();
+        if (!built) return sessionGone();
+        encodeFailure = encodeMessageFailure(built.response);
+        if (encodeFailure === null) {
+          // A re-take comes back empty when the session's buffer went away
+          // during it, so the label says what was sent, not what was asked.
+          if (scrollback === '') heldRung = 'sent an empty seed';
+          else if (historyLines === 0) heldRung = 'sent the grid alone';
+          else heldRung = `sent ${historyLines} history lines`;
+          break;
+        }
+      }
+      if (encodeFailure !== null) {
+        scrollback = '';
+        built = buildResponse();
+        if (!built) return sessionGone();
+        heldRung = 'sent an empty seed';
+      }
+      noteRequestSpan(session.deviceId, request.requestId, `seed shrink ${Math.round(performance.now() - shrinkStartedAt)} ms`);
+      console.warn(
+        `[mobile-bridge] read-stream/subscribe ${request.requestId} from ${session.deviceId.slice(0, 8)} shrank its terminal seed to fit the wire: ${Math.round(originalChars / 1024)}k chars to ${Math.round(scrollback.length / 1024)}k chars (${heldRung})`,
+      );
+    }
+
+    subscribeReadStream(payload.sessionId, built.snapshotSession, built.resumable, built.awaitedPromptId, session, context, subscriptions, wantsTerminal, seedCoverage);
+    subscribed = true;
+    return built.response;
+  } finally {
+    // Every exit, a throw included, lets go of the seed capture. On success
+    // this runs after subscribeReadStream took its own tap, so the host never
+    // sees the session untapped in between. Only a terminal subscribe that
+    // did not complete drops the marker, and only one it added: on success
+    // subscribeReadStream has re-registered that key for the live stream.
+    context.sessionManager.off('data-tap', captureRacedChunk);
+    releaseSeedTap?.();
+    if (wantsTerminal && !subscribed && !terminalMarkerAlreadyHeld) subscriptions.remove(terminalStreamKeyFor(payload.sessionId));
+  }
 }

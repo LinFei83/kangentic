@@ -50,6 +50,8 @@ vi.mock('simple-git', () => ({
 vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    // No own-record row, so the capture sites fall back to getLatestForTask.
+    findByAnyId = vi.fn(() => undefined);
     getLatestForTask = vi.fn(() => null);
     insert = vi.fn();
     updateStatus = vi.fn();
@@ -95,6 +97,7 @@ vi.mock('../../src/main/transition-engine/spawn-progress', () => ({
   emitSpawnProgress: vi.fn(),
   clearSpawnProgress: vi.fn(),
   createProgressCallback: vi.fn(() => vi.fn()),
+  claimSpawnProgress: vi.fn(() => ({ onProgress: vi.fn(), release: vi.fn() })),
 }));
 
 vi.mock('../../src/main/agent/shared', () => ({
@@ -120,9 +123,20 @@ const mockSpawnAgent = vi.fn(async () => {});
 const mockCreateTransitionEngine = vi.fn();
 const mockCleanupTaskResources = vi.fn(async () => {});
 const mockDeleteTaskWorktree = vi.fn(async () => true);
+const mockResolveSpawnOverrides = vi.fn((..._args: unknown[]) => ({}));
+const mockNotifySpawnBlocked = vi.fn((..._args: unknown[]) => {});
 
 vi.mock('../../src/main/ipc/helpers', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
+  // sessions.ts imports it for the exit handler's startup-failure notice. A
+  // spy rather than a missing export: a SESSION_RESUME that started passing a
+  // failure hook through it would otherwise hit a missing-export error that
+  // resumeTaskSession's hook guard swallows, and the no-notice test below
+  // would stay green.
+  notifySpawnBlocked: (...args: unknown[]) => mockNotifySpawnBlocked(...args),
+  // Read by SESSION_RESUME's Phase 3 just before the engine call; the scenarios
+  // that stop at a Phase 1 or Phase 2 exit never reach it.
+  resolveSpawnOverrides: (...args: unknown[]) => mockResolveSpawnOverrides(...args),
   ensureTaskWorktree: (...args: unknown[]) => mockEnsureTaskWorktree(...args),
   ensureTaskBranchCheckout: (...args: unknown[]) => mockEnsureTaskBranchCheckout(...args),
   spawnAgent: (...args: unknown[]) => mockSpawnAgent(...args),
@@ -136,7 +150,14 @@ import { registerTaskMoveHandlers, handleTaskMove } from '../../src/main/ipc/han
 import { registerSessionHandlers } from '../../src/main/ipc/handlers/sessions';
 import { IPC } from '../../src/shared/ipc-channels';
 import { resolveTargetAgent } from '../../src/main/transition-engine/agent-resolver';
-import { clearSpawnProgress } from '../../src/main/transition-engine/spawn-progress';
+import { claimSpawnProgress, clearSpawnProgress } from '../../src/main/transition-engine/spawn-progress';
+import { abortInFlightResume } from '../../src/main/ipc/handlers/session-resume-controllers';
+import { withTaskLock } from '../../src/main/ipc/task-lifecycle-lock';
+
+/** The claim SESSION_RESUME took, from the mocked claimSpawnProgress. */
+function resumeClaim(): { onProgress: MockInstance; release: MockInstance } | undefined {
+  return vi.mocked(claimSpawnProgress).mock.results[0]?.value as { onProgress: MockInstance; release: MockInstance } | undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -665,15 +686,18 @@ describe('SESSION_RESUME AbortError cleanup', () => {
     registerSessionHandlers(context as never);
   });
 
-  it('returns null, removes session, and nulls session_id on AbortError mid-Phase-2', async () => {
+  it('returns null and leaves the task\'s rows and session_id alone on AbortError mid-Phase-2', async () => {
     const handler = capturedHandlers.get(IPC.SESSION_RESUME);
     if (!handler) throw new Error('SESSION_RESUME handler not registered');
 
     let signalEntered!: () => void;
     const phase2Entered = new Promise<void>((resolve) => { signalEntered = resolve; });
 
-    mockEnsureTaskWorktree.mockImplementation(async (_ctx: unknown, _task: unknown, _tasks: unknown, _path: unknown, _opts: unknown) => {
+    mockEnsureTaskWorktree.mockImplementation(async (_context: unknown, _task: unknown, _tasks: unknown, _path: unknown, _options: unknown) => {
       signalEntered();
+      // Whatever the task holds when the abort lands belongs to the path that
+      // took it over: here, a session_id another spawn has written.
+      storedTask = { ...storedTask, session_id: 'sess-newer' };
       // DOMException with name 'AbortError' is what isAbortError() checks for.
       throw new DOMException('The operation was aborted', 'AbortError');
     });
@@ -686,12 +710,57 @@ describe('SESSION_RESUME AbortError cleanup', () => {
     const result = await firstResumePromise;
     expect(result).toBeNull();
 
-    // removeByTaskId must be called inside the locked micro-step.
-    expect(context.sessionManager.removeByTaskId).toHaveBeenCalledWith('task-resume-abort');
+    // No cleanup: an abort lands before this resume registers a row or writes
+    // session_id. A removeByTaskId here dropped the task's paused row, which a
+    // newer resume and a paired phone's feed still read, and nulling
+    // session_id would orphan the other path's session.
+    expect(context.sessionManager.removeByTaskId).not.toHaveBeenCalled();
+    expect(storedTask.session_id).toBe('sess-newer');
 
-    // session_id must have been nulled.
-    const lastRepos = mockGetProjectRepos.mock.results.at(-1)?.value as { tasks: { update: MockInstance } };
-    expect(lastRepos?.tasks.update).toHaveBeenCalledWith({ id: 'task-resume-abort', session_id: null });
+    // The aborted resume releases its own "Resuming session..." label, which
+    // clears it only while no other spawn has labelled the task since.
+    expect(claimSpawnProgress).toHaveBeenCalledWith(context.mainWindow, 'task-resume-abort');
+    expect(resumeClaim()?.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a progress report the git phase makes after the abort, so it cannot take the label back', async () => {
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+
+    mockEnsureTaskWorktree.mockImplementation(async (_context: unknown, _task: unknown, _tasks: unknown, _path: unknown, options: unknown) => {
+      const { onProgress } = options as { onProgress: (phase: string) => void };
+      onProgress('init-script');
+      // A newer resume or a Pause cancels this one while the post-worktree
+      // script runs, and the script's heartbeat ticks once more before the
+      // git phase rejects.
+      abortInFlightResume('task-resume-abort');
+      onProgress('init-script');
+      throw new DOMException('The operation was aborted', 'AbortError');
+    });
+
+    const result = await handler(null, 'task-resume-abort');
+    expect(result).toBeNull();
+
+    const claim = resumeClaim();
+    expect(claim?.onProgress.mock.calls).toEqual([['resuming'], ['init-script']]);
+    expect(claim?.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops before accepting or labelling when the abort lands while it waits for the lock', async () => {
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+
+    // Hold the task lock so the resume queues behind it, then cancel it there.
+    let releaseLock!: () => void;
+    const lockHeld = withTaskLock('task-resume-abort', () => new Promise<void>((resolve) => { releaseLock = resolve; }));
+    const resumePromise = handler(null, 'task-resume-abort') as Promise<unknown>;
+    abortInFlightResume('task-resume-abort');
+    releaseLock();
+    await lockHeld;
+
+    expect(await resumePromise).toBeNull();
+    expect(claimSpawnProgress).not.toHaveBeenCalled();
+    expect(mockEnsureTaskWorktree).not.toHaveBeenCalled();
   });
 });
 
@@ -877,6 +946,123 @@ describe('SESSION_RESUME split-lock dedup', () => {
     expect(mockCreateTransitionEngine).not.toHaveBeenCalled();
     expect(result).toMatchObject({ id: 'sess-other' });
   });
+
+  it('labels the resume "resuming" before the git phase, hands the git phase a callback that reports through the claim, and releases it once the resume resolves', async () => {
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+
+    let onProgressSeenByGitPhase: unknown;
+    let releasedDuringGitPhase = true;
+    mockEnsureTaskWorktree.mockImplementation(async (_context: unknown, _task: unknown, _tasks: unknown, _path: unknown, options: unknown) => {
+      onProgressSeenByGitPhase = (options as { onProgress?: unknown }).onProgress;
+      // The label is up, and not yet released, while the git phase runs.
+      releasedDuringGitPhase = (resumeClaim()?.release.mock.calls.length ?? 0) > 0;
+      // Phase 3 then resolves through its dedup return (this harness does not
+      // drive a full engine spawn); the finally runs the same either way.
+      storedTask = { ...storedTask, session_id: 'sess-other' };
+    });
+
+    await handler(null, 'task-2');
+
+    expect(releasedDuringGitPhase).toBe(false);
+
+    expect(claimSpawnProgress).toHaveBeenCalledWith(context.mainWindow, 'task-2');
+    const claim = resumeClaim();
+    expect(claim?.onProgress).toHaveBeenCalledWith('resuming');
+    // A guard around the claim's callback (see the abort suite), which reports
+    // through the claim while the resume is not aborted.
+    expect(typeof onProgressSeenByGitPhase).toBe('function');
+    (onProgressSeenByGitPhase as (phase: string) => void)('fetching');
+    expect(claim?.onProgress).toHaveBeenCalledWith('fetching');
+    expect(claim?.release).toHaveBeenCalledTimes(1);
+    // Never the unconditional clear, which would wipe another spawn's label.
+    expect(clearSpawnProgress).not.toHaveBeenCalled();
+  });
+
+  it('releases the label when the git phase fails', async () => {
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+    mockEnsureTaskWorktree.mockImplementation(async () => {
+      throw new Error('fetch failed');
+    });
+
+    await expect(handler(null, 'task-2')).rejects.toThrow(/Worktree setup failed/);
+    expect(resumeClaim()?.release).toHaveBeenCalledTimes(1);
+  });
+
+  // The phone's start-session hands resumeTaskSession an onFailed hook that
+  // sends the spawn-blocked notice, because the phone was answered before the
+  // work ran and has no rejection to show. The desktop Resume passes none: its
+  // invoke rejects and the renderer toasts that rejection, so a notice here
+  // would be a second toast for the same failure.
+  it.each([
+    ['the git phase', 'Worktree setup failed: fetch failed', (): void => {
+      mockEnsureTaskWorktree.mockImplementation(async () => {
+        throw new Error('fetch failed');
+      });
+    }],
+    ['the engine resume', 'spawn exploded', (): void => {
+      // clearAllMocks keeps implementations, so an earlier test's throw or hold
+      // would still be armed on the git phase.
+      mockEnsureTaskWorktree.mockImplementation(async () => {});
+      mockCreateTransitionEngine.mockReturnValue({
+        resumeSuspendedSession: vi.fn(async () => {
+          throw new Error('spawn exploded');
+        }),
+      });
+    }],
+  ])('rejects without sending a spawn-blocked notice when %s fails', async (_label, expectedMessage, armFailure) => {
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+    armFailure();
+
+    await expect(handler(null, 'task-2')).rejects.toThrow(expectedMessage);
+
+    expect(mockNotifySpawnBlocked).not.toHaveBeenCalled();
+    const blockedSends = context.mainWindow.webContents.send.mock.calls.filter(([channel]) => channel === IPC.TASK_SPAWN_BLOCKED);
+    expect(blockedSends).toEqual([]);
+  });
+
+  // The IPC handler is a one-line delegation to resumeTaskSession. Every call
+  // above passes only a task id, so dropping either trailing argument from that
+  // delegation would leave them all green. This one drives a full resume.
+  it('forwards the resume prompt and the explicit project id to the resume, not the ambient project', async () => {
+    const handler = capturedHandlers.get(IPC.SESSION_RESUME);
+    if (!handler) throw new Error('SESSION_RESUME handler not registered');
+
+    // clearAllMocks keeps implementations, so an earlier test's hold or throw
+    // would still be armed here.
+    mockEnsureTaskWorktree.mockImplementation(async () => {});
+    const resumeSuspendedSession = vi.fn(async (..._args: unknown[]) => {
+      // The engine records the spawned session on the task, as the real one does.
+      storedTask = { ...storedTask, session_id: 'sess-fresh' };
+    });
+    mockCreateTransitionEngine.mockReturnValue({ resumeSuspendedSession });
+    // The ambient project is 'proj-1'. The explicit one resolves its path from
+    // the project repo, as resolveProjectContext does for a non-current project.
+    context.projectRepo.getById.mockImplementation(() => ({ default_agent: 'claude', path: '/mock/other-project' }));
+
+    await handler(null, 'task-2', '/resume-prompt', 'proj-2');
+
+    expect(resumeSuspendedSession).toHaveBeenCalledTimes(1);
+    // Argument 4 of engine.resumeSuspendedSession is the resume prompt.
+    const resumeArguments = resumeSuspendedSession.mock.calls[0] as unknown[];
+    expect(resumeArguments[3]).toBe('/resume-prompt');
+
+    // createTransitionEngine(context, automations, automationRuns, tasks,
+    // sessionRepo, attachmentRepo, projectId, projectPath): the engine is built
+    // for the explicit project and its path.
+    const engineArguments = mockCreateTransitionEngine.mock.calls[0] as unknown[];
+    expect(engineArguments[6]).toBe('proj-2');
+    expect(engineArguments[7]).toBe('/mock/other-project');
+
+    // Every repository read in the resume (Phase 1, the reconcile, Phase 3)
+    // targets the explicit project, never the ambient 'proj-1'.
+    expect(mockGetProjectRepos).toHaveBeenCalled();
+    for (const [, projectIdArgument] of mockGetProjectRepos.mock.calls) {
+      expect(projectIdArgument).toBe('proj-2');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -972,6 +1158,9 @@ describe('SESSION_RESUME Phase 1 self-heal (live session already exists)', () =>
     // there's nothing to spawn.
     expect(mockEnsureTaskWorktree).not.toHaveBeenCalled();
     expect(mockCreateTransitionEngine).not.toHaveBeenCalled();
+    // Nothing spawns, so no "Resuming session..." label is put up over the
+    // live session the card already shows.
+    expect(claimSpawnProgress).not.toHaveBeenCalled();
   });
 
   it('does not clear task.session_id when returning the live session', async () => {
@@ -1058,5 +1247,61 @@ describe('SESSION_SUSPEND reconciles task.session_id before suspending', () => {
     await handler(null, 'task-pause');
 
     expect(context.sessionManager.suspend).toHaveBeenCalledWith('sess-pointer');
+  });
+
+  it('resolves undefined for a task with no live session, without leaking the not-live outcome', async () => {
+    context.sessionManager.getSession.mockImplementation(() => registryRow('exited'));
+    const handler = capturedHandlers.get(IPC.SESSION_SUSPEND);
+    if (!handler) throw new Error('SESSION_SUSPEND handler not registered');
+
+    const result = await handler(null, 'task-pause');
+
+    // The pause is a silent no-op for the desktop Pause button: the handler
+    // returns Promise<void>, so pauseTaskSession's 'not-live' outcome must not
+    // reach the renderer.
+    expect(result).toBeUndefined();
+  });
+
+  it('routes the repository lookups to an explicit projectId, not the current project', async () => {
+    context.sessionManager.getSession.mockImplementation(() => registryRow('running'));
+    const handler = capturedHandlers.get(IPC.SESSION_SUSPEND);
+    if (!handler) throw new Error('SESSION_SUSPEND handler not registered');
+    // project-scoped-ipc.md: the renderer stamps the project at interaction
+    // time, so it can differ from whatever project is current when the handler
+    // finally runs.
+    expect(context.currentProjectId).toBe('proj-1');
+
+    await handler(null, 'task-pause', 'proj-explicit');
+
+    // Both reconcileTaskSessionRef and applySuspendDbWrites look the repos up,
+    // so every recorded lookup must carry the explicit id. The positive
+    // assertions guard the negative one against passing vacuously.
+    expect(mockGetProjectRepos).toHaveBeenCalledWith(context, 'proj-explicit');
+    expect(mockGetProjectRepos).not.toHaveBeenCalledWith(context, 'proj-1');
+    const lookedUpProjectIds = mockGetProjectRepos.mock.calls.map((callArguments: unknown[]) => callArguments[1]);
+    expect(new Set(lookedUpProjectIds)).toEqual(new Set(['proj-explicit']));
+    expect(context.sessionManager.suspend).toHaveBeenCalledWith('sess-pointer');
+  });
+
+  it('rejects when no project is open and touches nothing', async () => {
+    // A live row is armed on purpose: were the no-project guard missing, the
+    // handler would reconcile it and suspend a real session.
+    context.sessionManager.getSession.mockImplementation(() => registryRow('running'));
+    (context as { currentProjectId: string | null }).currentProjectId = null;
+    const handler = capturedHandlers.get(IPC.SESSION_SUSPEND);
+    if (!handler) throw new Error('SESSION_SUSPEND handler not registered');
+    // Registration may have looked repos up; only the handler's own calls count.
+    mockGetProjectRepos.mockClear();
+
+    await expect(handler(null, 'task-pause')).rejects.toThrow(/No project is currently open/);
+
+    expect(context.sessionManager.suspend).not.toHaveBeenCalled();
+    // No repository lookup means no tasks.update could have run either.
+    expect(mockGetProjectRepos).not.toHaveBeenCalled();
+    expect(storedTask.session_id).toBe('sess-pointer');
+
+    // The throw happens inside withTaskLock; the lock must have been released
+    // so the next operation on the same task is not wedged behind it.
+    await expect(withTaskLock('task-pause', async () => 'ran')).resolves.toBe('ran');
   });
 });

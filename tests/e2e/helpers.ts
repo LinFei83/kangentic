@@ -347,6 +347,8 @@ export async function launchApp(options?: {
     throw new Error(`electron.launch() failed after ${maxLaunchAttempts} attempts: ${lastLaunchError?.message}`);
   }
 
+  await watchProcessDeaths(app, page);
+
   // When HEADED=1 (user-invoked), maximize so the user can watch.
   // Otherwise (CI/automated), just let it run at default size.
   const isHeaded = process.env.HEADED === '1' || process.env.HEADED === 'true';
@@ -369,6 +371,52 @@ export async function launchApp(options?: {
   await page.waitForSelector('text=Kangentic', { timeout: 15000 });
 
   return { app, page };
+}
+
+const PROCESS_DEATH_TAG = '[E2E process-gone]';
+
+/**
+ * Print why a renderer or child process died, into the test output.
+ *
+ * Playwright reports a dead renderer only as "Target crashed". The app records
+ * the reason and exit code in a crash file, but that lives in the test's data
+ * or project directory, which the spec deletes and CI does not upload. So main
+ * logs each death under a tag, with the free system memory at that moment,
+ * and this prints the tagged lines: `oom` with little memory free points at a
+ * crowded runner, `crashed` with plenty free points at Electron itself.
+ *
+ * Best-effort: a failure to install the listeners must not fail the launch.
+ */
+async function watchProcessDeaths(app: ElectronApplication, page: Page): Promise<void> {
+  app.on('console', (message) => {
+    // Not startsWith: main prefixes every console line with a timestamp.
+    const text = message.text();
+    if (text.includes(PROCESS_DEATH_TAG)) console.error(text);
+  });
+  page.on('crash', () => console.error(`${PROCESS_DEATH_TAG} Playwright saw the page crash`));
+  try {
+    await app.evaluate(({ app: electronApp, webContents }, tag) => {
+      // On Linux (CI's runner) `free` is MemFree, which excludes page cache and reads near
+      // zero on a healthy machine; `available` (MemAvailable, Linux only) is the pressure
+      // figure. JSON.stringify drops it where it is undefined.
+      const memoryKb = (): { freeMemoryKb: number; availableMemoryKb?: number } => {
+        const info = process.getSystemMemoryInfo();
+        return { freeMemoryKb: info.free, availableMemoryKb: info.available };
+      };
+      const watch = (contents: Electron.WebContents): void => {
+        contents.on('render-process-gone', (_event, details) => {
+          console.error(`${tag} renderer ${JSON.stringify({ ...details, url: contents.getURL(), ...memoryKb() })}`);
+        });
+      };
+      for (const contents of webContents.getAllWebContents()) watch(contents);
+      electronApp.on('web-contents-created', (_event, contents) => watch(contents));
+      electronApp.on('child-process-gone', (_event, details) => {
+        console.error(`${tag} child ${JSON.stringify({ ...details, ...memoryKb() })}`);
+      });
+    }, PROCESS_DEATH_TAG);
+  } catch (error) {
+    console.warn(`${PROCESS_DEATH_TAG} could not install the death listeners:`, error);
+  }
 }
 
 /**
@@ -493,6 +541,84 @@ async function killAppProcess(app: ElectronApplication): Promise<void> {
       console.warn(`[E2E closeApp] SIGKILL failed for pid=${pid}:`, error);
     }
   }
+}
+
+/**
+ * Whether a pid names a live process. Signal 0 is the standard probe on POSIX and
+ * Node supports it on Windows (libuv checks STILL_ACTIVE). EPERM means the process
+ * exists but belongs to someone else, which is still alive.
+ *
+ * On Linux a process that has exited but whose parent has not reaped it still
+ * answers signal 0. A process re-parented to an init that never reaps (a
+ * container's PID 1 can be such a process) would read as alive forever, so a
+ * zombie counts as dead.
+ */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+  if (process.platform === 'linux') {
+    const stat = readLinuxProcessStat(pid);
+    // Gone between the signal and the read, or exited and awaiting its reaper.
+    if (!stat || stat.state === 'Z' || stat.state === 'X') return false;
+  }
+  return true;
+}
+
+/**
+ * State, parent pid and start time from /proc/<pid>/stat (fields 3, 4 and 22),
+ * or null when unreadable. The start time, in clock ticks since boot, tells a
+ * process apart from a later one that reused its pid.
+ */
+export function readLinuxProcessStat(pid: number): { state: string; parentPid: number; startTicks: string } | null {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    // The command name is parenthesised and may itself contain spaces or parens,
+    // so split after the LAST closing paren. Field 3 is then index 0.
+    const afterCommand = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return { state: afterCommand[0], parentPid: parseInt(afterCommand[1], 10), startTicks: afterCommand[19] };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * closeApp, then wait until the Electron main process is actually gone.
+ *
+ * For a spec that closes an app and then relaunches against the SAME data dir,
+ * or opens that dir's project database directly. It replaces the fixed 1 to 2 s
+ * sleep those specs used to leave after closeApp, which stood in for exactly
+ * this: the old process, and with it every handle it held on config.json and
+ * the SQLite files, being gone before the next phase starts. A sleep guessed
+ * that duration; the pid says it.
+ *
+ * The pid is read BEFORE the close, because `app.process()` throws once
+ * Playwright has torn its handle down.
+ */
+export async function closeAppAndWaitForExit(
+  app: ElectronApplication | undefined,
+  timeoutMs = 10_000,
+): Promise<void> {
+  if (!app) return;
+  let pid: number | undefined;
+  try {
+    pid = app.process()?.pid;
+  } catch {
+    pid = undefined;
+  }
+  await closeApp(app);
+  if (!pid) return;
+  const closedPid = pid;
+  await expect
+    .poll(() => isProcessAlive(closedPid), {
+      timeout: timeoutMs,
+      intervals: [100, 250, 500],
+      message: `Electron main process ${closedPid} was still alive after closeApp`,
+    })
+    .toBe(false);
 }
 
 // Wait for the board to load (swimlanes visible)
@@ -754,20 +880,37 @@ export async function waitForTaskSession(
   throw new Error(`Timed out waiting for task ${taskId}'s session to reach status='running'`);
 }
 
+/**
+ * Poll `sessions.list()` until `predicate` holds or `timeoutMs` passes. A
+ * manual loop over page.evaluate, which awaits its async body: an async
+ * predicate handed to page.waitForFunction returns a Promise, which is truthy,
+ * so it resolved on the first tick and these helpers never waited at all.
+ */
+async function pollSessions(
+  page: Page,
+  predicate: 'some-running' | 'none-running',
+  timeoutMs: number,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const anyRunning = await page.evaluate(async () => {
+      const sessions: Session[] = await window.electronAPI.sessions.list();
+      return sessions.some((session) => session.status === 'running');
+    });
+    if (predicate === 'some-running' ? anyRunning : !anyRunning) return;
+    await page.waitForTimeout(200);
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${predicate === 'some-running' ? 'a running session' : 'no running session'}`);
+}
+
 /** Wait until at least one session reports status='running' via IPC. */
 export async function waitForRunningSession(page: Page, timeoutMs = 15000): Promise<void> {
-  await page.waitForFunction(async () => {
-    const sessions: Session[] = await window.electronAPI.sessions.list();
-    return sessions.some((session) => session.status === 'running');
-  }, null, { timeout: timeoutMs });
+  await pollSessions(page, 'some-running', timeoutMs);
 }
 
 /** Wait until no session reports status='running' (suspend/exit completion). */
 export async function waitForNoRunningSession(page: Page, timeoutMs = 15000): Promise<void> {
-  await page.waitForFunction(async () => {
-    const sessions: Session[] = await window.electronAPI.sessions.list();
-    return !sessions.some((session) => session.status === 'running');
-  }, null, { timeout: timeoutMs });
+  await pollSessions(page, 'none-running', timeoutMs);
 }
 
 /**
@@ -782,10 +925,11 @@ export async function waitForTaskSessionNotRunning(page: Page, taskId: string, t
   // can treat the returned Promise as truthy and resolve on the first tick.
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    // Any of the task's rows, not the first: an exited row listed ahead of a
+    // resumed one read as "not running" while the new session still ran.
     const running = await page.evaluate(async (taskId) => {
       const sessions: Session[] = await window.electronAPI.sessions.list();
-      const session = sessions.find((candidate) => candidate.taskId === taskId);
-      return !!session && session.status === 'running';
+      return sessions.some((candidate) => candidate.taskId === taskId && candidate.status === 'running');
     }, taskId);
     if (!running) return;
     await page.waitForTimeout(200);

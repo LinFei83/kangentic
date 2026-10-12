@@ -1,6 +1,6 @@
 import { test, expect, chromium } from '@playwright/test';
 import path from 'node:path';
-import { launchPage, createProject, createTask, waitForViteReady } from './helpers';
+import { launchPage, createProject, createTask, waitForViteReady, gotoVite } from './helpers';
 import type { Browser, Locator, Page } from '@playwright/test';
 
 // Each describe is isolated per worker (separate process; per-test page launch / goto reset),
@@ -189,14 +189,12 @@ test.describe('NewTaskDialog Advanced section', () => {
   });
 
   test('the agent edit button opens Settings scoped to THIS project, so a picked default actually persists', async () => {
-    // Distinct failure mode from the visibility test above: opening the panel to
-    // a tab WITHOUT a project path (setting only `settingsOpen` +
-    // `projectSettingsInitialTab`) leaves `projectSettingsPath` null, and
-    // `updateProjectOverride` returns early when that path is null - so a pencil
-    // that opened the Agent tab that way would show the SAME-LOOKING tab (the
-    // "Project Defaults" header above renders unconditionally from
-    // project-store's currentProject, not from projectSettingsPath) while
-    // silently dropping every write made from it. Permission Mode
+    // Distinct failure mode from the visibility test above: `updateProjectOverride`
+    // returns early when `projectSettingsPath` is null, so a pencil that opened
+    // the Agent tab without a project path would show the SAME-LOOKING tab while
+    // silently dropping every write made from it. SettingsPanel now seeds that
+    // path from currentProject when the panel opens without one, so this guards
+    // the pencil's own path and that seed together. Permission Mode
     // (agent.permissionMode, scope: 'project' in settings-registry.ts) is the
     // concrete probe: prove the pick lands in THIS project's stored overrides,
     // not just that the combobox's own on-screen value changed.
@@ -608,7 +606,7 @@ test.describe('NewTaskDialog Advanced - Agent picker (multi-agent fixture)', () 
       };
     });
     await multiPage.addInitScript({ path: MOCK_SCRIPT });
-    await multiPage.goto(VITE_URL);
+    await gotoVite(multiPage, VITE_URL);
     await multiPage.waitForLoadState('load');
     await multiPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(multiPage, `MultiAgent ${Date.now()}`);
@@ -759,7 +757,7 @@ test.describe('NewTaskDialog Advanced - Agent picker (no agent detected fixture)
       };
     });
     await noAgentPage.addInitScript({ path: MOCK_SCRIPT });
-    await noAgentPage.goto(VITE_URL);
+    await gotoVite(noAgentPage, VITE_URL);
     await noAgentPage.waitForLoadState('load');
     await noAgentPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(noAgentPage, `NoAgent ${Date.now()}`);
@@ -845,7 +843,7 @@ test.describe('NewTaskDialog Advanced - grouped model dropdown (suffixed fixture
       };
     });
     await groupedPage.addInitScript({ path: MOCK_SCRIPT });
-    await groupedPage.goto(VITE_URL);
+    await gotoVite(groupedPage, VITE_URL);
     await groupedPage.waitForLoadState('load');
     await groupedPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(groupedPage, `GroupedModels ${Date.now()}`);
@@ -1079,7 +1077,7 @@ test.describe('NewTaskDialog Advanced - Model dropdown open triggers a rescan', 
     const context = await rescanBrowser.newContext({ viewport: { width: 1920, height: 1080 } });
     rescanPage = await context.newPage();
     await rescanPage.addInitScript({ path: MOCK_SCRIPT });
-    await rescanPage.goto(VITE_URL);
+    await gotoVite(rescanPage, VITE_URL);
     await rescanPage.waitForLoadState('load');
     await rescanPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(rescanPage, `ModelRescan ${Date.now()}`);
@@ -1227,7 +1225,7 @@ test.describe('NewTaskDialog Advanced - context-window badge (telemetry-learned)
       };
     });
     await contextWindowPage.addInitScript({ path: MOCK_SCRIPT });
-    await contextWindowPage.goto(VITE_URL);
+    await gotoVite(contextWindowPage, VITE_URL);
     await contextWindowPage.waitForLoadState('load');
     await contextWindowPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(contextWindowPage, `ContextWindowBadge ${Date.now()}`);
@@ -1303,7 +1301,7 @@ test.describe('NewTaskDialog Advanced - context-window badge suppressed by a 1M 
       };
     });
     await suppressedPage.addInitScript({ path: MOCK_SCRIPT });
-    await suppressedPage.goto(VITE_URL);
+    await gotoVite(suppressedPage, VITE_URL);
     await suppressedPage.waitForLoadState('load');
     await suppressedPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(suppressedPage, `ContextWindowSuppressed ${Date.now()}`);
@@ -1374,7 +1372,7 @@ test.describe('NewTaskDialog Advanced - context-window badge on a demoted supers
       };
     });
     await demotedBadgePage.addInitScript({ path: MOCK_SCRIPT });
-    await demotedBadgePage.goto(VITE_URL);
+    await gotoVite(demotedBadgePage, VITE_URL);
     await demotedBadgePage.waitForLoadState('load');
     await demotedBadgePage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(demotedBadgePage, `DemotedContextBadge ${Date.now()}`);
@@ -1428,7 +1426,7 @@ test.describe('Combobox (Effort field) - typing filters, never auto-commits', ()
     const context = await filterBrowser.newContext({ viewport: { width: 1920, height: 1080 } });
     filterPage = await context.newPage();
     await filterPage.addInitScript({ path: MOCK_SCRIPT });
-    await filterPage.goto(VITE_URL);
+    await gotoVite(filterPage, VITE_URL);
     await filterPage.waitForLoadState('load');
     await filterPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(filterPage, `ComboboxFilter ${Date.now()}`);
@@ -1532,7 +1530,7 @@ test.describe('placeholderVariant: muted vs resolved', () => {
     const context = await variantBrowser.newContext({ viewport: { width: 1920, height: 1080 } });
     variantPage = await context.newPage();
     await variantPage.addInitScript({ path: MOCK_SCRIPT });
-    await variantPage.goto(VITE_URL);
+    await gotoVite(variantPage, VITE_URL);
     await variantPage.waitForLoadState('load');
     await variantPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(variantPage, `PlaceholderVariant ${Date.now()}`);
@@ -1765,7 +1763,7 @@ test.describe('Advanced overrides placeholder resolves against the task\'s own c
 
     await ghostLockPage.addInitScript({ path: MOCK_SCRIPT });
     await ghostLockPage.addInitScript(preConfigScript);
-    await ghostLockPage.goto(VITE_URL);
+    await gotoVite(ghostLockPage, VITE_URL);
     await ghostLockPage.waitForLoadState('load');
     await ghostLockPage.waitForSelector('text=Kangentic', { timeout: 15000 });
   });
@@ -1833,7 +1831,7 @@ test.describe('NewTaskDialog run-mode choice (profiles fixture)', () => {
       ];
     });
     await profilePage.addInitScript({ path: MOCK_SCRIPT });
-    await profilePage.goto(VITE_URL);
+    await gotoVite(profilePage, VITE_URL);
     await profilePage.waitForLoadState('load');
     await profilePage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await createProject(profilePage, `Profiles ${Date.now()}`);
@@ -2347,7 +2345,7 @@ test.describe('TaskDetailEditForm save gate: run_mode + pins omitted while a ses
       });
     `);
 
-    await gatedPage.goto(VITE_URL);
+    await gotoVite(gatedPage, VITE_URL);
     await gatedPage.waitForLoadState('load');
     await gatedPage.waitForSelector('text=Kangentic', { timeout: 15000 });
     await gatedPage.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });

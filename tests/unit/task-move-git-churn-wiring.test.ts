@@ -47,6 +47,8 @@ vi.mock('../../src/main/db/database', () => ({ getProjectDb: vi.fn(() => ({})) }
 vi.mock('../../src/main/db/repositories/task-repository', () => ({ TaskRepository: class {} }));
 vi.mock('../../src/main/db/repositories/session-repository', () => ({
   SessionRepository: class {
+    // No own-record row, so the capture sites fall back to getLatestForTask.
+    findByAnyId = vi.fn(() => undefined);
     getLatestForTask = vi.fn(() => hoisted.activeRecord);
     getSummaryForTask = vi.fn(() => null);
     updateGitStats = vi.fn();
@@ -83,7 +85,7 @@ vi.mock('../../src/main/transition-engine/agent-resolver', () => ({
   resolveTargetAgent: (...args: unknown[]) => mockResolveTargetAgent(...args),
 }));
 
-const mockPrepareInjectionPlan = vi.fn(() => null as { needsRestartForModel: boolean } | null);
+const mockPrepareInjectionPlan = vi.fn(() => null as { restartReason: 'model' | 'effort' | null } | null);
 vi.mock('../../src/main/transition-engine/injection-plan', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/main/transition-engine/injection-plan')>()),
   prepareInjectionPlan: (...args: unknown[]) => mockPrepareInjectionPlan(...args),
@@ -106,7 +108,9 @@ const mockGetProjectRepos = vi.fn();
 const mockEnsureTaskWorktree = vi.fn(async () => null);
 const mockEnsureTaskBranchCheckout = vi.fn(async () => {});
 const mockSpawnAgent = vi.fn(async () => {});
-const mockCreateTransitionEngine = vi.fn(() => ({}));
+// Phase 1 runs the source column's exit automations on every move. An empty
+// summary keeps it quiet instead of logging a TypeError per test.
+const mockCreateTransitionEngine = vi.fn(() => ({ executeTransition: vi.fn(async () => ({ failures: [] })) }));
 
 vi.mock('../../src/main/ipc/helpers/index', () => ({
   getProjectRepos: (...args: unknown[]) => mockGetProjectRepos(...args),
@@ -117,11 +121,10 @@ vi.mock('../../src/main/ipc/helpers/index', () => ({
   cleanupTaskResources: vi.fn(async () => {}),
   deleteTaskWorktree: vi.fn(async () => true),
   autoSpawnForTask: vi.fn(async () => {}),
-  // The Done branch snapshots the session's process tree before suspending and
-  // reaps it before the worktree delete. Inert here; covered by
-  // session-tree-reap.test.ts and bg-shell-watcher.test.ts.
-  captureSessionLeftovers: vi.fn(() => null),
-  reapSessionLeftovers: vi.fn(async () => {}),
+  // The Done branch reaps what the task left running after its session exits
+  // and before the worktree delete. Inert here; covered by
+  // session-leftover-reap-wiring.test.ts and task-tagged-reap.test.ts.
+  reapTaskLeftovers: vi.fn(async () => {}),
 }));
 vi.mock('../../src/main/pr/pr-linking', () => ({
   autoLinkPRForTask: vi.fn(),
@@ -195,8 +198,9 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     // on the live-session branches they exercise.
     getSession: vi.fn((id: string) => ({ id, status: 'running' })),
     findLiveSessionByTaskId: vi.fn(() => null),
-    // Read by resolveLiveEffort; empty means the agent reports no effort.
+    // Read by resolveReportedEffort; empty means the agent reports no effort.
     getUsageCache: vi.fn((): Record<string, unknown> => ({})),
+    getFirstReportedEffort: vi.fn((): string | null => null),
   };
   const context = {
     currentProjectId: 'proj-test',
@@ -409,7 +413,7 @@ describe('handleTaskMove git-churn capture wiring', () => {
       started_at: '2026-01-01T00:00:00Z', session_type: 'claude_agent',
     };
     // Forces the suspendLiveSessionForRespawn branch (step 1: model change).
-    mockPrepareInjectionPlan.mockReturnValue({ needsRestartForModel: true });
+    mockPrepareInjectionPlan.mockReturnValue({ restartReason: 'model' });
 
     const taskRepo = {
       getById: vi.fn()

@@ -24,7 +24,7 @@
 import { test, expect } from '@playwright/test';
 import { chromium, type Browser, type Page } from '@playwright/test';
 import path from 'node:path';
-import { waitForViteReady, collectPageErrors } from './helpers';
+import { waitForViteReady, collectPageErrors, gotoVite } from './helpers';
 
 const MOCK_SCRIPT = path.join(__dirname, 'mock-electron-api.js');
 const VITE_URL = `http://localhost:${process.env.PLAYWRIGHT_VITE_PORT || '5173'}`;
@@ -348,7 +348,7 @@ test.beforeAll(async () => {
   await page.addInitScript(preConfig);
   await page.addInitScript(buildFixtureScript());
 
-  await page.goto(VITE_URL);
+  await gotoVite(page, VITE_URL);
   await page.waitForLoadState('load');
   await page.waitForSelector('text=Kangentic', { timeout: 15000 });
   await page.locator('[data-swimlane-name="Code Review"]').waitFor({ state: 'visible', timeout: 10000 });
@@ -543,7 +543,9 @@ test.describe('Changes view: diff scroll memory', () => {
         .toBe(true);
 
       // monacoConfig's funnel only swallows the DiffEditor disposal error, so a
-      // genuine internal throw would still surface here.
+      // genuine internal throw still surfaces here: as a page error, or, for
+      // the "Illegal value for lineNumber" error the funnel reports as handled,
+      // as its [MONACO] console line, which collectPageErrors also collects.
       expect(getPageErrors()).toHaveLength(0);
     } finally {
       // Leave the shared page as this test found it for any later spec run.
@@ -658,8 +660,10 @@ test.describe('Changes view: diff scroll memory', () => {
       expect(originalState.lineCount).toBeGreaterThan(0);
       expect(originalState.maxVisibleLine).toBeLessThanOrEqual(originalState.lineCount);
 
-      // A throw on this path escapes a setTimeout to window.onerror and never
-      // reaches monacoConfig's funnel, so it surfaces here as a page error.
+      // A throw on this path is caught by monaco's Emitter and handed to
+      // monacoConfig's funnel, which reports it as handled instead of letting
+      // monaco rethrow it to window.onerror. It surfaces here through the
+      // funnel's [MONACO] console line, which collectPageErrors collects.
       expect(getPageErrors()).toHaveLength(0);
     } finally {
       await setCollapseUnchanged(page, false);

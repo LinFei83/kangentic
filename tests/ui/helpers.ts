@@ -11,6 +11,7 @@ const VITE_URL = `http://localhost:${process.env.PLAYWRIGHT_VITE_PORT || '5173'}
 // rarely sees them, but the filter stays as a belt-and-suspenders for any path
 // that reaches window despite the funnel wrapper.
 import { BENIGN_RENDERER_ERRORS, isBenignRendererError } from '../../src/shared/benign-renderer-errors';
+import { MONACO_HANDLED_ERROR_LOG_TAG } from '../../src/renderer/monaco-error-funnel';
 export { BENIGN_RENDERER_ERRORS, isBenignRendererError };
 
 /**
@@ -19,12 +20,23 @@ export { BENIGN_RENDERER_ERRORS, isBenignRendererError };
  * error messages so a spec can assert a clean console without tripping on
  * quirks the app cannot control. Attach before the interaction under test so
  * the error window is fully covered.
+ *
+ * It also collects the monaco funnel's [MONACO] console line. The funnel
+ * (src/renderer/monaco-error-funnel.ts) reports Sentry DESKTOP-19's error as
+ * handled instead of letting monaco rethrow it, so that error no longer
+ * reaches `pageerror`, and without this every spec asserting an empty result
+ * would stop seeing it.
  */
 export function collectPageErrors(page: Page): () => string[] {
   const errors: string[] = [];
   page.on('pageerror', (error) => {
     if (isBenignRendererError(error)) return;
     errors.push(error.message);
+  });
+  page.on('console', (message) => {
+    if (message.type() !== 'error') return;
+    if (!message.text().startsWith(MONACO_HANDLED_ERROR_LOG_TAG)) return;
+    errors.push(message.text());
   });
   return () => errors.slice();
 }
@@ -95,6 +107,99 @@ export async function gotoVite(page: Page, url: string = VITE_URL): Promise<void
       await waitForViteReady(url);
     }
   }
+}
+
+/** What `launchWithTransientTerminal` seeds: one project, and the id every Command Terminal spawns with. */
+export interface TransientTerminalSetup {
+  projectId: string;
+  projectName: string;
+  /** The transient session id `spawnTransient` returns, so `__mockFireSessionData` can target it. */
+  sessionId: string;
+  /** Extra `browser.newContext` options (e.g. `deviceScaleFactor`). The viewport defaults to 1600x1000. */
+  contextOptions?: Parameters<Browser['newContext']>[0];
+  /** Seeds the global `terminal.fontSize` before the app mounts, so a terminal is constructed at it. */
+  terminalFontSize?: number;
+}
+
+/**
+ * Launch a page with one project open and a deterministic Command Terminal
+ * session, ready for `openTransientCommandTerminal`. Each call owns its browser,
+ * so a spec using it can run its tests in parallel. Close the returned browser
+ * in a `finally`.
+ */
+export async function launchWithTransientTerminal(setup: TransientTerminalSetup): Promise<{ browser: Browser; page: Page }> {
+  const projectPath = `/mock/${setup.projectId}`;
+  const preConfigScript = `
+    window.__mockPreConfigure(function (state) {
+      var timestamp = new Date().toISOString();
+      state.projects.push({
+        id: ${JSON.stringify(setup.projectId)},
+        name: ${JSON.stringify(setup.projectName)},
+        path: ${JSON.stringify(projectPath)},
+        github_url: null,
+        default_agent: 'claude',
+        last_opened: timestamp,
+        created_at: timestamp,
+      });
+      state.DEFAULT_SWIMLANES.forEach(function (swimlane, index) {
+        state.swimlanes.push(Object.assign({}, swimlane, {
+          id: ${JSON.stringify(setup.projectId)} + '-lane-' + index,
+          position: index,
+          created_at: timestamp,
+        }));
+      });
+      ${setup.terminalFontSize === undefined ? '' : `state.config.terminal = Object.assign({}, state.config.terminal, { fontSize: ${JSON.stringify(setup.terminalFontSize)} });`}
+      return { currentProjectId: ${JSON.stringify(setup.projectId)} };
+    });
+    window.electronAPI.sessions.spawnTransient = async function (input) {
+      return {
+        session: {
+          id: ${JSON.stringify(setup.sessionId)},
+          taskId: ${JSON.stringify(setup.sessionId)},
+          projectId: input.projectId,
+          pid: null,
+          status: 'running',
+          shell: '/bin/bash',
+          cwd: ${JSON.stringify(projectPath)},
+          startedAt: new Date().toISOString(),
+          exitCode: null,
+          resuming: false,
+          transient: true,
+        },
+        branch: 'main',
+      };
+    };
+  `;
+
+  await waitForViteReady();
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, ...setup.contextOptions });
+  const page = await context.newPage();
+  await page.addInitScript({ path: MOCK_SCRIPT });
+  await page.addInitScript(preConfigScript);
+  await gotoVite(page);
+  await page.waitForLoadState('load');
+  await page.locator('[data-swimlane-name="To Do"]').waitFor({ state: 'visible', timeout: 15000 });
+  return { browser, page };
+}
+
+/**
+ * Open the Command Terminal with Ctrl+Shift+P and return its window once its
+ * xterm is mounted. Marks the session's first output, which is what lifts the
+ * launch overlay over a transient terminal that the mock never writes to.
+ */
+export async function openTransientCommandTerminal(page: Page, sessionId: string): Promise<Locator> {
+  await page.keyboard.press('Control+Shift+P');
+  const commandWindow = page.getByTestId('command-terminal-window');
+  await expect(commandWindow).toBeVisible();
+  await page.evaluate((targetSessionId) => {
+    const stores = (window as unknown as {
+      __zustandStores?: { session?: { getState: () => { markFirstOutput: (id: string) => void } } };
+    }).__zustandStores;
+    stores?.session?.getState().markFirstOutput(targetSessionId);
+  }, sessionId);
+  await expect(commandWindow.locator('.xterm-helper-textarea').first()).toBeAttached({ timeout: 8000 });
+  return commandWindow;
 }
 
 /**
@@ -299,6 +404,26 @@ export async function settleDndKitKeyboardSensor(page: Page): Promise<void> {
 }
 
 /**
+ * Resolves once `frames` animation frames have run. A state change that has
+ * already landed in a store needs one frame for React to commit it and another
+ * for anything that commit scheduled (a canvas repaint, a follow-up render), so
+ * two is the floor for "it has settled". For asserting that something is
+ * ABSENT after a result lands, where an assertion read right after the call
+ * would pass before the thing it guards against has had a chance to appear.
+ */
+export async function settleFrames(page: Page, frames = 2): Promise<void> {
+  await page.evaluate((frameCount) => new Promise<void>((resolve) => {
+    let remaining = frameCount;
+    const tick = () => {
+      remaining -= 1;
+      if (remaining <= 0) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }), frames);
+}
+
+/**
  * Launch a headless Chromium page with the electronAPI mock injected.
  * The Vite dev server must be running (started by playwright webServer config).
  */
@@ -341,8 +466,8 @@ export async function createProject(
   _projectPath?: string,
 ): Promise<void> {
   // Set the mock folder selection so basename = project name
-  await page.evaluate((n: string) => {
-    (window as any).__mockFolderPath = '/mock/projects/' + n;
+  await page.evaluate((projectName: string) => {
+    (window as unknown as { __mockFolderPath: string }).__mockFolderPath = '/mock/projects/' + projectName;
   }, name);
 
   // When no projects exist the sidebar is hidden and the welcome screen

@@ -1,7 +1,7 @@
 /**
  * EMPIRICAL tests for the `tasks.worktree_skip_reason`, `tasks.resolved_base_branch`,
  * and `tasks.pushed_branch` columns, run against a REAL SQLite engine
- * (node:sqlite) rather than a mocked repository.
+ * (better-sqlite3, the driver production uses) rather than a mocked repository.
  *
  * Every existing spec that touches `setWorktreeSkipReason`
  * (task-move-git-churn-wiring.test.ts, task-move-complete-analytics.test.ts,
@@ -20,60 +20,24 @@
  * maintained order (`task-repository.ts`'s `update()`); a forgotten column in
  * either list is a real, single-line mistake this file can catch and a mock
  * cannot, because a mock never touches the SQL text.
- *
- * node:sqlite rather than better-sqlite3: better-sqlite3 is compiled for
- * Electron's Node ABI, so a suite gated on it currently SKIPS everywhere, CI
- * included (see the header of tasks-run-mode-migration.test.ts). This file
- * follows the node:sqlite harness already established in
- * worktree-folder-migration.test.ts rather than inventing a new one.
- *
- * node:sqlite is built-in on Node 22.5+; this suite skips where unavailable.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { runProjectMigrations } from '../../src/main/db/migrations/project-schema';
 import { TaskRepository } from '../../src/main/db/repositories/task-repository';
 import type DatabaseType from 'better-sqlite3';
 
-type SqliteModule = typeof import('node:sqlite');
-let sqlite: SqliteModule | null = null;
-try {
-  sqlite = await import('node:sqlite');
-} catch {
-  sqlite = null;
-}
+import { openTestDatabase } from './helpers/test-database';
 
-const describeWithSqlite = sqlite ? describe : describe.skip;
+const openDatabases: DatabaseType.Database[] = [];
 
-/**
- * Adapt node:sqlite's DatabaseSync to the slice of better-sqlite3's surface
- * the migrations and repositories use. Mirrors the adapter in
- * worktree-folder-migration.test.ts so both suites share one known-good
- * shape rather than drifting two implementations of the same shim.
- */
-function adaptDatabase(database: InstanceType<SqliteModule['DatabaseSync']>): DatabaseType.Database {
-  const adapter = {
-    exec: (sql: string) => database.exec(sql),
-    prepare: (sql: string) => database.prepare(sql),
-    pragma: (statement: string) => database.prepare(`PRAGMA ${statement}`).all(),
-    transaction: <Args extends unknown[], Result>(body: (...args: Args) => Result) =>
-      (...args: Args): Result => {
-        database.exec('BEGIN');
-        try {
-          const result = body(...args);
-          database.exec('COMMIT');
-          return result;
-        } catch (error) {
-          database.exec('ROLLBACK');
-          throw error;
-        }
-      },
-  };
-  return adapter as unknown as DatabaseType.Database;
-}
+afterEach(() => {
+  for (const database of openDatabases.splice(0)) database.close();
+});
 
 function migratedDatabase(): DatabaseType.Database {
-  const database = adaptDatabase(new sqlite!.DatabaseSync(':memory:'));
+  const database = openTestDatabase();
+  openDatabases.push(database);
   runProjectMigrations(database);
   return database;
 }
@@ -95,7 +59,7 @@ function setUpdatedAt(database: DatabaseType.Database, taskId: string, updatedAt
   database.prepare('UPDATE tasks SET updated_at = ? WHERE id = ?').run(updatedAt, taskId);
 }
 
-describeWithSqlite('worktree_skip_reason', () => {
+describe('worktree_skip_reason', () => {
   it('persists a reason and clears it back to null', () => {
     const database = migratedDatabase();
     const tasks = new TaskRepository(database);
@@ -156,7 +120,7 @@ describeWithSqlite('worktree_skip_reason', () => {
   });
 });
 
-describeWithSqlite('pushed_branch (via the real update() UPDATE statement)', () => {
+describe('pushed_branch (via the real update() UPDATE statement)', () => {
   it('writes pushed_branch, and its column-list neighbors, each to its own column - not a shifted one', () => {
     // head_sha, pushed_branch, base_branch, and resolved_base_branch sit
     // adjacent in update()'s hand-maintained `SET ... = ?` list and its
@@ -197,7 +161,7 @@ describeWithSqlite('pushed_branch (via the real update() UPDATE statement)', () 
   });
 });
 
-describeWithSqlite('resolved_base_branch', () => {
+describe('resolved_base_branch', () => {
   it('records the resolved base branch on a real creation', () => {
     const database = migratedDatabase();
     const tasks = new TaskRepository(database);

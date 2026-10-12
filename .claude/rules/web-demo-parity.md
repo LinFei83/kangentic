@@ -145,6 +145,13 @@ three things staying in step, and each is enforced rather than remembered.
   wrote, sanitized whole, committed because the source lives on the recording machine), and the
   seed serves it through `transcripts.get` when a viewer opens. Every other session falls through
   to the mock's empty response, which is what the desktop shows once a history file is gone.
+- **The Knowledge Graph is main's pipeline over the recordings, never placed by hand.** A preview
+  indexes, embeds, lays out and names the sample install's recorded conversations, and the
+  snapshots are committed (`graph/knowledge-graph.json`). The web build emits them as their own
+  file, and the seed fetches it and joins each node's title, cost and times from the dataset's rows
+  when a frame first opens the graph. An archived task's Completed Tasks row is its own recorded
+  run (`archived/runs.json`). A scene whose subject keeps moving after `ready` names what to wait
+  on in `settle`, and the rig refuses a poster of the no-GPU card.
 - **The `demo` Playwright tier stays green**, and it runs on the exact bytes a release deploys.
 
 ## Enforcement (self-maintaining)
@@ -171,6 +178,13 @@ three things staying in step, and each is enforced rather than remembered.
   in the parser's shape, when its entries are not the run the card's trail came from (the trail's
   uuids are transcript uuids), when a marked manifest entry has no file or a file no mark, and when
   the build or the seed stops reading them. Runs via `npm run test:unit`.
+- **Test (mechanical, CI):** `tests/unit/demo-knowledge-graph-seeded.test.ts` fails when the
+  Knowledge Graph fixture lacks a project, draws a conversation the sample install does not record,
+  leaves a recorded one neither drawn nor named with a reason, points an edge, neighbour or region
+  out of range, leaves a region unnamed, or counts task records or commits other than the dataset's
+  rows and the History pane's; `tests/unit/demo-archived-summaries.test.ts` holds each Completed
+  Tasks row to its task's recorded run, and `tests/unit/archived-run-metrics.test.ts` replays a real
+  headless result and a real advisor turn through the recorder's readers. Run via `npm run test:unit`.
 - **Test (mechanical, CI):** `tests/unit/demo-guest-pages.test.ts` reads every `guest_page`
   `DEMO_PROJECTS` names and fails when the file is missing, references anything off-origin, reads
   `prefers-color-scheme`, or declares an animation or transition. Runs via `npm run test:unit`.
@@ -203,8 +217,9 @@ three things staying in step, and each is enforced rather than remembered.
   seeds, when a config key is not an `AppConfig` key (the mock's `Object.assign` accepts any key
   and the renderer never reads it), when the settings scenes stop matching `SETTINGS_TABS` one to
   one or a `setting-row-<id>` marker names a row that is not on that tab, when a `fitToRecording`
-  names a session the recordings index does not carry, and when `boot.js`'s
-  `STATE_KEYS` or `demo/vite.config.mts`'s `scenes.json` fields drift from the type. Runs via
+  names a session the recordings index does not carry, when `boot.js`'s
+  `STATE_KEYS` or `demo/vite.config.mts`'s `scenes.json` fields drift from the type, and when
+  `boot.js` reads `settle` or a `settle` selector names a testid no renderer file stamps. Runs via
   `npm run test:unit`.
 - **Test (behavior, CI):** `tests/demo/static-demo.spec.ts` boots EVERY bootable scene in the
   registry from a static server (the loop iterates `SCENES`, so a new entry is covered with no
@@ -241,7 +256,10 @@ three things staying in step, and each is enforced rather than remembered.
   only when the app has nothing of its own to close. A dialog, a task window, and a focused text
   field each keep the first press. A task window whose terminal is under the pointer still closes
   on it. A parked window, a Command Terminal, and a terminal outside every task window keep no
-  press, so the first press posts. Runs as the `demo` job in `.github/workflows/ci.yml`
+  press, so the first press posts. A scene that names `settle` must settle. The Knowledge Graph
+  must draw in a 3D context: no no-GPU card, island labels placed by a drawn frame, and named
+  region pills. Its maps are fetched once, by the frame that opens the graph, and never by a board
+  frame. Runs as the `demo` job in `.github/workflows/ci.yml`
   and again inside `.github/workflows/deploy-demo.yml` before the Pages deploy.
 - **Review:** `/code-review` flags a `location` check or a demo flag inside `src/renderer`, and a
   scene entry that carries code instead of data.

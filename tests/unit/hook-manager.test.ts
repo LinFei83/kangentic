@@ -7,7 +7,7 @@ import {
   removeHooks,
 } from '../../src/main/agent/adapters/claude';
 import { EventType } from '../../src/shared/types';
-import { extractDetail, setTypeWhen, setTypeWhenDetailContains, setTypeWhenDetailMatches } from '../../src/main/agent/shared/directive-builders';
+import { extractDetail, extractSubagentId, setTypeWhen, setTypeWhenDetailContains, setTypeWhenDetailMatches } from '../../src/main/agent/shared/directive-builders';
 
 let tmpDir: string;
 const EVENT_BRIDGE = '/fake/.kangentic/event-bridge.js';
@@ -93,6 +93,8 @@ describe('hook-manager', () => {
       // watcher's transcript drain (background-shell-transcript.ts).
       expect(hooks.UserPromptSubmit).toHaveLength(1);
       expect(hooks.UserPromptSubmit[0].hooks[0].command).toContain('prompt');
+      // A task session's events never carry the prompt's text.
+      expect(hooks.UserPromptSubmit[0].hooks[0].command).not.toContain(extractDetail(['prompt']));
 
       // Stop: idle
       expect(hooks.Stop).toHaveLength(1);
@@ -141,6 +143,11 @@ describe('hook-manager', () => {
       expect(hooks.SubagentStop).toHaveLength(1);
       expect(hooks.SubagentStop[0].hooks[0].command).toContain('subagent_stop');
 
+      // Both subagent hooks carry the agent_id correlation id, so the engine
+      // can release each subagent's depth slot once (task #759).
+      expect(hooks.SubagentStart[0].hooks[0].command).toContain(extractSubagentId(['agent_id']));
+      expect(hooks.SubagentStop[0].hooks[0].command).toContain(extractSubagentId(['agent_id']));
+
       // Notification: notification, with a "waiting for your input" -> idle_hint
       // classification directive (Claude-specific string lives here, not the engine)
       expect(hooks.Notification).toHaveLength(1);
@@ -175,6 +182,18 @@ describe('hook-manager', () => {
 
       // Total: 18 hook event keys
       expect(Object.keys(hooks)).toHaveLength(18);
+    });
+
+    it('carries the prompt text only for a session that asks for it (a Command Terminal)', () => {
+      const hooks = buildHooks(EVENT_BRIDGE, EVENTS_PATH, {}, { capturePromptText: true });
+      expect(hooks.UserPromptSubmit).toHaveLength(1);
+      expect(hooks.UserPromptSubmit[0].hooks[0].command).toContain(extractDetail(['prompt']));
+      // Only the prompt hook changes.
+      const plainHooks = buildHooks(EVENT_BRIDGE, EVENTS_PATH, {});
+      for (const hookEvent of Object.keys(plainHooks)) {
+        if (hookEvent === 'UserPromptSubmit') continue;
+        expect(hooks[hookEvent]).toEqual(plainHooks[hookEvent]);
+      }
     });
 
     it('preserves existing user hooks', () => {

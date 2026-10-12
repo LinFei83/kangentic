@@ -17,6 +17,8 @@ vi.mock('../../../src/main/mobile-bridge/handlers/answer-permission-prompt', () 
 vi.mock('../../../src/main/mobile-bridge/handlers/board-tool', () => ({ handleBoardTool: vi.fn() }));
 vi.mock('../../../src/main/mobile-bridge/handlers/register-push', () => ({ handleRegisterPush: vi.fn() }));
 vi.mock('../../../src/main/mobile-bridge/handlers/start-session', () => ({ handleStartSession: vi.fn() }));
+vi.mock('../../../src/main/mobile-bridge/handlers/pause-session', () => ({ handlePauseSession: vi.fn() }));
+vi.mock('../../../src/main/mobile-bridge/handlers/command-terminal', () => ({ handleCommandTerminal: vi.fn() }));
 
 import { CAPABILITY_VERBS } from '@kangentic/protocol';
 import { registerCapabilityHandlers } from '../../../src/main/mobile-bridge/handlers';
@@ -36,6 +38,7 @@ describe('registerCapabilityHandlers', () => {
       diffWatcher: {} as DiffWatcher,
       getSubscriptions: () => ({}) as SubscriptionRegistry,
       pushRegistrations: {} as PushRegistrationStore,
+      spawnProgressFeed: { onTaskSpawnProgressChanged: () => () => undefined },
     });
 
     const registeredVerbs = registerSpy.mock.calls.map(([verb]) => verb);

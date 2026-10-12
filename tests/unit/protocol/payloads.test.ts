@@ -83,8 +83,49 @@ describe('parseCapabilityRequestPayload', () => {
     ).toThrow(/scope/);
   });
 
-  it('read-diff: rejects a missing taskId', () => {
-    expect(() => parseCapabilityRequestPayload('read-diff', { projectId: 'p-1' })).toThrow(/taskId/);
+  it('read-diff: a missing taskId is a project-folder diff (protocol 0.20.0)', () => {
+    const parsed = parseCapabilityRequestPayload('read-diff', { projectId: 'p-1' });
+    expect(parsed).toEqual({ projectId: 'p-1', filePath: undefined, scope: undefined, action: undefined });
+    expect('taskId' in parsed).toBe(false);
+  });
+
+  it('read-diff: rejects a non-string taskId', () => {
+    expect(() => parseCapabilityRequestPayload('read-diff', { taskId: 7, projectId: 'p-1' })).toThrow(/taskId/);
+  });
+
+  it('read-diff: still requires the projectId', () => {
+    expect(() => parseCapabilityRequestPayload('read-diff', {})).toThrow(/projectId/);
+  });
+
+  it('command-terminal: parses a start that names only the project', () => {
+    expect(parseCapabilityRequestPayload('command-terminal', { action: 'start', projectId: 'p-1' }))
+      .toEqual({ action: 'start', projectId: 'p-1' });
+  });
+
+  it('command-terminal: a start never carries a branch, model or effort through to the desktop', () => {
+    const parsed = parseCapabilityRequestPayload('command-terminal', {
+      action: 'start',
+      projectId: 'p-1',
+      branch: 'feature/x',
+      model: 'some-model',
+      effort: 'high',
+    });
+    expect(parsed).toEqual({ action: 'start', projectId: 'p-1' });
+  });
+
+  it('command-terminal: parses a stop that names the session', () => {
+    expect(parseCapabilityRequestPayload('command-terminal', { action: 'stop', sessionId: 's-1' }))
+      .toEqual({ action: 'stop', sessionId: 's-1' });
+  });
+
+  it('command-terminal: rejects a start with no project and a stop with no session', () => {
+    expect(() => parseCapabilityRequestPayload('command-terminal', { action: 'start' })).toThrow(/projectId/);
+    expect(() => parseCapabilityRequestPayload('command-terminal', { action: 'stop' })).toThrow(/sessionId/);
+  });
+
+  it('command-terminal: rejects any other action, including a missing one', () => {
+    expect(() => parseCapabilityRequestPayload('command-terminal', { action: 'run', projectId: 'p-1' })).toThrow(/action/);
+    expect(() => parseCapabilityRequestPayload('command-terminal', { projectId: 'p-1' })).toThrow(/action/);
   });
 
   it('send-user-message: rejects a missing text', () => {
@@ -130,6 +171,30 @@ describe('parseCapabilityRequestPayload', () => {
 
   it('start-session: rejects a missing projectId', () => {
     expect(() => parseCapabilityRequestPayload('start-session', { taskId: 't-1' })).toThrow(/projectId/);
+  });
+
+  it('pause-session: parses a valid payload to exactly the trusted fields', () => {
+    const parsed = parseCapabilityRequestPayload('pause-session', {
+      taskId: 't-1',
+      projectId: 'p-1',
+      // Keyed by task: a phone cannot name the session to suspend, which a
+      // stale view could get wrong, nor anything else.
+      sessionId: 'sess-9',
+      targetSwimlaneId: 'lane-9',
+    });
+    expect(parsed).toEqual({ taskId: 't-1', projectId: 'p-1' });
+  });
+
+  it('pause-session: rejects a missing taskId', () => {
+    expect(() => parseCapabilityRequestPayload('pause-session', { projectId: 'p-1' })).toThrow(/taskId/);
+  });
+
+  it('pause-session: rejects a missing projectId', () => {
+    expect(() => parseCapabilityRequestPayload('pause-session', { taskId: 't-1' })).toThrow(/projectId/);
+  });
+
+  it('pause-session: rejects a non-string taskId', () => {
+    expect(() => parseCapabilityRequestPayload('pause-session', { taskId: 7, projectId: 'p-1' })).toThrow(/taskId/);
   });
 
   it('answer-permission-prompt: rejects a missing promptId', () => {

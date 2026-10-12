@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { DictationConfig, DictationHardwareProfile } from '../../src/shared/types';
 import { buildDictationInfo, primaryModel } from '../../src/main/transcription/dictation-info';
-import type { ModelDef } from '../../src/main/transcription/models/model-registry';
+import { getModel, type ModelDef } from '../../src/main/transcription/models/model-registry';
 
 /**
  * `dictation-info.ts` is the pure half of `TranscriptionService.getInfo`, moved out so the web
@@ -45,8 +45,8 @@ describe('buildDictationInfo - streaming-tiny tier (weak machine)', () => {
   });
 
   it('selects no refinement (final) model - the tier default is not accurate-base', () => {
-    // engine-selection.ts's finalModelFor: an absent modelId only auto-picks an accurate model
-    // on the accurate-base tier; streaming-tiny gets no final model at all.
+    // A weak machine's default preset is Light (TIER_DEFAULT_PRESET), which has no
+    // refinement model at all.
     expect(info.selectedFinalModelId).toBeNull();
   });
 
@@ -68,16 +68,16 @@ describe('buildDictationInfo - accurate-base tier (capable machine)', () => {
 
   it('resolves to the accurate-base tier and selects both a live and a final model', () => {
     expect(info.tier).toBe('accurate-base');
-    expect(info.selectedLiveModelId).toBe('streaming-zipformer-en');
-    expect(info.selectedFinalModelId).toBe('parakeet-tdt-0.6b-en');
+    expect(info.selectedLiveModelId).toBe('nemotron-streaming-0.6b-en');
+    expect(info.selectedFinalModelId).toBe('parakeet-tdt-0.6b-v3');
   });
 
   it('primaryModel prefers the offline (final) model over the live one', () => {
-    expect(info.selectedModelId).toBe('parakeet-tdt-0.6b-en');
+    expect(info.selectedModelId).toBe('parakeet-tdt-0.6b-v3');
   });
 
-  it('selectedModelSizeMb sums BOTH selected models (70 + 660), not just one', () => {
-    expect(info.selectedModelSizeMb).toBe(730);
+  it('selectedModelSizeMb sums BOTH selected models (631 + 639), not just one', () => {
+    expect(info.selectedModelSizeMb).toBe(1270);
   });
 });
 
@@ -110,13 +110,43 @@ describe('buildDictationInfo - pass-through fields', () => {
   });
 });
 
+describe('buildDictationInfo - model options carry accuracy and license from the registry', () => {
+  // The Dictation tab sorts its dropdowns on accuracyRank, prints accuracyLabel after
+  // each name, and shows the license. All three come from the registry entry, so each
+  // option must match the entry it was built from, in both dropdown lists.
+  const info = buildDictationInfo(makeProfile({ cpuCores: 8, totalRamGb: 16, gpu: 'none' }), makeConfig(), []);
+
+  it('every live and final option carries the accuracy rank, accuracy label and license of its registry entry', () => {
+    expect(info.liveModels.length).toBeGreaterThan(1);
+    expect(info.finalModels.length).toBeGreaterThan(1);
+
+    for (const option of [...info.liveModels, ...info.finalModels]) {
+      const registryEntry = getModel(option.id);
+      expect(registryEntry, `${option.id} is in the registry`).toBeDefined();
+      expect(option.accuracyRank, `${option.id} accuracyRank`).toBe(registryEntry?.accuracy.rank);
+      expect(option.accuracyLabel, `${option.id} accuracyLabel`).toBe(registryEntry?.accuracy.label);
+      expect(option.license, `${option.id} license`).toBe(registryEntry?.license);
+    }
+  });
+
+  // One literal pin, so a registry entry and its option cannot drift together
+  // unnoticed: Parakeet v3 is in both lists, as the model Best refines with and
+  // the one Balanced runs alone.
+  it('Parakeet v3 is High accuracy (rank 6) under CC-BY-4.0, in both the live and the final list', () => {
+    for (const options of [info.liveModels, info.finalModels]) {
+      const parakeetV3 = options.find((option) => option.id === 'parakeet-tdt-0.6b-v3');
+      expect(parakeetV3).toMatchObject({ accuracyRank: 6, accuracyLabel: 'High accuracy', license: 'CC-BY-4.0' });
+    }
+  });
+});
+
 describe('primaryModel', () => {
   const live: ModelDef = {
     id: 'live-model',
     engineKind: 'online-transducer',
     displayName: 'Live',
     license: 'Apache-2.0',
-    tier: 'streaming-tiny',
+    accuracy: { rank: 1, label: 'Basic accuracy' },
     approxSizeMb: 10,
     files: [],
     roles: {},
@@ -126,7 +156,7 @@ describe('primaryModel', () => {
     engineKind: 'offline-whisper',
     displayName: 'Offline',
     license: 'MIT',
-    tier: 'accurate-base',
+    accuracy: { rank: 1, label: 'Basic accuracy' },
     approxSizeMb: 20,
     files: [],
     roles: {},

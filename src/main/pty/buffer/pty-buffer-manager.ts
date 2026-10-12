@@ -2,6 +2,7 @@ import { findSafeStartIndex } from './scrollback-utils';
 import { HeadlessFrameBuffer } from './headless-frame';
 import { collectPeekLines, PEEK_LINE_COUNT } from './output-peek';
 import { traceTerminal, type RepaintSettleReason } from '../terminal-trace';
+import type { SeedFrameResult } from '../host/protocol';
 
 const MAX_SCROLLBACK = 512 * 1024; // 512KB per session
 /**
@@ -303,7 +304,10 @@ function buildDecPrivateModePrefix(activeModes: Set<number>): string {
 }
 
 interface PtyBufferManagerCallbacks {
-  onFlush(sessionId: string, data: string): void;
+  /** `endOffset` is the cumulative parser offset just past `data` (see
+   *  BufferState.parserWrittenChars), so a consumer holding a seed's
+   *  barrierOffset can tell which bytes the seed already contains. */
+  onFlush(sessionId: string, data: string, endOffset: number): void;
   /** Replay-drain report: fired synchronously at the moment a replay sample
    *  (getScrollback / getReplaySnapshot) empties the pending buffer as its
    *  double-delivery guard, carrying exactly the drained bytes (never an
@@ -314,8 +318,9 @@ interface PtyBufferManagerCallbacks {
    *  pending when a desktop terminal mounted the same session. Listeners
    *  must not call back into the buffer manager synchronously, and must not
    *  throw - a throw is caught and logged at the reportDrain chokepoint so
-   *  it can never unwind a replay whose pending buffer is already emptied. */
-  onDrain(sessionId: string, data: string): void;
+   *  it can never unwind a replay whose pending buffer is already emptied.
+   *  `endOffset` as for onFlush. */
+  onDrain(sessionId: string, data: string, endOffset: number): void;
   /** Fired when a session's stream transitions INTO the alternate screen
    *  buffer (inAltScreen false -> true during onData's mode parse) - the
    *  moment a fullscreen TUI demonstrably composed its first frame. This is
@@ -325,10 +330,22 @@ interface PtyBufferManagerCallbacks {
    *  post-boot geometry re-assert on it. Fires on EVERY entry (a TUI can
    *  leave and re-enter); the listener's own arming makes repeats no-ops. */
   onAltScreenEnter?(sessionId: string): void;
+  /** Fired when the stream leaves the alternate screen (a TUI exiting, or an
+   *  RIS). With `onAltScreenEnter` it lets a process that does not own this
+   *  buffer (main, while the pty host owns it) mirror the current state. */
+  onAltScreenExit?(sessionId: string): void;
 }
 
 interface BufferState {
   buffer: string;
+  /** Characters written to the headless parser by onData since init. The
+   *  pending buffer and the parser receive the same characters in the same
+   *  order (the pre-TUI clear injection included), so `parserWrittenChars -
+   *  buffer.length` is always the offset just past the last emitted
+   *  character. A seed records this at its serialize barrier (getSeedFrame);
+   *  every flushed or drained chunk carries its end offset, and a phone
+   *  drops tap bytes at or before the barrier because the seed holds them. */
+  parserWrittenChars: number;
   flushScheduled: boolean;
   /** Count of getReplaySnapshot samples currently awaiting their serialize.
    *  While > 0, scheduleFlush's tick re-arms instead of emitting, so no flush
@@ -438,7 +455,7 @@ interface BufferState {
    *  Its serialized frame is a snapshot of the PARSED grid, served instead of
    *  the raw byte replay so write-once static TUI cells (whose drawing bytes
    *  have aged out of the 512KB window) survive a cold replay. Two consumers:
-   *  the mobile seed (getSerializedFrame) and the desktop replay
+   *  the mobile seed (getSeedFrame) and the desktop replay
    *  (getReplaySnapshot, for alt-screen and geometry-gated sessions); desktop
    *  non-alt sessions still read the raw `scrollback` while their ring holds
    *  a single geometry. Disposed in removeSession. */
@@ -503,6 +520,7 @@ export class PtyBufferManager {
     }
     this.buffers.set(sessionId, {
       buffer: '',
+      parserWrittenChars: 0,
       flushScheduled: false,
       replaySamplesInFlight: 0,
       scrollback: previousScrollback,
@@ -561,6 +579,8 @@ export class PtyBufferManager {
       updateModeState(state, combined);
       if (!wasInAltScreen && state.inAltScreen) {
         this.callbacks.onAltScreenEnter?.(sessionId);
+      } else if (wasInAltScreen && !state.inAltScreen) {
+        this.callbacks.onAltScreenExit?.(sessionId);
       }
       // The TUI-takeover clear of a fresh session: the first NORMAL-buffer
       // full clear PRECEDED by printable output (ConPTY's escape-only startup
@@ -640,9 +660,11 @@ export class PtyBufferManager {
       if (bytesBeforeInjection) state.headless.write(bytesBeforeInjection);
       state.headless.write(PRE_TUI_SCROLLBACK_CLEAR);
       if (bytesAfterInjection) state.headless.write(bytesAfterInjection);
+      state.parserWrittenChars += bytesBeforeInjection.length + PRE_TUI_SCROLLBACK_CLEAR.length + bytesAfterInjection.length;
     } else {
       state.buffer += data;
       state.headless.write(data);
+      state.parserWrittenChars += data.length;
     }
     // Stamp the arrival so a pending repaint-settle can tell that the
     // post-resize redraw has landed (data after the resize) and then quiesced.
@@ -707,7 +729,7 @@ export class PtyBufferManager {
         : current.buffer.length;
       const chunk = current.buffer.slice(0, end);
       current.buffer = current.buffer.slice(end);
-      this.callbacks.onFlush(sessionId, chunk);
+      this.callbacks.onFlush(sessionId, chunk, current.parserWrittenChars - current.buffer.length);
       // Drain any remainder on the next tick instead of waiting for new data.
       if (current.buffer) this.scheduleFlush(sessionId, current);
     }, 16);
@@ -1112,12 +1134,13 @@ export class PtyBufferManager {
    *  getReplaySnapshot back into this manager) a harmless no-op instead of
    *  unbounded recursion with duplicate tap delivery - and at the serialize
    *  site it is also the counter's exception-safety. Report-before-clear
-   *  breaks both silently. */
-  private reportDrain(sessionId: string, drained: string): void {
+   *  breaks both silently. Because the buffer is already empty, the drained
+   *  bytes end exactly at the parser offset the caller passes. */
+  private reportDrain(sessionId: string, drained: string, endOffset: number): void {
     if (!drained) return;
     traceTerminal(sessionId, 'replay-drain', { bytes: drained.length });
     try {
-      this.callbacks.onDrain(sessionId, drained);
+      this.callbacks.onDrain(sessionId, drained, endOffset);
     } catch (error) {
       // Two of the three drain sites run after the pending buffer is already
       // emptied; a listener throw propagating from there would reject the
@@ -1139,7 +1162,7 @@ export class PtyBufferManager {
     // reports them through onDrain instead of dropping them.
     const drained = state.buffer;
     state.buffer = '';
-    this.reportDrain(sessionId, drained);
+    this.reportDrain(sessionId, drained, state.parserWrittenChars);
 
     let scrollback = state.scrollback;
 
@@ -1166,7 +1189,7 @@ export class PtyBufferManager {
     // A raw byte replay is not a frame snapshot. A fullscreen TUI does not redraw
     // every cell after every clear: write-once static cells keep their content
     // from earlier bytes, which is exactly why the mobile seed path uses the
-    // headless PARSED grid (`getSerializedFrame`) instead of this byte replay -
+    // headless PARSED grid (`getSeedFrame`) instead of this byte replay -
     // see the note on BufferState.headless. Slicing at the last clear discards
     // those cells, and when the sample lands at or just after a clear (likely on a
     // rapid reopen, where the settle rides its deadline mid-repaint) the replay is
@@ -1248,7 +1271,8 @@ export class PtyBufferManager {
 
   /**
    * Snapshot of the PARSED grid as a self-contained escape-sequence frame, for
-   * the mobile seed (getReplaySnapshot serves the desktop equivalent). Unlike
+   * the prompt-options probe; the mobile seed takes the same frame through
+   * getSeedFrame (getReplaySnapshot serves the desktop equivalent). Unlike
    * getScrollback (a raw 512KB byte replay), this reconstructs every
    * currently-visible cell whatever its draw age, so a fullscreen TUI's
    * write-once static regions are never dropped. The frame carries its own
@@ -1262,9 +1286,27 @@ export class PtyBufferManager {
    * need appears. Returns '' for an unknown session.
    */
   async getSerializedFrame(sessionId: string): Promise<string> {
+    return (await this.getSeedFrame(sessionId)).frame;
+  }
+
+  /**
+   * The mobile seed: the getSerializedFrame frame plus the parser offset its snapshot
+   * covers. serialize() is atomic with its parser barrier (see
+   * HeadlessFrameBuffer.serialize), so the frame holds exactly the characters
+   * written before this call, and `barrierOffset` is that count. A phone
+   * streaming the session's tap drops every chunk ending at or before it and
+   * slices the one that straddles it, so a byte that races the seed arrives
+   * exactly once. Unlike the desktop's replay sampling, this drains nothing:
+   * a desktop terminal on the same session keeps every byte it was owed.
+   *
+   * `scrollbackLines` caps the history rows included above the grid (see
+   * HeadlessFrameBuffer.serialize); the grid itself is always whole.
+   */
+  async getSeedFrame(sessionId: string, scrollbackLines?: number): Promise<Pick<SeedFrameResult, 'frame' | 'barrierOffset'>> {
     const state = this.buffers.get(sessionId);
-    if (!state) return '';
-    return state.headless.serialize();
+    if (!state) return { frame: '', barrierOffset: 0 };
+    const barrierOffset = state.parserWrittenChars;
+    return { frame: await state.headless.serialize(scrollbackLines), barrierOffset };
   }
 
   /**
@@ -1336,7 +1378,7 @@ export class PtyBufferManager {
     // this is synchronous, so no flush tick can interleave.
     const drainedBeforeSerialize = state.buffer;
     state.buffer = '';
-    this.reportDrain(sessionId, drainedBeforeSerialize);
+    this.reportDrain(sessionId, drainedBeforeSerialize, state.parserWrittenChars);
     state.replaySamplesInFlight += 1;
     try {
       let deadlineTimer: NodeJS.Timeout | undefined;
@@ -1377,7 +1419,7 @@ export class PtyBufferManager {
       // keeps the held flush tick silent once it re-fires.
       const tail = state.buffer;
       state.buffer = '';
-      this.reportDrain(sessionId, tail);
+      this.reportDrain(sessionId, tail, state.parserWrittenChars);
       // Re-assert the tracked DEC private modes after the frame. The serialize
       // addon emits mouse TRACKING from terminal.modes (?1000h etc.) but has no
       // API for the mouse ENCODING modes (1005/1006/1015/1016), so a bare frame
@@ -1441,5 +1483,10 @@ export class PtyBufferManager {
     const state = this.buffers.get(sessionId);
     if (!state) return null;
     return { pendingBytes: state.buffer.length, scrollbackBytes: state.scrollback.length };
+  }
+
+  /** Every session with a ring, for diagnostics. */
+  sessionIds(): string[] {
+    return [...this.buffers.keys()];
   }
 }

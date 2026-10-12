@@ -12,12 +12,16 @@
  *
  * Usage: node scripts/worktree-preview.js [--fresh] [--env KEY=VALUE]...
  *
- * `--env` forwards a variable into the dev server's environment. It has to
- * be spliced into the terminal command itself: the launcher hands the command
- * to wt.exe (or the platform's terminal), and a new tab inherits the terminal
- * HOST's environment, not this process's, so a variable merely set here never
- * reaches dev.js. That is how the analytics rig (docs/analytics.md, "Local
- * verification") silently lost its variables before this flag existed.
+ * `--env` forwards a variable into the dev server's environment. It is
+ * spliced into the terminal command itself because the launcher hands the
+ * command to the platform's terminal, which decides what environment the new
+ * tab gets. Terminal.app and gnome-terminal start it from their own
+ * long-running process, so a variable merely set here does not reach dev.js
+ * there, and the analytics rig (docs/analytics.md, "Local verification")
+ * silently lost its variables before this flag existed. Windows Terminal 1.24
+ * does pass this process's environment into the new tab (measured: a variable
+ * set in the launching shell reached it), which is also how a task's
+ * KANGENTIC_TASK_ID reaches a preview launched from that task's terminal.
  */
 
 const { spawn, execSync } = require('child_process');
@@ -25,6 +29,11 @@ const path = require('path');
 const fs = require('fs');
 const net = require('net');
 const { readExitRecord, clearExitRecord, classifyPreviewExit, exitRecordPath } = require('./preview-exit-record');
+const {
+  findOtherPreviewInstances,
+  isProcessAlive,
+  stoppingMarkerPathFor,
+} = require('./preview-isolation');
 
 // ---------------------------------------------------------------------------
 // Worktree / root detection
@@ -61,6 +70,54 @@ function findRootProject(worktreeDir) {
 // node_modules junction / symlink
 // ---------------------------------------------------------------------------
 
+/**
+ * The dependency tree a lockfile declares, as one comparable string: every
+ * `packages` entry, with the `version` dropped from the root and workspace
+ * entries (the keys outside `node_modules/`). A release bumps those versions
+ * without changing a dependency, and a root checkout one release ahead of the
+ * branch would otherwise read as a different tree.
+ */
+function dependencyTree(lockText) {
+  const lock = JSON.parse(lockText);
+  const packages = {};
+  for (const [key, entry] of Object.entries(lock.packages ?? {})) {
+    if (!key.startsWith('node_modules/') && entry && typeof entry === 'object') {
+      const withoutVersion = { ...entry };
+      delete withoutVersion.version;
+      packages[key] = withoutVersion;
+    } else {
+      packages[key] = entry;
+    }
+  }
+  return JSON.stringify({ packages, dependencies: lock.dependencies ?? null });
+}
+
+/**
+ * Whether the worktree's package-lock.json declares a different dependency tree
+ * than the root's. A branch that adds, removes or bumps a dependency needs its
+ * OWN install: previewing it against the root's junctioned node_modules runs
+ * the root's packages, which either fails to resolve the new one (a Vite
+ * "Failed to resolve import") or, worse, quietly runs a code path whose native
+ * module is missing. Unreadable lockfiles count as "same", keeping the old
+ * junction behavior. A lockfile that is not JSON (a merge left conflict
+ * markers in it) is compared as text.
+ */
+function lockfilesDiffer(worktreeDir, rootDir) {
+  let worktreeLock;
+  let rootLock;
+  try {
+    worktreeLock = fs.readFileSync(path.join(worktreeDir, 'package-lock.json'), 'utf8');
+    rootLock = fs.readFileSync(path.join(rootDir, 'package-lock.json'), 'utf8');
+  } catch {
+    return false;
+  }
+  try {
+    return dependencyTree(worktreeLock) !== dependencyTree(rootLock);
+  } catch {
+    return worktreeLock.replace(/\r\n/g, '\n') !== rootLock.replace(/\r\n/g, '\n');
+  }
+}
+
 function ensureNodeModulesLink(worktreeDir, rootDir) {
   const rootModules = path.join(rootDir, 'node_modules');
   const wtModules = path.join(worktreeDir, 'node_modules');
@@ -71,6 +128,8 @@ function ensureNodeModulesLink(worktreeDir, rootDir) {
     );
   }
 
+  const ownDependencies = lockfilesDiffer(worktreeDir, rootDir);
+
   // Check if the link already exists and points to the right place
   try {
     const stat = fs.lstatSync(wtModules);
@@ -80,12 +139,19 @@ function ensureNodeModulesLink(worktreeDir, rootDir) {
       const target = fs.realpathSync(wtModules);
       const rootReal = fs.realpathSync(rootModules);
       if (target === rootReal) {
+        if (ownDependencies) warnJunctionedAgainstOwnLockfile(worktreeDir);
         console.log('[preview] node_modules junction already correct');
         return;
       }
       // Points elsewhere -- remove and recreate
       console.log('[preview] node_modules junction points elsewhere, recreating...');
       fs.rmSync(wtModules, { recursive: true, force: true });
+    } else if (ownDependencies) {
+      // A real install for a branch whose dependencies differ from the root's
+      // is exactly what this preview needs. Deleting it (the old behavior)
+      // previewed the branch against the root's packages.
+      console.log("[preview] Keeping this worktree's own node_modules: its package-lock.json differs from the root's.");
+      return;
     } else {
       // Real directory (from a previous npm install) -- remove it
       console.log('[preview] Removing existing node_modules directory...');
@@ -96,10 +162,21 @@ function ensureNodeModulesLink(worktreeDir, rootDir) {
     // Doesn't exist yet -- will create below
   }
 
+  if (ownDependencies) warnJunctionedAgainstOwnLockfile(worktreeDir);
+
   // Create the junction/symlink
   const linkType = process.platform === 'win32' ? 'junction' : 'dir';
   fs.symlinkSync(rootModules, wtModules, linkType);
   console.log(`[preview] Created ${linkType}: ${wtModules} -> ${rootModules}`);
+}
+
+function warnJunctionedAgainstOwnLockfile(worktreeDir) {
+  console.warn(
+    "[preview] WARNING: this worktree's package-lock.json differs from the root's, but node_modules is "
+    + "the root's junction, so the preview runs the ROOT's packages. Replace the junction with a real "
+    + `install (remove the junction, then "npm install" in ${worktreeDir}) and relaunch; the preview `
+    + 'keeps a real install when the lockfiles differ.',
+  );
 }
 
 function isJunction(p) {
@@ -377,15 +454,6 @@ function stopFilePathFor(worktreeDir, port) {
  *  it (see the comment at the wait loop). */
 const STOP_GRACE_MS = 45000;
 
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function forceKill(pid) {
   try {
     if (process.platform === 'win32') {
@@ -438,18 +506,22 @@ async function stopPreview(worktreeDir, requestedPort) {
       continue;
     }
 
-    console.log(`[preview] Port ${port}: requesting graceful stop of PID ${pid}...`);
-    fs.writeFileSync(stopFilePathFor(worktreeDir, port), String(Date.now()));
+    if (fs.existsSync(stoppingMarkerPathFor(worktreeDir, port))) {
+      // Already stopping (a closed terminal or window, or an earlier --stop): no
+      // stop file to write, only the exit to wait for.
+      console.log(`[preview] Port ${port}: PID ${pid} is already shutting down, waiting...`);
+    } else {
+      console.log(`[preview] Port ${port}: requesting graceful stop of PID ${pid}...`);
+      fs.writeFileSync(stopFilePathFor(worktreeDir, port), String(Date.now()));
+    }
 
     // dev.js polls for the stop file every 500ms, asks Electron to quit
-    // through its real quit path (up to 8s), and then removes the worktree's
-    // .kangentic/, which holds two full clones of the repo. That removal alone
-    // takes longer than the old 10s window on Windows once Electron has
-    // exited cleanly and nothing holds the files, which is how a graceful stop
-    // read as "no graceful exit" and got force-killed mid-removal, leaving a
-    // half-deleted tree behind. The kill path used to fit in 10s only because
-    // the killed Electron's children kept the clones locked and the removal
-    // failed at once.
+    // through its real quit path (up to 8s), and then moves the worktree's
+    // .kangentic/ into a trash folder a detached process deletes. A rename
+    // that a held handle refuses falls back to deleting the two repo clones in
+    // place, which takes longer than the old 10s window on Windows, which is
+    // how a graceful stop once read as "no graceful exit" and got force-killed
+    // mid-removal. Hence the generous grace.
     const deadline = Date.now() + STOP_GRACE_MS;
     while (Date.now() < deadline && isProcessAlive(pid)) {
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -461,6 +533,44 @@ async function stopPreview(worktreeDir, requestedPort) {
       removeStalePidFile(worktreeDir, port);
     } else {
       console.log(`[preview] Port ${port}: stopped cleanly (terminal tab closes itself)`);
+    }
+  }
+}
+
+/**
+ * One preview per worktree. Every preview of a worktree uses the same
+ * <worktree>/.kangentic/data, and both a launch and an exit cleanup delete it, so
+ * a second preview breaks the first. A relaunch that overlapped an exit once got
+ * its clone's `.git` deleted, and that clone's fill then hard-reset the worktree
+ * itself (see scripts/preview-isolation.js). So a running preview refuses the
+ * launch, and one that is shutting down is waited out first.
+ *
+ * Runs before the port scan: the outgoing preview may already have released its
+ * port, and launching on that port clears its PID file and exit record.
+ */
+async function waitForOtherPreviews(worktreeDir) {
+  const otherPreviews = findOtherPreviewInstances(worktreeDir);
+  const runningPreviews = otherPreviews.filter((instance) => !instance.shuttingDown);
+  if (runningPreviews.length > 0) {
+    const ports = runningPreviews.map((instance) => instance.port).join(', ');
+    throw new Error(
+      `A preview of this worktree is already running on port ${ports}, and two would share and delete one data folder. `
+      + 'Stop it first: node scripts/worktree-preview.js --stop'
+    );
+  }
+  for (const instance of otherPreviews) {
+    console.log(`[preview] Waiting for the preview on port ${instance.port} (PID ${instance.pid}) to finish shutting down...`);
+    // The same liveness test findOtherPreviewInstances used, so the wait and the
+    // scan never disagree about a pid.
+    const deadline = Date.now() + STOP_GRACE_MS;
+    while (Date.now() < deadline && isProcessAlive(instance.pid)) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (isProcessAlive(instance.pid)) {
+      throw new Error(
+        `The preview on port ${instance.port} (PID ${instance.pid}) is still shutting down after ${STOP_GRACE_MS / 1000}s. `
+        + `Try again, or end it with: node scripts/worktree-preview.js --stop --port=${instance.port}`
+      );
     }
   }
 }
@@ -634,6 +744,7 @@ async function main() {
 
   ensureNodeModulesLink(worktreeDir, rootDir);
 
+  await waitForOtherPreviews(worktreeDir);
   const port = await findAvailablePort(5174);
   removeStalePidFile(worktreeDir, port);
   clearExitRecord(worktreeDir, port);
@@ -674,5 +785,20 @@ if (require.main === module) {
 // quoting of --env: a quoting bug here is silent (the preview launches, the
 // variable is simply wrong or missing), so it needs a mechanical guard.
 // buildAppleScriptCommand is exported for the same reason (see its own
-// comment above openTerminalMac).
-module.exports = { buildCommand, envPrefix, parseEnvArgs, buildAppleScriptCommand };
+// comment above openTerminalMac). ensureNodeModulesLink is exported for
+// tests/unit/worktree-preview-node-modules.test.ts, which pins that a branch
+// with its own dependencies keeps its own install. waitForOtherPreviews is
+// exported for tests/unit/preview-isolation.test.ts. pidFilePathFor and
+// stopFilePathFor are exported for tests/unit/worktree-preview-stop.test.ts,
+// which pins them against the dev-build Done stop
+// (src/devtools/main/worktree-preview-stop.ts) that speaks the same protocol.
+module.exports = {
+  buildCommand,
+  envPrefix,
+  parseEnvArgs,
+  buildAppleScriptCommand,
+  ensureNodeModulesLink,
+  waitForOtherPreviews,
+  pidFilePathFor,
+  stopFilePathFor,
+};

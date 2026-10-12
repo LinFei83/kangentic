@@ -27,6 +27,11 @@
  *      applyConfigOnOpen()/exportFromDb() when the current project changed
  *      before the setImmediate callback fires, and runs both when it hasn't.
  *
+ * Section 6 adds a fourth: startToolBreakdownRepair (module-private) is started
+ * from all three open paths once recovery has run, with the project's own
+ * database and `<project>/.kangentic/sessions`, hands its replay to the
+ * retrieval worker, and never runs twice at once for one project.
+ *
  * Pattern: capture ipcMain.handle registrations (board-swimlane-update-restart
  * pattern) to invoke the real PROJECT_OPEN handler for #2; call the exported
  * activateAllProjects/openProjectByPath functions directly for #1/#3. Every
@@ -52,6 +57,11 @@ const state = vi.hoisted(() => ({
   cleanupGate: null as { promise: Promise<void>; resolve: () => void } | null,
   resumeError: null as Error | null,
   autoSpawnError: null as Error | null,
+  // One entry per repairToolBreakdownDurations call: the sessions directory it
+  // was handed and a copy of `callOrder` at that moment.
+  repairSnapshots: [] as Array<{ sessionsDir: string; callOrder: string[] }>,
+  // While set, a mocked repair run stays in flight until it resolves.
+  repairGate: null as { promise: Promise<void>; resolve: () => void } | null,
 }));
 
 // ---------------------------------------------------------------------------
@@ -86,23 +96,23 @@ vi.mock('../../src/main/ipc/handlers/project-relocate', () => ({
 }));
 
 vi.mock('../../src/main/transition-engine/session-startup', () => ({
-  resumeSuspendedSessions: vi.fn(async (...args: unknown[]) => {
+  resumeSuspendedSessions: vi.fn(async () => {
     state.callOrder.push('resumeSuspendedSessions');
     if (state.resumeError) throw state.resumeError;
   }),
-  autoSpawnTasks: vi.fn(async (...args: unknown[]) => {
+  autoSpawnTasks: vi.fn(async () => {
     state.callOrder.push('autoSpawnTasks');
     if (state.autoSpawnError) throw state.autoSpawnError;
   }),
 }));
 
 vi.mock('../../src/main/transition-engine/resource-cleanup', () => ({
-  cleanupStaleResourcesAsync: vi.fn(async (...args: unknown[]) => {
+  cleanupStaleResourcesAsync: vi.fn(async () => {
     state.callOrder.push('cleanupStaleResourcesAsync');
     if (state.cleanupGate) await state.cleanupGate.promise;
     if (state.cleanupError) throw state.cleanupError;
   }),
-  pruneOrphanedWorktreeTasks: vi.fn(async (...args: unknown[]) => {
+  pruneOrphanedWorktreeTasks: vi.fn(async () => {
     state.callOrder.push('pruneOrphanedWorktreeTasks');
     if (state.pruneResult instanceof Error) throw state.pruneResult;
     return state.pruneResult;
@@ -140,6 +150,8 @@ vi.mock('../../src/main/config/apply-runtime-config', () => ({
 
 vi.mock('../../src/main/ipc/helpers', () => ({
   ensureGitignore: vi.fn(async () => {}),
+  reapTaskLeftovers: vi.fn(async () => {}),
+  leftoverSweepOptions: vi.fn(() => ({ stoppingEnabled: () => true, onReport: () => {} })),
 }));
 
 vi.mock('../../src/main/ipc/helpers/project-entry-search', () => ({
@@ -168,6 +180,33 @@ vi.mock('../../src/main/git/git-fetch-scheduler', () => ({
 
 vi.mock('../../src/main/retrieval/retrieval-service', () => ({
   retrievalService: { startForProject: vi.fn(), stop: vi.fn(), reconcileEmbedWorker: vi.fn() },
+}));
+
+// The worker client: `call` carries the tool breakdown replay (section 6),
+// `closeProject` is awaited by cleanupProject.
+vi.mock('../../src/main/retrieval/retrieval-client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/main/retrieval/retrieval-client')>()),
+  retrievalClient: {
+    call: vi.fn(async () => ({ breakdowns: {}, unreadable: [] })),
+    closeProject: vi.fn(async () => undefined),
+  },
+}));
+
+// The one-time duration repair. The real helper is covered against a real
+// database in tool-breakdown-repair.test.ts; here it only records that it was
+// started, with what, and after which recovery steps, then forwards one replay
+// to the worker the way the real one does.
+vi.mock('../../src/main/ipc/helpers/tool-breakdown-repair', () => ({
+  repairToolBreakdownDurations: vi.fn(async (
+    _database: unknown,
+    sessionsDir: string,
+    replay: (sessionsDir: string, sessionIds: string[]) => Promise<unknown>,
+  ) => {
+    state.repairSnapshots.push({ sessionsDir, callOrder: [...state.callOrder] });
+    if (state.repairGate) await state.repairGate.promise;
+    await replay(sessionsDir, ['record-1']);
+    return { completed: true, scanned: 1, repaired: 0, unreadable: 0 };
+  }),
 }));
 
 // The board_snapshot analytics callback (scheduleBoardSnapshot, reached from
@@ -206,13 +245,18 @@ vi.mock('../../src/main/db/repositories/task-repository', () => ({
 import { trackEvent } from '../../src/main/analytics/analytics';
 import { isShuttingDown } from '../../src/main/shutdown-state';
 import { gitFetchScheduler } from '../../src/main/git/git-fetch-scheduler';
+import { getProjectDb } from '../../src/main/db/database';
+import { retrievalClient } from '../../src/main/retrieval/retrieval-client';
+import { repairToolBreakdownDurations } from '../../src/main/ipc/helpers/tool-breakdown-repair';
 import { DEFAULT_SWIMLANES } from '../../src/main/db/migrations/default-data';
 import {
   registerProjectHandlers,
   openProjectByPath,
   activateAllProjects,
   cleanupProject,
+  recoverSessionsAfterPtyHostLoss,
 } from '../../src/main/ipc/handlers/projects';
+import { resumeSuspendedSessions, autoSpawnTasks } from '../../src/main/transition-engine/session-startup';
 import { ensureGitignore } from '../../src/main/ipc/helpers';
 import { TaskRepository } from '../../src/main/db/repositories/task-repository';
 import { IPC, PROJECT_NOT_FOUND_PREFIX } from '../../src/shared/ipc-channels';
@@ -249,7 +293,7 @@ interface MockContext {
     create: ReturnType<typeof vi.fn>;
     updateLastOpened: ReturnType<typeof vi.fn>;
   };
-  sessionManager: { setTranscriptRepository: ReturnType<typeof vi.fn> };
+  sessionManager: Record<string, unknown>;
   configManager: { getEffectiveConfig: ReturnType<typeof vi.fn> };
   boardConfigManager: {
     attach: ReturnType<typeof vi.fn>;
@@ -257,6 +301,7 @@ interface MockContext {
     applyConfigOnOpen: ReturnType<typeof vi.fn>;
     exportFromDb: ReturnType<typeof vi.fn>;
     getBoardProfiles: ReturnType<typeof vi.fn>;
+    sendOpenWarnings: ReturnType<typeof vi.fn>;
   };
   currentProjectId: string | null;
   currentProjectPath: string | null;
@@ -274,7 +319,12 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
       create: vi.fn(),
       updateLastOpened: vi.fn(),
     },
-    sessionManager: { setTranscriptRepository: vi.fn() },
+    // A project delete has the pty host close its database handle first. The
+    // host-loss recovery reads the registry to map lost session ids to tasks.
+    sessionManager: {
+      closeProjectInPtyHost: vi.fn(async () => undefined),
+      listSessions: vi.fn(() => []),
+    },
     configManager: { getEffectiveConfig: vi.fn(() => ({ mcpServer: { enabled: false } })) },
     boardConfigManager: {
       attach: vi.fn(),
@@ -282,6 +332,7 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
       applyConfigOnOpen: vi.fn(() => []),
       exportFromDb: vi.fn(),
       getBoardProfiles: vi.fn(() => []),
+      sendOpenWarnings: vi.fn(),
     },
     currentProjectId: null,
     currentProjectPath: null,
@@ -320,6 +371,8 @@ beforeEach(() => {
   state.cleanupGate = null;
   state.resumeError = null;
   state.autoSpawnError = null;
+  state.repairSnapshots = [];
+  state.repairGate = null;
   // mockReturnValue persists across tests (vi.clearAllMocks() resets call
   // history, not implementation), so reset both to their neutral defaults
   // here rather than letting one test's override leak into the next.
@@ -842,6 +895,9 @@ describe('PROJECT_OPEN cold-open block (registerProjectHandlers)', () => {
         return deferred.promise;
       }),
       remove: vi.fn((sessionId: string) => { timeline.push(`remove:${sessionId}`); }),
+      // cleanupProject also cancels and awaits every task's in-flight spawn and
+      // any other session of the task, once the session rows are removed.
+      removeByTaskId: vi.fn(async (taskId: string) => { timeline.push(`removeByTaskId:${taskId}`); }),
     });
 
     // The mocked TaskRepository class only defines countAll (see the module
@@ -876,6 +932,7 @@ describe('PROJECT_OPEN cold-open block (registerProjectHandlers)', () => {
         'kill:session-1', 'awaitExit:session-1',
         'kill:session-2', 'awaitExit:session-2',
         'remove:session-1', 'remove:session-2',
+        'removeByTaskId:task-1', 'removeByTaskId:task-2',
       ]);
     } finally {
       delete (TaskRepository.prototype as unknown as { list?: unknown }).list;
@@ -923,6 +980,62 @@ describe("openProjectByPath's deferred board-config block", () => {
 
     expect(context.boardConfigManager.applyConfigOnOpen).not.toHaveBeenCalled();
     expect(context.boardConfigManager.exportFromDb).not.toHaveBeenCalled();
+  });
+
+  // The reconcile's warnings used to reach only the log, so a broken
+  // kangentic.json left the board on stale data with nothing on screen.
+  it('pushes the reconcile warnings to the renderer, tagged with the project', async () => {
+    const context = createMockContext();
+    const project = makeProject();
+    context.projectRepo.list.mockReturnValue([project]);
+    context.recoveredProjects.add(project.id);
+    context.boardConfigManager.exists.mockReturnValue(true);
+    context.boardConfigManager.applyConfigOnOpen.mockReturnValue(['kangentic.json could not be read']);
+    state.existingPaths.add(project.path);
+
+    await openProjectByPath(asIpcContext(context), project.path);
+    await flushSetImmediate();
+
+    expect(context.boardConfigManager.sendOpenWarnings).toHaveBeenCalledWith(project.id, ['kangentic.json could not be read']);
+  });
+
+  it('pushes an empty list when there is no kangentic.json, so the last banner clears', async () => {
+    const context = createMockContext();
+    const project = makeProject();
+    context.projectRepo.list.mockReturnValue([project]);
+    context.recoveredProjects.add(project.id);
+    state.existingPaths.add(project.path);
+
+    await openProjectByPath(asIpcContext(context), project.path);
+    await flushSetImmediate();
+
+    expect(context.boardConfigManager.sendOpenWarnings).toHaveBeenCalledWith(project.id, []);
+  });
+
+  it('turns a reconcile that throws into a warning rather than only a log line', async () => {
+    const context = createMockContext();
+    const project = makeProject();
+    context.projectRepo.list.mockReturnValue([project]);
+    context.recoveredProjects.add(project.id);
+    context.boardConfigManager.exists.mockReturnValue(true);
+    context.boardConfigManager.applyConfigOnOpen.mockImplementation(() => {
+      throw new TypeError('(group ?? []) is not iterable');
+    });
+    state.existingPaths.add(project.path);
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await openProjectByPath(asIpcContext(context), project.path);
+    await flushSetImmediate();
+    const loggedErrors = consoleError.mock.calls.map((call) => call.map(String).join(' '));
+    consoleError.mockRestore();
+
+    const [, warnings] = context.boardConfigManager.sendOpenWarnings.mock.calls[0] as [string, string[]];
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('kangentic.json could not be applied');
+    // The error goes to the log, not the banner: a message can carry an
+    // absolute path, and the banner is on screen in demos and screen shares.
+    expect(warnings[0]).not.toContain('is not iterable');
+    expect(loggedErrors.some((message) => message.includes('is not iterable'))).toBe(true);
   });
 });
 
@@ -1010,5 +1123,382 @@ describe('ensureGitignore fire-and-forget on the open critical path', () => {
       expect(state.callOrder).toContain('autoSpawnTasks');
     }, { timeout: 2000 });
     gate.resolve();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. recoverSessionsAfterPtyHostLoss: the pty host died and a new one is up.
+// ---------------------------------------------------------------------------
+
+describe('recoverSessionsAfterPtyHostLoss', () => {
+  // resumeSuspendedSessions' tenth parameter is the scope: without it the
+  // recovery gather would also wake sessions the host never held. Red-green:
+  // drop `lostSessionIds` from the call in projects.ts and the first test goes
+  // red (the tenth argument is undefined).
+  const RESUME_ONLY_SESSION_IDS_ARGUMENT = 9;
+  // autoSpawnTasks' tenth parameter is its scope, for the same reason: an
+  // unscoped pass would also restart a task whose agent exited earlier this run.
+  // It is `{ taskIds, lostSessionIds }`: the lost sessions' tasks, and the lost
+  // rows themselves, so the pass can tell them from a later row of the same task
+  // (a resume whose spawn failed leaves one) that must keep a fresh agent away.
+  // Red-green: pass `lostTaskIds` bare, or leave `lostSessionIds` out of the
+  // object, in projects.ts and the two tests that read it go red.
+  const AUTO_SPAWN_LOST_SCOPE_ARGUMENT = 9;
+
+  function registerProjects(context: MockContext, projects: Project[]): void {
+    const byId = new Map(projects.map((project) => [project.id, project]));
+    context.projectRepo.getById.mockImplementation((projectId: string) => byId.get(projectId));
+    for (const project of projects) state.existingPaths.add(project.path);
+  }
+
+  afterEach(() => {
+    // The top-level beforeEach clears call history, not a custom implementation.
+    vi.mocked(isShuttingDown).mockReturnValue(false);
+  });
+
+  it('resumes each project with exactly the session ids its host loss took down', async () => {
+    const context = createMockContext();
+    const projectA = makeProject({ id: 'project-A', name: 'Project A', path: path.join(PROJECT_PATH, 'a'), default_agent: 'claude' });
+    const projectB = makeProject({ id: 'project-B', name: 'Project B', path: path.join(PROJECT_PATH, 'b'), default_agent: 'codex' });
+    registerProjects(context, [projectA, projectB]);
+    const lostInA = new Set(['session-a1', 'session-a2']);
+    const lostInB = new Set(['session-b1']);
+
+    await recoverSessionsAfterPtyHostLoss(asIpcContext(context), new Map([['project-A', lostInA], ['project-B', lostInB]]));
+
+    const calls = vi.mocked(resumeSuspendedSessions).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0][0]).toBe('project-A');
+    expect(calls[0][1]).toBe(projectA.path);
+    expect(calls[0][2]).toBe(context.sessionManager);
+    expect(calls[0][4]).toBe('claude');
+    expect(calls[0][RESUME_ONLY_SESSION_IDS_ARGUMENT]).toBe(lostInA);
+    expect(calls[1][0]).toBe('project-B');
+    expect(calls[1][4]).toBe('codex');
+    expect(calls[1][RESUME_ONLY_SESSION_IDS_ARGUMENT]).toBe(lostInB);
+  });
+
+  it('then starts fresh only the tasks whose sessions the loss took down, the way startup does', async () => {
+    const context = createMockContext();
+    const project = makeProject({ id: 'project-A', name: 'Project A', path: path.join(PROJECT_PATH, 'a') });
+    registerProjects(context, [project]);
+    // session-a2 had no agent session id, so the resume could not take it back;
+    // session-other belongs to a task the host loss never touched.
+    context.sessionManager.listSessions = vi.fn(() => [
+      { id: 'session-a1', taskId: 'task-1', status: 'running' },
+      { id: 'session-a2', taskId: 'task-2', status: 'exited' },
+      { id: 'session-other', taskId: 'task-3', status: 'exited' },
+    ]);
+
+    const lostInA = new Set(['session-a1', 'session-a2']);
+
+    await recoverSessionsAfterPtyHostLoss(asIpcContext(context), new Map([['project-A', lostInA]]));
+
+    expect(state.callOrder).toEqual(['resumeSuspendedSessions', 'autoSpawnTasks']);
+    const autoSpawnCalls = vi.mocked(autoSpawnTasks).mock.calls;
+    expect(autoSpawnCalls).toHaveLength(1);
+    expect(autoSpawnCalls[0][0]).toBe('project-A');
+    expect(autoSpawnCalls[0][2]).toBe(context.sessionManager);
+    // Both lost tasks go in; which of them already has a session again is for
+    // autoSpawnTasks to decide from the registry. `toEqual` on the object also
+    // pins the shape: no key beyond these two.
+    expect(autoSpawnCalls[0][AUTO_SPAWN_LOST_SCOPE_ARGUMENT]).toEqual({
+      taskIds: new Set(['task-1', 'task-2']),
+      lostSessionIds: lostInA,
+    });
+    // The project's own lost set, not a copy that could drift from what the resume got.
+    expect(autoSpawnCalls[0][AUTO_SPAWN_LOST_SCOPE_ARGUMENT]?.lostSessionIds).toBe(lostInA);
+  });
+
+  it('reads the lost tasks before the resume replaces the rows it brings back, and leaves out a lost row with no task', async () => {
+    // The resume swaps a lost row for a fresh one (new id, running), so a read
+    // after it finds no lost id. Red-green: move the `lostTaskIds` read below the
+    // resume in projects.ts and the set is empty; drop its `&& session.taskId`
+    // filter and the set gains `undefined`.
+    const context = createMockContext();
+    const project = makeProject({ id: 'project-A', name: 'Project A', path: path.join(PROJECT_PATH, 'a') });
+    registerProjects(context, [project]);
+    interface RegistryRow { id: string; taskId: string | undefined; status: string }
+    const listSessions = vi.fn((): RegistryRow[] => [
+      { id: 'session-a1', taskId: 'task-1', status: 'exited' },
+      { id: 'session-a2', taskId: 'task-2', status: 'exited' },
+      { id: 'session-a3', taskId: undefined, status: 'exited' },
+      { id: 'session-other', taskId: 'task-3', status: 'exited' },
+    ]);
+    context.sessionManager.listSessions = listSessions;
+    let resumeRan = false;
+    vi.mocked(resumeSuspendedSessions).mockImplementationOnce(async () => {
+      state.callOrder.push('resumeSuspendedSessions');
+      resumeRan = true;
+      listSessions.mockReturnValue([
+        { id: 'session-new-1', taskId: 'task-1', status: 'running' },
+        { id: 'session-new-2', taskId: 'task-2', status: 'running' },
+        { id: 'session-other', taskId: 'task-3', status: 'exited' },
+      ]);
+    });
+
+    const lostInA = new Set(['session-a1', 'session-a2', 'session-a3']);
+
+    await recoverSessionsAfterPtyHostLoss(asIpcContext(context), new Map([['project-A', lostInA]]));
+
+    // The swap happened before autoSpawnTasks ran, so a late read would see it.
+    expect(resumeRan).toBe(true);
+    expect(state.callOrder).toEqual(['resumeSuspendedSessions', 'autoSpawnTasks']);
+    const autoSpawnCalls = vi.mocked(autoSpawnTasks).mock.calls;
+    expect(autoSpawnCalls).toHaveLength(1);
+    // The lost ids stay whole, session-a3 included: it has no task, so it is out
+    // of `taskIds`, but it is still a lost row the scoped pass must not count.
+    expect(autoSpawnCalls[0][AUTO_SPAWN_LOST_SCOPE_ARGUMENT]).toEqual({
+      taskIds: new Set(['task-1', 'task-2']),
+      lostSessionIds: lostInA,
+    });
+    expect(autoSpawnCalls[0][AUTO_SPAWN_LOST_SCOPE_ARGUMENT]?.lostSessionIds).toBe(lostInA);
+  });
+
+  it('skips a project that left the index and one whose folder is gone, and still resumes the rest', async () => {
+    const context = createMockContext();
+    const projectMoved = makeProject({ id: 'project-moved', path: path.join(PROJECT_PATH, 'moved') });
+    const projectKept = makeProject({ id: 'project-kept', path: path.join(PROJECT_PATH, 'kept') });
+    registerProjects(context, [projectMoved, projectKept]);
+    // Deleted from disk after it was registered; 'project-deleted' was never in the index.
+    state.existingPaths.delete(projectMoved.path);
+
+    await recoverSessionsAfterPtyHostLoss(asIpcContext(context), new Map([
+      ['project-deleted', new Set(['session-1'])],
+      ['project-moved', new Set(['session-2'])],
+      ['project-kept', new Set(['session-3'])],
+    ]));
+
+    const resumedProjectIds = vi.mocked(resumeSuspendedSessions).mock.calls.map((call) => call[0]);
+    expect(resumedProjectIds).toEqual(['project-kept']);
+  });
+
+  it('a project whose resume fails is logged and does not stop the next, and the recovery never rejects', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const context = createMockContext();
+      const projectA = makeProject({ id: 'project-A', name: 'Project A', path: path.join(PROJECT_PATH, 'a') });
+      const projectB = makeProject({ id: 'project-B', name: 'Project B', path: path.join(PROJECT_PATH, 'b') });
+      registerProjects(context, [projectA, projectB]);
+      vi.mocked(resumeSuspendedSessions).mockRejectedValueOnce(new Error('resume exploded'));
+
+      await expect(recoverSessionsAfterPtyHostLoss(asIpcContext(context), new Map([
+        ['project-A', new Set(['session-a1'])],
+        ['project-B', new Set(['session-b1'])],
+      ]))).resolves.toBeUndefined();
+
+      expect(vi.mocked(resumeSuspendedSessions).mock.calls.map((call) => call[0])).toEqual(['project-A', 'project-B']);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0][0])).toContain('Project A');
+    } finally {
+      // Restored on a failed assertion too, or every later test runs with
+      // console.error silenced and hides its own failure output.
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('stops resuming once the quit has begun, even partway through the projects', async () => {
+    const context = createMockContext();
+    const projectA = makeProject({ id: 'project-A', path: path.join(PROJECT_PATH, 'a') });
+    const projectB = makeProject({ id: 'project-B', path: path.join(PROJECT_PATH, 'b') });
+    registerProjects(context, [projectA, projectB]);
+    // The first project's check passes; the quit begins before the second's.
+    vi.mocked(isShuttingDown).mockReturnValueOnce(false).mockReturnValue(true);
+
+    await recoverSessionsAfterPtyHostLoss(asIpcContext(context), new Map([
+      ['project-A', new Set(['session-a1'])],
+      ['project-B', new Set(['session-b1'])],
+    ]));
+
+    expect(vi.mocked(resumeSuspendedSessions).mock.calls.map((call) => call[0])).toEqual(['project-A']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. startToolBreakdownRepair: the one-time repair of per-tool durations, fired
+//    from the three open paths once recovery has run. Every case uses its own
+//    project ids and counts only the repair calls made for that project's
+//    sessions directory, because the in-flight set is module-level and a
+//    neighbouring case's run must not be able to skip or inflate this one.
+// ---------------------------------------------------------------------------
+
+describe('startToolBreakdownRepair (the one-time tool breakdown duration repair)', () => {
+  const COLD_OPEN_RECOVERY = [
+    'pruneOrphanedWorktreeTasks',
+    'cleanupStaleResourcesAsync',
+    'resumeSuspendedSessions',
+    'autoSpawnTasks',
+  ];
+  const databases = new Map<string, object>();
+
+  /** A distinct database object per project id, so a repair handed the wrong project's database shows. */
+  function databaseFor(projectId: string): object {
+    let database = databases.get(projectId);
+    if (!database) {
+      database = { databaseOf: projectId };
+      databases.set(projectId, database);
+    }
+    return database;
+  }
+
+  function makeRepairProject(name: string): Project {
+    return makeProject({ id: `repair-${name}`, name: `Repair ${name}`, path: path.join(PROJECT_PATH, `repair-${name}`) });
+  }
+
+  function sessionsDirOf(project: Project): string {
+    return path.join(project.path, '.kangentic', 'sessions');
+  }
+
+  function repairCallsFor(project: Project) {
+    return vi.mocked(repairToolBreakdownDurations).mock.calls.filter((callArguments) => callArguments[1] === sessionsDirOf(project));
+  }
+
+  function resumeCallsFor(project: Project) {
+    return vi.mocked(resumeSuspendedSessions).mock.calls.filter((callArguments) => callArguments[0] === project.id);
+  }
+
+  function recoveryBeforeRepairOf(project: Project): string[] | undefined {
+    return state.repairSnapshots.find((snapshot) => snapshot.sessionsDir === sessionsDirOf(project))?.callOrder;
+  }
+
+  async function registerAndOpen(context: MockContext, project: Project): Promise<void> {
+    context.projectRepo.getById.mockReturnValue(project);
+    state.existingPaths.add(project.path);
+    registerProjectHandlers(asIpcContext(context));
+    const handler = capturedHandlers.get(IPC.PROJECT_OPEN);
+    if (!handler) throw new Error('PROJECT_OPEN handler was not registered');
+    await handler(null, project.id);
+  }
+
+  function expectStartedOnceFor(project: Project): void {
+    const calls = repairCallsFor(project);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe(databaseFor(project.id));
+    expect(calls[0][1]).toBe(path.join(project.path, '.kangentic', 'sessions'));
+    // The replay it is handed runs in the retrieval worker, with no time limit
+    // on a project's whole history.
+    expect(vi.mocked(retrievalClient.call)).toHaveBeenCalledWith(
+      'sessions.replayToolBreakdowns',
+      { sessionsDir: sessionsDirOf(project), sessionIds: ['record-1'] },
+      { timeoutMs: null },
+    );
+  }
+
+  beforeEach(() => {
+    databases.clear();
+    vi.mocked(getProjectDb).mockImplementation(((projectId: string) => databaseFor(projectId)) as never);
+  });
+
+  afterEach(() => {
+    // The top-level beforeEach clears call history, not a custom implementation.
+    vi.mocked(getProjectDb).mockImplementation((() => ({})) as never);
+    state.repairGate?.resolve();
+    state.repairGate = null;
+  });
+
+  it('openProjectByPath: a cold open starts it after prune, cleanup, resume and auto-spawn', async () => {
+    const context = createMockContext();
+    const project = makeRepairProject('open-by-path');
+    context.projectRepo.list.mockReturnValue([project]);
+    state.existingPaths.add(project.path);
+
+    await openProjectByPath(asIpcContext(context), project.path);
+    await vi.waitFor(() => {
+      expect(repairCallsFor(project)).toHaveLength(1);
+    }, { timeout: 2000 });
+
+    expectStartedOnceFor(project);
+    expect(recoveryBeforeRepairOf(project)).toEqual(COLD_OPEN_RECOVERY);
+  });
+
+  it('the PROJECT_OPEN handler: a cold open starts it after prune, cleanup, resume and auto-spawn', async () => {
+    const context = createMockContext();
+    const project = makeRepairProject('open-handler');
+
+    await registerAndOpen(context, project);
+    await vi.waitFor(() => {
+      expect(repairCallsFor(project)).toHaveLength(1);
+    }, { timeout: 2000 });
+
+    expectStartedOnceFor(project);
+    expect(recoveryBeforeRepairOf(project)).toEqual(COLD_OPEN_RECOVERY);
+  });
+
+  it('activateAllProjects: starts it for each other project with its own database and directory, and not for the current one', async () => {
+    const context = createMockContext();
+    const current = makeRepairProject('activate-current');
+    const otherA = makeRepairProject('activate-a');
+    const otherB = makeRepairProject('activate-b');
+    context.currentProjectId = current.id;
+    context.projectRepo.list.mockReturnValue([current, otherA, otherB]);
+    for (const project of [current, otherA, otherB]) state.existingPaths.add(project.path);
+
+    await activateAllProjects(asIpcContext(context));
+
+    expect(repairCallsFor(current)).toHaveLength(0);
+    expectStartedOnceFor(otherA);
+    expectStartedOnceFor(otherB);
+    // Each started after its own recovery chain had reached auto-spawn.
+    expect(recoveryBeforeRepairOf(otherA)).toContain('autoSpawnTasks');
+    expect(recoveryBeforeRepairOf(otherB)).toContain('autoSpawnTasks');
+  });
+
+  it('a warm reopen starts nothing: the repair belongs to a cold open', async () => {
+    const context = createMockContext();
+    const warmByHandler = makeRepairProject('warm-handler');
+    const warmByPath = makeRepairProject('warm-path');
+    context.recoveredProjects.add(warmByHandler.id);
+    context.recoveredProjects.add(warmByPath.id);
+    context.projectRepo.list.mockReturnValue([warmByPath]);
+    state.existingPaths.add(warmByPath.path);
+
+    await registerAndOpen(context, warmByHandler);
+    await openProjectByPath(asIpcContext(context), warmByPath.path);
+    // A call that must not happen cannot be polled for: two full rounds of the
+    // event loop are the budget for any latent start to land.
+    await flushSetImmediate();
+    await flushSetImmediate();
+
+    // Warm means recovery itself did not run for either project.
+    expect(resumeCallsFor(warmByHandler)).toHaveLength(0);
+    expect(resumeCallsFor(warmByPath)).toHaveLength(0);
+    expect(repairCallsFor(warmByHandler)).toHaveLength(0);
+    expect(repairCallsFor(warmByPath)).toHaveLength(0);
+  });
+
+  it('two overlapping starts for one project run one repair, leave other projects alone, and start again once the run settles', async () => {
+    const context = createMockContext();
+    const project = makeRepairProject('overlap');
+    const otherProject = makeRepairProject('overlap-other');
+    context.projectRepo.list.mockReturnValue([project, otherProject]);
+    state.existingPaths.add(project.path);
+    state.existingPaths.add(otherProject.path);
+
+    // The first start comes from a cold open, and its run is held in flight.
+    state.repairGate = createDeferred();
+    await openProjectByPath(asIpcContext(context), project.path);
+    await vi.waitFor(() => {
+      expect(repairCallsFor(project)).toHaveLength(1);
+    }, { timeout: 2000 });
+
+    // A second open path for the same project fires meanwhile. activateAllProjects
+    // does not skip a project that is already recovered, and the project it
+    // opened is no longer the current one. The other project is a control
+    // that the guard is per project and not global.
+    context.currentProjectId = 'a-different-project';
+    await activateAllProjects(asIpcContext(context));
+
+    // Both open paths ran their recovery for the project; only one repair started.
+    expect(resumeCallsFor(project)).toHaveLength(2);
+    expect(repairCallsFor(project)).toHaveLength(1);
+    expect(repairCallsFor(otherProject)).toHaveLength(1);
+
+    // The run settles; the in-flight mark goes with it.
+    state.repairGate.resolve();
+    state.repairGate = null;
+    await flushSetImmediate();
+
+    await activateAllProjects(asIpcContext(context));
+    expect(repairCallsFor(project)).toHaveLength(2);
   });
 });

@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
-import type { AutomationRunAgainResult, BoardProfile, Task, Swimlane } from '../../../shared/types';
+import type { AutomationRunAgainResult, BoardProfile, SessionSummary, Task, Swimlane } from '../../../shared/types';
 import type { PRResolveOptions } from '../../pr/shared/pr-connector';
+import type { TaskKnowledge } from '../../retrieval/task-knowledge';
 
 export interface CommandContext {
   /**
@@ -26,9 +27,8 @@ export interface CommandContext {
    */
   getDefaultBaseBranch?: () => string | undefined;
   /**
-   * This project's per-resolve PR settings (`git.prEvaluateBranchPolicies`,
-   * `git.prBypassCountsAsReady`), for the two `linkPRForTask` calls this
-   * module makes itself. Bound to the
+   * This project's per-resolve PR settings (`git.prBypassCountsAsReady`), for
+   * the two `linkPRForTask` calls this module makes itself. Bound to the
    * request's project like `getDefaultBaseBranch`. Optional so a test context
    * can omit it; the linker treats absent as every option off.
    */
@@ -75,6 +75,20 @@ export interface CommandContext {
    * caller's `?.`.
    */
   onTaskPrLinkChanged?: (task: Task) => void;
+  /**
+   * A write changed what model or effort the task should run at (a model or
+   * effort pin, a profile, or the run mode). The host applies it to the task's
+   * live session the way the ContextBar pick does, restarting it when it runs
+   * at something else; without this an agent or phone write only took effect
+   * at the next spawn. Called after `onTaskUpdated`, with the written row and
+   * which targets the stored values moved, and only when one did: a write that
+   * re-sends a value the task already holds must not restart a session the
+   * user tuned by hand.
+   *
+   * Optional for the same reason as `onTaskPrLinkChanged`: test suites
+   * hand-build a context. The production builder implements it.
+   */
+  onTaskSettingsChanged?: (task: Task, changed: { model: boolean; effort: boolean }) => void;
   onTaskDeleted: (task: Task) => void;
   onTaskMove: (input: { taskId: string; targetSwimlaneId: string; targetPosition: number }) => Promise<void>;
   /**
@@ -122,7 +136,26 @@ export interface CommandContext {
    * with a plain message when it is absent rather than throwing.
    */
   onRunAutomation?: (automationId: string, taskId: string) => Promise<AutomationRunAgainResult>;
+  /**
+   * What the Knowledge Graph knows about some tasks (the summary, the commits
+   * linked to each, the files its sessions changed), for the task reads, or
+   * `indexOn: false` while the index is switched off. Read in the retrieval
+   * worker, so it answers asynchronously. Optional because test suites
+   * hand-build a context; without it the reads print no knowledge.
+   */
+  readTaskKnowledge?: (taskIds: string[]) => Promise<TaskKnowledgeRead> | TaskKnowledgeRead;
+  /**
+   * Every task's lifetime session summary, keyed by task id, read in the
+   * retrieval worker (it aggregates every session row). Optional because test
+   * suites hand-build a context; without it the handlers read it themselves.
+   */
+  listSessionSummaries?: () => Promise<Record<string, SessionSummary>>;
 }
+
+/** The index's knowledge of some tasks, as `readTaskKnowledge` returns it. */
+export type TaskKnowledgeRead =
+  | { indexOn: false }
+  | { indexOn: true; summariesOn: boolean; byTask: Map<string, TaskKnowledge> };
 
 export interface CommandResponse {
   success: boolean;

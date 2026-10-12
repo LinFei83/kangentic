@@ -3,7 +3,7 @@
  *
  * The Kangentic MCP server registers tools across the `*-tools.ts` files in
  * `src/main/agent/mcp-http/`. Two surfaces enumerate those tools for humans:
- * the Settings -> MCP Server "Available Tools" list (`McpServerTab.tsx`) and
+ * the Settings -> MCP Server tool list (`McpServerTab.tsx`) and
  * `docs/mcp-server.md`. Before this manifest existed both hardcoded their own
  * copies and drifted: the panel listed 10 of 46 registered tools.
  *
@@ -14,13 +14,13 @@
  * directions plus presence in `docs/mcp-server.md`; the convention is
  * documented in `.claude/rules/mcp-tool-list-parity.md`.
  *
- * The panel renders every entry as a pill, grouped by `category` in
- * `MCP_TOOL_CATEGORIES` order, so the complete tool catalogue is visible
- * (the dev-leaning diagnostics group sorts last under its own header). The
- * array below is ordered to mirror that grouping; `category`, not array
- * position, is what drives the panel grouping.
+ * The panel renders every entry as a cell in its `category`'s group, in
+ * `MCP_TOOL_CATEGORIES` order, so the complete tool catalogue is listed
+ * (the dev-leaning diagnostics group sorts last and starts closed). The array below is ordered
+ * to mirror that grouping; `category`, not array position, is what drives the
+ * panel grouping.
  *
- * Each panel pill deep-links to its entry on the live docs page
+ * Each panel cell deep-links to its entry on the live docs page
  * (`MCP_SERVER_DOCS_URL`) via `mcpToolDocsUrl(tool.name)`; the docs page uses
  * one anchor per tool named after the registered tool, so the link is derived
  * from `name` with no per-tool hardcoding.
@@ -41,13 +41,21 @@ export interface McpToolManifestEntry {
   category: McpToolCategoryId;
 }
 
-/** Categories in panel render order. The diagnostics group sorts last under its own header. */
-export const MCP_TOOL_CATEGORIES: { id: McpToolCategoryId; label: string }[] = [
+export interface McpToolCategory {
+  id: McpToolCategoryId;
+  /** Sentence case, like every settings label. */
+  label: string;
+  /** The panel shows this group closed on every visit: dev-leaning tools most users never open. */
+  startsClosed?: boolean;
+}
+
+/** Categories in panel render order. The diagnostics group sorts last and starts closed. */
+export const MCP_TOOL_CATEGORIES: McpToolCategory[] = [
   { id: 'tasks', label: 'Tasks' },
   { id: 'board', label: 'Board' },
   { id: 'sessions', label: 'Sessions' },
-  { id: 'browser', label: 'Browser Automation' },
-  { id: 'diagnostics', label: 'Diagnostics' },
+  { id: 'browser', label: 'Browser automation' },
+  { id: 'diagnostics', label: 'Diagnostics', startsClosed: true },
 ];
 
 export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
@@ -55,8 +63,8 @@ export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
   { name: 'kangentic_create_task', label: 'Create Task', blurb: 'add a task to any board column or the backlog', category: 'tasks' },
   { name: 'kangentic_list_tasks', label: 'List Tasks', blurb: 'browse tasks, optionally filtered by column', category: 'tasks' },
   { name: 'kangentic_search_tasks', label: 'Search Tasks', blurb: 'keyword search across board and backlog tasks', category: 'tasks' },
-  { name: 'kangentic_find_task', label: 'Find Task', blurb: 'look up a task by ID, branch, title, or PR number', category: 'tasks' },
-  { name: 'kangentic_get_current_task', label: 'Current Task', blurb: 'resolve the task for the current directory or branch', category: 'tasks' },
+  { name: 'kangentic_find_task', label: 'Find Task', blurb: 'look up a task by ID, branch, title, or PR number, with its summary, linked commits, and changed files', category: 'tasks' },
+  { name: 'kangentic_get_current_task', label: 'Current Task', blurb: 'resolve the task for the current directory or branch, with its branch, PR, and what the Knowledge Graph knows about it', category: 'tasks' },
   { name: 'kangentic_get_task_stats', label: 'Task Stats', blurb: 'token usage, cost, duration, lines changed, and the subagent-type breakdown per task', category: 'tasks' },
   { name: 'kangentic_update_task', label: 'Update Task', blurb: 'edit title, description (full, in-place find/replace, or append), PR info, agent, model, effort, permission mode, run mode, priority, labels, base branch, worktree, and attachments', category: 'tasks' },
   { name: 'kangentic_move_task', label: 'Move Task', blurb: 'move a task between columns and place it at a slot, running the same lifecycle as a drag', category: 'tasks' },
@@ -87,7 +95,7 @@ export const MCP_TOOL_MANIFEST: McpToolManifestEntry[] = [
   { name: 'kangentic_update_backlog_item', label: 'Update Backlog Item', blurb: 'edit a backlog item title, description, priority, labels, or attachments', category: 'board' },
   { name: 'kangentic_delete_backlog_item', label: 'Delete Backlog Item', blurb: 'permanently remove a backlog item and its attachments', category: 'board' },
   { name: 'kangentic_list_projects', label: 'List Projects', blurb: 'every Kangentic project registered on this machine', category: 'board' },
-  { name: 'kangentic_search', label: 'Search', blurb: 'unified search across tasks, backlog, session events, projects, and past conversations (keyword or semantic)', category: 'board' },
+  { name: 'kangentic_search', label: 'Search', blurb: 'unified search across tasks, backlog, session events, projects, past conversations (by meaning or keyword), and commits, or tasks ranked by a topic or by how like one task they are', category: 'board' },
 
   // ── Sessions (session-tools.ts, steering-tools.ts) - per-task session history,
   //    transcripts, handoff, and the one write-side tool that steers a live session ──

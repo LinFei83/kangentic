@@ -34,13 +34,45 @@ export interface CapabilityRequestMessage {
 
 /**
  * A stable key a client can branch on, beside the human-readable `error`.
- * Today the one member is the refusal a desktop sends for a verb its build
- * does not know (see `UnsupportedVerbError` in framing.ts), so a newer phone
- * can tell "desktop is old" from "desktop is unreachable" and show the right
- * copy. A union rather than a bare string so a second code is a deliberate
- * addition here, not a typo at a call site.
+ * A union rather than a bare string so a new code is a deliberate addition
+ * here, not a typo at a call site.
+ *
+ * - `unsupported-verb`: the desktop's build does not know the verb (see
+ *   `UnsupportedVerbError` in framing.ts), so a newer phone can tell "desktop
+ *   is old" from "desktop is unreachable" and show the right copy.
+ * - `response-too-large`: the answer would not fit the frame caps
+ *   (MAX_DECODED_LENGTH before compression, MAX_FRAME_LENGTH after), so the
+ *   desktop refused instead of sending it. The request was valid and its
+ *   target still exists, so a client must not read it as the target being
+ *   gone (a session ending, a project removed). It is a backstop. A desktop
+ *   shrinks a `read-stream` terminal seed to fit rather than refuse it, so a
+ *   phone's terminal subscribe is never answered with this code.
+ * - `unknown-project`: the request named a project id this desktop does not
+ *   have (removed, or never registered).
+ * - `unknown-session`: the request named a session id that is not live. For a
+ *   `command-terminal` stop it means the terminal already ended, so a phone
+ *   treats it as stopped.
+ * - `command-terminal-limit`: the project already runs the most Command
+ *   Terminals a project may have at once (four).
+ * - `not-command-terminal`: a `command-terminal` stop named a session that is
+ *   not a Command Terminal (a task's agent). Nothing was stopped.
+ * - `agent-unavailable`: the project's agent CLI could not be found on the
+ *   desktop, so nothing could be started.
+ * - `command-terminal-start-failed`: a `command-terminal` start failed for any
+ *   other reason. `error` carries the desktop's text for logs.
+ *
+ * A peer must treat a code it does not know as a generic failure and show
+ * `error` or a plain line of its own: a newer desktop may add codes.
  */
-export type CapabilityErrorCode = 'unsupported-verb';
+export type CapabilityErrorCode =
+  | 'unsupported-verb'
+  | 'response-too-large'
+  | 'unknown-project'
+  | 'unknown-session'
+  | 'command-terminal-limit'
+  | 'not-command-terminal'
+  | 'agent-unavailable'
+  | 'command-terminal-start-failed';
 
 export interface CapabilityResponseMessage {
   type: 'capability-response';

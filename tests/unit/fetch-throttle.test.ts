@@ -13,6 +13,7 @@
  * fetchIfStale's own logic without spawning real subprocesses.
  */
 
+import { isDeepStrictEqual } from 'node:util';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const { mockRunGitWithTimeout, mockIsGitTimeoutError } = vi.hoisted(() => ({
@@ -27,7 +28,7 @@ vi.mock('../../src/main/git/git-spawn', () => ({
   isGitTimeoutError: mockIsGitTimeoutError,
 }));
 
-import { fetchIfStale, fetchAllRemotesIfStale, clearFetchCache, classifyFetchFailure } from '../../src/main/git/fetch-throttle';
+import { fetchIfStale, fetchAllRemotesIfStale, clearFetchCache, classifyFetchFailure, nonInteractiveGitEnv } from '../../src/main/git/fetch-throttle';
 import type { FetchFailureReason, FetchIfStaleOutcome } from '../../src/main/git/fetch-throttle';
 import type { SimpleGit } from 'simple-git';
 
@@ -55,9 +56,11 @@ describe('fetchIfStale', () => {
 
     expect(result).toBe(`origin/${BRANCH}`);
     expect(mockRunGitWithTimeout).toHaveBeenCalledTimes(1);
+    // --no-auto-gc: on Windows the fetch's auto maintenance cannot detach, so
+    // without it a due gc runs inside this foreground fetch.
     expect(mockRunGitWithTimeout).toHaveBeenCalledWith(
       PROJECT_PATH,
-      ['fetch', 'origin', BRANCH],
+      ['fetch', '--no-auto-gc', 'origin', BRANCH],
       expect.objectContaining({ timeoutMs: 15_000 }),
     );
   });
@@ -126,7 +129,7 @@ describe('fetchIfStale', () => {
 
     expect(mockRunGitWithTimeout).toHaveBeenCalledWith(
       PROJECT_PATH,
-      ['fetch', 'origin', BRANCH],
+      ['fetch', '--no-auto-gc', 'origin', BRANCH],
       expect.objectContaining({ signal: controller.signal }),
     );
   });
@@ -185,6 +188,76 @@ describe('fetchIfStale onOutcome', () => {
     mockRunGitWithTimeout.mockRejectedValueOnce(new Error('fatal: unable to access remote'));
     await expect(fetchIfStale(stubGit, PROJECT_PATH, BRANCH, { onOutcome: throwingObserver }))
       .resolves.toBe(BRANCH);
+  });
+});
+
+describe('fetchIfStale nonInteractive', () => {
+  // A phone-started Command Terminal fetches with nobody at the desk. Without
+  // the non-interactive env, a stale credential makes Git Credential Manager
+  // raise a dialog no one will click, and the start waits on it. These tests
+  // pin that the option reaches the git run as an env override, and that the
+  // default (a user-driven fetch) keeps the inherited env.
+  interface GitRunOptions {
+    timeoutMs: number;
+    signal?: AbortSignal;
+    env?: NodeJS.ProcessEnv;
+  }
+
+  function lastGitRunOptions(): GitRunOptions {
+    const lastCall = mockRunGitWithTimeout.mock.calls.at(-1);
+    if (!lastCall) throw new Error('runGitWithTimeout was never called');
+    return lastCall[2] as GitRunOptions;
+  }
+
+  // The env is a copy of process.env, so a failed assertion on the whole object
+  // would print every variable on the machine (tokens included) into the test
+  // log. Compare booleans and the two prompt variables instead.
+  function promptVariables(env: NodeJS.ProcessEnv | undefined): Record<string, string | undefined> {
+    return { GIT_TERMINAL_PROMPT: env?.GIT_TERMINAL_PROMPT, GCM_INTERACTIVE: env?.GCM_INTERACTIVE };
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    clearFetchCache();
+    mockRunGitWithTimeout.mockReset();
+    mockIsGitTimeoutError.mockClear();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mockRunGitWithTimeout.mockResolvedValue({ stdout: '', stderr: '' });
+  });
+
+  it('runs the fetch with nonInteractiveGitEnv() as its env', async () => {
+    const result = await fetchIfStale(stubGit, PROJECT_PATH, BRANCH, { nonInteractive: true });
+
+    expect(result).toBe(`origin/${BRANCH}`);
+    expect(mockRunGitWithTimeout).toHaveBeenCalledTimes(1);
+    const options = lastGitRunOptions();
+    expect(options.env).toBeDefined();
+    expect(isDeepStrictEqual(options.env, nonInteractiveGitEnv())).toBe(true);
+    // The helper is the contract's source, so also pin what the env must do:
+    // fail instead of prompting, and stop the credential manager's GUI.
+    expect(promptVariables(options.env)).toEqual({ GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' });
+  });
+
+  it('passes no env override when the option is absent, so a user-driven fetch can still prompt', async () => {
+    await fetchIfStale(stubGit, PROJECT_PATH, BRANCH);
+
+    expect(typeof lastGitRunOptions().env).toBe('undefined');
+  });
+
+  it('passes no env override when nonInteractive is explicitly false', async () => {
+    await fetchIfStale(stubGit, PROJECT_PATH, BRANCH, { nonInteractive: false });
+
+    expect(typeof lastGitRunOptions().env).toBe('undefined');
+  });
+
+  it('forwards the AbortSignal alongside the non-interactive env', async () => {
+    const controller = new AbortController();
+
+    await fetchIfStale(stubGit, PROJECT_PATH, BRANCH, { signal: controller.signal, nonInteractive: true });
+
+    const options = lastGitRunOptions();
+    expect(options.signal).toBe(controller.signal);
+    expect(promptVariables(options.env)).toEqual({ GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' });
   });
 });
 
@@ -315,14 +388,16 @@ describe('fetchAllRemotesIfStale', () => {
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
   });
 
-  it('fetches all remotes with prune and quiet using the probe timeout', async () => {
+  it('fetches all remotes with prune and quiet, and no auto-gc, using the probe timeout', async () => {
     routeByGitSubcommand(() => Promise.resolve({ stdout: '', stderr: '' }));
 
     await fetchAllRemotesIfStale(WORKTREE_PATH);
 
+    // --no-auto-gc: on Windows a due gc would run inside this 5 s-capped fetch
+    // and get killed, and the scheduler runs it holding the project's git queue.
     expect(mockRunGitWithTimeout).toHaveBeenCalledWith(
       WORKTREE_PATH,
-      ['fetch', '--all', '--prune', '--quiet'],
+      ['fetch', '--all', '--prune', '--quiet', '--no-auto-gc'],
       expect.objectContaining({ timeoutMs: 5_000 }),
     );
   });
@@ -347,7 +422,10 @@ describe('fetchAllRemotesIfStale', () => {
     expect(mockRunGitWithTimeout).toHaveBeenCalledTimes(2);
     for (const call of mockRunGitWithTimeout.mock.calls) {
       const env = (call[2] as { env?: NodeJS.ProcessEnv }).env;
-      expect(env).toMatchObject({ GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' });
+      // One variable per assertion: a failed match on the whole object would
+      // print every inherited variable, secrets included, into the CI log.
+      expect(env?.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env?.GCM_INTERACTIVE).toBe('never');
       // A copy of the inherited env, not a replacement: git still needs PATH, HOME, and friends.
       expect(env?.PATH ?? env?.Path).toBe(process.env.PATH ?? process.env.Path);
     }

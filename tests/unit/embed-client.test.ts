@@ -27,7 +27,7 @@ const IDLE_SHUTDOWN_MS = 30 * 60_000;
 
 const TEST_MODEL: EmbeddingModelDef = {
   id: 'test-model',
-  tier: 'balanced',
+  tier: 'light',
   hfId: 'Xenova/test-model',
   displayName: 'Test',
   dimensions: 384,
@@ -648,7 +648,7 @@ describe('EmbedClient', () => {
   it('setWarmHold(false) with no hold taken leaves the running idle countdown untouched', async () => {
     // The getStatus poll shape: a "nothing to drain" pass releases a hold it
     // never took. If that restarted the countdown, the worker could never
-    // expire while the Memory tab (which polls every 1.5 s) was open.
+    // expire while the Knowledge Graph tab (which polls every 1.5 s) was open.
     vi.useFakeTimers();
     try {
       const client = new EmbedClient(TEST_MODEL);
@@ -923,7 +923,7 @@ describe('EmbedClient', () => {
 
     expect(mockFork).toHaveBeenCalledTimes(1);
     expect(recordCrashSpy).toHaveBeenCalledTimes(1);
-    expect(recordCrashSpy).toHaveBeenCalledWith(null);
+    expect(recordCrashSpy).toHaveBeenCalledWith(null, undefined, { cause: 'fork_failed' });
     // A single fork failure is one crash, not three - the client must not be
     // latched off after it.
     expect(client.crashed).toBe(false);

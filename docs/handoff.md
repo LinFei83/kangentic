@@ -68,7 +68,7 @@ Read this file for context on what was done, decisions made, and current state.
 
 For Claude (MCP-capable), it also appends: "You can also use the `kangentic_get_transcript` MCP tool for a structured view of the prior session."
 
-For agents without session files (Aider), the prompt falls back to: "No session history file is available - check `git log` for prior changes."
+When the source agent has no session file to point at (Cursor, Copilot, Oz, Ollama and Goose return none, and Aider has none until it writes `.aider.chat.history.md`), the prompt falls back to: "No session history file is available - check `git log` for prior changes."
 
 The prompt is built entirely by `buildSessionHistoryReference()` with no per-adapter customization needed.
 
@@ -95,7 +95,7 @@ Claude Code sessions can access handoff metadata via the `kangentic_get_handoff_
 
 ## Disabling Session History Passthrough
 
-Each column has a "Session history passthrough" toggle (default: **off**). When disabled, cross-agent transitions still detect the agent change and spawn the correct target agent, but no session history is passed - no file location, no handoff DB record. The new agent receives only the task title and description, starting with a clean slate.
+Each column has a "Session history passthrough" toggle (default: **off**). When disabled, cross-agent transitions still detect the agent change and spawn the correct target agent, but no session history is passed - no file location, no handoff DB record. The new agent receives only the task title and description. When it already has an earlier conversation on this task that can be resumed, it resumes that conversation instead.
 
 This is useful for workflows where independent review is desired. For example, a "Code Review" column with `agent_override` set to a different agent can disable passthrough so the reviewing agent assesses the code without being influenced by the previous agent's conversation or reasoning.
 
@@ -103,7 +103,7 @@ The toggle is a per-column setting in the Edit Column dialog, under the Agent se
 
 ## Per-Agent Transcript Cleanup
 
-TUI agents (Claude Code, Codex CLI, Gemini CLI, Qwen Code, Aider, Kimi Code, Droid, OpenCode, Grok Build, Antigravity CLI) produce raw PTY output with agent-specific rendering artifacts. Antigravity's cleaner captures the last turn only (its responses carry no marker glyph, the same limitation as Gemini's redraw model). Cleanup utilities in `src/main/agent/handoff/transcript-cleanup.ts` provide shared functions (`filterNoiseLines`, `finalizeTranscript`) used by per-adapter transcript cleanup files. Each agent's cleanup lives in its adapter folder: `src/main/agent/adapters/<name>/transcript-cleanup.ts`.
+TUI agents (Claude Code, Codex CLI, Gemini CLI, Qwen Code, Aider, Kimi Code, Droid, OpenCode, Grok Build, Antigravity CLI) produce raw PTY output with agent-specific rendering artifacts. Antigravity's cleaner captures the last turn only (its responses carry no marker glyph, the same limitation as Gemini's redraw model). Cleanup utilities in `src/main/agent/handoff/transcript-cleanup.ts` provide shared functions (`filterNoiseLines`, `finalizeTranscript`) used by per-adapter transcript cleanup files, and the `cleanTranscriptForHandoff` dispatcher, which routes by source agent id to the matching cleaner and falls back to `finalizeTranscript` for an unknown id. Each agent's cleanup lives in its adapter folder: `src/main/agent/adapters/<name>/transcript-cleanup.ts`.
 
 GitHub Copilot CLI is also a TUI agent but does not yet ship its own `transcript-cleanup.ts`, so its handoff transcripts may contain rendering artifacts until one is added. Cursor CLI, Oz CLI (Warp), Ollama, and Goose CLI stream plain text output (no alternate screen buffer) and do not need per-adapter cleanup.
 

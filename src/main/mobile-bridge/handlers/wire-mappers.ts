@@ -27,6 +27,7 @@ import {
 } from '@kangentic/protocol';
 import { isJsonValue } from '@kangentic/protocol';
 import { NEVER_AUTO_SPAWN_ROLES } from '../../../shared/types';
+import { stripAnsiControlCodes } from '../../../shared/ansi-strip';
 import type {
   ActivityReason,
   BacklogTask,
@@ -298,7 +299,93 @@ export function toBoardColumnWire(swimlane: Swimlane): BoardColumnWire {
   };
 }
 
-export function toBoardTaskWire(task: Task): BoardTaskWire {
+/** Longest spawn-progress label a phone receives, in characters (code points). */
+export const SPAWN_PROGRESS_LABEL_WIRE_MAX_LENGTH = 120;
+
+/**
+ * Characters that change how a label renders without showing anything: the
+ * bidi embeddings, overrides and isolates (U+202A-U+202E, U+2066-U+2069), the
+ * left-to-right, right-to-left and Arabic letter marks (U+200E, U+200F,
+ * U+061C), the zero-width space (U+200B), the word joiner and the invisible
+ * math operators (U+2060-U+2064), the soft hyphen (U+00AD) and the byte order
+ * mark (U+FEFF). A bidi override can make one string read as another. The
+ * zero-width joiner and non-joiner stay: emoji sequences and several scripts
+ * need them.
+ */
+const INVISIBLE_FORMAT_CHARACTERS = /[\u{00AD}\u{061C}\u{200B}\u{200E}\u{200F}\u{202A}-\u{202E}\u{2060}-\u{2064}\u{2066}-\u{2069}\u{FEFF}]/gu;
+
+/**
+ * The tag characters (U+E0000-U+E007F). They render as nothing and can spell
+ * out a whole hidden string. The one place they show is a subdivision flag:
+ * the black flag (U+1F3F4), a code in tag letters, then the cancel tag
+ * (U+E007F). The first group matches only the three flags that render
+ * (England "gbeng", Scotland "gbsct", Wales "gbwls"), so the replacement keeps
+ * those. Keeping any flag-shaped run instead would let hidden text through
+ * wrapped in a black flag and a cancel tag.
+ */
+const TAG_CHARACTERS = /(\u{1F3F4}\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073})\u{E007F})|[\u{E0000}-\u{E007F}]/gu;
+
+/** Drops every tag character except those inside one of the three flags TAG_CHARACTERS keeps. */
+function stripTagCharacters(text: string): string {
+  return text.replace(TAG_CHARACTERS, (_tagMatch: string, flagSequence: string | undefined) => flagSequence ?? '');
+}
+
+/**
+ * Tabs and line breaks: CR, LF, the vertical tab, the form feed, the C1 next
+ * line (U+0085) and the Unicode line and paragraph separators (U+2028,
+ * U+2029). Replaced before the escape strip, which deletes the vertical tab,
+ * the form feed and the next line outright and would join the words on
+ * either side.
+ */
+const LABEL_LINE_BREAKS = /[\t\n\v\f\r\u{0085}\u{2028}\u{2029}]+/gu;
+
+/**
+ * A spawn-progress label as it may leave the desktop. Most labels are the
+ * desktop's own phase text, but createProgressCallback passes an unknown phase
+ * through verbatim, and the automation runner uses that to show `Running
+ * "<automation name>"...`. That name comes from the column's config, which a
+ * team shares in a committed `kangentic.json`, so it is text another person
+ * wrote. Escape sequences, control characters, invisible format characters
+ * and tag characters outside the three subdivision flags are stripped, tabs
+ * and line breaks become spaces, and the result is capped
+ * at SPAWN_PROGRESS_LABEL_WIRE_MAX_LENGTH with a trailing "...". A label with
+ * nothing left to show is null, which the phone reads as no spawn in flight.
+ */
+export function toSpawnProgressLabelWire(label: string | null): string | null {
+  if (label === null) return null;
+  const spaced = label.replace(LABEL_LINE_BREAKS, ' ');
+  const visible = stripTagCharacters(stripAnsiControlCodes(spaced).replace(INVISIBLE_FORMAT_CHARACTERS, ''));
+  const cleaned = visible.replace(/ {2,}/g, ' ').trim();
+  if (cleaned === '') return null;
+  const characters = Array.from(cleaned);
+  if (characters.length <= SPAWN_PROGRESS_LABEL_WIRE_MAX_LENGTH) return cleaned;
+  // The cut can land inside a kept flag; stripping again drops the tag
+  // characters it leaves behind and keeps the black flag.
+  const head = stripTagCharacters(characters.slice(0, SPAWN_PROGRESS_LABEL_WIRE_MAX_LENGTH - 3).join(''));
+  return `${head.trimEnd()}...`;
+}
+
+/**
+ * `spawnProgressLabel` is the task's in-flight label from
+ * getInFlightSpawnProgress(), or null; it goes through
+ * toSpawnProgressLabelWire here, so a caller that filters on the mapped row
+ * sees what the phone gets. Required rather than optional so every call site
+ * decides, and so a bare `.map(toBoardTaskWire)` (which would pass the array
+ * index here) fails to compile.
+ *
+ * `pauseFlags` holds `paused`, whether the task has a paused session and no
+ * live one (`taskSessionStatesOf`), `resumable`, `isResumeOffered` for that
+ * same answer, and `pausable`, `isPauseOffered` for the task's live session.
+ * The caller resolves all three because they need the session registry and
+ * the column; see `BoardTaskWire.paused`, `BoardTaskWire.resumable` and
+ * `BoardTaskWire.pausable`. One object rather than positional booleans, so a
+ * call site cannot swap them.
+ */
+export function toBoardTaskWire(
+  task: Task,
+  spawnProgressLabel: string | null,
+  pauseFlags: { paused: boolean; resumable: boolean; pausable: boolean },
+): BoardTaskWire {
   return {
     id: task.id,
     display_id: task.display_id,
@@ -321,6 +408,10 @@ export function toBoardTaskWire(task: Task): BoardTaskWire {
     archived_at: task.archived_at,
     created_at: task.created_at,
     updated_at: task.updated_at,
+    spawn_progress: toSpawnProgressLabelWire(spawnProgressLabel),
+    resumable: pauseFlags.resumable,
+    paused: pauseFlags.paused,
+    pausable: pauseFlags.pausable,
   };
 }
 

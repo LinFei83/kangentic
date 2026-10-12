@@ -383,22 +383,24 @@ export const handleUpdateTask: CommandHandler = (
   context: CommandContext,
 ): CommandResponse => {
   const taskId = params.taskId as string;
-  const newTitle = params.title as string | null;
-  const newDescription = params.description as string | null;
+  // Every field gated on `!== null` below is normalized to null, so an omitted
+  // key reads the same as the explicit `null` the MCP tool layer forwards,
+  // matching handleCreateTask. A caller that omits one (a direct handler call,
+  // a devtools command, a mobile-bridge payload) otherwise passes the gate as
+  // `undefined`: the title became the string 'undefined', and an omitted
+  // priority wrote NaN, which SQLite stores as NULL and the NOT NULL column
+  // refuses, failing the whole update.
+  const newTitle = (params.title as string | null | undefined) ?? null;
+  const newDescription = (params.description as string | null | undefined) ?? null;
   const newDescriptionEdits = (params.descriptionEdits ?? null) as DescriptionEdit[] | null;
   const newAppendDescription = (params.appendDescription ?? null) as string | null;
-  // Normalized to null so an omitted key reads the same as the explicit `null`
-  // the MCP tool layer forwards, matching handleCreateTask. Without it a caller
-  // that passes neither key (a direct handler call, or a mobile-bridge payload
-  // that omits them) writes the literal string 'undefined' into pr_url and NaN
-  // into pr_number, since `undefined !== null` passes the gates below.
   const newPrUrl = (params.prUrl as string | null | undefined) ?? null;
   const newPrNumber = (params.prNumber as number | null | undefined) ?? null;
-  const newAgent = params.agent as string | null;
-  const newPriority = params.priority as number | null;
-  const newLabels = params.labels as string[] | null;
-  const newBaseBranch = params.baseBranch as string | null;
-  const newUseWorktree = params.useWorktree as boolean | null;
+  const newAgent = (params.agent as string | null | undefined) ?? null;
+  const newPriority = (params.priority as number | null | undefined) ?? null;
+  const newLabels = (params.labels as string[] | null | undefined) ?? null;
+  const newBaseBranch = (params.baseBranch as string | null | undefined) ?? null;
+  const newUseWorktree = (params.useWorktree as boolean | null | undefined) ?? null;
   const newModel = params.model as string | null | undefined;
   const newEffort = params.effort as string | null | undefined;
   const newPermissionMode = params.permissionMode as PermissionMode | null | undefined;
@@ -552,6 +554,21 @@ export const handleUpdateTask: CommandHandler = (
 
   context.onTaskUpdated(updated);
 
+  // A write that moves the task's model or effort target reaches a running
+  // session, as a ContextBar pick does. Compared on the stored row, so a write
+  // that re-sends a value the task already holds restarts nothing: the apply
+  // reads a changed field's source from the live session, and a manual
+  // `/effort` would read as drift to undo. A profile or run-mode switch counts
+  // for both fields, since each changes the column values the targets fold
+  // through, and a pin clears the profile.
+  const profileOrRunModeMoved = updated.profile_id !== task.profile_id || updated.run_mode !== task.run_mode;
+  const settingsMoved = {
+    model: updated.model_override !== task.model_override || profileOrRunModeMoved,
+    effort: updated.effort_override !== task.effort_override || profileOrRunModeMoved,
+  };
+  const settingsChanged = settingsMoved.model || settingsMoved.effort;
+  if (settingsChanged) context.onTaskSettingsChanged?.(updated, settingsMoved);
+
   // Gated on what THIS call wrote, not on the post-write row: `updated` falls
   // back to the untouched task when nothing scalar changed, so reading its
   // fields would make a title-only edit on an already-linked task re-resolve.
@@ -586,7 +603,12 @@ export const handleUpdateTask: CommandHandler = (
 
   return {
     success: true,
-    message: `Updated ${changedFields.join(', ')} for "${updated.title}".`,
+    // The restart cuts the session's turn, which is the caller's own turn when
+    // an agent updates its own task, so say so rather than leave it a surprise.
+    message: `Updated ${changedFields.join(', ')} for "${updated.title}".`
+      + (settingsChanged && updated.session_id
+        ? ' Its running session restarts if it is not already on these settings, which ends its current turn.'
+        : ''),
     data: {
       id: updated.id,
       displayId: updated.display_id,

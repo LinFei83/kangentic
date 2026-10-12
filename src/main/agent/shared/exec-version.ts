@@ -1,8 +1,6 @@
-import { execFile, exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execAsync, execFileAsync } from '../../utility-process/off-main-exec';
+import { quoteCmdExecutable } from '../../../shared/shell-quote';
 
-const execFileAsync = promisify(execFile);
-const execAsync = promisify(exec);
 
 /**
  * Run `candidatePath --version` and return { stdout, stderr }.
@@ -22,7 +20,7 @@ export async function execVersion(
 ): Promise<{ stdout: string; stderr: string }> {
   if (process.platform === 'win32') {
     // Safe: candidatePath comes from which() or hardcoded fallback paths, never user input
-    return execAsync(`"${candidatePath}" --version`, { timeout, windowsHide: true });
+    return execAsync(`${quoteCmdExecutable(candidatePath)} --version`, { timeout, windowsHide: true });
   }
   return execFileAsync(candidatePath, ['--version'], { timeout });
 }

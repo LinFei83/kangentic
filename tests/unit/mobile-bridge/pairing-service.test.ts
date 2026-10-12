@@ -32,22 +32,16 @@ import {
 } from '@kangentic/protocol';
 import { PAIRING_TOKEN_TTL_MS } from '../../../src/main/mobile-bridge/pairing/pairing-token';
 
-vi.mock('electron', () => ({
-  app: {
-    isReady: () => true,
-    whenReady: () => Promise.resolve(),
-  },
-  safeStorage: {
-    isEncryptionAvailable: () => true,
-    encryptString: (plaintext: string) => Buffer.from(`encrypted:${plaintext}`, 'utf8'),
-    decryptString: (buffer: Buffer) => {
-      const raw = buffer.toString('utf8');
-      if (raw.startsWith('encrypted:')) return raw.slice('encrypted:'.length);
-      throw new Error('safeStorage.decryptString: invalid ciphertext');
+vi.mock('electron', async () => {
+  const { createFakeSafeStorage } = await import('../helpers/fake-safe-storage');
+  return {
+    app: {
+      isReady: () => true,
+      whenReady: () => Promise.resolve(),
     },
-    getSelectedStorageBackend: () => 'keychain',
-  },
-}));
+    safeStorage: createFakeSafeStorage(),
+  };
+});
 
 const existsSyncSpy = vi.hoisted(() => vi.fn<(filePath: string) => boolean>());
 const readFileSyncSpy = vi.hoisted(() => vi.fn<(filePath: string, encoding: BufferEncoding) => string>());
@@ -85,7 +79,7 @@ const { PairingService, DEFAULT_PAIRING_CAPABILITIES, SAS_PENDING_TIMEOUT_MS, sa
 );
 const { generateEd25519KeyPair } = await import('@kangentic/protocol');
 type BridgeIdentityModule = typeof import('../../../src/main/mobile-bridge/identity');
-type BridgeIdentity = ReturnType<BridgeIdentityModule['loadOrCreateBridgeIdentity']>;
+type BridgeIdentity = Awaited<ReturnType<BridgeIdentityModule['loadOrCreateBridgeIdentity']>>;
 type PairingServiceInstance = InstanceType<typeof PairingService>;
 
 function testIdentity(): BridgeIdentity {
@@ -368,7 +362,7 @@ describe('PairingService ceremony', () => {
 
   /**
    * Transport.send() genuinely throws - RelayClient rejects a send while not
-   * connected, and on its per-session byte cap - and message 2 is now sent
+   * connected - and message 2 is now sent
    * after the phase has already flipped to sas-pending. Without a guard the
    * throw would escape into the transport callback and leave the ceremony
    * parked for the whole SAS timeout, waiting on a confirm frame the phone

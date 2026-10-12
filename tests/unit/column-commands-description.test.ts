@@ -1,3 +1,4 @@
+import { passThroughTransaction } from './helpers/transaction-double';
 import { describe, it, expect, vi } from 'vitest';
 import { handleCreateColumn, handleUpdateColumn } from '../../src/main/agent/commands/column-commands';
 import { handleGetColumnDetail } from '../../src/main/agent/commands/analytics-commands';
@@ -77,7 +78,7 @@ function createMockDb(swimlaneRows: MockSwimlaneRow[] = [], taskRows: unknown[] 
   return {
     // handleCreateColumn wraps the position shift and the insert in one
     // transaction; better-sqlite3's transaction(fn) returns a callable.
-    transaction: (body: () => unknown) => () => body(),
+    transaction: passThroughTransaction,
     prepare: vi.fn((sql: string) => {
       // SwimlaneRepository.create() with no position asks for the current max.
       if (sql.includes('MAX(position)')) {
@@ -618,11 +619,8 @@ describe('handleUpdateColumn - enum narrowing on the unvalidated path', () => {
 // ---------------------------------------------------------------------------
 // The session-track pairing, on the mock harness.
 //
-// column-commands-create-delete.test.ts covers this against a real SQLite DB,
-// but that whole file is gated on better-sqlite3 loading under the runner's
-// Node ABI, and postinstall rebuilds better-sqlite3 for ELECTRON's ABI - so it
-// skips locally and on CI alike (see the note in vitest.config.ts). These cases
-// pin the same update-path behavior somewhere that actually executes.
+// column-commands-create-delete.test.ts covers this against a real SQLite DB.
+// These cases pin the same update-path behavior on the mock harness.
 // ---------------------------------------------------------------------------
 
 describe('handleUpdateColumn - session track pairing', () => {
