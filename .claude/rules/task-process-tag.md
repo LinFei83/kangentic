@@ -39,8 +39,9 @@ rule keeps both halves true: every spawn tags, and every reap kills only what is
   task's sessions have exited and before any worktree removal.** Today that is the Done branch of
   `handleTaskMove`, `cleanupTaskSession` (To Do, Backlog demote, task and bulk delete, unarchive
   into To Do), the MCP `onTaskDeleted` (any task, worktree or not), `PROJECT_DELETE` (archived
-  tasks included), and the startup sweep for archived and To Do tasks. A new terminal transition
-  calls it too, with the project path and each task's `worktree_path`. In a dev build, with
+  tasks included). The startup sweep for archived and To Do tasks reaps through
+  `reapTaskProcesses` directly, so it stops no background session, by decision. A new terminal
+  transition calls `reapTaskLeftovers` too, with the project path and each task's `worktree_path`. In a dev build, with
   stopping on, `reapTaskLeftovers` first stops a `/preview` running in each task worktree through
   the launcher's stop file (`src/devtools/main/worktree-preview-stop.ts`), so its Electron quits
   through the real quit path instead of outliving a terminate on a dead dev server. That stop file
@@ -197,6 +198,18 @@ rule keeps both halves true: every spawn tags, and every reap kills only what is
   says, as `stopLostPtyTree` does for a crashed host: the session is over, not parked. Do not add
   tag or directory matching to it, and do not use it as a reap: what an agent detached from its
   tree is still the reap's to find.
+- **An agent CLI's own background session is stopped by the CLI, before the reap.** Claude Code's
+  `/bg` moves a task's conversation into a background session its supervisor runs outside the
+  task's PTY, tagged and in the task's folder, so the reap would kill it with no exit of its own.
+  `reapTaskLeftovers` first calls `AgentAdapter.stopBackgroundSession` (Claude: `claude stop <id>`,
+  measured to run its SessionEnd hook) for the task's newest records, naming the session by its
+  exact `sessionId` and `kind: background` in the CLI's own listing, never by cwd or name. It runs
+  only when the record's own events file shows the conversation in one
+  (`backgroundSessionHoldingConversation`), and it is not gated on `stopLeftoverProcesses`: it ends the
+  task's own agent, which every terminal transition ends. A Command Terminal has no record, so
+  `CommandTerminalLeftoverReaper` starts the same stop at the removal on the agent's own files
+  (`backgroundSessionOf`, no CLI), and its reap waits for it. Do not route it through the reap or
+  widen its match.
 - **The Windows reader opens `PROCESS_VM_READ` only on a process in the caller's Windows session
   owned by the caller's user,** and a kill re-checks the creation time on the handle it
   terminates through. A scan that cannot read the caller's own session or user fails, so the reap
@@ -224,6 +237,15 @@ rule keeps both halves true: every spawn tags, and every reap kills only what is
   server, qemu, netsimd and the emulator launcher; which clients count; propagation; a listener
   that is never kept for its children). `tests/unit/local-connections.test.ts` pins the pairing.
   `tests/unit/task-directories.test.ts` pins the roots that are never accepted.
+- **Test (background session):** `tests/unit/session-leftover-reap-wiring.test.ts` pins that
+  `reapTaskLeftovers` stops a background session holding the conversation before the reap, with
+  "Stop leftover processes" off too, and runs no CLI without the record's hook evidence;
+  `tests/unit/claude-background-sessions.test.ts` pins Claude's exact match (full `sessionId`,
+  `kind: background`, a live `pid`, a plain short id) and its failures reading as nothing stopped,
+  and that `backgroundSessionOf` runs no CLI. `tests/unit/command-terminal-leftovers.test.ts` pins
+  that a Command Terminal's reap waits for the stop, and
+  `tests/unit/command-terminal-background-session.test.ts` that an ordinary end runs no CLI, not
+  even `detect`.
 - **Test (wiring):** `tests/unit/session-leftover-reap-wiring.test.ts` pins the Done and
   `cleanupTaskSession` orderings (exit, then reap, then worktree removal), a Done move whose
   session ended earlier, the `auto_spawn=false` and Pause/Stop negatives, and `PROJECT_DELETE`'s

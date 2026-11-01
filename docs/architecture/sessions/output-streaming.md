@@ -78,9 +78,13 @@ Now each renderer holds its own port to the host and main never relays a keystro
 - **One write queue, in the host.** A renderer's keystrokes and main's writes (an injected command,
   a paste, dictation) share the PTY's queue (`write-queue.ts`), so a key never lands inside a large
   paste. The prompt-draft ledger records each write in queue order and the host reports changes
-  (`promptDraft`), which main mirrors for `getPendingDraft`. The host also reports the first write
-  that carries a human's key or text (`userInput`, once per session), which is how main learns a
-  Command Terminal was used when the keys never crossed it. Keystroke injection asks the host
+  (`promptDraft`), which main mirrors for `getPendingDraft`. The host also reports a write that
+  carries a human's key or text (`userInput`, with `at`, epoch ms), which is how main learns a
+  Command Terminal was used when the keys never crossed it. It reports the first one at once, then
+  at most once every 10 s, so `at` can trail the last keystroke by up to 10 s. Main keeps `at` as
+  `getLastUserInputAt`, never moved by a write Kangentic makes: workflow recovery reads input in
+  the last 5 minutes as the user being there, and a phone's prompt answer logs whether someone
+  typed after its call began. Keystroke injection asks the host
   instead (`readPendingDraft`), so a key that reached the host on a port just before is counted.
   `drain()` is a host request. Every
   place main drops a session's PTY handle calls `sealUserInput()` first, so the host stops writing a
@@ -426,7 +430,7 @@ spawn 56 to 67 ms with the build inside) to 3 (spawn 51 to 54 ms, React only).
   one-resize, held-output, cap and recovery cases beside them.
 - **A window drag holds every window terminal's refit, and closes itself (the manager-resize
   gate).** The window manager's resizers (a window edge, a tile seam, a tiled group's outer edge,
-  the Command Terminal panel's edges) move frames imperatively per pointer frame, so each opens a
+  the Command Terminal panel's edges and its rail's edge) move frames imperatively per pointer frame, so each opens a
   gesture on `manager-resize-gate.ts` for the drag. While one is open, `TerminalTab` skips its
   per-frame ResizeObserver refit and `scheduleWindowTerminalResize` holds its ask, and the last
   gesture to close sends one, so a drag ends in one SIGWINCH. Because every window terminal waits
@@ -436,7 +440,9 @@ spawn 56 to 67 ms with the build inside) to 3 (spawn 51 to 54 ms, React only).
   the first host pointer event that shows the primary button up (a move, an enter, a new press of
   the same pointer, a release no owner answered) or the window losing focus abandons it: the owner
   commits its drag as it stands and forgets it, then the gesture closes. There is no timer, since
-  holding still mid-drag is a drag. A drag of the OS window's own edge shows the page no pointer,
+  holding still mid-drag is a drag. A release's look runs a task after it, and input outranks
+  that task: measured, it ran 61 ms late while a second drag began, so it abandons only the
+  gestures open at the release, never one the same pointer opened since. A drag of the OS window's own edge shows the page no pointer,
   only a resize event per frame, and each one reached the PTY: measured, a 40-step drag sent 40
   resizes to a maximized task window's terminal, on this branch's base as well. So the gate watches
   the window's resizes too. A second resize within `WINDOW_RESIZE_SETTLE_MS` (150 ms) of the last

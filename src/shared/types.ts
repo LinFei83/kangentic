@@ -10,6 +10,7 @@ import type {
 } from './announcements';
 import type { AppLocale } from './i18n/locales';
 import { PREVIOUS_TERMINAL_DEFAULTS } from './terminal-native-defaults';
+import { COMMAND_RAIL_DEFAULT_WIDTH_PX, type CommandTerminalRailState } from './command-terminal-rail';
 
 // === Database Models ===
 
@@ -1362,14 +1363,18 @@ export interface Session {
    *  reason as the slot: recovery restores it, so a recovered terminal's header
    *  branch pill is not blank. */
   commandTerminalBranch?: string | null;
-  /** For a transient session, the name auto-derived from its first prompt. Null
-   *  until one is derived, and for task agents.
+  /** For a transient session, its name: the one the user gave it, else the one
+   *  auto-derived from its first prompt. Null until either exists, and for task
+   *  agents.
    *
    *  Derived in main (`command-terminal-namer.ts`), so a terminal started from a
    *  phone, or in a project the desktop does not have open, is named too. Main
    *  announces the name on `session-changed`, and the window title, the Agent
    *  Monitor and the phone all read it from this row. */
   commandTerminalLabel?: string | null;
+  /** The user renamed this Command Terminal (or cleared its name), so the namer
+   *  never names it: a manual name always wins over the auto-derived one. */
+  commandTerminalNamedByUser?: boolean;
   /**
    * Someone typed, pasted or sent something into this session's terminal
    * (`writeCarriesUserContent`, src/shared/terminal-input-content.ts), or it
@@ -1401,12 +1406,16 @@ export type SessionRecordStatus = 'running' | 'queued' | 'suspended' | 'exited' 
 
 /**
  * Who suspended a session. `'user'`: the Pause button or a phone pause.
- * `'auto'`: Kangentic paused an agent that was waiting on the user, for low
- * memory or the idle timeout. `'system'`: a quit, a move or a settings
- * restart. `'user'` and `'auto'` hold the task paused until the user resumes
- * it (`isHeldPause`, `src/shared/held-pause.ts`); `'system'` holds nothing.
+ * `'auto'`: Kangentic's idle timeout paused an agent that was waiting on the
+ * user. `'low_memory'`: Kangentic's low-memory pause, its own value so a
+ * restart can still tell which workflow tasks come back by themselves once
+ * memory recovers (`workflow-memory-resume.ts`, task #952). `'system'`: a
+ * quit, a move or a settings restart. `'user'`, `'auto'` and `'low_memory'`
+ * hold the task paused until the user resumes it (`isHeldPause`,
+ * `src/shared/held-pause.ts`), apart from that memory resume; `'system'`
+ * holds nothing.
  */
-export type SuspendedBy = 'user' | 'system' | 'auto';
+export type SuspendedBy = 'user' | 'system' | 'auto' | 'low_memory';
 
 export interface SessionRecord {
   id: string;
@@ -1419,6 +1428,13 @@ export interface SessionRecord {
    * multiple independently-resumable sessions.
    */
   isolated_swimlane_id: string | null;
+  /**
+   * The worktree HEAD an isolated column's session started on (task #952). The
+   * task's main conversation, resumed after it, is told the commits since the
+   * first such session began. NULL for a main session, when HEAD could not be
+   * read, and for rows from before the column existed.
+   */
+  start_head_sha: string | null;
   agent_session_id: string | null;
   command: string;
   cwd: string;
@@ -2342,6 +2358,16 @@ export interface SessionEvent {
    * launch rides cannot carry the flag.
    */
   noActivityHold?: boolean;
+  /**
+   * On a `tool_start`: the call starts a subagent (Claude's Agent tool), so a
+   * `subagent_start` may be its own approved call running. The engine closes a
+   * permission prompt on a `subagent_start` only when the call it awaited
+   * carries this; a parallel subagent's start leaves the prompt open.
+   *
+   * Source: the adapter's `markSubagentLaunch` directive, which names its own
+   * subagent tools. Undefined means no report.
+   */
+  launchesSubagent?: boolean;
   /**
    * On an `idle` with `detail: IdleReason.Permission`, what the wait is for:
    * a question the agent asked or an approval it wants. Undefined means the
@@ -4282,6 +4308,17 @@ export interface AppConfig {
      */
     linkNodeModules: boolean;
     /**
+     * What a task's agent does while its new worktree runs `initScript`. On
+     * (the default), the agent starts at once but gets its first prompt only
+     * once the script succeeds, and a failed script fails the task as it always
+     * did. Off, the prompt goes at once too, with a note that the script is
+     * still running, and a failed script is reported on the task and to the
+     * agent instead. Applies to an agent that can take its first prompt typed
+     * (`AgentAdapter.firstPromptMayBeTyped`); any other agent starts after the
+     * script when on.
+     */
+    holdPromptForInitScript: boolean;
+    /**
      * Keep the open project's PRs current in the background. On, each PR whose
      * state can still change is checked about 2 minutes after its own last
      * check, one call at a time and at least 10 s apart
@@ -4848,6 +4885,14 @@ export interface AppConfig {
    *  until the panel is first moved, resized or maximized. Renderer-authoritative,
    *  always written whole. See src/renderer/components/command-bar/. */
   commandTerminalPanel: CommandTerminalPanelGeometry | null;
+  /** GLOBAL width of the Command Terminal panel's rail, as the user dragged its
+   *  edge (200 to 400, 300 by default), and whether it is folded to its 37px
+   *  strip. Shared across all projects and the detached Command Terminal window,
+   *  and kept across restarts. A narrow window shows the rail narrower without
+   *  rewriting it. Written by both the panel and the detached window, so the
+   *  renderer re-reads it from disk rather than preserving its own copy. See
+   *  src/shared/command-terminal-rail.ts. */
+  commandTerminalRail: CommandTerminalRailState;
   /** GLOBAL in-app layout for the Agent Monitor's task-detail window layer: which
    *  details are open over the monitor and how they are arranged. One blob, not
    *  keyed by project, because the monitor is cross-project by design (its windows
@@ -5033,6 +5078,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     copyFiles: [],
     initScript: null,
     linkNodeModules: true,
+    holdPromptForInitScript: true,
     prAutoRefresh: true,
     autoFetch: true,
     prBypassCountsAsReady: true,
@@ -5115,6 +5161,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   workspaceByProject: {},
   commandTerminalWorkspace: null,
   commandTerminalPanel: null,
+  commandTerminalRail: { width: COMMAND_RAIL_DEFAULT_WIDTH_PX, collapsed: false },
   monitorWorkspace: null,
   discoveredModelsByAgent: {},
   discoveredContextWindowsByAgent: {},
@@ -6524,6 +6571,16 @@ export const ActivityDetection = {
     ({ kind: 'hooks_and_pty', detectIdle }),
 } as const;
 
+/** What one SessionStart hook says (`AdapterRuntimeStrategy.statusFile.parseSessionStart`). */
+export interface SessionStartReport {
+  /** The conversation id the hook names. */
+  agentSessionId: string;
+  /** The hook moved the terminal's conversation to that id, rather than reporting a session launched fresh. */
+  movesConversation: boolean;
+  /** The hook's session is the agent CLI's own background session, which the task's PTY does not own. */
+  inBackgroundSession: boolean;
+}
+
 /**
  * Declares how an agent exposes runtime state to Kangentic.
  * One location per adapter for activity detection + session ID capture,
@@ -6680,6 +6737,47 @@ export interface AdapterRuntimeStrategy {
      * separate byte cursor regardless of this flag.
      */
     readonly isFullRewrite: boolean;
+
+    /**
+     * Read a SessionStart hook's payload (the `hookContext` of a
+     * `session_start` line): the conversation id it names, and whether the
+     * hook moved the terminal's conversation to that id (a fork, a /clear, a
+     * /resume, a compaction) rather than reporting a session launched fresh.
+     * Returns null for a payload it cannot read.
+     *
+     * Declared by an agent whose `parseStatus` reports a session id. A status
+     * write's id then counts as a conversation switch only after a hook that
+     * moves the conversation named it, because more than one process can run
+     * the same `--settings` and write one status file (Claude Code's
+     * background daemon runs a spare session beside the real one). Without
+     * it, every id change in the status file is a switch.
+     *
+     * `inBackgroundSession` is true when the hook's session is the agent CLI's
+     * own background session (Claude Code's `/bg`), which the task's PTY does
+     * not own: a resume and a terminal transition then stop it first
+     * (`AgentAdapter.stopBackgroundSession`).
+     */
+    parseSessionStart?(hookContext: string): SessionStartReport | null;
+
+    /**
+     * For a SessionStart whose session is the CLI's own background session
+     * (`inBackgroundSession`): did the terminal's conversation move there, or
+     * did a copy start beside it? Claude Code's `/bg` moves it and its `/fork`
+     * copies it, and the two hooks are identical; a move ends the old
+     * conversation's transcript with a `continued-in` record naming the new id.
+     * The status channel switches to a background session only on true.
+     * Resolves false on any doubt. Without it, such a hook is a move.
+     */
+    confirmsBackgroundMove?(options: {
+      cwd: string;
+      /** The conversation the terminal ran (the session's current id). */
+      fromAgentSessionId: string;
+      /** The background session's id, from its SessionStart. */
+      toAgentSessionId: string;
+      cliTarget?: StoredCliTarget | null;
+      /** The transcript path the agent reported for `fromAgentSessionId`, read before any path derived from `cwd`. */
+      transcriptPath?: string | null;
+    }): Promise<boolean>;
   };
 
   /**
@@ -7105,6 +7203,9 @@ export type TranscriptBlock =
  */
 export type ExitSequenceStep = string | { delayMs: number };
 
+/** Who resumed a session (`SpawnSessionInput.resumedBy`): a person, or Kangentic itself. */
+export type SessionResumer = 'user' | 'recovery' | 'memory';
+
 export interface SpawnSessionInput {
   /** Caller-provided session ID. When omitted, spawn() generates one via uuidv4(). */
   id?: string;
@@ -7117,6 +7218,14 @@ export interface SpawnSessionInput {
   eventsOutputPath?: string; // path for the event bridge JSONL file (activity log)
   /** True when this session is resuming a previous Claude conversation. */
   resuming?: boolean;
+  /**
+   * Who started a resuming session, when it was not a person: `'recovery'`,
+   * Kangentic after a quit, a crash or a pty host loss; `'memory'`, a workflow
+   * task Kangentic paused for low memory and brought back. Rides the
+   * `'session-resumed'` event, so workflow recovery can tell that the agent's
+   * background commands died with the old process. Unset means a person.
+   */
+  resumedBy?: SessionResumer;
   /** True for ephemeral command terminal sessions. */
   transient?: boolean;
   /** Set for a workflow's own agent (transient, never a Command Terminal). See src/shared/session-owner.ts. */
@@ -7195,7 +7304,42 @@ export interface SpawnSessionInput {
    * readers and its reap.
    */
   cliTarget?: StoredCliTarget | null;
+  /**
+   * Start the session idle rather than seeded as thinking, for a fresh task
+   * spawn that carries no prompt: an agent launched while its worktree's setup
+   * script runs, whose first prompt is typed in once the script ends.
+   */
+  seedIdle?: boolean;
+  /**
+   * Keep the session out of the task's view until `SessionManager.adoptSession`:
+   * no `session-changed` or other session event reaches a listener, it is not
+   * listed, not the task's live session, and not writable. Set only for an
+   * agent launched while its worktree's setup script runs
+   * (`TransitionEngine.launchEarlyAgent`), which nothing may type into before
+   * its first prompt and which the database knows nothing of until adopted.
+   */
+  hiddenUntilAdopted?: boolean;
+  /**
+   * The agent draws its input box in the alternate screen, and any screen it
+   * shows first (Claude's approval of a new project MCP server) outside it
+   * (`AgentAdapter.firstPromptMayBeTyped` answered true for this launch). A
+   * background paste then waits for the alternate screen, or for the agent to
+   * take a prompt (`SessionManager.awaitInputReady`), so it never answers that
+   * screen.
+   */
+  inputInAlternateScreen?: boolean;
 }
+
+/**
+ * What a spawn warning (`TASK_SPAWN_WARNING`) is about. The agent started
+ * either way.
+ * - `base-not-refreshed`: the base branch could not be fetched, so the
+ *   worktree may start from a stale base.
+ * - `setup-script-failed`: the worktree's setup script failed after the agent
+ *   was already working (`git.holdPromptForInitScript` off), so the task kept
+ *   its agent and worktree, and the agent was told.
+ */
+export type SpawnWarningKind = 'base-not-refreshed' | 'setup-script-failed';
 
 export interface SpawnTransientSessionInput {
   projectId: string;
@@ -7811,7 +7955,11 @@ export interface ElectronAPI {
      * start its agent" would be a lie here. Cooldown-guarded in main so a bulk
      * unarchive while offline produces one toast per project, not one per task.
      */
-    onSpawnWarning: (callback: (taskId: string, message: string, projectId?: string) => void) => () => void;
+    /**
+     * A spawn went ahead with something wrong the user should know. `kind`
+     * picks the toast's title; absent means `'base-not-refreshed'`.
+     */
+    onSpawnWarning: (callback: (taskId: string, message: string, projectId?: string, kind?: SpawnWarningKind) => void) => () => void;
     /**
      * A column's auto_command finished delivering, and the result is worth
      * telling the user about.
@@ -8072,8 +8220,12 @@ export interface ElectronAPI {
     /** Mirror where a Command Terminal's checkout actually sits, re-derived
      *  from live HEAD by the renderer, onto its live registry row so the
      *  Monitor row and a post-reload adopt agree with the pill. Last write
-     *  wins, unlike the label: HEAD moves, and the newest reading is true. */
+     *  wins: HEAD moves, and the newest reading is true. */
     setTransientBranch: (sessionId: string, branch: string) => Promise<void>;
+    /** Rename a Command Terminal. Null (or an empty or slot-title name) clears it
+     *  back to "Command Terminal N". Either way the namer stands down for good.
+     *  Resolves whether the name changed. */
+    renameTransient: (sessionId: string, name: string | null) => Promise<boolean>;
     /** A project's earlier Command Terminal conversations, newest first. */
     listCommandTerminalHistory: (projectId: string) => Promise<CommandTerminalHistoryEntry[]>;
     /** A project's earlier conversations changed: re-list them. */

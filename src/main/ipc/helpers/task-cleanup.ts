@@ -1,11 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import PQueue from 'p-queue';
 import { TaskRepository } from '../../db/repositories/task-repository';
 import { SessionRepository } from '../../db/repositories/session-repository';
 import { WorktreeManager, prepareWorktreeForRemoval, GitQueuePriority } from '../../git/worktree-manager';
+import { waitForWorktreeCreation } from '../../git/worktree-creation-registry';
+import { scheduleRemovedWorktreeDeletion } from '../../git/removed-worktrees';
 import { readWorktreeHead } from '../../git/worktree-head';
+import { waitForChurnRead } from '../handlers/git-stats-capture';
 import { getOpenProjectDb, getProjectDb } from '../../db/database';
 import { agentRegistry } from '../../agent/agent-registry';
+import type { AgentAdapter } from '../../agent/agent-adapter';
+import type { SessionRecord } from '../../../shared/types';
 import { parseStoredCliTarget, parseWslCliPath, type CliPlace } from '../../agent/shared/cli-target';
 import { isWslDistroRunning, resolveWslDistroFacts } from '../../agent/shared/wsl-distro';
 import type { IpcContext } from '../ipc-context';
@@ -14,6 +20,7 @@ import { getProjectRepos } from './project-repos';
 import { withTaskLock } from '../task-lifecycle-lock';
 import { isShuttingDown } from '../../shutdown-state';
 import type { LeftoverSweepOptions } from '../../transition-engine/resource-cleanup';
+import { backgroundSessionHoldingConversation } from '../../transition-engine/resume-id-reconcile';
 import { closeTaskWindows } from './task-windows';
 // Dev-only (dropped from prod via __KANGENTIC_DEV__ dead-code elimination).
 import { stopWorktreePreviews } from '../../../devtools/main/worktree-preview-stop';
@@ -58,6 +65,9 @@ export async function reapTaskLeftovers(
   } = {},
 ): Promise<void> {
   if (tasks.length === 0) return;
+  // Before the reap, which would otherwise kill it: a conversation moved into
+  // the agent CLI's own background session is still the task's agent.
+  await stopTaskBackgroundSessions(context, projectPath ?? null, tasks.map((task) => task.id));
   // Held for the whole reap, so a bulk delete's reaps, which the host runs in
   // two batches a second apart, still make one toast.
   const releaseReport = leftoverProcessReports.beginReap();
@@ -98,6 +108,110 @@ export async function reapTaskLeftovers(
     console.warn(`[TASK-REAP] Leftover reap failed for ${tasks.length} task(s) (non-fatal):`, error);
   } finally {
     releaseReport();
+  }
+}
+
+/** How many of a task's newest session records are checked for a conversation in a background session. */
+const BACKGROUND_SESSION_RECORDS_PER_TASK = 3;
+
+/**
+ * How many records one call checks and stops at once. A bulk or project delete
+ * checks many, and each stop lists every background session on the machine,
+ * which can start the CLI's supervisor, so they run a few at a time rather
+ * than one after another (a stop can take its whole 10 s budget) or all at once.
+ */
+const BACKGROUND_SESSION_STOP_CONCURRENCY = 2;
+
+/**
+ * The longest one call waits for its stops before the reap goes ahead. Twice
+ * one stop's own 10 s budget, so a single stop always gets all of it, while a
+ * bulk delete behind a supervisor that does not answer waits this long, not a
+ * budget for every record. A stop still running at the deadline is not waited
+ * for, and none starts after it.
+ */
+const BACKGROUND_SESSION_STOPS_DEADLINE_MS = 20_000;
+
+/**
+ * Stop the agent CLI's own background session holding a task's conversation,
+ * for each of the tasks (Claude Code's `/bg` moves a conversation into one,
+ * which outlives the task's PTY: see `AgentAdapter.stopBackgroundSession`).
+ * It ends the task's own agent through the CLI's own stop, where the reap
+ * after it would kill it with no exit of its own, and before the worktree it
+ * works in is removed.
+ *
+ * Not gated on "Stop leftover processes": that setting is about what the agent
+ * left running, and this is the agent itself, which every terminal transition
+ * ends. Runs a CLI only for a record whose own hooks show its conversation
+ * moved into a background session (`backgroundSessionHoldingConversation`), so
+ * a task that never did costs a few file reads. The CLI is the project's
+ * configured one, so a record whose CLI ran somewhere that path no longer
+ * reaches is left to the reap. Best-effort: never throws.
+ */
+async function stopTaskBackgroundSessions(context: IpcContext, projectPath: string | null, taskIds: readonly string[]): Promise<void> {
+  if (!projectPath || taskIds.length === 0) return;
+  try {
+    const project = context.projectRepo.list().find((candidate) => candidate.path === projectPath);
+    const db = project ? getOpenProjectDb(project.id) : null;
+    if (!db) return;
+    const sessionRepo = new SessionRepository(db);
+    const cliPathOverrides = context.configManager.getEffectiveConfig(projectPath).agent.cliPaths;
+    const records = taskIds.flatMap((taskId) => sessionRepo.listForTaskNewestFirst(taskId).slice(0, BACKGROUND_SESSION_RECORDS_PER_TASK));
+    /** One detection per adapter for the whole call. */
+    const cliPaths = new Map<string, Promise<string | null>>();
+    const cliPathOf = (adapter: AgentAdapter): Promise<string | null> => {
+      let cliPath = cliPaths.get(adapter.name);
+      if (!cliPath) {
+        cliPath = adapter.detect(cliPathOverrides[adapter.name] ?? null).then((detection) => (detection.found && detection.path ? detection.path : null));
+        cliPaths.set(adapter.name, cliPath);
+      }
+      return cliPath;
+    };
+    const stopped = new Set<string>();
+    const stopForRecord = async (record: SessionRecord): Promise<void> => {
+      try {
+        const agentSessionId = record.agent_session_id;
+        if (!agentSessionId) return;
+        const adapter = agentRegistry.getBySessionType(record.session_type);
+        if (!adapter?.stopBackgroundSession) return;
+        const backgroundId = await backgroundSessionHoldingConversation({
+          adapter,
+          projectPath,
+          recordId: record.id,
+          agentSessionId,
+          cwd: record.cwd,
+          cliTarget: parseStoredCliTarget(record.cli_target),
+        });
+        if (!backgroundId || stopped.has(backgroundId)) return;
+        // Claimed before the first await below, so two records naming one
+        // conversation never stop it twice.
+        stopped.add(backgroundId);
+        const cliPath = await cliPathOf(adapter);
+        if (cliPath) await adapter.stopBackgroundSession({ agentSessionId: backgroundId, cliPath });
+      } catch (error) {
+        console.warn(`[TASK-REAP] could not stop a background session for record ${record.id.slice(0, 8)} before the reap (non-fatal):`, error);
+      }
+    };
+    const queue = new PQueue({ concurrency: BACKGROUND_SESSION_STOP_CONCURRENCY });
+    const allStops = Promise.all(records.map((record) => queue.add(() => stopForRecord(record))));
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<'deadline'>((resolve) => {
+      deadlineTimer = setTimeout(() => resolve('deadline'), BACKGROUND_SESSION_STOPS_DEADLINE_MS);
+    });
+    try {
+      const outcome = await Promise.race([allStops.then(() => 'done' as const), deadline]);
+      if (outcome === 'deadline') {
+        const notStarted = queue.size;
+        queue.clear();
+        console.warn(
+          `[TASK-REAP] background session stops passed ${BACKGROUND_SESSION_STOPS_DEADLINE_MS} ms; the reap goes ahead`
+          + ` (${queue.pending} still stopping, ${notStarted} not started)`,
+        );
+      }
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
+  } catch (error) {
+    console.warn('[TASK-REAP] could not stop a background session before the reap (non-fatal):', error);
   }
 }
 
@@ -183,6 +297,14 @@ export async function retryDoneWorktreeRemoval(
  * `/preview`'s cleanup helper deleting inside the worktree measured about 3 s.
  */
 export const DONE_REMOVAL_RETRY_DELAY_MS = 10_000;
+
+/**
+ * How long a Done move's removal waits for the churn capture it just fired into
+ * the worktree. That read is six git processes at background priority, about a
+ * second on a quiet machine; past this the removal goes ahead and the capture
+ * reports nothing, which never overwrites an earlier one.
+ */
+const CHURN_READ_WAIT_MS = 15_000;
 
 /**
  * Retry a Done move's worktree removal once, a little later, when it failed.
@@ -479,10 +601,16 @@ export async function cleanupTaskResources(
  * failed removal still leaves the corrected name persisted for the startup
  * retry pass.
  *
- * Returns true when the directory was actually removed and the DB field
- * was cleared, false when there was nothing to delete or the removal
- * failed. Callers use the return value for log classification; callers
- * that want to retry on failure rely on the preserved `worktree_path`.
+ * The directory is moved aside first (`WorktreeManager.moveWorktreeAside`):
+ * renamed into `.kangentic/removed-worktrees/`, and its files are deleted in
+ * the background, never while a Post-Worktree Script runs
+ * (`removed-worktrees.ts`). Only when the rename fails, because something
+ * still holds the directory, is it removed in place as before.
+ *
+ * Returns true when the directory left its path and the DB field was cleared,
+ * false when there was nothing to delete or the removal failed. Callers use
+ * the return value for log classification; callers that want to retry on
+ * failure rely on the preserved `worktree_path`.
  *
  * LOCK CONTRACT: callers MUST hold a `withTaskLock(taskId, ...)` for the
  * duration of this call. Crosses an await boundary and mutates per-task
@@ -511,21 +639,44 @@ export async function deleteTaskWorktree(
     tasks.update({ id: task.id, branch_name: capturedBranch });
   }
 
+  // The Done move fired its churn capture into this worktree just before this
+  // call. The in-place delete below used to give it 30 s of slack; a move
+  // aside takes the directory at once.
+  await waitForChurnRead(task.worktree_path, CHURN_READ_WAIT_MS);
+
   let removed = false;
+  // True once the worktree sits in removed-worktrees/ and the deleter has to
+  // be started for it. False after an in-place removal, which leaves no copy.
+  let copyAwaitsDeleter = false;
   try {
     const worktreeManager = new WorktreeManager(resolvedProjectPath);
-    // Reap orphans + clear node_modules BEFORE taking the git lock so the slow
-    // fs work (and a pinned-handle stall) does not head-of-line-block every
-    // other spawn on this project. Safe outside the lock per the LOCK CONTRACT
-    // above: the caller holds withTaskLock(taskId), which serializes same-path
-    // work; no other task ever shares this worktree path.
-    await prepareWorktreeForRemoval(task.worktree_path, 'moderate');
-    await worktreeManager.withLock(async () => {
-      removed = await worktreeManager.removeWorktree(task.worktree_path!, { removalProfile: 'moderate' });
-      // BACKGROUND: nothing user-visible gates on the removal finishing (the
-      // board mutation + archive already happened); a batch Done-move must not
-      // park a fresh agent spawn behind its removals.
-    }, { label: `remove-worktree:${task.id.slice(0, 8)}`, priority: GitQueuePriority.BACKGROUND });
+    // A creation still setting this path up writes there outside the git
+    // queue; wait it out here, since the move inside the queue only refuses.
+    await waitForWorktreeCreation(task.worktree_path);
+    // BACKGROUND: nothing user-visible gates on the removal finishing (the
+    // board mutation + archive already happened); a batch Done-move must not
+    // park a fresh agent spawn behind its removals.
+    copyAwaitsDeleter = await worktreeManager.withLock(
+      () => worktreeManager.moveWorktreeAside(task.worktree_path!),
+      { label: `remove-worktree:${task.id.slice(0, 8)}`, priority: GitQueuePriority.BACKGROUND },
+    );
+    removed = copyAwaitsDeleter;
+    if (!copyAwaitsDeleter) {
+      // The rename failed (something holds the directory) or was refused.
+      // Remove in place, as before the move existed, so the retry net below
+      // and at the next project open still applies.
+      //
+      // Reap orphans + clear node_modules BEFORE taking the git lock so the slow
+      // fs work (and a pinned-handle stall) does not head-of-line-block every
+      // other spawn on this project. Safe outside the lock per the LOCK CONTRACT
+      // above: the caller holds withTaskLock(taskId), which serializes same-path
+      // work; no other task ever shares this worktree path.
+      await prepareWorktreeForRemoval(task.worktree_path, 'moderate');
+      removed = await worktreeManager.withLock(
+        () => worktreeManager.removeWorktree(task.worktree_path!, { removalProfile: 'moderate' }),
+        { label: `remove-worktree:${task.id.slice(0, 8)}`, priority: GitQueuePriority.BACKGROUND },
+      );
+    }
   } catch (err) {
     console.error(`[WORKTREE] Failed to delete worktree for task ${task.id.slice(0, 8)}:`, err);
   }
@@ -533,5 +684,8 @@ export async function deleteTaskWorktree(
   if (removed) {
     tasks.update({ id: task.id, worktree_path: null, ...(capturedSha ? { head_sha: capturedSha } : {}) });
   }
+  // After the row stops naming the path. The deleter waits while any init
+  // script runs, so the next task's install has the disk to itself.
+  if (copyAwaitsDeleter) scheduleRemovedWorktreeDeletion(resolvedProjectPath);
   return removed;
 }

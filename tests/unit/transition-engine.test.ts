@@ -36,7 +36,8 @@ import type { ConversationExpiredNotice } from '../../src/shared/types';
 import { OpenCodeCommandBuilder, type OpenCodeCommandOptions } from '../../src/main/agent/adapters/opencode';
 import { CodexCommandBuilder, type CodexCommandOptions } from '../../src/main/agent/adapters/codex';
 import { AgentCliNotFoundError, agentCliNotFoundMessage } from '../../src/main/agent/shared/agent-cli-not-found';
-import type { AgentExecutionServer, AgentProjectExecution, AgentLaunchOptionInfo, SessionUsage } from '../../src/shared/types';
+import type { AgentExecutionServer, AgentProjectExecution, AgentLaunchOptionInfo, SessionStartReport, SessionUsage } from '../../src/shared/types';
+import { claudeSessionStartLine } from './helpers/claude-session-start';
 
 // ---------------------------------------------------------------------------
 // Minimal mock factories
@@ -125,13 +126,6 @@ function makeTaskRepo() {
   };
 }
 
-function makeActionRepo(action: ReturnType<typeof makeAction>) {
-  return {
-    getTransitionsFor: vi.fn(() => [{ action_id: action.id }]),
-    getById: vi.fn(() => action),
-  };
-}
-
 function makeAttachmentRepo() {
   return {
     getPathsForTask: vi.fn(() => []),
@@ -200,7 +194,16 @@ const mockAdapter = {
   // "TransitionEngine - resume-time agent-session-id reconcile wiring"
   // describe below is the only one that sets this, and resets it to
   // undefined in its afterEach so it never leaks into other describes.
-  runtime: undefined as { statusFile?: { parseStatus: (raw: string) => SessionUsage | null } } | undefined,
+  runtime: undefined as {
+    statusFile?: {
+      parseStatus: (raw: string) => SessionUsage | null;
+      parseSessionStart?: (hookContext: string) => SessionStartReport | null;
+    };
+  } | undefined,
+  // Undefined by default, as on every adapter that has no background session of
+  // its own to stop. The reconcile describe's background-session test sets a
+  // spy and resets it in afterEach.
+  stopBackgroundSession: undefined as AgentAdapter['stopBackgroundSession'],
   locateSessionHistoryFile: vi.fn(async (_agentSessionId: string, _cwd: string): Promise<string | null> => null),
   // Undefined by default, so no resume is ever proven expired; the
   // expired-conversation describe below sets Claude's real proof and resets it.
@@ -905,6 +908,7 @@ describe('TransitionEngine - resume-time agent-session-id reconcile wiring (exec
   afterEach(() => {
     fs.rmSync(projectPath, { recursive: true, force: true });
     mockAdapter.runtime = undefined;
+    mockAdapter.stopBackgroundSession = undefined;
     mockAdapter.locateSessionHistoryFile.mockReset();
     mockAdapter.locateSessionHistoryFile.mockImplementation(async () => null);
   });
@@ -1009,6 +1013,45 @@ describe('TransitionEngine - resume-time agent-session-id reconcile wiring (exec
 
     expect(capturedSessionId).toBe(STORED_ID);
     expect(sessionRepo.updateAgentSessionId).not.toHaveBeenCalled();
+  });
+
+  it('hands the background-session stop the CLI path this spawn detected, for a conversation the record saw move into one', async () => {
+    // The record's events file holds a background-session SessionStart (source
+    // `fork`) naming the stored id: the conversation moved into the CLI's own
+    // background session, which outlives the task's PTY. Written with
+    // fs.promises.mkdir for the same reason as writeStatusFile above.
+    const sessionDir = path.join(projectPath, '.kangentic', 'sessions', RECORD_ID);
+    await fs.promises.mkdir(sessionDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionDir, 'events.jsonl'), `${claudeSessionStartLine(STORED_ID, 'fork', 1)}\n`);
+
+    mockAdapter.runtime = {
+      statusFile: {
+        parseStatus: ClaudeStatusParser.parseStatus,
+        parseSessionStart: ClaudeStatusParser.parseSessionStart,
+      },
+    };
+    const stopBackgroundSession = vi.fn(async (_options: { agentSessionId: string; cliPath: string }) => true);
+    mockAdapter.stopBackgroundSession = stopBackgroundSession;
+
+    const sessionRepo = makeSessionRepo();
+    sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue({
+      id: RECORD_ID,
+      agent_session_id: STORED_ID,
+      session_type: 'claude_agent',
+      status: 'suspended',
+      cwd: path.join(projectPath, 'worktree'),
+    });
+    const { runSpawn } = makeEngine({ sessionRepo, projectPath });
+
+    await runSpawn(makeTask({ worktree_path: null }));
+
+    // Red: deleting `cliPath: detection.path` from executeSpawnAgent's
+    // reconcileResumeAgentSessionId call makes the reconcile skip the stop
+    // (`if (cliPath)`), so the resume starts a second process on the
+    // conversation and this spy is never called. '/usr/bin/claude' is the path
+    // the file-level mockAdapter's `detect` reports.
+    expect(stopBackgroundSession).toHaveBeenCalledTimes(1);
+    expect(stopBackgroundSession).toHaveBeenCalledWith({ agentSessionId: STORED_ID, cliPath: '/usr/bin/claude' });
   });
 });
 
@@ -1771,6 +1814,156 @@ describe('TransitionEngine - a resume whose conversation the agent deleted start
     expect(capturedOptions?.sessionId).toBe(AGENT_SESSION_ID);
     expect(capturedOptions?.prompt).toBe('/code-review');
     expect(notices).toEqual([]);
+  });
+});
+
+describe('TransitionEngine - where an isolated pass began, and who resumed a session (executeSpawnAgent chokepoint)', () => {
+  // Task #952. An isolated column's pass records the HEAD of the checkout it
+  // starts in (`SessionRecord.start_head_sha`), read through the injected
+  // `readStartHead` BEFORE the spawn because the agent may commit within its
+  // first seconds. A main session records none, and a read that fails never
+  // fails the spawn. `spawnOverrides.resumedBy` (the workflow's memory resume
+  // passes 'memory') rides the spawn only when it really resumes.
+  //
+  // Red-green: calling readStartHead for a main session fails the first
+  // main-session test; dropping its try/catch fails the throw test; forwarding
+  // resumedBy on a fresh spawn fails the fresh-spawn test, and dropping the
+  // forward fails the resume test.
+  const AGENT_SESSION_ID = 'agent-sess-uuid';
+  const START_HEAD = '0123456789abcdef0123456789abcdef01234567';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAdapter.buildCommand.mockImplementation((options: { prompt?: string }) => `claude ${options.prompt ?? ''}`);
+  });
+
+  /** A suspended record the spawn resumes, or no record at all for a fresh spawn. */
+  function repoWithResumableRecord(resumable: boolean) {
+    const sessionRepo = makeSessionRepo();
+    if (resumable) {
+      const record = {
+        id: 'session-record-resume',
+        agent_session_id: AGENT_SESSION_ID,
+        session_type: 'claude_agent',
+        status: 'suspended',
+        cwd: '/some/project',
+        isolated_swimlane_id: null,
+      };
+      sessionRepo.getLatestForTaskByTypeAndIsolation.mockReturnValue(record as never);
+      sessionRepo.listForTaskNewestFirst.mockReturnValue([record] as never);
+    }
+    return sessionRepo;
+  }
+
+  type SpawnedArguments = { cwd: string; resuming?: boolean; resumedBy?: string };
+
+  describe('start_head_sha', () => {
+    it('reads the HEAD of the checkout an isolated pass starts in, before the spawn, and records it', async () => {
+      const readStartHead = vi.fn(async (_cwd: string) => START_HEAD);
+      const { engine, sessionManager, sessionRepo } = makeEngine({ services: { readStartHead } });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        null, true, '/code-review', undefined, 'claude', undefined, { isolatedSwimlaneId: 'lane-review' },
+      );
+
+      const spawned = sessionManager.spawn.mock.calls[0][0] as unknown as SpawnedArguments;
+      expect(readStartHead).toHaveBeenCalledTimes(1);
+      expect(readStartHead).toHaveBeenCalledWith(spawned.cwd);
+      // Before the spawn: the agent may commit within its first seconds.
+      expect(readStartHead.mock.invocationCallOrder[0]).toBeLessThan(sessionManager.spawn.mock.invocationCallOrder[0]);
+      expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({
+        isolated_swimlane_id: 'lane-review',
+        start_head_sha: START_HEAD,
+      }));
+    });
+
+    it('reads nothing for the main session, and records no start HEAD', async () => {
+      const readStartHead = vi.fn(async (_cwd: string) => START_HEAD);
+      const { engine, sessionRepo } = makeEngine({ services: { readStartHead } });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        null, true, '/code-review', undefined, 'claude',
+      );
+
+      expect(readStartHead).not.toHaveBeenCalled();
+      expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({
+        isolated_swimlane_id: null,
+        start_head_sha: null,
+      }));
+    });
+
+    it('records no start HEAD, and still spawns, when the read throws', async () => {
+      const readStartHead = vi.fn(async (_cwd: string): Promise<string | null> => { throw new Error('not a git checkout'); });
+      const { engine, sessionManager, sessionRepo } = makeEngine({ services: { readStartHead } });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        null, true, '/code-review', undefined, 'claude', undefined, { isolatedSwimlaneId: 'lane-review' },
+      );
+
+      expect(readStartHead).toHaveBeenCalledTimes(1);
+      expect(sessionManager.spawn).toHaveBeenCalledTimes(1);
+      expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({
+        isolated_swimlane_id: 'lane-review',
+        start_head_sha: null,
+      }));
+    });
+
+    it('records no start HEAD when the checkout has none to report', async () => {
+      const readStartHead = vi.fn(async (_cwd: string): Promise<string | null> => null);
+      const { engine, sessionRepo } = makeEngine({ services: { readStartHead } });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        null, true, '/code-review', undefined, 'claude', undefined, { isolatedSwimlaneId: 'lane-review' },
+      );
+
+      expect(sessionRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ start_head_sha: null }));
+    });
+  });
+
+  describe('resumedBy', () => {
+    it('is forwarded to the spawn when the session resumes', async () => {
+      const { engine, sessionManager } = makeEngine({ sessionRepo: repoWithResumableRecord(true) });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        null, false, undefined, undefined, 'claude', undefined, { resumedBy: 'memory' },
+      );
+
+      const spawned = sessionManager.spawn.mock.calls[0][0] as unknown as SpawnedArguments;
+      // The control: this really is a resume.
+      expect(spawned.resuming).toBe(true);
+      expect(spawned.resumedBy).toBe('memory');
+    });
+
+    it('is left off a fresh spawn, which resumes nobody', async () => {
+      const { engine, sessionManager } = makeEngine({ sessionRepo: repoWithResumableRecord(false) });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        null, false, undefined, undefined, 'claude', undefined, { resumedBy: 'memory' },
+      );
+
+      const spawned = sessionManager.spawn.mock.calls[0][0] as unknown as SpawnedArguments;
+      expect(spawned.resuming).toBe(false);
+      expect(spawned).not.toHaveProperty('resumedBy');
+    });
+
+    it('is left off a resume nobody else asked for (a person resumes by default)', async () => {
+      const { engine, sessionManager } = makeEngine({ sessionRepo: repoWithResumableRecord(true) });
+
+      await engine.resumeSuspendedSession(
+        makeTask() as Parameters<typeof engine.resumeSuspendedSession>[0],
+        null, false, undefined, undefined, 'claude',
+      );
+
+      const spawned = sessionManager.spawn.mock.calls[0][0] as unknown as SpawnedArguments;
+      expect(spawned.resuming).toBe(true);
+      expect(spawned).not.toHaveProperty('resumedBy');
+    });
   });
 });
 

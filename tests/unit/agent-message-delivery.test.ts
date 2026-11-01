@@ -48,6 +48,8 @@ function makeContext(sessionStatus: string | null = 'running') {
   return {
     sessionManager: {
       getSession: vi.fn((id: string) => (sessionStatus ? { id, status: sessionStatus } : undefined)),
+      // At its input box, or an agent that draws none in the alternate screen.
+      awaitInputReady: vi.fn(async () => true),
     },
     terminalSubmitScheduler: {
       scheduleKeystrokes: vi.fn(),
@@ -163,12 +165,63 @@ describe('deliverAgentMessageInBackground', () => {
     expect(context.terminalSubmit.submitContent).toHaveBeenCalledWith(
       SESSION_ID,
       MULTI_LINE,
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      // `automated: true` makes the paste wait for the automated-keys guard, so
+      // it never lands in the middle of a person's typing. Red: dropping it
+      // from the background path's submitContent call.
+      expect.objectContaining({ signal: expect.any(AbortSignal), automated: true }),
     );
     await settle();
     expect(reports).toHaveLength(1);
     expect(reports[0].outcome).toBe('unconfirmed');
     expect(reports[0].commands).toEqual([MULTI_LINE]);
+  });
+
+  it('waits for the agent to reach its input box before the turn wait, so a screen it shows first never takes the paste', async () => {
+    const context = makeContext();
+    // Claude at its approval of a new project MCP server: drawn before the alternate screen.
+    let reachInputBox: (atInput: boolean) => void = () => {};
+    context.sessionManager.awaitInputReady.mockImplementationOnce(() => new Promise<boolean>((resolve) => { reachInputBox = resolve; }));
+    const reports: InjectionReport[] = [];
+    deliverAgentMessageInBackground(context as never, {
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+      message: MULTI_LINE,
+      mode: 'immediate',
+      verifier: null,
+      onOutcome: (report) => reports.push(report),
+    });
+    await settle();
+    expect(context.sessionManager.awaitInputReady).toHaveBeenCalledWith(SESSION_ID, expect.any(Number), expect.any(AbortSignal));
+    // Red: without the gate the turn wait starts here, and the stale-thinking
+    // reclaim would end it with the screen still up.
+    expect(turnWaits).toHaveLength(0);
+
+    reachInputBox(true);
+    await settle();
+    expect(turnWaits).toHaveLength(1);
+    turnWaits[0].resolve('completed');
+    await settle();
+    expect(context.terminalSubmit.submitContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a paste failed, writing nothing, when the agent never reaches its input box', async () => {
+    const context = makeContext();
+    context.sessionManager.awaitInputReady.mockResolvedValueOnce(false);
+    const reports: InjectionReport[] = [];
+    deliverAgentMessageInBackground(context as never, {
+      taskId: TASK_ID,
+      sessionId: SESSION_ID,
+      message: MULTI_LINE,
+      mode: 'immediate',
+      verifier: null,
+      onOutcome: (report) => reports.push(report),
+    });
+    await settle();
+
+    expect(turnWaits).toHaveLength(0);
+    expect(context.terminalSubmit.submitContent).not.toHaveBeenCalled();
+    expect(reports.map((report) => report.outcome)).toEqual(['failed']);
+    expect(reports[0].textReachedAgent).toBe(false);
   });
 
   it('a move out of the column cancels a paste still waiting for the turn, and reports it cancelled', async () => {
@@ -371,7 +424,8 @@ describe('deliverAgentMessageAndWait', () => {
     expect(context.terminalSubmit.submitContent).toHaveBeenCalledWith(
       SESSION_ID,
       MULTI_LINE,
-      expect.objectContaining({ signal: runController.signal }),
+      // Red: dropping `automated: true` from the awaited path's submitContent call.
+      expect.objectContaining({ signal: runController.signal, automated: true }),
     );
     expect(delivered).toBe(false);
 

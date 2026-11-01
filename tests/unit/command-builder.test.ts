@@ -1967,13 +1967,14 @@ describe('Merged Settings -- Local Settings Merge', () => {
       .not.toContain('--allow-dangerously-skip-permissions');
   });
 
-  it('registers the plan approval hook on ExitPlanMode alone, reading this session\'s decision file', () => {
+  it('registers the plan approval hook on ExitPlanMode, and the tool approval entry on MCP tools and Artifact, both reading this session\'s decision file', () => {
     // Registered on every spawn, whatever the column says: the decision file
-    // decides at run time, so it must name THIS session's directory.
+    // decides at run time, so it must name THIS session's directory. The tool
+    // approval entry is on every spawn too, since a built-in Artifact read needs
+    // no allow rule (task #952).
     const sessionDir = path.join(tmpDir, '.kangentic', 'sessions', 'plan-sess');
     const builder = new CommandBuilder();
-    // A home with no settings: an MCP allow rule in the developer's own would
-    // add the tool approval entry, which runs the same bridge.
+    // A home with no settings, so the entries come from Kangentic alone.
     vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
     try {
       builder.buildClaudeCommand({
@@ -1993,11 +1994,12 @@ describe('Merged Settings -- Local Settings Merge', () => {
       hooks: Record<string, Array<{ matcher: string; hooks: Array<{ command: string }> }>>;
     };
     const approvers = merged.hooks.PermissionRequest.filter((entry) => entry.hooks.some((hook) => hook.command.includes('plan-approval-bridge')));
-    expect(approvers).toHaveLength(1);
-    expect(approvers[0].matcher).toBe('ExitPlanMode');
-    const command = approvers[0].hooks[0].command;
-    expect(command).toContain(path.join(sessionDir, 'plan-approval.json').replace(/\\/g, '/'));
-    expect(command).toContain(path.join(sessionDir, 'events.jsonl').replace(/\\/g, '/'));
+    expect(approvers.map((entry) => entry.matcher).sort()).toEqual(['ExitPlanMode', 'mcp__.*|Artifact']);
+    for (const approver of approvers) {
+      const command = approver.hooks[0].command;
+      expect(command).toContain(path.join(sessionDir, 'plan-approval.json').replace(/\\/g, '/'));
+      expect(command).toContain(path.join(sessionDir, 'events.jsonl').replace(/\\/g, '/'));
+    }
   });
 
   // Task #857: the background shell hint points at kangentic_mark_background_service,
@@ -2720,6 +2722,20 @@ describe('Merged Settings -- TUI Fullscreen Default', () => {
     const secondSettings = JSON.parse(fs.readFileSync(path.join(tmpDir, '.kangentic', 'sessions', 'tui-edit-2', 'settings.json'), 'utf-8'));
     expect(secondSettings.tui).toBe('default');
   });
+
+  it('O: drawsInAlternateScreen reads the renderer variables in the order Claude ranks them', () => {
+    // An agent started during a setup script is adopted only once its TUI enters the alternate
+    // screen, so a classic launch must say so up front rather than be started for nothing.
+    vi.spyOn(os, 'homedir').mockReturnValue(tempHome);
+    const builder = new CommandBuilder();
+    const options = { cwd: tmpDir };
+    expect(builder.drawsInAlternateScreen(options, {})).toBe(true);
+    expect(builder.drawsInAlternateScreen(options, { CLAUDE_CODE_NO_FLICKER: 'TRUE' })).toBe(true);
+    expect(builder.drawsInAlternateScreen(options, { CLAUDE_CODE_NO_FLICKER: '0' })).toBe(false);
+    expect(builder.drawsInAlternateScreen(options, { CLAUDE_CODE_NO_FLICKER: '1', CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: '1' })).toBe(false);
+    writeProjectSettings({ tui: 'default' });
+    expect(builder.drawsInAlternateScreen(options, {})).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2796,6 +2812,16 @@ describe('ClaudeAdapter.buildEnv renderer environment', () => {
     const { fromAdapter, fromBuilder } = adapterAndBuilderAnswers();
     expect(fromBuilder).toBeNull();
     expect(fromAdapter).toBeNull();
+  });
+
+  it('firstPromptMayBeTyped answers true only for a launch on the fullscreen renderer', () => {
+    const adapter = new ClaudeAdapter();
+    expect(adapter.firstPromptMayBeTyped(spawnOptions() as never)).toBe(true);
+    vi.stubEnv('CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN', '1');
+    expect(adapter.firstPromptMayBeTyped(spawnOptions() as never)).toBe(false);
+    vi.stubEnv('CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN', undefined);
+    fs.writeFileSync(path.join(projectDir, '.claude', 'settings.json'), JSON.stringify({ tui: 'default' }));
+    expect(adapter.firstPromptMayBeTyped(spawnOptions() as never)).toBe(false);
   });
 });
 

@@ -5,8 +5,8 @@
  * (separate from the board task-detail layer) that renders into the panel's
  * terminal area and lets the panel arrange them (`hostArranged`): one fills
  * the area, two sit side by side, three and four tile in fixed presets that
- * resize by their seams, and an area too small for that grid shows one
- * expanded. The panel itself moves, resizes and maximizes.
+ * resize by their seams, and the panel never resizes under that grid. The panel
+ * itself moves, resizes and maximizes.
  *
  * GEOMETRY is GLOBAL: the panel's place (`AppConfig.commandTerminalPanel`) and
  * the terminals' seams (`AppConfig.commandTerminalWorkspace`) are shared across
@@ -38,9 +38,11 @@ import {
   windowIdsInReadingOrder,
 } from '../../window-manager';
 import type { ManagedWindow, WindowManagerLayerOptions } from '../../window-manager';
+import { heldSplitSizes, TILE_GAP_PX } from '../../window-manager/tiling/resolve-layout';
 import { COMMAND_PANEL_HEADER_HEIGHT_PX, CommandTerminalPanel } from './CommandTerminalPanel';
-import { COMMAND_RAIL_WIDTH_PX, CommandTerminalRail } from './CommandTerminalRail';
-import type { RunningCommandTerminal } from './CommandTerminalRail';
+import { CommandTerminalRail } from './CommandTerminalRail';
+import { COMMAND_RAIL_COLLAPSED_WIDTH_PX, COMMAND_RAIL_DEFAULT_WIDTH_PX, COMMAND_RAIL_MIN_WIDTH_PX } from '../../../shared/command-terminal-rail';
+import type { RailCommandTerminal } from './useRailTerminalMenuActions';
 import { killCommandTerminalInSlot } from './stop-command-terminal';
 import type { CommandTerminalHistoryEntry, Session } from '../../../shared/types';
 import { useConfigStore } from '../../stores/config-store';
@@ -51,10 +53,9 @@ import { useKeybinding } from '../../hooks/useKeybinding';
 import { getIsHmrReload } from '../../utils/hmr-flag';
 import { runTerminalLayoutChange, terminalLayoutScopeOf } from '../../utils/terminal-layout-transition';
 import { CommandTerminalLayerProvider } from './command-terminal-context';
-import { commandTerminalGridFits } from './command-terminal-grid-fit';
-import type { AreaSize } from './command-terminal-grid-fit';
+import { COMMAND_TERMINAL_FLOOR, commandTerminalAreaMinWidth, commandTerminalGridMinimum } from './command-terminal-grid-fit';
+import { PanelWidthContext, type PanelWidthChange } from './panel-edge-push';
 import { planCommandWindowReconciliation } from './command-window-reconcile';
-import { DEFAULT_MIN_WIDTH_PX } from '../../window-manager/dnd/useWindowResize';
 import { MAX_COMMAND_TERMINALS, commandTerminalSlotId, commandTerminalTitle } from '../../../shared/command-terminal-name';
 import { resolveProjectRoot } from '../../../shared/git-utils';
 import { selectLiveCommandTerminalSlots, transientKey } from '../../stores/session-store/transient-session-slice';
@@ -71,18 +72,12 @@ const COMMAND_WORKSPACE_KEY = 'command-terminal';
 const COMMAND_LAYER_ROOT_ID = 'command-terminal-layer-root';
 
 /**
- * The panel arranges its terminals (`hostArranged`). The pane floor is a task
- * window's 650px width, about the 80 columns an agent's interface is laid out
- * for, so the context bar wraps to two rows at most, as it does in a task
- * window. It was 320px, what four terminals kept beside the rail at the 900 x
- * 600 window floor, and at that width (about 37 columns) the agent's own output
- * wrapped and the context bar took five rows. A panel too small for the grid at
- * this floor shows one terminal expanded instead (`useExpandWhileGridDoesNotFit`).
- * The height floor stays 200px, so two rows still fit a 1080p screen. Seams stop
- * at the floor.
+ * The panel arranges its terminals (`hostArranged`). The pane floor is
+ * `COMMAND_TERMINAL_FLOOR`, 630 x 200, and the panel never resizes under the
+ * grid at that floor (`panelMinSizeFor`). Seams stop at the floor.
  */
 const COMMAND_LAYER_OPTIONS: WindowManagerLayerOptions = {
-  minSize: { width: DEFAULT_MIN_WIDTH_PX, height: 200 },
+  minSize: COMMAND_TERMINAL_FLOOR,
   hostArranged: true,
 };
 
@@ -351,20 +346,25 @@ function useArrangeOnPopulationChange(): void {
   }), []);
 }
 
-/** The terminals behind the expanded one, in the order they tile, for the
- *  rail's Running list; null while none is expanded. */
-function useRunningBehindExpanded(): RunningCommandTerminal[] | null {
-  const expandedWindowId = commandWindowManager.store((state) => state.expandedWindowId);
-  const windowIds = commandWindowManager.store(useShallow((state) =>
-    (state.expandedWindowId === null
-      ? []
-      : windowIdsInReadingOrder(state.tileTree).filter((id) => id !== state.expandedWindowId))));
+/** Every terminal in the panel in the order they tile, for the rail's Running
+ *  list and its strip, and the one in front: the expanded one, else the focused
+ *  tile. A window not yet in the tile tree follows the placed ones. */
+function useRailTerminals(): { terminals: RailCommandTerminal[]; frontWindowId: string | null } {
+  const windowIds = commandWindowManager.store(useShallow((state) => {
+    const placed = windowIdsInReadingOrder(state.tileTree).filter((id) => state.windows[id] !== undefined);
+    return [...placed, ...Object.keys(state.windows).filter((id) => !placed.includes(id))];
+  }));
   const slots = commandWindowManager.store(useShallow((state) =>
     windowIds.map((id) => state.windows[id]?.anchor ?? '')));
-  return useMemo(
-    () => (expandedWindowId === null ? null : windowIds.map((windowId, index) => ({ windowId, slot: slots[index] }))),
-    [expandedWindowId, windowIds, slots],
+  const frontWindowId = commandWindowManager.store((state) => {
+    const front = state.expandedWindowId ?? state.focusedWindowId;
+    return front !== null && state.windows[front] !== undefined ? front : null;
+  });
+  const terminals = useMemo(
+    () => windowIds.map((windowId, index) => ({ windowId, slot: slots[index] })),
+    [windowIds, slots],
   );
+  return { terminals, frontWindowId };
 }
 
 /** Every slot is taken: the Command Terminal windows (the store is a module
@@ -515,66 +515,28 @@ function CommandBackdrop({ onHide }: { onHide: () => void }) {
 }
 
 /** What the panel adds around its terminals: the rail beside them and the
- *  header above, plus the 1px border on each side. */
-const PANEL_CHROME = { width: COMMAND_RAIL_WIDTH_PX + 2, height: COMMAND_PANEL_HEADER_HEIGHT_PX + 2 };
-
-/** The smallest panel: the rail beside one terminal at the pane floor, under
- *  the panel header, plus the 1px border. Whatever the count, since a panel
- *  too small for the grid shows one terminal expanded. At the 900px window
- *  floor this is the whole width. */
-const PANEL_MIN_SIZE = {
-  width: COMMAND_RAIL_WIDTH_PX + COMMAND_LAYER_OPTIONS.minSize.width + 2,
-  height: COMMAND_PANEL_HEADER_HEIGHT_PX + COMMAND_LAYER_OPTIONS.minSize.height + 2,
-};
-
-/** The element's client size, kept current by a ResizeObserver; zero until it mounts. */
-function useElementSize(element: HTMLElement | null): AreaSize {
-  const [size, setSize] = useState<AreaSize>({ width: 0, height: 0 });
-  useEffect(() => {
-    if (!element) return;
-    const measure = () => {
-      const width = element.clientWidth;
-      const height = element.clientHeight;
-      setSize((previous) => (previous.width === width && previous.height === height ? previous : { width, height }));
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [element]);
-  return size;
-}
+ *  header above, plus the 1px border on each side. It sizes a panel nobody has
+ *  moved, so it reads the rail's DEFAULT width, never its live one: a panel
+ *  nobody moved opens at one size whatever the rail was left at. */
+const PANEL_CHROME = { width: COMMAND_RAIL_DEFAULT_WIDTH_PX + 2, height: COMMAND_PANEL_HEADER_HEIGHT_PX + 2 };
 
 /**
- * Show one terminal expanded, the others under Running, while the terminal
- * area is too small for the grid at the pane floor. The expanded one follows
- * focus, so a terminal just added (or a Running row clicked) is the one shown.
- * Once there is room again the grid comes back, but only when this hook did the
- * expanding: a terminal the user expanded themselves stays expanded.
+ * The smallest panel: the rail at its narrowest (its 200px drag minimum open,
+ * its strip folded) beside the grid at the pane floor, under the panel header,
+ * plus the 1px border. So a resize stops where the grid still fits, and a
+ * terminal added or the grid restored grows the panel to fit
+ * (`CommandTerminalPanel` keeps the size it grew to). Only while one is expanded
+ * may the panel shrink to one terminal. Opening the rail grows the panel by what
+ * the rail takes (`panel-edge-push.ts`), so a panel sized down to the strip
+ * leaves the terminals their floor when the rail opens. An area smaller than
+ * this (a small window) shows the panel at the area's size, its terminals tiled
+ * under the floor.
  */
-function useExpandWhileGridDoesNotFit(gridFits: boolean, terminalCount: number): void {
-  const expandedHere = useRef(false);
-  const expandedWindowId = commandWindowManager.store((state) => state.expandedWindowId);
-  const focusedWindowId = commandWindowManager.store((state) => state.focusedWindowId);
-  useEffect(() => {
-    const state = commandWindowManager.store.getState();
-    if (!gridFits && terminalCount > 1) {
-      const focused = focusedWindowId !== null && state.windows[focusedWindowId] ? focusedWindowId : null;
-      if (state.expandedWindowId === null) {
-        const target = focused ?? windowIdsInReadingOrder(state.tileTree)[0] ?? null;
-        if (target === null) return;
-        expandedHere.current = true;
-        state.setExpandedWindow(target);
-      } else if (expandedHere.current && focused !== null && focused !== state.expandedWindowId) {
-        state.setExpandedWindow(focused);
-      }
-      return;
-    }
-    if (expandedHere.current) {
-      expandedHere.current = false;
-      if (state.expandedWindowId !== null) state.setExpandedWindow(null);
-    }
-  }, [gridFits, terminalCount, expandedWindowId, focusedWindowId]);
+function panelMinSizeFor(gridMinimum: { width: number; height: number }, railMinimumWidth: number): { width: number; height: number } {
+  return {
+    width: railMinimumWidth + gridMinimum.width + 2,
+    height: COMMAND_PANEL_HEADER_HEIGHT_PX + gridMinimum.height + 2,
+  };
 }
 
 /**
@@ -591,14 +553,19 @@ export function CommandTerminalLayer({ onHide, host = 'panel' }: { onHide: () =>
   const [layerRoot] = useState(() => (host === 'panel' ? getPortalHost(COMMAND_LAYER_ROOT_ID) : null));
   // The window engine renders INTO the panel's terminal area, once it exists.
   const [terminalArea, setTerminalArea] = useState<HTMLElement | null>(null);
-  const terminalAreaSize = useElementSize(terminalArea);
   const projectId = useProjectStore((state) => state.currentProject?.id ?? null);
   const projectName = useProjectStore((state) => state.currentProject?.name ?? '');
   const terminalCount = commandWindowManager.store((state) => Object.keys(state.windows).length);
-  // Unmeasured (zero) counts as fitting, so nothing expands before the area exists.
-  const gridFits = terminalAreaSize.width === 0
-    || commandTerminalGridFits(terminalCount, terminalAreaSize, COMMAND_LAYER_OPTIONS.minSize);
-  useExpandWhileGridDoesNotFit(gridFits, terminalCount);
+  const expanded = commandWindowManager.store((state) => state.expandedWindowId !== null);
+  const gridMinimum = commandTerminalGridMinimum(terminalCount, expanded, COMMAND_LAYER_OPTIONS.minSize);
+  // The rail's narrowest: its strip folded, its drag minimum open.
+  const railFolded = useConfigStore((state) => state.config.commandTerminalRail?.collapsed === true);
+  const railMinimumWidth = railFolded ? COMMAND_RAIL_COLLAPSED_WIDTH_PX : COMMAND_RAIL_MIN_WIDTH_PX;
+  const terminalAreaMinWidth = commandTerminalAreaMinWidth(gridMinimum.width, railMinimumWidth);
+  const panelMinSize = useMemo(
+    () => panelMinSizeFor({ width: gridMinimum.width, height: gridMinimum.height }, railMinimumWidth),
+    [gridMinimum.width, gridMinimum.height, railMinimumWidth],
+  );
   const atCap = useCommandTerminalAtCap(projectId);
   const terminalsStarting = useTerminalsStarting(projectId);
   // A terminal added or stopped re-tiles the others, which hold their frames in
@@ -606,23 +573,47 @@ export function CommandTerminalLayer({ onHide, host = 'panel' }: { onHide: () =>
   const changeLayout = useCallback((change: () => void) => {
     runTerminalLayoutChange(terminalLayoutScopeOf(terminalArea), change);
   }, [terminalArea]);
+  // The panel's width change (`panel-edge-push.ts`), which the rail drives,
+  // reached through the ref the panel fills: the detached window has no panel,
+  // so there the terminals give the rail its room.
+  const panelWidthRef = useRef<PanelWidthChange | null>(null);
+  const widthChange = useMemo<PanelWidthChange>(() => ({
+    begin: (options) => panelWidthRef.current?.begin(options) ?? null,
+  }), []);
+  // Before the panel resizes, the terminals take the proportions on screen as
+  // their own: two the floor holds even at the panel's minimum grow evenly, not
+  // from a seam an earlier, wider panel left skewed. Nothing on screen moves.
+  const adoptHeldLayout = useCallback(() => {
+    const state = commandWindowManager.store.getState();
+    if (!terminalArea || !state.tileTree || state.expandedWindowId !== null) return;
+    const size = {
+      width: terminalArea.clientWidth * state.tileTreeRect.w,
+      height: terminalArea.clientHeight * state.tileTreeRect.h,
+    };
+    for (const split of heldSplitSizes(state.tileTree, size, TILE_GAP_PX, COMMAND_LAYER_OPTIONS.minSize)) {
+      state.setSplitSizes(split.splitId, split.sizes);
+    }
+  }, [terminalArea]);
   const handleNewTerminal = useCallback(() => {
     changeLayout(spawnAdditionalCommandTerminal);
   }, [changeLayout]);
   const handleResume = useCallback((entry: CommandTerminalHistoryEntry) => {
     changeLayout(() => resumeCommandTerminalConversation(entry.agentSessionId));
   }, [changeLayout]);
-  const running = useRunningBehindExpanded();
-  const handleExpand = useCallback((windowId: string) => {
-    commandWindowManager.store.getState().setExpandedWindow(windowId);
-    // The frame stops being inert on the commit after the expand, so the
-    // keyboard follows the click into that terminal a frame later.
+  const { terminals: railTerminals, frontWindowId } = useRailTerminals();
+  // A rail entry's click: expanded over the others while one is expanded, else
+  // the focused tile. The frame stops being inert on the commit after an
+  // expand, so the keyboard follows the click into that terminal a frame later.
+  const handleBringToFront = useCallback((windowId: string) => {
+    const state = commandWindowManager.store.getState();
+    if (state.expandedWindowId !== null) state.setExpandedWindow(windowId);
+    else state.focusWindow(windowId);
     requestAnimationFrame(() => {
-      // arrival-focus-ok: the user's own click on this terminal's Running row.
+      // arrival-focus-ok: the user's own click on this terminal's rail entry.
       document.querySelector<HTMLElement>(`[data-testid="window-frame-${windowId}"] .xterm-helper-textarea`)?.focus();
     });
   }, []);
-  const handleStopRunning = useCallback(async (terminal: RunningCommandTerminal) => {
+  const handleStopRunning = useCallback(async (terminal: RailCommandTerminal) => {
     await killCommandTerminalInSlot(terminal.slot);
     // The arrange bridge re-tiles the rest; with one left, nothing stays expanded.
     changeLayout(() => commandWindowManager.store.getState().closeWindow(terminal.windowId));
@@ -654,21 +645,25 @@ export function CommandTerminalLayer({ onHide, host = 'panel' }: { onHide: () =>
     <CommandTerminalRail
       projectId={projectId}
       atCap={atCap}
-      running={running}
+      terminals={railTerminals}
+      frontWindowId={frontWindowId}
+      terminalsMinWidth={gridMinimum.width}
       onNewTerminal={handleNewTerminal}
       onResume={handleResume}
-      onExpand={handleExpand}
+      onBringToFront={handleBringToFront}
       onStop={handleStopRunning}
+      onLayoutChange={changeLayout}
     />
   );
 
   return (
-    <CommandTerminalLayerProvider hideLayer={onHide} resumeBeside={resumeCommandTerminalBeside} gridFits={gridFits}>
+    <PanelWidthContext.Provider value={widthChange}>
+    <CommandTerminalLayerProvider hideLayer={onHide} resumeBeside={resumeCommandTerminalBeside}>
       {layerRoot === null ? (
         // The window's own title bar takes the place of the panel header.
         <div className="flex flex-1 min-h-0" data-testid="command-terminal-detached">
           {rail}
-          <div ref={setTerminalArea} className="relative flex-1 min-w-0" data-testid="command-terminal-area" />
+          <div ref={setTerminalArea} className="relative flex-1" style={{ minWidth: terminalAreaMinWidth }} data-testid="command-terminal-area" />
         </div>
       ) : createPortal(
         // Above board windows (z-40), below true modal dialogs / popovers (z-50)
@@ -677,7 +672,10 @@ export function CommandTerminalLayer({ onHide, host = 'panel' }: { onHide: () =>
           <CommandBackdrop onHide={onHide} />
           <CommandTerminalPanel
             onHide={onHide}
-            minSize={PANEL_MIN_SIZE}
+            minSize={panelMinSize}
+            terminalAreaMinWidth={terminalAreaMinWidth}
+            onResizeStart={adoptHeldLayout}
+            widthChangeRef={panelWidthRef}
             chrome={PANEL_CHROME}
             onTerminalAreaReady={setTerminalArea}
             onOpenInNewWindow={handleOpenInNewWindow}
@@ -699,5 +697,6 @@ export function CommandTerminalLayer({ onHide, host = 'panel' }: { onHide: () =>
         />
       )}
     </CommandTerminalLayerProvider>
+    </PanelWidthContext.Provider>
   );
 }

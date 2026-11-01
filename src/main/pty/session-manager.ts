@@ -4,6 +4,7 @@ import path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import { isAbortError } from '../../shared/abort-utils';
 import { isCommandTerminalSession, isWorkflowAgentSession } from '../../shared/session-owner';
+import { normalizeCommandTerminalName } from '../../shared/command-terminal-name';
 
 /**
  * Renderer key used when a caller does not identify itself (headless callers, and
@@ -17,6 +18,8 @@ import { SessionQueue } from './session-queue';
 import { SessionHistoryReader } from './readers/session-history-reader';
 import { StatusFileReader } from './readers/status-file-reader';
 import { SessionTelemetry } from '../activity-engine/session-telemetry';
+import type { OpenWork } from '../activity-engine/open-work-ledger';
+import { forgetAutomatedKeysSession } from './automated-keys-guard';
 import type { TranscriptSink } from './buffer/transcript-writer';
 import { SessionIdManager } from './lifecycle/session-id-manager';
 import { SessionFileManager } from './lifecycle/session-file-manager';
@@ -62,6 +65,7 @@ import type {
   ActivityState,
   ActivityReason,
   SessionEvent,
+  SessionResumer,
   SpawnSessionInput,
   PerToolStat,
   PtyResizeOrigin,
@@ -114,6 +118,17 @@ const REPORTED_PROCESS_CHECK_TIMEOUT_MS = 5_000;
  *  this long at most, about the removal reap's own 5 s scan cap, where a
  *  reap's budget would hold it 30 s. */
 const WORKTREE_HOLDER_STOP_TIMEOUT_MS = 5_000;
+
+/**
+ * The events a session hidden until adopted still emits: raw output signals,
+ * which a surface subscribes to only for a session it shows. Every other event
+ * of a hidden session is kept from listeners (`SessionManager.emit`).
+ */
+const EVENTS_A_HIDDEN_SESSION_EMITS: ReadonlySet<string | symbol> = new Set(['output-seen', 'data', 'data-tap', 'pty-resize']);
+/** Where a hidden session's 'exit' goes instead, for `awaitExit` alone. */
+const HIDDEN_SESSION_EXIT = 'hidden-session-exit';
+/** How often `awaitAltScreen` reads the alt-screen mirror while it waits. */
+const ALT_SCREEN_POLL_MS = 100;
 
 /** A Command Terminal's per-session directory, created by `startCommandTerminal`. */
 function commandTerminalSessionDirectory(session: ManagedSession): string {
@@ -235,7 +250,10 @@ export interface TurnEndedPayload {
  * resume moves it (`SessionManager.isLatestTurn`). A resume begins no turn, so
  * it has no turn start and no transcript anchor.
  */
-export type SessionResumedPayload = Omit<TurnEndedPayload, 'turnStartedAt' | 'transcriptAnchor'>;
+export type SessionResumedPayload = Omit<TurnEndedPayload, 'turnStartedAt' | 'transcriptAnchor'> & {
+  /** Who resumed it: a person, or Kangentic after a restart (`'recovery'`) or a memory pause (`'memory'`). */
+  resumedBy: SessionResumer;
+};
 
 /** Per-session pipeline numbers for the dev terminal-pipeline route. */
 export interface SessionPipelineStats {
@@ -430,6 +448,27 @@ export class SessionManager extends EventEmitter {
    *  backstop timer for each one still waiting. */
   private firstOutputTracker = new FirstOutputTracker();
   /**
+   * Sessions launched while their worktree's setup script runs and not yet
+   * adopted by their task's spawn (`spawn({ hiddenUntilAdopted })`,
+   * `adoptSession`). The database knows nothing of them, so no listener may:
+   * `emit` keeps every event of theirs from listeners but the raw output
+   * signals, and the lookups that hand a task its session skip them.
+   */
+  private readonly hiddenUntilAdopted = new Set<string>();
+  /**
+   * Sessions whose agent draws its input box in the alternate screen
+   * (`spawn({ inputInAlternateScreen })`). Until the TUI enters it, any screen
+   * on show is one the agent draws first, so `awaitInputReady` holds a
+   * background paste back.
+   */
+  private readonly inputInAlternateScreen = new Set<string>();
+  /**
+   * Sessions whose agent has taken a prompt (its hook reported one). Such an
+   * agent is past every screen it shows before its input box, whatever its
+   * renderer, so `awaitInputReady` no longer needs the alternate screen for it.
+   */
+  private readonly tookPrompt = new Set<string>();
+  /**
    * The pty host: every PTY, its output pipeline (ring, headless parser,
    * transcript, detectors), backpressure and the redraw filter live there.
    */
@@ -479,6 +518,8 @@ export class SessionManager extends EventEmitter {
    * auto_command never concatenates onto a draft.
    */
   private promptDraftMirror = new Map<string, string>();
+  /** When a person last typed into each session (epoch ms), from the host's `userInput` reports. */
+  private lastUserInputAt = new Map<string, number>();
   /** Renderers that hold a direct port to the host, to re-issue on a host restart. */
   private portRenderers = new Set<number>();
   /**
@@ -690,6 +731,7 @@ export class SessionManager extends EventEmitter {
         // The agent's own hook: evidence it runs, for an agent that starts
         // without drawing anything the stream can see.
         if (event.type === EventType.SessionStart) this.markAgentReady(sessionId);
+        if (event.type === EventType.Prompt) this.tookPrompt.add(sessionId);
         this.noteCommandTerminalAgentEvent(sessionId, event);
         this.emit('event', sessionId, event);
       },
@@ -719,8 +761,9 @@ export class SessionManager extends EventEmitter {
         // 1. Fresh capture: agent_session_id was null (Codex/Gemini), now captured from hooks/PTY output.
         // 2. Stale recovery: agent_session_id was pre-specified (Claude --resume) but the agent
         //    created a different session (--resume failed silently). DB needs the correct ID.
-        // 3. Mid-session fork: the agent moved the live conversation to a NEW id (Claude /clear)
-        //    and its status file re-reported it, so this callback fires AGAIN mid-session.
+        // 3. Mid-session move: the agent moved the live conversation to a NEW id (Claude /clear,
+        //    or a fork into Claude Code's background daemon), a SessionStart hook said so, and
+        //    the status file re-reported it, so this callback fires AGAIN mid-session.
         //    Everything below is repeat-safe: the mutation is value-guarded, and the history
         //    re-attach is blocked by hasReceivedStatus (see the note further down).
         // recoverStaleSessionId() handles all cases - emit unconditionally.
@@ -779,6 +822,21 @@ export class SessionManager extends EventEmitter {
           });
         }
       },
+      // The session's own place and the transcript its agent reported, for the
+      // adapter's check that a background session's hook is the conversation
+      // moving rather than a copy starting beside it.
+      confirmsBackgroundMove: async (sessionId, fromAgentSessionId, toAgentSessionId) => {
+        const session = this.registry.get(sessionId);
+        const confirm = session?.agentParser?.runtime?.statusFile?.confirmsBackgroundMove;
+        if (!session || !confirm) return false;
+        return confirm({
+          cwd: session.cwd,
+          fromAgentSessionId,
+          toAgentSessionId,
+          cliTarget: session.cliTarget,
+          transcriptPath: this.telemetry.getReportedTranscriptPath(sessionId),
+        });
+      },
       // A Command Terminal is never paused: it has no task record to resume
       // in place, so a suspend ends the terminal the user was looking at (its
       // conversation only survives as an Earlier row). The sweep
@@ -786,6 +844,9 @@ export class SessionManager extends EventEmitter {
       // (`isPauseEligible`). A workflow's own agent is transient too but stays
       // in the sweep.
       isIdleTimeoutExempt: (sessionId) => {
+        // A session launched hidden sits idle at its input box until its
+        // task's setup script ends, and has no task record to pause.
+        if (this.hiddenUntilAdopted.has(sessionId)) return true;
         const session = this.registry.get(sessionId);
         return session !== undefined && isCommandTerminalSession(session);
       },
@@ -886,6 +947,9 @@ export class SessionManager extends EventEmitter {
       onUsageParsed: (sessionId, usage) => this.telemetry.processStatusUpdate(sessionId, this.usageOnHost(sessionId, usage)),
       onEventsParsed: (sessionId, rawLines, events) => {
         this.telemetry.captureHookSessionIds(sessionId, rawLines);
+        // Before the events, and on every batch: a SessionStart that moves the
+        // conversation is what lets the status channel follow a new id.
+        this.telemetry.noteSessionStartHooks(sessionId, rawLines);
         this.telemetry.ingestEvents(sessionId, events);
       },
       onFirstStatus: (sessionId) => {
@@ -913,6 +977,8 @@ export class SessionManager extends EventEmitter {
       // sends a null `promptDraft` on its own exit; this covers a lost host,
       // whose PTYs exit here with nothing to send it.
       this.promptDraftMirror.delete(sessionId);
+      this.lastUserInputAt.delete(sessionId);
+      forgetAutomatedKeysSession(sessionId);
       // Nothing left to reshape either: a respawn spawns at the desktop grid.
       this.cancelRestingGridRestore(sessionId);
       // A deferred force-kill whose PTY exited on its own inside the grace has
@@ -946,6 +1012,9 @@ export class SessionManager extends EventEmitter {
         // A renderer types on its own port to the host, so main hears of a
         // human's first key or text here, not through write().
         this.markUserInput(event.sessionId);
+        // Only here, never in `markUserInput`: a paste Kangentic sends marks
+        // the session used too, and must not read as a person at the keys.
+        this.lastUserInputAt.set(event.sessionId, event.at ?? Date.now());
         return;
       case 'tap':
         // Raw output for a session someone subscribed to (subscribeDataTap):
@@ -1109,6 +1178,156 @@ export class SessionManager extends EventEmitter {
     } catch (error) {
       console.warn('[pty-host] closing a project database failed:', error);
     }
+  }
+
+  /**
+   * Every session event goes through here. A session hidden until adopted
+   * emits only the raw output signals, which no surface subscribes to for a
+   * session it cannot see. Its 'exit' goes to `awaitExit` alone
+   * (`HIDDEN_SESSION_EXIT`), so a discard can wait on it while no listener
+   * reports an exit for a session nobody was told about. Everything else waits
+   * for `adoptSession`, which announces the session as it stands then.
+   */
+  override emit(eventName: string | symbol, ...args: unknown[]): boolean {
+    const sessionId = args[0];
+    if (this.hiddenUntilAdopted.size > 0 && typeof sessionId === 'string' && this.hiddenUntilAdopted.has(sessionId)
+      && !EVENTS_A_HIDDEN_SESSION_EMITS.has(eventName)) {
+      if (eventName === 'exit') {
+        const delivered = super.emit(HIDDEN_SESSION_EXIT, ...args);
+        // The exit a removal left pending (`remove`): with the row gone, so
+        // is the reason to hide it.
+        if (!this.registry.get(sessionId)) this.hiddenUntilAdopted.delete(sessionId);
+        return delivered;
+      }
+      return false;
+    }
+    return super.emit(eventName, ...args);
+  }
+
+  /** True while `sessionId` was launched hidden and no spawn has adopted it. */
+  isHiddenUntilAdopted(sessionId: string): boolean {
+    return this.hiddenUntilAdopted.has(sessionId);
+  }
+
+  /**
+   * Hand a session launched hidden to its task: it becomes an ordinary session
+   * from here on. Announces it as it stands now (its status, its activity with
+   * the idle clock started over, its usage, and its agent being on screen), the
+   * pushes a spawn makes along the way, which the hidden launch kept back.
+   * Returns false when the session is not hidden or no longer running, in
+   * which case nothing changes and the caller discards it.
+   */
+  adoptSession(sessionId: string): boolean {
+    const session = this.registry.get(sessionId);
+    if (!this.hiddenUntilAdopted.has(sessionId) || !session?.pty || session.status !== 'running') return false;
+    this.hiddenUntilAdopted.delete(sessionId);
+    this.emit('session-changed', sessionId, toSession(session));
+    if (!this.telemetry.restartIdleClock(sessionId)) {
+      const activity = this.telemetry.getActivityCache()[sessionId];
+      if (activity) this.emit('activity', sessionId, activity, this.telemetry.getActivityReason(sessionId));
+    }
+    const usage = this.telemetry.getUsageCache()[sessionId];
+    if (usage) this.emit('usage', sessionId, usage);
+    if (this.firstOutputTracker.hasEmitted(sessionId)) this.emit('first-output', sessionId);
+    return true;
+  }
+
+  /**
+   * Whether the agent of `sessionId` is on screen (`markAgentReady`): its first
+   * output, its alt-screen entry, its SessionStart hook, or the ceiling.
+   * Resolves at once when it already is, false when the session exits or
+   * `timeoutMs` passes first. For a caller about to type into an agent it
+   * launched earlier, which must not type before the CLI reads its input.
+   */
+  awaitAgentReady(sessionId: string, timeoutMs: number): Promise<boolean> {
+    if (this.firstOutputTracker.hasEmitted(sessionId)) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      const finish = (ready: boolean): void => {
+        clearTimeout(timer);
+        this.removeListener('first-output', onReady);
+        this.removeListener('exit', onExit);
+        this.removeListener(HIDDEN_SESSION_EXIT, onExit);
+        resolve(ready);
+      };
+      const onReady = (readySessionId: string): void => {
+        if (readySessionId === sessionId) finish(true);
+      };
+      const onExit = (exitedSessionId: string): void => {
+        if (exitedSessionId === sessionId) finish(false);
+      };
+      const timer = setTimeout(() => finish(this.firstOutputTracker.hasEmitted(sessionId)), timeoutMs);
+      this.on('first-output', onReady);
+      this.on('exit', onExit);
+      this.on(HIDDEN_SESSION_EXIT, onExit);
+      if (this.firstOutputTracker.hasEmitted(sessionId)) finish(true);
+    });
+  }
+
+  /**
+   * Whether the session's TUI has entered the alternate screen, waiting at
+   * most `timeoutMs` for it. Resolves false once the session is gone or the
+   * time runs out. An agent that may take its first prompt typed draws its
+   * input box there, and any screen it shows first (Claude's approval of a
+   * new project MCP server) outside it, so this tells the two apart: typing
+   * into the earlier screen would answer it. An abort of `signal` ends the
+   * wait with false at once: the caller holds the task lock while it waits.
+   */
+  awaitAltScreen(sessionId: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (this.inAltScreen.get(sessionId) === true) return Promise.resolve(true);
+    if (timeoutMs <= 0 || signal?.aborted || !this.registry.get(sessionId)?.pty) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const deadline = Date.now() + timeoutMs;
+      const finish = (atInput: boolean): void => {
+        clearInterval(poll);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(atInput);
+      };
+      const onAbort = (): void => finish(false);
+      const poll = setInterval(() => {
+        if (this.inAltScreen.get(sessionId) === true) {
+          finish(true);
+          return;
+        }
+        if (Date.now() >= deadline || !this.registry.get(sessionId)?.pty) finish(false);
+      }, ALT_SCREEN_POLL_MS);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  /**
+   * Whether the session's agent is at its input box, waiting at most
+   * `timeoutMs`. True at once for an agent not known to draw its input box in
+   * the alternate screen (`SpawnSessionInput.inputInAlternateScreen`), since
+   * nothing can tell its input box apart. For one that does, true once its TUI
+   * is in the alternate screen, so a paste never lands in a screen the agent
+   * shows first (Claude's approval of a new project MCP server), or once it
+   * has taken a prompt, which puts it past every such screen. The second
+   * matters for a launch judged fullscreen that draws classic: a renderer
+   * variable set only in the user's shell profile reaches the agent but not
+   * Kangentic, and that agent never enters the alternate screen. A queued
+   * session has no PTY yet and is about to start, so the wait holds through
+   * its promotion rather than reading it as gone.
+   */
+  async awaitInputReady(sessionId: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (!this.inputInAlternateScreen.has(sessionId)) return true;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (this.inAltScreen.get(sessionId) === true || this.tookPrompt.has(sessionId)) return true;
+      const session = this.registry.get(sessionId);
+      if (!session || (session.status !== 'queued' && !session.pty)) return false;
+      if (signal?.aborted || Date.now() >= deadline) return false;
+      await new Promise<void>((resolve) => setTimeout(resolve, ALT_SCREEN_POLL_MS));
+    }
+  }
+
+  /** Drop the hidden sessions from a session-keyed map handed to a reader outside. */
+  private withoutHidden<Value>(entries: Record<string, Value>): Record<string, Value> {
+    if (this.hiddenUntilAdopted.size === 0) return entries;
+    const visible: Record<string, Value> = {};
+    for (const [sessionId, value] of Object.entries(entries)) {
+      if (!this.hiddenUntilAdopted.has(sessionId)) visible[sessionId] = value;
+    }
+    return visible;
   }
 
   /**
@@ -1854,6 +2073,18 @@ export class SessionManager extends EventEmitter {
       throw new Error('Cannot spawn session during shutdown');
     }
 
+    // Marked before the spawn, so a queued session keeps it through promotion.
+    if (input.inputInAlternateScreen && input.id) this.inputInAlternateScreen.add(input.id);
+
+    if (input.hiddenUntilAdopted) return this.spawnHidden(input);
+
+    // A task's own spawn supersedes an agent launched hidden for it during its
+    // setup script (a start that reached the task lock first once the script
+    // ended). That agent ends the way every kill ends one, and has exited,
+    // before this one starts in its folder; the sibling drain would otherwise
+    // find its live PTY and kill it with no grace (pty-teardown-grace).
+    if (this.hiddenUntilAdopted.size > 0 && input.taskId) await this.discardHiddenForTask(input.taskId);
+
     if (this.sessionQueue.shouldQueue()) {
       // Return a queued placeholder immediately (don't block the caller).
       // SessionQueue will promote it to a running PTY when a slot opens.
@@ -1899,6 +2130,71 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  /**
+   * Spawn a session hidden until adopted (`SpawnSessionInput.hiddenUntilAdopted`).
+   * Never queued: an early launch exists only to save the queue-free start, so
+   * with no slot free it is refused and the task's spawn starts the agent later
+   * as usual. The id is hidden before the PTY exists, so not one of its events
+   * reaches a listener. A spawn that fails leaves no hidden row behind.
+   */
+  private async spawnHidden(input: SpawnSessionInput): Promise<Session> {
+    const id = input.id ?? uuidv4();
+    if (this.sessionQueue.shouldQueue()) {
+      releaseCommandHold(input.agentParser, input.cwd, id);
+      // `spawn()` marked it before handing over; nothing else would clear it.
+      this.inputInAlternateScreen.delete(id);
+      throw new Error('No agent slot is free for an early launch');
+    }
+    this.hiddenUntilAdopted.add(id);
+    this.spawningCount++;
+    try {
+      const session = await this.doSpawn({ ...input, id });
+      if (session.status !== 'running' && this.registry.get(id)) {
+        // A failed spawn's exited placeholder: nothing shows it, so it goes.
+        this.remove(id);
+      }
+      return session;
+    } catch (error) {
+      // The launcher gets this error, not a handle, so nothing else will end a
+      // row the spawn left: one whose PTY started (a failure after the host
+      // ran it) ends here, still hidden, the way a discard ends it.
+      const row = this.registry.get(id);
+      if (row?.pty) {
+        this.kill(id);
+        const exited = this.awaitExit(id);
+        this.remove(id);
+        await exited;
+      } else if (row) {
+        this.remove(id);
+      } else {
+        this.hiddenUntilAdopted.delete(id);
+      }
+      this.inputInAlternateScreen.delete(id);
+      throw error;
+    } finally {
+      this.spawningCount--;
+      this.sessionQueue.notifySlotFreed();
+    }
+  }
+
+  /**
+   * End every session of `taskId` still hidden until adopted: the kill, the
+   * exit wait taken while the row exists, the removal, then the wait. It stays
+   * hidden throughout, so no listener learns of it, and its handle's own
+   * discard later finds nothing left to end.
+   */
+  private async discardHiddenForTask(taskId: string): Promise<void> {
+    const exits: Promise<void>[] = [];
+    for (const session of this.registry.listByTaskId(taskId)) {
+      if (!this.hiddenUntilAdopted.has(session.id)) continue;
+      console.log(`[SessionManager] Ending the hidden early agent ${session.id.slice(0, 8)} of task ${taskId.slice(0, 8)}: the task's own spawn is starting`);
+      this.kill(session.id);
+      exits.push(this.awaitExit(session.id));
+      this.remove(session.id);
+    }
+    await Promise.all(exits);
+  }
+
   private async doSpawn(input: SpawnSessionInput): Promise<Session> {
     // The id is fixed here rather than in the spawn flow, so a teardown that
     // lands before the host answers can find this spawn by it.
@@ -1927,7 +2223,9 @@ export class SessionManager extends EventEmitter {
       // park, as on any switch).
       if (session.status === 'running') this.reconsiderRestingGrid(id);
       if (session.status === 'running') this.armAgentReadyCeiling(id);
-      if (session.status === 'running' && input.resuming && !input.transient) this.announceResumed(id, input.agentSessionId ?? null);
+      if (session.status === 'running' && input.resuming && !input.transient) {
+        this.announceResumed(id, input.agentSessionId ?? null, input.resumedBy ?? 'user');
+      }
       return session;
     } catch (error) {
       // A spawn that never became a session (a teardown overtook it, the quit
@@ -1952,7 +2250,7 @@ export class SessionManager extends EventEmitter {
    * The conversation's id is the one the resume named until the session
    * reports its own.
    */
-  private announceResumed(sessionId: string, resumedAgentSessionId: string | null): void {
+  private announceResumed(sessionId: string, resumedAgentSessionId: string | null, resumedBy: SessionResumer): void {
     const session = this.registry.get(sessionId);
     if (!session) return;
     const payload: SessionResumedPayload = {
@@ -1962,6 +2260,7 @@ export class SessionManager extends EventEmitter {
       agentSessionId: session.agentSessionId ?? resumedAgentSessionId,
       isolatedSwimlaneId: session.isolatedSwimlaneId ?? null,
       workSerial: this.telemetry.getWorkSerial(sessionId) ?? 0,
+      resumedBy,
     };
     try {
       this.emit('session-resumed', payload);
@@ -2070,6 +2369,9 @@ export class SessionManager extends EventEmitter {
    * writability.
    */
   isWritable(sessionId: string): boolean {
+    // A session launched hidden waits for its task's opening prompt: nothing
+    // may type into it first (a held-message flush, an MCP or phone send).
+    if (this.hiddenUntilAdopted.has(sessionId)) return false;
     return !!this.registry.get(sessionId)?.pty;
   }
 
@@ -2131,6 +2433,16 @@ export class SessionManager extends EventEmitter {
    */
   getPendingDraft(sessionId: string): string | null {
     return this.promptDraftMirror.get(sessionId) ?? null;
+  }
+
+  /**
+   * When a person last typed into this session (epoch ms), or null, from the
+   * host's `userInput` reports: at most ten seconds behind a keystroke, and
+   * never moved by a write Kangentic makes. Workflow recovery reads it as the
+   * user being there, where a terminal merely on screen is not.
+   */
+  getLastUserInputAt(sessionId: string): number | null {
+    return this.lastUserInputAt.get(sessionId) ?? null;
   }
 
   /**
@@ -2468,6 +2780,12 @@ export class SessionManager extends EventEmitter {
     }
     this.registry.delete(sessionId);
     this.clearSessionCaches(sessionId);
+    // After the removal's own emits, which a hidden session keeps to itself.
+    // A running row's exit is still on its way (kill() above nulled its PTY;
+    // the exit stamps the status), so the id stays hidden until that exit lands
+    // (`emit`): the exit, and every event its handler sends, reaches
+    // `awaitExit` alone, and no listener reports a session nobody was told of.
+    if (session?.status !== 'running') this.hiddenUntilAdopted.delete(sessionId);
   }
 
   /**
@@ -2484,6 +2802,8 @@ export class SessionManager extends EventEmitter {
     this.telemetry.removeSession(sessionId);
     this.firstOutputTracker.removeSession(sessionId);
     this.inAltScreen.delete(sessionId);
+    this.inputInAlternateScreen.delete(sessionId);
+    this.tookPrompt.delete(sessionId);
     this.bufferCols.delete(sessionId);
     this.forgetTranscriptAnchors(sessionId);
     this.cancelAgentEndSettle(sessionId);
@@ -3277,8 +3597,13 @@ export class SessionManager extends EventEmitter {
     }
 
     return new Promise<void>((resolve) => {
-      const safetyTimeout = setTimeout(() => {
+      const stopListening = (): void => {
         this.removeListener('exit', onExit);
+        // A session launched hidden reports its exit here instead (see `emit`).
+        this.removeListener(HIDDEN_SESSION_EXIT, onExit);
+      };
+      const safetyTimeout = setTimeout(() => {
+        stopListening();
         console.warn(`[SessionManager] awaitExit safety timeout for session ${sessionId.slice(0, 8)} - process may still hold handles`);
         resolve();
       }, 10_000);
@@ -3286,19 +3611,20 @@ export class SessionManager extends EventEmitter {
       const onExit = (exitedSessionId: string) => {
         if (exitedSessionId === sessionId) {
           clearTimeout(safetyTimeout);
-          this.removeListener('exit', onExit);
+          stopListening();
           resolve();
         }
       };
 
       this.on('exit', onExit);
+      this.on(HIDDEN_SESSION_EXIT, onExit);
 
       // Re-check after subscribing (process may have exited between the
       // initial check and event registration)
       const currentSession = this.registry.get(sessionId);
       if (!currentSession || currentSession.status === 'exited' || currentSession.status === 'suspended' || currentSession.status === 'queued') {
         clearTimeout(safetyTimeout);
-        this.removeListener('exit', onExit);
+        stopListening();
         resolve();
       }
     });
@@ -3608,18 +3934,22 @@ export class SessionManager extends EventEmitter {
   }
 
   listSessions(): Session[] {
-    return this.registry.listSessions();
+    const sessions = this.registry.listSessions();
+    if (this.hiddenUntilAdopted.size === 0) return sessions;
+    return sessions.filter((session) => !this.hiddenUntilAdopted.has(session.id));
   }
 
   /** Registry rows carrying `agentName`, for the cross-project Agent Monitor.
    *  See SessionRegistry.listManagedSummaries for why this is separate from listSessions. */
   listManagedSummaries(): ManagedSessionSummary[] {
-    return this.registry.listManagedSummaries();
+    const summaries = this.registry.listManagedSummaries();
+    if (this.hiddenUntilAdopted.size === 0) return summaries;
+    return summaries.filter((summary) => !this.hiddenUntilAdopted.has(summary.id));
   }
 
   /** Return cached usage data for all sessions (survives renderer reloads). */
   getUsageCache(): Record<string, SessionUsage> {
-    return this.telemetry.getUsageCache();
+    return this.withoutHidden(this.telemetry.getUsageCache());
   }
 
   /**
@@ -3648,22 +3978,46 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * Record a Command Terminal's auto-derived name (`CommandTerminalNamer`).
+   * Record a Command Terminal's auto-derived name (`CommandTerminalNamer`), or
+   * the name a resume seeds it with.
    *
    * First write wins, so a later re-derivation cannot silently rename a
-   * terminal the user already knows by name. An applied name is announced on
+   * terminal the user already knows by name, and a terminal the user named
+   * (or cleared) refuses it outright, which also covers a naming call still in
+   * flight when the user renamed. An applied name is announced on
    * 'session-changed', which carries it to the renderer's replica (the window
    * title reads it there), the Agent Monitor, and a phone's board feed.
    * Returns whether it applied; unknown or non-transient sessions are ignored.
    */
   setCommandTerminalLabel(sessionId: string, label: string): boolean {
     const session = this.registry.get(sessionId);
-    if (!session || !isCommandTerminalSession(session) || session.commandTerminalLabel) return false;
+    if (!session || !isCommandTerminalSession(session)) return false;
+    if (session.commandTerminalLabel || session.commandTerminalNamedByUser) return false;
     const trimmed = label.trim();
     if (!trimmed) return false;
     session.commandTerminalLabel = trimmed;
     this.emit('session-changed', sessionId, toSession(session));
     return true;
+  }
+
+  /**
+   * The user renames a Command Terminal. Unlike the derived name this replaces
+   * whatever the terminal is called, and a null, empty or slot-title name
+   * clears it back to "Command Terminal N" (`normalizeCommandTerminalName`).
+   * Either way the terminal is marked named by the user, so the namer never
+   * names it afterward. Announced once on 'session-changed'; returns whether
+   * the name changed. Unknown or non-Command-Terminal sessions are refused.
+   */
+  renameCommandTerminal(sessionId: string, name: string | null): boolean {
+    const session = this.registry.get(sessionId);
+    if (!session || !isCommandTerminalSession(session)) return false;
+    const label = normalizeCommandTerminalName(name, session.commandTerminalSlot);
+    const changed = (session.commandTerminalLabel ?? null) !== label;
+    if (!changed && session.commandTerminalNamedByUser) return false;
+    session.commandTerminalLabel = label;
+    session.commandTerminalNamedByUser = true;
+    this.emit('session-changed', sessionId, toSession(session));
+    return changed;
   }
 
   /**
@@ -3688,7 +4042,7 @@ export class SessionManager extends EventEmitter {
 
   /** Return cached activity state for all sessions (survives renderer reloads). */
   getActivityCache(): Record<string, ActivityState> {
-    return this.telemetry.getActivityCache();
+    return this.withoutHidden(this.telemetry.getActivityCache());
   }
 
   /** Return the latest ActivityReason for a session, or null if unknown. */
@@ -3807,7 +4161,7 @@ export class SessionManager extends EventEmitter {
 
   /** Return cached ActivityReason for all sessions (HMR/full-reload reconcile). */
   getActivityReasonsCache(): Record<string, ActivityReason> {
-    return this.telemetry.getActivityReasonsCache();
+    return this.withoutHidden(this.telemetry.getActivityReasonsCache());
   }
 
   /**
@@ -3821,6 +4175,33 @@ export class SessionManager extends EventEmitter {
   /** Return cached events for a specific session (survives renderer reloads). */
   getEventsForSession(sessionId: string): SessionEvent[] {
     return this.telemetry.getEventsForSession(sessionId);
+  }
+
+  /**
+   * What the session still has open: tool calls with no end, background shells
+   * it waits on, subagents left running past a turn end. Read from the hook
+   * events, never from the activity engine's display state, whose resets are
+   * not evidence that any of it ended (`open-work-ledger.ts`).
+   */
+  getOpenWork(sessionId: string): OpenWork {
+    return this.telemetry.getOpenWork(sessionId);
+  }
+
+  /**
+   * Why Kangentic may not type into this session right now, or null when it
+   * may. Every automated keystroke asks first (`automated-keys-guard.ts`): a
+   * permission prompt takes typed keys as its answer, so an Enter would approve
+   * a tool call nobody saw. The engine's permission flag is one signal, and a
+   * tool call with no end is the other: the flag has been cleared early (a
+   * parallel subagent's start) with the prompt still on screen.
+   */
+  automatedKeysBlocker(sessionId: string): string | null {
+    // activity-state-ok: granular, a permission prompt is the one state that
+    // must never take keys.
+    if (this.telemetry.getSessionActivity(sessionId) === 'permission') return 'a permission prompt is open';
+    const openCall = this.telemetry.getOpenWork(sessionId).toolCalls[0];
+    if (openCall) return `the ${openCall.tool} tool call has not ended`;
+    return null;
   }
 
   /**
@@ -3870,7 +4251,7 @@ export class SessionManager extends EventEmitter {
 
   /** Return cached events for all sessions (survives renderer reloads). */
   getEventsCache(): Record<string, SessionEvent[]> {
-    return this.telemetry.getEventsCache();
+    return this.withoutHidden(this.telemetry.getEventsCache());
   }
 
   /**
@@ -3882,7 +4263,7 @@ export class SessionManager extends EventEmitter {
   getFirstOutputCache(): Record<string, boolean> {
     const result: Record<string, boolean> = {};
     for (const sessionId of this.firstOutputTracker.snapshot()) {
-      result[sessionId] = true;
+      if (!this.hiddenUntilAdopted.has(sessionId)) result[sessionId] = true;
     }
     return result;
   }
@@ -3890,7 +4271,7 @@ export class SessionManager extends EventEmitter {
   /** Return cached usage data filtered to a specific project. */
   getUsageCacheForProject(projectId: string): Record<string, SessionUsage> {
     return filterCacheByProject(
-      this.telemetry.getUsageCache(),
+      this.getUsageCache(),
       (sessionId) => this.registry.getSessionProjectId(sessionId),
       projectId,
     );
@@ -3899,7 +4280,7 @@ export class SessionManager extends EventEmitter {
   /** Return cached activity state filtered to a specific project. */
   getActivityCacheForProject(projectId: string): Record<string, ActivityState> {
     return filterCacheByProject(
-      this.telemetry.getActivityCache(),
+      this.getActivityCache(),
       (sessionId) => this.registry.getSessionProjectId(sessionId),
       projectId,
     );
@@ -3908,7 +4289,7 @@ export class SessionManager extends EventEmitter {
   /** Return cached ActivityReason filtered to a specific project. */
   getActivityReasonsCacheForProject(projectId: string): Record<string, ActivityReason> {
     return filterCacheByProject(
-      this.telemetry.getActivityReasonsCache(),
+      this.getActivityReasonsCache(),
       (sessionId) => this.registry.getSessionProjectId(sessionId),
       projectId,
     );
@@ -3917,7 +4298,7 @@ export class SessionManager extends EventEmitter {
   /** Return cached events filtered to a specific project. */
   getEventsCacheForProject(projectId: string): Record<string, SessionEvent[]> {
     return filterCacheByProject(
-      this.telemetry.getEventsCache(),
+      this.getEventsCache(),
       (sessionId) => this.registry.getSessionProjectId(sessionId),
       projectId,
     );
@@ -4013,7 +4394,10 @@ export class SessionManager extends EventEmitter {
    * cleared (or points at a now-suspended id).
    */
   findLiveSessionByTaskId(taskId: string): Session | undefined {
-    return this.registry.findLiveSessionByTaskId(taskId);
+    const session = this.registry.findLiveSessionByTaskId(taskId);
+    // A session launched hidden is not the task's until its spawn adopts it.
+    if (session && this.hiddenUntilAdopted.has(session.id)) return undefined;
+    return session;
   }
 
   /**

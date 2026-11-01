@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveTileLayout } from '../../src/renderer/window-manager/tiling/resolve-layout';
+import { heldSplitSizes, resolveTileLayout } from '../../src/renderer/window-manager/tiling/resolve-layout';
 import {
   treeContainsWindow,
   collectWindowIds,
@@ -7,6 +7,8 @@ import {
   insertWindowIntoTree,
   wrapTreeWithRoot,
   setSeamRatio,
+  setSplitSizes,
+  seamPairRatio,
   clampTileRatio,
   MIN_TILE_RATIO,
   MAX_TILE_RATIO,
@@ -83,6 +85,119 @@ describe('resolveTileLayout', () => {
     expect(layout.rects.get('wc')).toEqual({ left: 503, top: 403, width: 497, height: 397 });
     expect(layout.seams.map((seam) => seam.splitId).sort()).toEqual(['s1', 's2']);
   });
+
+  describe('with a pane floor (a host-arranged layer)', () => {
+    const FLOOR = { width: 560, height: 200 };
+
+    it('holds a pane a dragged seam would put under the floor, taking the room from its neighbour', () => {
+      // The Command Terminal at its minimum: two floors wide, the seam dragged to 0.68.
+      const tree = hsplit('s1', [leaf('la', 'wa'), leaf('lb', 'wb')], [0.68, 0.32]);
+      const layout = resolveTileLayout(tree, { width: 1120, height: 800 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      expect(layout.rects.get('wa')!.width).toBeCloseTo(560, 6);
+      expect(layout.rects.get('wb')!.width).toBeCloseTo(560, 6);
+      expect(layout.seams[0].rect.left).toBeCloseTo(560, 6);
+    });
+
+    it('keeps the dragged proportions while every pane clears the floor', () => {
+      const tree = hsplit('s1', [leaf('la', 'wa'), leaf('lb', 'wb')], [0.68, 0.32]);
+      const layout = resolveTileLayout(tree, { width: 2000, height: 800 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      expect(layout.rects.get('wa')!.width).toBeCloseTo(1360, 6);
+      expect(layout.rects.get('wb')!.width).toBeCloseTo(640, 6);
+    });
+
+    it('holds a stacked column at its panes\' floors, both ways', () => {
+      // Three terminals: one tall beside two stacked, the stack squeezed by both seams.
+      const tree = hsplit(
+        's1',
+        [leaf('la', 'wa'), vsplit('s2', [leaf('lb', 'wb'), leaf('lc', 'wc')], [0.9, 0.1])],
+        [0.8, 0.2],
+      );
+      const layout = resolveTileLayout(tree, { width: 1120, height: 400 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      expect(layout.rects.get('wb')!.width).toBeCloseTo(560, 6);
+      expect(layout.rects.get('wb')!.height).toBeCloseTo(200, 6);
+      expect(layout.rects.get('wc')!.height).toBeCloseTo(200, 6);
+    });
+
+    it('scales the floors down together when the area cannot hold them all (a window too small for the grid)', () => {
+      const tree = hsplit('s1', [leaf('la', 'wa'), leaf('lb', 'wb')], [0.68, 0.32]);
+      const layout = resolveTileLayout(tree, { width: 800, height: 600 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      expect(layout.rects.get('wa')!.width).toBeCloseTo(400, 6);
+      expect(layout.rects.get('wb')!.width).toBeCloseTo(400, 6);
+    });
+
+    it('names the sizes that match a layout the floor holds, and none for one it does not', () => {
+      // The seam dragged to 0.28 in a wide panel, then the panel at the grid's minimum: shown even.
+      const tree = hsplit('s1', [leaf('la', 'wa'), leaf('lb', 'wb')], [0.28, 0.72]);
+      const held = heldSplitSizes(tree, { width: 1120, height: 800 }, 0, FLOOR);
+      expect(held).toHaveLength(1);
+      expect(held[0].splitId).toBe('s1');
+      expect(held[0].sizes[0]).toBeCloseTo(0.5, 6);
+      expect(held[0].sizes[1]).toBeCloseTo(0.5, 6);
+      // Adopted, the tree grows evenly from there.
+      const adopted = setSplitSizes(tree, 's1', held[0].sizes);
+      const grown = resolveTileLayout(adopted, { width: 2000, height: 800 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      expect(grown.rects.get('wa')!.width).toBeCloseTo(1000, 6);
+      // Wide enough that the hold moves nothing: nothing to adopt.
+      expect(heldSplitSizes(tree, { width: 2200, height: 800 }, 0, FLOOR)).toEqual([]);
+    });
+
+    it('names the floors scaled down together for an area too small for them, the way the layout shows them', () => {
+      // 800 wide holds one floor and a half of the 1120 two floors need.
+      const tree = hsplit('s1', [leaf('la', 'wa'), leaf('lb', 'wb')], [0.68, 0.32]);
+      const held = heldSplitSizes(tree, { width: 800, height: 600 }, 0, FLOOR);
+      expect(held).toHaveLength(1);
+      expect(held[0].splitId).toBe('s1');
+      expect(held[0].sizes[0]).toBeCloseTo(0.5, 6);
+      expect(held[0].sizes[1]).toBeCloseTo(0.5, 6);
+      // What it names is what resolveTileLayout draws there.
+      const shown = resolveTileLayout(tree, { width: 800, height: 600 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      expect(shown.rects.get('wa')!.width).toBeCloseTo(800 * held[0].sizes[0], 6);
+      expect(shown.rects.get('wb')!.width).toBeCloseTo(800 * held[0].sizes[1], 6);
+    });
+
+    it('scales the floors down in their own proportions, not evenly, when an area is too small for a pane and a pair', () => {
+      // A tall pane beside two side by side: floors of 560 and 1120 in 840, so 280 and 560.
+      const pair = hsplit('s2', [leaf('lb', 'wb'), leaf('lc', 'wc')], [0.5, 0.5]);
+      const tree = hsplit('s1', [leaf('la', 'wa'), pair], [0.5, 0.5]);
+      const held = heldSplitSizes(tree, { width: 840, height: 600 }, 0, FLOOR);
+      // The pair then gets 560 of the 1120 its floors need, split evenly as its own sizes
+      // already say, so only the outer split has anything to adopt.
+      expect(held).toHaveLength(1);
+      expect(held[0].splitId).toBe('s1');
+      expect(held[0].sizes[0]).toBeCloseTo(1 / 3, 6);
+      expect(held[0].sizes[1]).toBeCloseTo(2 / 3, 6);
+    });
+
+    it('names nothing for an area with no room at all', () => {
+      const tree = hsplit('s1', [leaf('la', 'wa'), leaf('lb', 'wb')], [0.68, 0.32]);
+      expect(heldSplitSizes(tree, { width: 0, height: 0 }, 0, FLOOR)).toEqual([]);
+      // And a lone pane has no split to name.
+      expect(heldSplitSizes(leaf('la', 'wa'), { width: 800, height: 600 }, 0, FLOOR)).toEqual([]);
+    });
+
+    it('adopts a held split of three exactly, room moving past a pair', () => {
+      const three = hsplit('s3', [leaf('lx', 'wx'), leaf('ly', 'wy'), leaf('lz', 'wz')], [0.1, 0.1, 0.8]);
+      const held = heldSplitSizes(three, { width: 2000, height: 800 }, 0, FLOOR);
+      let adopted: TileNode = three;
+      for (const split of held) adopted = setSplitSizes(adopted, split.splitId, split.sizes);
+      const shown = resolveTileLayout(three, { width: 2000, height: 800 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      const after = resolveTileLayout(adopted, { width: 2000, height: 800 }, 0, 0, { left: 0, top: 0 });
+      for (const windowId of ['wx', 'wy', 'wz']) {
+        expect(after.rects.get(windowId)!.width).toBeCloseTo(shown.rects.get(windowId)!.width, 6);
+      }
+    });
+
+    it('moves a pane a pixel, never back to the seam fractions, when the area falls a pixel short of the floors', () => {
+      // A panel shrinking a frame ahead of the rail beside it: the terminal area a pixel
+      // under the grid's minimum must not drop the hold and jump to the seam's 0.68.
+      const tree = hsplit('s1', [leaf('la', 'wa'), leaf('lb', 'wb')], [0.68, 0.32]);
+      const atMinimum = resolveTileLayout(tree, { width: 1120, height: 800 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      const pixelShort = resolveTileLayout(tree, { width: 1119, height: 800 }, 0, 0, { left: 0, top: 0 }, FLOOR);
+      for (const windowId of ['wa', 'wb']) {
+        expect(Math.abs(atMinimum.rects.get(windowId)!.width - pixelShort.rects.get(windowId)!.width)).toBeLessThan(1);
+      }
+    });
+  });
 });
 
 describe('tile tree-ops', () => {
@@ -135,6 +250,62 @@ describe('tile tree-ops', () => {
     expect(inner.sizes[1]).toBeCloseTo(0.3, 6);
     // Original is untouched.
     expect((tree.children[1] as Split).sizes).toEqual([0.5, 0.5]);
+  });
+
+  it('seamPairRatio reads back the pair ratio setSeamRatio wrote, in a nested split and in one of three', () => {
+    const tree = hsplit('s1', [leaf('la', 'wa'), vsplit('s2', [leaf('lb', 'wb'), leaf('lc', 'wc')], [0.5, 0.5])], [0.5, 0.5]);
+    expect(seamPairRatio(tree, 's2', 0)).toBeCloseTo(0.5, 6);
+    expect(seamPairRatio(setSeamRatio(tree, 's2', 0, 0.7), 's2', 0)).toBeCloseTo(0.7, 6);
+    // Of three panes 0.2 / 0.3 / 0.5, the second seam's pair is 0.3 + 0.5.
+    const three = hsplit('s3', [leaf('lx', 'wx'), leaf('ly', 'wy'), leaf('lz', 'wz')], [0.2, 0.3, 0.5]);
+    expect(seamPairRatio(three, 's3', 1)).toBeCloseTo(0.375, 6);
+    expect(seamPairRatio(setSeamRatio(three, 's3', 1, 0.5), 's3', 1)).toBeCloseTo(0.5, 6);
+    // No such split, a seam index past the end, or a lone leaf: nothing to read.
+    expect(seamPairRatio(tree, 'missing', 0)).toBeNull();
+    expect(seamPairRatio(tree, 's1', 1)).toBeNull();
+    expect(seamPairRatio(leaf('lone', 'wl'), 'lone', 0)).toBeNull();
+  });
+
+  it('setSplitSizes sets every child size of the split at once, normalized to sum to 1, immutably', () => {
+    const inner = vsplit('s2', [leaf('lb', 'wb'), leaf('lc', 'wc')], [0.5, 0.5]);
+    const tree = hsplit('s1', [leaf('la', 'wa'), inner], [0.5, 0.5]);
+
+    const next = setSplitSizes(tree, 's2', [1, 3]) as Split;
+    expect(next).not.toBe(tree);
+    expect(next.children[0]).toBe(tree.children[0]); // untouched subtree keeps its reference
+    expect((next.children[1] as Split).sizes).toEqual([0.25, 0.75]);
+    expect(next.sizes).toEqual([0.5, 0.5]); // the split above is not the target
+    // Original is untouched.
+    expect((tree.children[1] as Split).sizes).toEqual([0.5, 0.5]);
+
+    // A split of three takes all three at once, not a pair.
+    const three = hsplit('s3', [leaf('lx', 'wx'), leaf('ly', 'wy'), leaf('lz', 'wz')], [0.2, 0.3, 0.5]);
+    expect((setSplitSizes(three, 's3', [1, 1, 2]) as Split).sizes).toEqual([0.25, 0.25, 0.5]);
+  });
+
+  it('setSplitSizes returns the same tree for sizes it cannot adopt', () => {
+    const inner = vsplit('s2', [leaf('lb', 'wb'), leaf('lc', 'wc')], [0.5, 0.5]);
+    const tree = hsplit('s1', [leaf('la', 'wa'), inner], [0.5, 0.5]);
+
+    // A count that does not match the split's children, either way.
+    expect(setSplitSizes(tree, 's2', [1])).toBe(tree);
+    expect(setSplitSizes(tree, 's2', [1, 1, 1])).toBe(tree);
+    expect(setSplitSizes(tree, 's2', [])).toBe(tree);
+    expect(setSplitSizes(tree, 's1', [1, 1, 1])).toBe(tree);
+    // A size that is zero, negative or not a number.
+    expect(setSplitSizes(tree, 's2', [0, 1])).toBe(tree);
+    expect(setSplitSizes(tree, 's2', [-1, 2])).toBe(tree);
+    expect(setSplitSizes(tree, 's2', [1, Number.NaN])).toBe(tree);
+    expect(setSplitSizes(tree, 's1', [1, 0])).toBe(tree);
+  });
+
+  it('setSplitSizes returns the same tree when it holds no such split', () => {
+    const tree = hsplit('s1', [leaf('la', 'wa'), vsplit('s2', [leaf('lb', 'wb'), leaf('lc', 'wc')], [0.5, 0.5])], [0.5, 0.5]);
+    expect(setSplitSizes(tree, 'missing', [1, 1])).toBe(tree);
+    // A leaf's id is not a split's.
+    expect(setSplitSizes(tree, 'la', [1, 1])).toBe(tree);
+    const lone = leaf('lone', 'wl');
+    expect(setSplitSizes(lone, 'lone', [1])).toBe(lone);
   });
 
   it('clampTileRatio keeps ratios inside [MIN, MAX]', () => {

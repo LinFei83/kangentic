@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Spawn flow
-description: The two spawn chokepoints (spawnAgent and prepareAgentSpawn) and every entry point into them, the engine and SessionManager.doSpawn steps, the concurrency queue, isolated session tracks (session_target, session_spawn_strategy), AbortSignal cancellation, and cross-agent handoff.
+description: The two spawn chokepoints (spawnAgent and prepareAgentSpawn) and every entry point into them, the engine and SessionManager.doSpawn steps, an agent started hidden during the worktree's setup script and adopted by the spawn, the concurrency queue, isolated session tracks (session_target, session_spawn_strategy), AbortSignal cancellation, and cross-agent handoff.
 tags: [sessions, spawn, queue, isolated-sessions, handoff]
 sources:
   - resource: src/main/transition-engine/spawn-preamble.ts
@@ -17,6 +17,7 @@ sources:
   - resource: src/main/ipc/handlers/task-move.ts
   - resource: src/main/transition-engine/session-startup/auto-spawn.ts
   - resource: src/main/agent/handoff/index.ts
+  - resource: src/main/transition-engine/early-agent.ts
 ---
 # Spawn flow
 
@@ -72,6 +73,7 @@ sessions bypass all of this (not task agents).
    - If fresh: generate new UUID for `agent_session_id`, use `--session-id`, include prompt
    - Create session directory at `.kangentic/sessions/<agentSessionId>/`
    - Build agent CLI command via `CommandBuilder`
+   - For an isolated column's session, read the checkout's HEAD (`TransitionEngineServices.readStartHead`) before the spawn, since the agent may commit in its first seconds, and record it as `sessions.start_head_sha`. A failed read records NULL and never fails the spawn. The main conversation's return recap counts commits from it ([Resume](resume.md#a-return-to-the-main-conversation-opens-on-a-recap)); startup recovery copies it onto the record it writes
    - Call `SessionManager.spawn()`
 3. `SessionManager.spawn()`:
    - Check concurrency limit; queue if full (returns `queued` placeholder)
@@ -93,6 +95,52 @@ sessions bypass all of this (not task agents).
      - Start events file watcher (50ms debounce)
      - The host runs the output handler (16ms batched flush, 512KB scrollback)
      - After 100ms delay, write CLI command to PTY stdin, prefixed with the shell's own clear via `buildSpawnClearPrelude` (every typed command launches an agent, a transient session's included: a Command Terminal or a workflow's agent)
+
+## An agent started during the setup script
+
+A move or an auto-spawn into a new worktree with a Post-Worktree Script starts the agent while the
+script runs, and the spawn after the script adopts it instead of launching a second one (the two
+modes and their failure handling: [Worktree creation](../worktrees/worktree-creation.md#the-agent-starts-while-the-script-runs)).
+
+1. **Launch.** `createEarlyAgentLauncher` (`agent-spawn.ts`) runs inside the creation's hold,
+   without the task lock. It checks what the spawn will check (no session, the column spawns, no
+   held pause, no handoff, the column's first enter row needs the agent or there is none),
+   resolves the agent, permission and overrides with `previewSpawnPreamble` (the preamble's lock
+   computed on a copy and written nowhere), and calls `TransitionEngine.launchEarlyAgent`. That
+   launches only a fresh spawn of an agent whose adapter's `firstPromptMayBeTyped` answers true
+   for this launch (Claude's does on its fullscreen renderer), with a free concurrency slot and no
+   session row for the task: `ensureTrust` for the worktree, the command built with no prompt
+   (`resolveLaunch`, the same options a spawn builds), and `sessionManager.spawn` with
+   `hiddenUntilAdopted`, `seedIdle` and `inputInAlternateScreen`. Nothing is written to the
+   database. Every spawn the engine makes carries that last flag when the adapter answers true, so
+   a later background paste waits for the alternate screen too (`awaitInputReady`).
+2. **Hidden.** `SessionManager.emit` keeps every event of a hidden session from listeners except
+   the raw output signals; its `exit` reaches `awaitExit` alone. It is left out of
+   `listSessions`, the caches a renderer syncs from, `findLiveSessionByTaskId` and the idle sweep,
+   and `isWritable` is false, so a held-message flush, an MCP send or a phone holds its message
+   for the opening prompt. `killByTaskId`, `removeByTaskId` and `killAll` still reach it, so a
+   delete or a quit leaves nothing running.
+3. **Adopt.** `spawnAgent` passes the handle through `SpawnOverrides.earlyAgent`.
+   `executeSpawnAgent` adopts it only for a fresh spawn with no handoff prefix whose launch, built
+   with the early agent's ids and no prompt, has the same `launchKey`: same agent, CLI target,
+   permission mode, model, effort, folder, launch options. It must also be at its input box: its
+   TUI has entered the alternate screen (`awaitAltScreen`, waiting at most until 15 s after its
+   launch), since a screen it shows first, such as Claude's approval of a new project MCP server,
+   is drawn outside it and would take the typed prompt's Enter. Adopting commits it as a spawn commits
+   a new session (`session_id`, the session record with the prompt), then `adoptSession` restarts
+   its idle clock and announces it with one `session-changed`. The outcome's `typedOpening` is the
+   prompt the command line would have carried.
+4. **Type the opening.** `deliverOpeningPromptAndWait` waits for the agent to be on screen and
+   its screen to be quiet, then sends the prompt the way every delivery decides (`shouldPaste`): a
+   bracketed paste for the task template, keystrokes for one line or a slash command. It is
+   awaited, so the column's later messages and held messages go after it.
+5. **Discard.** Every path that does not adopt it discards it: a spawn whose launch changed, an
+   agent that exited, a Phase 3 re-check that skips the spawn, `spawnAgent`'s own `finally`, the
+   move's catch, and a failed or cancelled script inside the creation's hold. A discard is a kill,
+   an exit wait taken while the row exists, then a removal, and it runs at most once. The row stays
+   hidden until its exit lands, so that exit reaches `awaitExit` alone. A start that reaches the
+   task lock before the move does (an MCP or phone start, once the script ends) spawns normally,
+   and `SessionManager.spawn` ends the task's hidden agent the same way before it starts its own.
 
 ## Queue
 
@@ -123,14 +171,14 @@ Both fields are enums so future tracks/strategies need no schema migration.
 
 **An isolated session is context-isolated.** It does NOT inherit the main session's conversation. This is the point of the feature: pairing `session_target: isolated` (with the default `always_spawn_new`) and `auto_command: /code-review` yields an independent reviewer that judges the current diff without the generator's reasoning trail. (This is distinct from Claude Code's own `/fork` / `--fork-session`, which *inherit* the conversation; we deliberately do not.) "Restart the conversation" within a session is otherwise left to the agent's native `/clear` / `/compact`.
 
-**One active PTY per task** is preserved. The worktree is shared across a task's sessions (same `task.worktree_path`), so an isolated session's edits are real and persist; the main session sees the changed tree but not the isolated conversation.
+**One active PTY per task** is preserved. The worktree is shared across a task's sessions (same `task.worktree_path`), so an isolated session's edits are real and persist; the main session sees the changed tree but not the isolated conversation. When the main conversation resumes after one, its opening message says what the isolated sessions committed and the final message each ended on (the return recap, see [Resume](resume.md#a-return-to-the-main-conversation-opens-on-a-recap)).
 
 **`always_spawn_new` applies on column entry only.** An app restart / pause-resume of an in-progress session still resumes it (the recovery path is unaffected), so a crash never discards active work. The Resume path (`resumeTaskSession`) and the in-place settings restart (`restartSessionForSettingsChange`) pass `forceFresh: false` over what `resolveSpawnOverrides` derives from the column. They used to forward the column's `true`, so a Resume in a reviewer column retired the paused conversation and started a blank one.
 
 Lifecycle on task move (`task-move.ts`, the session switch branch inside Priority 3):
 
 - **Enter an isolated column from a live main session**: suspend the main session (preserve `agent_session_id`), then Phase 3 spawns/resumes the isolated session and runs its `auto_command`. With `always_spawn_new` (the isolated default) it spawns fresh each entry, retiring the prior pass.
-- **Leave an isolated column for a normal column**: suspend the isolated session (resumable), then Phase 3 resumes the **main** session.
+- **Leave an isolated column for a normal column**: suspend the isolated session (resumable), then Phase 3 resumes the **main** session, which opens on the return recap when the isolated session left a commit or a final message.
 - **Reset-main / recycle**: an `always_spawn_new` column forces a fresh spawn on its target track even when the live session is already on that track, so the switch fires on `resolveForceFresh(toLane)`, not only on a target change.
 - The target + spawn policy are derived from the destination column in `resolveSpawnOverrides`, threaded through `SpawnOverrides.isolatedSwimlaneId` / `SpawnOverrides.forceFresh` into `resolveSpawnIntent` (which retires the prior record on a forced-fresh entry) and `sessionRepo.insert`. The terminal tab badges an isolated session as "Isolated" vs "Main".
 - **A switch the live session asked for itself** (its own `kangentic_move_task`, the way a main session sends its task to Code Review) suspends that session only once the turn that made the move ends, so the move stays in its conversation. The new track's spawn waits behind it. See [A call that ends the caller's own session](suspend-and-cleanup.md#a-call-that-ends-the-callers-own-session).

@@ -235,6 +235,126 @@ describe('startCommandTerminal: resuming an earlier conversation', () => {
     expect(context.sessionManager.spawn).not.toHaveBeenCalled();
   });
 
+  // `/bg` moves a terminal's conversation into the agent CLI's own background
+  // session, which a quit leaves running. A resume beside it would put a second
+  // process on the conversation, so it is stopped first, on the agent's files
+  // alone, and the resume names the id a `--resume` reaches.
+  describe("a conversation in the agent CLI's own background session", () => {
+    function withBackgroundSupport(options: { inBackground: boolean; resolvesTo?: string; distro?: string }, order: string[] = []) {
+      const claude = makeAdapter('claude', { resumable: true, distro: options.distro });
+      Object.assign(claude, {
+        // The row is the background session itself when the files show one.
+        backgroundSessionOf: vi.fn(async ({ agentSessionId }: { agentSessionId: string }) => {
+          order.push('check');
+          return options.inBackground ? agentSessionId : null;
+        }),
+        stopBackgroundSession: vi.fn(async () => { order.push('stop'); return true; }),
+        resolveResumableSessionId: vi.fn(async ({ agentSessionId }: { agentSessionId: string }) => {
+          order.push('resolve');
+          return options.resolvesTo ?? agentSessionId;
+        }),
+      });
+      claude.ensureTrust.mockImplementation(async () => { order.push('trust'); });
+      adapters.set('claude', claude);
+      return claude as typeof claude & {
+        backgroundSessionOf: ReturnType<typeof vi.fn>;
+        stopBackgroundSession: ReturnType<typeof vi.fn>;
+        resolveResumableSessionId: ReturnType<typeof vi.fn>;
+      };
+    }
+
+    it('stops it before the spawn and resumes the conversation it continued, claiming that one too', async () => {
+      const order: string[] = [];
+      const claude = withBackgroundSupport({ inBackground: true, resolvesTo: 'conversation-before-bg' }, order);
+      const context = createContext({ 'conversation-a': { agent_name: 'claude', label: 'Fix the flaky drag test' } });
+
+      await spawn(context, { projectId: 'proj-1', slot: 'slot-2', resumeAgentSessionId: 'conversation-a' });
+
+      expect(claude.backgroundSessionOf).toHaveBeenCalledWith({ agentSessionId: 'conversation-a', cwd: PROJECT_ROOT, place: null });
+      expect(claude.stopBackgroundSession).toHaveBeenCalledWith({ agentSessionId: 'conversation-a', cliPath: '/mock/claude' });
+      // Settled before anything is built for the spawn.
+      expect(order).toEqual(['check', 'stop', 'resolve', 'trust']);
+      expect(claude.buildCommand).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'conversation-before-bg', resume: true }));
+      expect(context.sessionManager.spawn).toHaveBeenCalledWith(expect.objectContaining({ agentSessionId: 'conversation-before-bg', resuming: true }));
+      expect(context.commandTerminalHistory.claimResume).toHaveBeenCalledWith('proj-1', 'conversation-a');
+      expect(context.commandTerminalHistory.claimResume).toHaveBeenCalledWith('proj-1', 'conversation-before-bg');
+      expect(context.commandTerminalHistory.settleResume).toHaveBeenCalledWith('proj-1', 'conversation-a', 'session-1');
+      expect(context.commandTerminalHistory.settleResume).toHaveBeenCalledWith('proj-1', 'conversation-before-bg', 'session-1');
+    });
+
+    // A conversation of a CLI that ran in a WSL distro keeps its transcripts in
+    // that distro's home. The place the resume resolved for the CLI goes to both
+    // reads, or each looks in this machine's folder, finds no transcript, and
+    // the background session keeps running beside the resume. Red-green: handing
+    // either read no place (null) fails the matching assertion below.
+    it('hands the background check and the resumable-id lookup the distro its CLI resolved to', async () => {
+      const claude = withBackgroundSupport({ inBackground: true, resolvesTo: 'conversation-before-bg', distro: 'Ubuntu' });
+      const context = createContext({ 'conversation-a': { agent_name: 'claude', label: null, cli_target: storedDistroTarget('Ubuntu') } });
+
+      await spawn(context, { projectId: 'proj-1', slot: 'slot-2', resumeAgentSessionId: 'conversation-a' });
+
+      const distroPlace = expect.objectContaining({
+        kind: 'wsl',
+        distro: 'Ubuntu',
+        facts: expect.objectContaining({
+          homeUnc: '\\\\wsl.localhost\\Ubuntu\\home\\dev',
+          uncRoot: '\\\\wsl.localhost\\Ubuntu',
+        }),
+      });
+      expect(claude.backgroundSessionOf).toHaveBeenCalledTimes(1);
+      expect(claude.backgroundSessionOf).toHaveBeenCalledWith({ agentSessionId: 'conversation-a', cwd: PROJECT_ROOT, place: distroPlace });
+      expect(claude.resolveResumableSessionId).toHaveBeenCalledTimes(1);
+      expect(claude.resolveResumableSessionId).toHaveBeenCalledWith({ agentSessionId: 'conversation-a', cwd: PROJECT_ROOT, place: distroPlace });
+      // The resume is the one the lookup named, so the settled id reached the spawn.
+      expect(claude.buildCommand).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'conversation-before-bg',
+        resume: true,
+        cliTarget: expect.objectContaining({ kind: 'wsl', distro: 'Ubuntu' }),
+      }));
+    });
+
+    it('runs no CLI for a conversation that never moved into one', async () => {
+      const claude = withBackgroundSupport({ inBackground: false, resolvesTo: 'conversation-before-bg' });
+      const context = createContext({ 'conversation-a': { agent_name: 'claude', label: null } });
+
+      await spawn(context, { projectId: 'proj-1', resumeAgentSessionId: 'conversation-a' });
+
+      expect(claude.backgroundSessionOf).toHaveBeenCalled();
+      expect(claude.stopBackgroundSession).not.toHaveBeenCalled();
+      expect(claude.resolveResumableSessionId).not.toHaveBeenCalled();
+      expect(claude.buildCommand).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'conversation-a', resume: true }));
+      expect(context.commandTerminalHistory.claimResume).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the background session the row moved into running while a live terminal holds it, and resumes the row', async () => {
+      const claude = withBackgroundSupport({ inBackground: false });
+      claude.backgroundSessionOf.mockImplementation(async () => 'background-held-live');
+      const context = createContext({ 'conversation-a': { agent_name: 'claude', label: null } });
+      context.sessionManager.listSessions.mockReturnValue([{ id: 'terminal-1', agentSessionId: 'background-held-live', status: 'running' }] as never);
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      await spawn(context, { projectId: 'proj-1', resumeAgentSessionId: 'conversation-a' });
+
+      expect(claude.stopBackgroundSession).not.toHaveBeenCalled();
+      expect(claude.resolveResumableSessionId).not.toHaveBeenCalled();
+      expect(claude.buildCommand).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'conversation-a', resume: true }));
+      logSpy.mockRestore();
+    });
+
+    it('refuses with conversation-open when another terminal holds the conversation it continued, and hands both claims back', async () => {
+      withBackgroundSupport({ inBackground: true, resolvesTo: 'conversation-before-bg' });
+      const context = createContext({ 'conversation-a': { agent_name: 'claude', label: null } });
+      context.commandTerminalHistory.claimResume.mockImplementation((_projectId: string, agentSessionId: string) => agentSessionId === 'conversation-a');
+
+      await expect(spawn(context, { projectId: 'proj-1', resumeAgentSessionId: 'conversation-a' }))
+        .rejects.toMatchObject({ code: 'conversation-open' });
+
+      expect(context.sessionManager.spawn).not.toHaveBeenCalled();
+      expect(context.commandTerminalHistory.settleResume).toHaveBeenCalledWith('proj-1', 'conversation-a', null);
+      expect(context.commandTerminalHistory.settleResume).not.toHaveBeenCalledWith('proj-1', 'conversation-before-bg', expect.anything());
+    });
+  });
+
   // A conversation is kept in the home of the place its CLI ran in. A CLI path
   // moved into, out of, or between distros since then would be handed a
   // `--resume` it cannot find. Red-green: dropping the `isSameCliPlace` check

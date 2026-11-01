@@ -100,8 +100,19 @@ function makeEngine(options: Partial<ActivityEngineOptions> = {}): {
   return { engine, transitions, syntheticEvents };
 }
 
-function event(type: EventType, opts?: { detail?: string; tool?: string; toolId?: string }): SessionEvent {
-  return { ts: Date.now(), type, detail: opts?.detail, tool: opts?.tool, toolId: opts?.toolId };
+function event(
+  type: EventType,
+  opts?: { detail?: string; tool?: string; toolId?: string; subagentId?: string; launchesSubagent?: boolean },
+): SessionEvent {
+  return {
+    ts: Date.now(),
+    type,
+    detail: opts?.detail,
+    tool: opts?.tool,
+    toolId: opts?.toolId,
+    ...(opts?.subagentId ? { subagentId: opts.subagentId } : {}),
+    ...(opts?.launchesSubagent ? { launchesSubagent: true } : {}),
+  };
 }
 
 const SESSION_ID = 'session-1';
@@ -831,6 +842,53 @@ describe('ActivityEngine', () => {
       expect(engine.getState(SESSION_ID)?.activity).toBe('thinking');
     });
 
+    it('a parallel subagent starting does NOT clear a prompt for another call (the lost Artifact prompt)', () => {
+      // Captured overnight: an Artifact read went out in one batch with three
+      // background Explore subagents. The prompt opened, a subagent started
+      // 36 ms later and cleared it, the card read working then idle, and a
+      // recovery nudge's Enter approved the read nobody saw.
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      engine.processEvent(SESSION_ID, event(EventType.ToolStart, { tool: 'Artifact', toolId: 'tool-artifact' }));
+      engine.processEvent(SESSION_ID, event(EventType.ToolStart, { tool: 'Agent', toolId: 'tool-explore', launchesSubagent: true }));
+      engine.processEvent(SESSION_ID, event(EventType.Idle, { detail: IdleReason.Permission, tool: 'Artifact' }));
+      expect(engine.getState(SESSION_ID)?.permissionAwaitedToolId).toBe('tool-artifact');
+      transitions.length = 0;
+
+      engine.processEvent(SESSION_ID, event(EventType.SubagentStart, { detail: 'Explore', subagentId: 'agent-1' }));
+      expect(engine.getState(SESSION_ID)?.permissionPending).toBe(true);
+      expect(engine.getState(SESSION_ID)?.activity).toBe('permission');
+    });
+
+    it('a subagent starting DOES clear the prompt when the awaited call is the one that starts it', () => {
+      // Approving an Agent call is what starts its subagent, so its start is
+      // the answer. The adapter tags the call (`launchesSubagent`).
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      engine.processEvent(SESSION_ID, event(EventType.ToolStart, { tool: 'Agent', toolId: 'tool-agent', launchesSubagent: true }));
+      engine.processEvent(SESSION_ID, event(EventType.Idle, { detail: IdleReason.Permission, tool: 'Agent' }));
+      transitions.length = 0;
+
+      engine.processEvent(SESSION_ID, event(EventType.SubagentStart, { detail: 'Explore', subagentId: 'agent-1' }));
+      expect(engine.getState(SESSION_ID)?.permissionPending).toBe(false);
+      expect(engine.getState(SESSION_ID)?.activity).toBe('thinking');
+    });
+
+    it('a depth-0 sibling call starting or ending with its own id does NOT clear the prompt', () => {
+      // Both ids are known, so the call is told apart from the awaited one:
+      // it is a parallel sibling, not the answer.
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      engine.processEvent(SESSION_ID, event(EventType.ToolStart, { tool: 'Artifact', toolId: 'tool-artifact' }));
+      engine.processEvent(SESSION_ID, event(EventType.Idle, { detail: IdleReason.Permission, tool: 'Artifact' }));
+      transitions.length = 0;
+
+      engine.processEvent(SESSION_ID, event(EventType.ToolStart, { tool: 'Read', toolId: 'tool-read' }));
+      engine.processEvent(SESSION_ID, event(EventType.ToolEnd, { tool: 'Read', toolId: 'tool-read' }));
+      expect(engine.getState(SESSION_ID)?.permissionPending).toBe(true);
+
+      // Its own end still answers it.
+      engine.processEvent(SESSION_ID, event(EventType.ToolEnd, { tool: 'Artifact', toolId: 'tool-artifact' }));
+      expect(engine.getState(SESSION_ID)?.permissionPending).toBe(false);
+    });
+
     it('no-toolId permission: permissionAwaitedToolId is null and depth-0 ToolEnd still clears (id-less adapter no-regression)', () => {
       // When an adapter supplies no correlation id, updatePermissionFlag must
       // store null in permissionAwaitedToolId (the `?? null` fallback). The
@@ -1093,6 +1151,112 @@ describe('ActivityEngine', () => {
       engine.markThinkingSignal(SESSION_ID);
       expect(engine.getState(SESSION_ID)!.lastSignalAt).not.toBe(before);
       expect(transitions).toHaveLength(0);
+    });
+  });
+
+  describe('restartIdleClock (an adopted early agent starts its wait over)', () => {
+    // An agent launched while its worktree's setup script runs sits idle the whole
+    // time, then is adopted by its task. Its idle clock must read "waiting since
+    // adoption", not "since launch", for the card and the idle-timeout sweep.
+    // The engine reads Date.now, which the fake timers drive, so advancing the
+    // timers moves the clock the restart reads.
+    const ELAPSED_MS = 60_000;
+
+    it('restamps idleTimestamp and needsUserSince to now for an idle session and returns true', () => {
+      engine.initSession(SESSION_ID);
+      const seededIdleAt = engine.getState(SESSION_ID)!.idleTimestamp;
+      const seededNeedsUserSince = engine.getState(SESSION_ID)!.needsUserSince;
+      expect(seededIdleAt).not.toBeNull();
+      expect(seededNeedsUserSince).not.toBeNull();
+
+      vi.advanceTimersByTime(ELAPSED_MS);
+      const restartedAt = Date.now();
+      expect(restartedAt - seededIdleAt!).toBe(ELAPSED_MS);
+
+      expect(engine.restartIdleClock(SESSION_ID)).toBe(true);
+
+      const state = engine.getState(SESSION_ID)!;
+      expect(state.activity).toBe('idle');
+      expect(state.idleTimestamp).toBe(restartedAt);
+      expect(state.needsUserSince).toBe(restartedAt);
+    });
+
+    it('pushes the idle activity again through onActivityChange, with a reason whose since is the new clock', () => {
+      engine.initSession(SESSION_ID);
+      transitions.length = 0;
+
+      vi.advanceTimersByTime(ELAPSED_MS);
+      const restartedAt = Date.now();
+      engine.restartIdleClock(SESSION_ID);
+
+      // The activity did not change, but the reason's `since` did, so the push is
+      // the only way the card learns the wait restarted.
+      expect(transitions).toHaveLength(1);
+      expect(transitions[0].sessionId).toBe(SESSION_ID);
+      expect(transitions[0].activity).toBe('idle');
+      expect(transitions[0].reason).toEqual({ kind: 'idle', since: restartedAt });
+      // A later read of the reason agrees with what was pushed.
+      expect(engine.getActivityReason(SESSION_ID)).toEqual({ kind: 'idle', since: restartedAt });
+    });
+
+    it('restarts again from a later now on a second call', () => {
+      engine.initSession(SESSION_ID);
+      vi.advanceTimersByTime(ELAPSED_MS);
+      engine.restartIdleClock(SESSION_ID);
+      transitions.length = 0;
+
+      vi.advanceTimersByTime(ELAPSED_MS);
+      const secondRestartAt = Date.now();
+      expect(engine.restartIdleClock(SESSION_ID)).toBe(true);
+
+      expect(engine.getState(SESSION_ID)!.needsUserSince).toBe(secondRestartAt);
+      expect(transitions).toHaveLength(1);
+      expect(transitions[0].reason).toEqual({ kind: 'idle', since: secondRestartAt });
+    });
+
+    it('is a no-op returning false for a thinking session: no restamp, no push', () => {
+      engine.initSession(SESSION_ID, true);
+      expect(engine.getState(SESSION_ID)!.activity).toBe('thinking');
+      const before = {
+        idleTimestamp: engine.getState(SESSION_ID)!.idleTimestamp,
+        needsUserSince: engine.getState(SESSION_ID)!.needsUserSince,
+      };
+      transitions.length = 0;
+
+      // Stay under the stale-thinking watchdog so the session is still thinking.
+      vi.advanceTimersByTime(TEST_STALE_TIMEOUT_MS / 2);
+      expect(engine.restartIdleClock(SESSION_ID)).toBe(false);
+
+      const state = engine.getState(SESSION_ID)!;
+      expect(state.activity).toBe('thinking');
+      expect(state.idleTimestamp).toBe(before.idleTimestamp);
+      expect(state.needsUserSince).toBe(before.needsUserSince);
+      expect(transitions).toHaveLength(0);
+    });
+
+    it('is a no-op returning false for a permission session: its park time is kept and nothing is pushed', () => {
+      // Permission also needs the user, but only an IDLE wait restarts: the
+      // permission prompt really has been waiting since it opened.
+      engine.initSession(SESSION_ID);
+      engine.processEvent(SESSION_ID, event(EventType.Prompt));
+      engine.processEvent(SESSION_ID, event(EventType.Idle, { detail: IdleReason.Permission }));
+      expect(engine.getState(SESSION_ID)!.activity).toBe('permission');
+      const parkedAt = engine.getState(SESSION_ID)!.needsUserSince;
+      expect(parkedAt).not.toBeNull();
+      transitions.length = 0;
+
+      vi.advanceTimersByTime(TEST_STALE_TIMEOUT_MS / 2);
+      expect(engine.restartIdleClock(SESSION_ID)).toBe(false);
+
+      expect(engine.getState(SESSION_ID)!.needsUserSince).toBe(parkedAt);
+      expect(transitions).toHaveLength(0);
+    });
+
+    it('is a no-op returning false for an unknown session id: no push', () => {
+      expect(engine.restartIdleClock('unknown')).toBe(false);
+      expect(transitions).toHaveLength(0);
+      // It does not conjure state for the id either.
+      expect(engine.getState('unknown')).toBeUndefined();
     });
   });
 

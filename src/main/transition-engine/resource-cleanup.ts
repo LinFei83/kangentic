@@ -11,10 +11,13 @@ import { isWorktreeCreationInFlight } from '../git/worktree-creation-registry';
 import { removeNodeModulesPath } from '../git/node-modules-link';
 import { removeWithRetry } from '../git/rm-with-retry';
 import { WorktreeManager, GitQueuePriority } from '../git/worktree-manager';
+import { scheduleRemovedWorktreeDeletion } from '../git/removed-worktrees';
 import { readLocalBranchSha } from '../git/worktree-head';
 import { holdsPRIdentity } from '../pr/pr-identity';
 import { withTaskLock } from '../ipc/task-lifecycle-lock';
-import type { AutomationRunRepository } from '../db/repositories/automation-run-repository';
+import { workflowKeepsRuns, type AutomationRunRepository } from '../db/repositories/automation-run-repository';
+import { WorkflowRepository } from '../db/repositories/workflow-repository';
+import { getExistingProjectDb } from '../db/database';
 import type { LeftoverProcessEntry } from '../pty/process-tag/tagged-reap';
 
 
@@ -103,6 +106,9 @@ export async function cleanupStaleResourcesAsync(
   await sweepTerminalTaskLeftovers(projectPath, taskRepo, swimlaneRepo, sessionManager, leftovers);
   await cleanBacklogTaskResources(projectPath, taskRepo, taskMoveRepo, swimlaneRepo, sessionRepo, sessionManager);
   await retryFailedDoneCleanups(projectPath, taskRepo, swimlaneRepo);
+  // Worktrees a Done move set aside and a quit left undeleted, plus any the
+  // retry above just moved. In the background: it waits while init scripts run.
+  scheduleRemovedWorktreeDeletion(projectPath);
   await pruneOrphanedDirectories(projectPath, taskRepo, sessionRepo, sessionManager);
   const interrupted = sweepAutomationRuns(automationRunRepo);
   if (interrupted > 0) onRunsInterrupted(interrupted);
@@ -221,7 +227,15 @@ export function _resetTerminalTaskSweepForTests(): void {
 export function sweepAutomationRuns(automationRunRepo: AutomationRunRepository): number {
   try {
     const interrupted = automationRunRepo.markStaleRunsInterrupted(PROCESS_STARTED_AT);
-    automationRunRepo.pruneTo();
+    // A workflow's tasks keep every run until it has been done a day (task #952).
+    // With that unreadable, nothing is pruned this open: a prune cannot be undone.
+    let keepWorkflowIds: string[] | null = null;
+    try {
+      keepWorkflowIds = automationRunRepo.workflowIdsKeepingRuns(Date.now(), workflowHomedElsewhereKeepsRuns);
+    } catch (keepError) {
+      console.warn('[automations] Could not read which workflows keep their runs, so none were pruned:', keepError);
+    }
+    if (keepWorkflowIds !== null) automationRunRepo.pruneTo(undefined, keepWorkflowIds);
     if (interrupted > 0) {
       console.log(`[automations] Marked ${interrupted} interrupted run(s) from a previous session`);
     }
@@ -230,6 +244,22 @@ export function sweepAutomationRuns(automationRunRepo: AutomationRunRepository):
     // A project that cannot sweep is still a usable project.
     console.warn('[automations] Run sweep failed:', sweepError);
     return 0;
+  }
+}
+
+/**
+ * Whether a workflow homed in another project still keeps its tasks' runs,
+ * read from that project's own database. Never creates one: a home that is gone
+ * took its workflow with it, so nothing is kept for it.
+ */
+function workflowHomedElsewhereKeepsRuns(homeProjectId: string, workflowId: string): boolean {
+  try {
+    const homeDb = getExistingProjectDb(homeProjectId);
+    const workflow = homeDb ? new WorkflowRepository(homeDb).getById(workflowId) : undefined;
+    return workflow !== undefined && workflowKeepsRuns(workflow.state, workflow.finished_at, Date.now());
+  } catch {
+    // Unreadable: keep, since a prune cannot be taken back.
+    return true;
   }
 }
 
@@ -521,10 +551,14 @@ async function cleanBacklogTaskResources(
  * killed Claude CLI were still holding file handles on the worktree.
  *
  * By the time the user relaunches Kangentic, those orphaned processes are
- * gone, so this pass usually succeeds on the first try. The retry reuses the
- * full `WorktreeManager.removeWorktree` flow (node_modules cleanup -> git
- * worktree remove --force -> removeWithRetry fallback) so it handles every
- * removal mode the original move attempted. On success we clear
+ * gone, so this pass usually succeeds on the first try. The retry moves the
+ * worktree aside as the Done move does (`WorktreeManager.moveWorktreeAside`,
+ * with `scheduleRemovedWorktreeDeletion` right after this pass deleting the
+ * files), and falls back to the full `WorktreeManager.removeWorktree` flow
+ * (node_modules cleanup -> git worktree remove --force -> removeWithRetry
+ * fallback) so it handles every removal mode the original move attempted. A
+ * quit before the move even started leaves exactly this row, so this pass is
+ * also what finishes a Done move across a restart. On success we clear
  * `worktree_path`, which also unsticks the task for resume if the user later
  * drags it out of Done (`ensureWorktree` skips only when `worktree_path` still
  * points at a live worktree on disk; a cleared or husk path recreates it).
@@ -568,17 +602,26 @@ export async function retryFailedDoneCleanups(
       // ahead, and fail-fast so one stuck removal can't hold the queue for 15s.
       // A false return is logged below and deferred to the next project open.
       //
-      // removeWorktree has TWO failure modes, not one: it returns false when the
-      // directory is held, and it THROWS when the stored path is not a direct
+      // Moved aside first, as the Done move does, so its files are deleted in
+      // the background and never while an init script runs (a task this
+      // project open starts may be running one). In place only when the move
+      // fails.
+      //
+      // Both calls have TWO failure modes, not one: they return false when the
+      // directory is held, and they THROW when the stored path is not a direct
       // child of this project's worktrees root (assertRemovableWorktreePath).
-      // The throw must be caught per task. This loop is the only removeWorktree
+      // The throw must be caught per task. This loop is the only removal
       // caller with no per-iteration guard, so an unhandled throw here would
       // propagate out of withTaskLock and abandon every REMAINING Done task in
       // the pass, not just the one with the bad row.
       let removed: boolean;
       try {
         removed = await worktreeManager.withLock(
-          () => worktreeManager.removeWorktree(current.worktree_path!, { timeoutMs: 3000, removalProfile: 'fast' }),
+          async () => {
+            const movedAside = await worktreeManager.moveWorktreeAside(current.worktree_path!, { timeoutMs: 3000 });
+            if (movedAside) return true;
+            return worktreeManager.removeWorktree(current.worktree_path!, { timeoutMs: 3000, removalProfile: 'fast' });
+          },
           { priority: GitQueuePriority.BACKGROUND, label: `retry-remove-worktree:${task.id.slice(0, 8)}` },
         );
       } catch (removalError) {

@@ -1,7 +1,8 @@
 /**
  * A draggable seam between tiled panes. One per split node. Dragging it adjusts
  * that split's ratio, so BOTH sides resize together (a nested split's seam
- * cascades to every window in its two subtrees).
+ * cascades to every window in its two subtrees). Double-clicking it evens its
+ * two panes, 50/50.
  *
  * Performance: the drag is IMPERATIVE (like the window-resize handle). On each
  * pointermove it re-resolves the layout for the proposed ratio and writes the
@@ -19,7 +20,7 @@ import type { ContainerSize } from '../store/geometry';
 import type { TileNode } from '../store/types';
 import { resolveTileLayout } from '../tiling/resolve-layout';
 import type { TileSeam } from '../tiling/resolve-layout';
-import { clampTileRatio, setSeamRatio as resizeSeamInTree } from '../tiling/tree-ops';
+import { clampTileRatio, seamPairRatio, setSeamRatio as resizeSeamInTree } from '../tiling/tree-ops';
 import { beginManagerResize, type ManagerResizeGesture } from '../terminal/manager-resize-gate';
 import { runTerminalLayoutChange, terminalLayoutScopeOf } from '../../utils/terminal-layout-transition';
 
@@ -66,6 +67,8 @@ export function TileSplitter({ seam, tileTree, treeSize, treeOrigin, gapPx, seam
   // The layer's pixel min-size: a seam can't shrink either pane of the pair below
   // it (so a tiled pane never goes narrower/shorter than a floating one's floor).
   const { layer } = useWindowManager();
+  // The panes a host-arranged layer holds at its floor, as WindowLayer lays them out.
+  const heldMinimum = layer.hostArranged ? layer.minSize : undefined;
   const dragRef = useRef<SeamDrag | null>(null);
   // Keeps the accent line lit through the whole drag (CSS :hover drops out when
   // the captured pointer travels off the thin overlay).
@@ -111,7 +114,7 @@ export function TileSplitter({ seam, tileTree, treeSize, treeOrigin, gapPx, seam
     if (!overlay) return;
     const overlayRect = overlay.getBoundingClientRect();
     // Cache every frame + seam node once so pointermove is pure DOM writes.
-    const layout = resolveTileLayout(tileTree, treeSize, gapPx, seamPx, treeOrigin);
+    const layout = resolveTileLayout(tileTree, treeSize, gapPx, seamPx, treeOrigin, heldMinimum);
     const frameNodes = new Map<string, HTMLElement>();
     for (const windowId of layout.rects.keys()) {
       const node = document.querySelector<HTMLElement>(`[data-testid="window-frame-${windowId}"]`);
@@ -159,7 +162,7 @@ export function TileSplitter({ seam, tileTree, treeSize, treeOrigin, gapPx, seam
     // Re-resolve at the proposed pair ratio and write rects imperatively. No store
     // write -> no React render -> no terminal fit until release.
     const proposed = resizeSeamInTree(tileTree, seam.splitId, seam.index, ratio);
-    const layout = resolveTileLayout(proposed, treeSize, gapPx, seamPx, treeOrigin);
+    const layout = resolveTileLayout(proposed, treeSize, gapPx, seamPx, treeOrigin, heldMinimum);
     for (const [windowId, rect] of layout.rects) {
       const node = drag.frameNodes.get(windowId);
       if (node) applyRect(node, rect);
@@ -178,27 +181,50 @@ export function TileSplitter({ seam, tileTree, treeSize, treeOrigin, gapPx, seam
     finishDrag(drag);
   };
 
+  // A double-click evens the seam's pair, 50/50, as a sash does in an editor.
+  // Its two clicks commit nothing on their own (a press and release in place),
+  // and an already even pair refits nothing.
+  const onDoubleClick = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    const current = seamPairRatio(tileTree, seam.splitId, seam.index);
+    if (current === null || Math.abs(current - 0.5) < 0.001) return;
+    runTerminalLayoutChange(terminalLayoutScopeOf(overlayRef.current), () => {
+      commitSeamRatio(seam.splitId, seam.index, 0.5);
+    });
+  };
+
   const isHorizontal = seam.direction === 'horizontal';
+  // A pair with no room above both panes' floor (a Command Terminal panel at its
+  // minimum) has nowhere to move its seam, the same limit the drag clamps to, so
+  // the seam does not look or act draggable: no resize cursor, no accent line, no
+  // drag and no double-click. It comes back once the pair has room.
+  const pairExtent = isHorizontal ? seam.bounds.width : seam.bounds.height;
+  const paneFloor = isHorizontal ? layer.minSize.width : layer.minSize.height;
+  const movable = pairExtent - 2 * paneFloor > 1;
 
   return (
     <div
-      onPointerDown={onPointerDown}
+      onPointerDown={movable ? onPointerDown : undefined}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
+      onDoubleClick={movable ? onDoubleClick : undefined}
       // z above any window: window zIndex grows by 1 per focus and is unbounded,
       // so a fixed-low seam z would slip under the windows after enough focus
       // clicks (and become un-grabbable). Stays below the snap preview (~2.147e9).
-      className={`group pointer-events-auto absolute z-[2000000000] ${isHorizontal ? 'cursor-col-resize' : 'cursor-row-resize'}`}
+      className={`group pointer-events-auto absolute z-[2000000000] ${
+        !movable ? '' : isHorizontal ? 'cursor-col-resize' : 'cursor-row-resize'
+      }`}
       style={{ left: seam.rect.left, top: seam.rect.top, width: seam.rect.width, height: seam.rect.height }}
       data-testid={`tile-splitter-${seamKey(seam)}`}
+      data-movable={movable ? 'true' : 'false'}
     >
       {/* Invisible at rest (panes sit flush); a thin accent line at the boundary
-          appears only on hover or while dragging. */}
+          appears only on hover or while dragging, and never on a seam with no room. */}
       <div
         className={`absolute transition-colors ${
           isHorizontal ? 'inset-y-0 left-1/2 -translate-x-1/2 w-0.5' : 'inset-x-0 top-1/2 -translate-y-1/2 h-0.5'
-        } ${dragging ? 'bg-accent' : 'bg-transparent group-hover:bg-accent'}`}
+        } ${dragging ? 'bg-accent' : movable ? 'bg-transparent group-hover:bg-accent' : 'bg-transparent'}`}
       />
     </div>
   );

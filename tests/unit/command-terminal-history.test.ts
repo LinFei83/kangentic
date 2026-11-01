@@ -232,6 +232,90 @@ describe('CommandTerminalHistory', () => {
     expect((await history.list(PROJECT_ID)).map((entry) => entry.agentSessionId)).toEqual(['conversation-a']);
   });
 
+  it('follows a rename and a clear, so Earlier lists the name the terminal ended with', async () => {
+    const { sessions, history, repository } = setup();
+    sessions.add('pty-1', { hasUserInput: true, commandTerminalSlot: 'slot-1' });
+    sessions.reportAgentId('pty-1', 'conversation-a');
+    sessions.change('pty-1', { commandTerminalLabel: 'Derived name' });
+    sessions.change('pty-1', { commandTerminalLabel: 'Auth refactor', commandTerminalNamedByUser: true });
+    expect(repository.get('conversation-a')?.label).toBe('Auth refactor');
+
+    // A clear: the row reads as its first prompt again.
+    sessions.prompt('pty-1', 'tidy the auth module');
+    sessions.change('pty-1', { commandTerminalLabel: null });
+    expect(repository.get('conversation-a')?.label).toBeNull();
+
+    sessions.change('pty-1', { commandTerminalLabel: 'DB migration review' });
+    sessions.remove('pty-1');
+    expect(await history.list(PROJECT_ID)).toMatchObject([{ agentSessionId: 'conversation-a', label: 'DB migration review' }]);
+  });
+
+  it('writes nothing for a status push that leaves the name as it was', () => {
+    const { sessions, repository } = setup();
+    sessions.add('pty-1', { hasUserInput: true, commandTerminalLabel: 'Auth refactor', commandTerminalNamedByUser: true });
+    sessions.reportAgentId('pty-1', 'conversation-a');
+    // The row is renamed behind the terminal's back; a later push about
+    // something else must not put the live name back over it.
+    repository.setLabel('conversation-a', 'Edited elsewhere');
+    sessions.change('pty-1', { status: 'running' });
+    expect(repository.get('conversation-a')?.label).toBe('Edited elsewhere');
+  });
+
+  it('keeps a rename made between a resume\'s spawn and its agent reporting the id', async () => {
+    const { sessions, history, repository } = setup();
+    // The conversation as it ended under its old name.
+    sessions.add('pty-1', { hasUserInput: true, commandTerminalLabel: 'Old name' });
+    sessions.reportAgentId('pty-1', 'conversation-a');
+    sessions.remove('pty-1');
+    expect(repository.get('conversation-a')?.label).toBe('Old name');
+
+    // The resumed terminal is seeded with the old name, then renamed before
+    // its agent reports the conversation's id.
+    sessions.add('pty-2', { hasUserInput: true, commandTerminalLabel: 'Old name' });
+    sessions.change('pty-2', { commandTerminalLabel: 'New name', commandTerminalNamedByUser: true });
+    sessions.reportAgentId('pty-2', 'conversation-a');
+    sessions.remove('pty-2');
+
+    expect(await history.list(PROJECT_ID)).toMatchObject([{ agentSessionId: 'conversation-a', label: 'New name' }]);
+  });
+
+  it('does not hold a derived name that arrives before the id, so a resumed conversation keeps its own', async () => {
+    const { sessions, history, repository } = setup();
+    // The conversation as it ended under the name its user gave it.
+    sessions.add('pty-1', { hasUserInput: true, commandTerminalLabel: 'Old name' });
+    sessions.reportAgentId('pty-1', 'conversation-a');
+    sessions.remove('pty-1');
+    expect(repository.get('conversation-a')?.label).toBe('Old name');
+
+    // The resumed terminal is seeded with the old name. Its label then changes to
+    // one the namer derived (no `commandTerminalNamedByUser`) before the agent
+    // reports the conversation's id: that is not a user's rename, so nothing is
+    // held to be replayed over the row once the id arrives.
+    sessions.add('pty-2', { hasUserInput: true, commandTerminalLabel: 'Old name' });
+    sessions.change('pty-2', { commandTerminalLabel: 'Derived name' });
+    sessions.reportAgentId('pty-2', 'conversation-a');
+    expect(repository.get('conversation-a')?.label).toBe('Old name');
+
+    sessions.remove('pty-2');
+    expect(await history.list(PROJECT_ID)).toMatchObject([{ agentSessionId: 'conversation-a', label: 'Old name' }]);
+  });
+
+  it('keeps the name of a conversation a renamed terminal resumes into', () => {
+    const { sessions, repository } = setup();
+    sessions.add('pty-1', { hasUserInput: true, commandTerminalLabel: 'Other conversation' });
+    sessions.reportAgentId('pty-1', 'conversation-b');
+    sessions.remove('pty-1');
+
+    // A terminal the user named moves, by `/resume`, into conversation-b.
+    sessions.add('pty-2', { hasUserInput: true, commandTerminalLabel: 'Auth refactor', commandTerminalNamedByUser: true });
+    sessions.reportAgentId('pty-2', 'conversation-a');
+    sessions.reportAgentId('pty-2', 'conversation-b');
+    sessions.change('pty-2', { status: 'running' });
+
+    expect(repository.get('conversation-a')?.label).toBe('Auth refactor');
+    expect(repository.get('conversation-b')?.label).toBe('Other conversation');
+  });
+
   it("never records a board task's or a workflow's conversation", async () => {
     const { database, sessions, repository } = setup();
     database.prepare(

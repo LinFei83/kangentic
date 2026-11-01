@@ -469,6 +469,31 @@ export interface AgentAdapter {
    */
   readonly resumePromptDelivery: 'command-line' | 'typed' | 'no-resume';
 
+  /**
+   * Whether a FRESH launch with no prompt opens the agent's interactive input,
+   * where a prompt typed in (keystrokes, or a bracketed paste) is the same first
+   * message the command line would have carried. True lets a task's agent start
+   * while its new worktree's setup script runs, its first prompt typed in once
+   * the script exits (`TransitionEngine.launchEarlyAgent`). Absent or false, the
+   * agent starts only after the script, as before.
+   *
+   * Declare it only for a CLI whose promptless launch is that same interactive
+   * session. A CLI that runs a one-shot job, or switches to another mode, when
+   * no prompt is given (a `run`/`-p` print mode, a REPL with other semantics)
+   * must leave it off: a prompt typed into it is not the task's first message.
+   * Its input box must also be drawn in the alternate screen, and any screen
+   * it shows before it (an update offer, a sign-in, an MCP server approval)
+   * outside it: the spawn adopts the early agent only once its TUI has
+   * entered the alternate screen (`SessionManager.awaitAltScreen`), and
+   * relaunches it as before otherwise, so the user answers that screen.
+   *
+   * Asked per launch, with the options the command is built from, so a launch
+   * that will not draw in the alternate screen at all (Claude on its classic
+   * renderer) answers false and is not started early: it could never be
+   * adopted, and would only cost a launch and the adoption's wait.
+   */
+  firstPromptMayBeTyped?(options: SpawnCommandOptions): boolean;
+
   /** Supported permission modes with agent-specific labels. */
   readonly permissions: AgentPermissionEntry[];
 
@@ -861,6 +886,56 @@ export interface AgentAdapter {
    * Absent: `locateSessionHistoryFile` answers both questions.
    */
   locateResumeHistoryFile?(agentSessionId: string, cwd: string, place?: CliPlace | null): Promise<string | null>;
+
+  /**
+   * Optional: stop the agent CLI's own background session that holds the
+   * conversation `agentSessionId`, when one is running. An agent CLI can move a
+   * terminal's conversation into a background session of its own (Claude
+   * Code's `/bg`), run by a process outside the task's PTY. Ending the PTY
+   * ends only the terminal's client, and a `--resume` would then run a second
+   * process on the conversation beside it.
+   *
+   * Called before a resume of the conversation (`reconcileResumeAgentSessionId`)
+   * and on a terminal transition before the leftover reap (`reapTaskLeftovers`),
+   * so the agent ends through the CLI's own stop rather than the reap's kill.
+   * Both call it only when the session record's own SessionStart hooks show the
+   * conversation started there (`statusFile.parseSessionStart`'s
+   * `inBackgroundSession`, `backgroundSessionHoldingConversation`), so an
+   * ordinary resume runs no CLI. A Command Terminal has no session record and
+   * its events file goes with it, so its end (before its leftover reap) and an
+   * Earlier resume call it on `backgroundSessionOf` instead
+   * (`command-terminal-background-session.ts`). `cliPath` is the agent's CLI
+   * as the caller resolved it, which also names its place (a WSL distro): the
+   * spawn's own on a resume, the project's configured one on a terminal
+   * transition. Resolves true once the CLI's stop ran for a session holding the
+   * conversation, false when none did. Every caller goes on either way. Never
+   * throws.
+   */
+  stopBackgroundSession?(options: { agentSessionId: string; cliPath: string }): Promise<boolean>;
+
+  /**
+   * Optional: the id of the agent CLI's own background session (Claude Code's
+   * `/bg`) the conversation `agentSessionId` moved into, by the CLI's own files
+   * alone, or null. Either the conversation is that session, or its own record
+   * says it moved on to it. Runs no CLI, so it is the gate in front of
+   * `stopBackgroundSession` where no session record holds SessionStart hooks
+   * to read: a Command Terminal's end and an Earlier resume. Claude: the
+   * `continued-in` record `/bg` ends the old transcript with. That record
+   * outlives the session, so an id means the conversation may still be running
+   * there; the stop finds out whether it is. Never throws; any doubt is null.
+   */
+  backgroundSessionOf?(options: { agentSessionId: string; cwd: string; place?: CliPlace | null }): Promise<string | null>;
+
+  /**
+   * Optional: the id a `--resume` should name to reach the conversation
+   * `agentSessionId`. Claude Code moves a conversation into a background session
+   * under a new id whose transcript holds no conversation until that session's
+   * first turn, so until then `--resume <new id>` answers "No conversation
+   * found" while the conversation it continued from still resumes. Returns
+   * `agentSessionId` itself whenever it resumes as it is or nothing better is
+   * proven. Never throws.
+   */
+  resolveResumableSessionId?(options: { agentSessionId: string; cwd: string; place?: CliPlace | null }): Promise<string>;
 
   /**
    * Optional: prove that a conversation's history file no longer exists, so a

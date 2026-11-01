@@ -67,7 +67,8 @@ import { notifyWorkflowOfTask } from '../../workflows/workflow-changed';
 import { isTaskWorkflowPaused, taskWorkflowState } from '../../workflows/workflow-home';
 import { isMoveByAPerson } from '../../../shared/task-move-origin';
 import { isHeldPause } from '../../../shared/held-pause';
-import { resolveInjectionVerifier } from '../helpers/agent-spawn';
+import { createEarlyAgentLauncher, resolveInitScriptMode, resolveInjectionVerifier, setupStillRunningFor } from '../helpers/agent-spawn';
+import type { EarlyAgentHandle } from '../../transition-engine/early-agent';
 import { reconcileTaskSessionRef, restartSessionForSettingsChange } from './session-reconcile';
 import { abortInFlightMove, registerMoveController, releaseMoveController } from './task-move-controllers';
 import { markOwnCallSession, waitForOwnAgentTurn } from './own-call-turn-wait';
@@ -339,6 +340,11 @@ export async function handleTaskMove(
   // column once the lock lets it through. A Move to column row resolves its
   // target from its own column outside the lock, so a move that landed while
   // this one waited must not send the task on from a column it has left.
+  //
+  // `carriesMessage` says a message follows the move to the agent (a Move to
+  // column row's Message, `kangentic_move_task`'s `message`). It usually holds
+  // the reply the last column ended on, so a return to the main conversation
+  // does not repeat that reply in its recap (`return-recap.ts`).
   options?: {
     continuationPrompt?: string;
     onCommitted?: () => void;
@@ -347,6 +353,7 @@ export async function handleTaskMove(
     moverIsTaskAgent?: boolean;
     moverSessionId?: string;
     expectedFromSwimlaneId?: string;
+    carriesMessage?: boolean;
   },
 ): Promise<void> {
   // A workflow task's lock, asked BEFORE anything below aborts work in flight:
@@ -1545,13 +1552,46 @@ export async function handleTaskMove(
       info.jobsAhead,
       info.runningLabel ? { label: info.runningLabel, elapsedMs: info.runningElapsedMs } : undefined,
     );
+    // The agent started while a new worktree ran its setup script
+    // (`createEarlyAgentLauncher`), for Phase 3's spawn to adopt. Discarded
+    // after Phase 3 and in the catch, so a path that never reaches the spawn
+    // leaves no agent behind (a no-op once adopted).
+    // Typed by assertion: assigned inside a nested try, which control flow
+    // analysis does not carry into the catch below.
+    let earlyAgent = null as EarlyAgentHandle | null;
+    // The note Phase 3's prompt carries when the script runs on in the background.
+    let setupStillRunning: string | undefined;
     try {
       // Create worktree if worktrees are enabled and task doesn't have one yet.
       // If worktree creation fails (e.g. duplicate branch), revert the task
       // back to its original column so it doesn't get stuck without a session.
       try {
-        const { tasks: tasksPhase2 } = getProjectRepos(context, resolvedProjectId);
-        await ensureTaskWorktree(context, task, tasksPhase2, resolvedProjectPath, { signal, onProgress, onWaitProgress, projectId: resolvedProjectId });
+        const {
+          tasks: tasksPhase2, automations: automationsPhase2, automationRuns: automationRunsPhase2, attachments: attachmentsPhase2,
+        } = getProjectRepos(context, resolvedProjectId);
+        // Only a spawning move gets an early agent; a move with no destination
+        // lane (and every caller but this one and auto-spawn) runs the script
+        // before the agent, as before.
+        const initScriptMode = toLane
+          ? resolveInitScriptMode(context, resolvedProjectPath, createEarlyAgentLauncher({
+            context,
+            tasks: tasksPhase2,
+            automations: automationsPhase2,
+            automationRuns: automationRunsPhase2,
+            attachments: attachmentsPhase2,
+            taskId: task.id,
+            toLane,
+            settingsSourceLane: fromLane ?? null,
+            projectId: resolvedProjectId,
+            projectPath: resolvedProjectPath,
+            signal,
+          }))
+          : undefined;
+        const hadWorktree = Boolean(task.worktree_path);
+        earlyAgent = await ensureTaskWorktree(context, task, tasksPhase2, resolvedProjectPath, {
+          signal, onProgress, onWaitProgress, projectId: resolvedProjectId, initScript: initScriptMode,
+        });
+        setupStillRunning = setupStillRunningFor(context, resolvedProjectPath, initScriptMode, hadWorktree ? null : task.worktree_path);
       } catch (error) {
         // Let AbortError propagate to the outer catch for centralized handling
         if (isAbortError(error)) throw error;
@@ -1712,12 +1752,19 @@ export async function handleTaskMove(
           const sessionRepoPhase3 = new SessionRepository(dbPhase3);
           const engine = createTransitionEngine(context, automationsPhase3, automationRunsPhase3, tasksPhase3, sessionRepoPhase3, attachmentsPhase3, resolvedProjectId, resolvedProjectPath);
           if (toLane) {
-            await spawnAgent({ context, engine, tasks: tasksPhase3, sessionRepo: sessionRepoPhase3, task: current, fromSwimlaneId, toLane, skipPromptTemplate, signal, projectId: resolvedProjectId, projectPath: resolvedProjectPath, continuationPrompt, suppressAutoCommand, settingsSourceLane: fromLane ?? null, attachments: attachmentsPhase3 });
+            await spawnAgent({
+              context, engine, tasks: tasksPhase3, sessionRepo: sessionRepoPhase3, task: current, fromSwimlaneId, toLane, skipPromptTemplate, signal,
+              projectId: resolvedProjectId, projectPath: resolvedProjectPath, continuationPrompt, suppressAutoCommand,
+              settingsSourceLane: fromLane ?? null, attachments: attachmentsPhase3, moveCarriesMessage: options?.carriesMessage === true,
+              earlyAgent: earlyAgent ?? undefined, setupStillRunning,
+            });
           }
         } finally {
           clearSpawnProgress(context.mainWindow, task.id);
         }
       });
+      // Phase 3 returned without a spawn adopting it (a check above failed).
+      await earlyAgent?.discard();
     } catch (error) {
       // clearSpawnProgress touches only in-memory maps and a guarded IPC
       // send, never the DB, so it is safe to call unconditionally here -
@@ -1725,6 +1772,9 @@ export async function handleTaskMove(
       // respawn branch's label (see suspendLiveSessionForRespawn) until the
       // 120s TTL.
       clearSpawnProgress(context.mainWindow, task.id);
+      // An early agent nothing adopted goes before the rollback below; one the
+      // spawn adopted is the task's session, which the rollback handles.
+      await earlyAgent?.discard();
 
       // Shutdown closed the DB while a Phase 1 / 2 / 3 await was in flight.
       // Both the post-await DB write inside Phase 1 (e.g. line 226's

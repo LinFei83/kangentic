@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import type { Session } from '../../src/shared/types';
+import type { Session, StoredCliTarget } from '../../src/shared/types';
 import {
   COMMAND_TERMINAL_REAP_DELAY_MS,
   CommandTerminalLeftoverReaper,
@@ -137,6 +137,117 @@ describe('CommandTerminalLeftoverReaper', () => {
     expect(quitting.reaps).toEqual([]);
     expect(disposed.reaps).toEqual([]);
     expect(disposed.sessionManager.listenerCount('session-removed')).toBe(0);
+  });
+
+  // `/bg` moves a terminal's conversation into the agent CLI's own background
+  // session, which runs outside the PTY, tagged and in the terminal's folder, so
+  // the reap would kill it with no exit of its own. The CLI stops it first.
+  describe("the agent CLI's own background session", () => {
+    function makeStopRig(options: { stop?: () => Promise<void>; cliTarget?: StoredCliTarget | null } = {}) {
+      const sessionManager = new EventEmitter();
+      // The registry row, deleted right after the removal's emit, as remove() does.
+      const rows = new Map<string, { agentName: string; cliTarget: StoredCliTarget | null }>([
+        ['session-1', { agentName: 'claude', cliTarget: options.cliTarget ?? null }],
+      ]);
+      Object.assign(sessionManager, {
+        getSessionAgentName: (sessionId: string) => rows.get(sessionId)?.agentName,
+        getSessionCliTarget: (sessionId: string) => rows.get(sessionId)?.cliTarget ?? null,
+      });
+      const order: string[] = [];
+      let finishStop: () => void = () => undefined;
+      const stopBackgroundSession = vi.fn((_ended: unknown) => {
+        order.push('stop');
+        if (options.stop) return options.stop();
+        return new Promise<void>((resolve) => { finishStop = resolve; });
+      });
+      let shuttingDown = false;
+      const reaper = new CommandTerminalLeftoverReaper({
+        sessionManager: sessionManager as never,
+        reap: async () => { order.push('reap'); },
+        stopBackgroundSession,
+        isShuttingDown: () => shuttingDown,
+      });
+      reaper.start();
+      const remove = (session: Session) => {
+        sessionManager.emit('session-removed', session.id, session);
+        rows.delete(session.id);
+      };
+      return { stopBackgroundSession, order, remove, finishStop: () => finishStop(), setShuttingDown: (value: boolean) => { shuttingDown = value; } };
+    }
+
+    it("stops it with the agent and place the row named at the removal, and reaps only once the stop is done", async () => {
+      const rig = makeStopRig();
+      rig.remove(removedSession({ agentSessionId: 'background-conversation-1' }));
+
+      await vi.advanceTimersByTimeAsync(0);
+      // Read during the emit: the row was gone by the time the stop ran.
+      expect(rig.stopBackgroundSession).toHaveBeenCalledWith({
+        agentName: 'claude',
+        agentSessionId: 'background-conversation-1',
+        cwd: 'C:\\work\\project',
+        cliTarget: null,
+      });
+
+      // The stop can take its whole budget; the reap waits past its own delay for it.
+      await vi.advanceTimersByTimeAsync(COMMAND_TERMINAL_REAP_DELAY_MS * 2);
+      expect(rig.order).toEqual(['stop']);
+      rig.finishStop();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rig.order).toEqual(['stop', 'reap']);
+    });
+
+    // A conversation of a CLI that ran in a WSL distro keeps its transcripts in
+    // that distro's home, so the stop is told where the terminal's CLI ran. The
+    // row that holds it is deleted once the removal's listeners return, and the
+    // stop runs on a later tick, so the read has to happen during the emit.
+    // Red-green: handing the stop no target (null) reads the distro's
+    // transcripts as this machine's, finds none, and leaves the session running.
+    it("hands the stop the WSL target the row named at the removal, though the row is gone by the time the stop runs", async () => {
+      const wslTarget: StoredCliTarget = {
+        kind: 'wsl',
+        distro: 'Ubuntu',
+        homeLinux: '/home/dev',
+        homeUnc: '\\\\wsl.localhost\\Ubuntu\\home\\dev',
+        uncRoot: '\\\\wsl.localhost\\Ubuntu',
+        env: {},
+        linuxCliPath: '/home/dev/.local/bin/claude',
+      };
+      const rig = makeStopRig({ cliTarget: wslTarget });
+      rig.remove(removedSession({ agentSessionId: 'background-conversation-1', shell: 'wsl -d Ubuntu' }));
+
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(rig.stopBackgroundSession).toHaveBeenCalledTimes(1);
+      expect(rig.stopBackgroundSession).toHaveBeenCalledWith({
+        agentName: 'claude',
+        agentSessionId: 'background-conversation-1',
+        cwd: 'C:\\work\\project',
+        cliTarget: wslTarget,
+      });
+    });
+
+    it('still reaps, after the delay, when the stop fails', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const rig = makeStopRig({ stop: async () => { throw new Error('supervisor gone'); } });
+      rig.remove(removedSession({ agentSessionId: 'background-conversation-1' }));
+
+      await vi.advanceTimersByTimeAsync(COMMAND_TERMINAL_REAP_DELAY_MS);
+
+      expect(rig.order).toEqual(['stop', 'reap']);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('background session stop failed'), 'supervisor gone');
+      warn.mockRestore();
+    });
+
+    it('asks nothing for a terminal whose agent never reported a conversation, or once the app is quitting', async () => {
+      const rig = makeStopRig();
+      rig.remove(removedSession({ agentSessionId: null }));
+      rig.setShuttingDown(true);
+      rig.remove(removedSession({ id: 'session-2', agentSessionId: 'background-conversation-2' }));
+
+      await vi.advanceTimersByTimeAsync(COMMAND_TERMINAL_REAP_DELAY_MS * 2);
+
+      expect(rig.stopBackgroundSession).not.toHaveBeenCalled();
+    });
   });
 
   it('logs a failed reap and never throws', async () => {

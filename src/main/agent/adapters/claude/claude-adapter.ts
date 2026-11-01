@@ -45,6 +45,7 @@ import { discoverClaudeStaticCapabilities, rescanClaudeModels } from './capabili
 import { createSlashCommandVerifier } from './slash-command-verifier';
 import { describeClaudeStartupFailure } from './startup-failure';
 import { proveClaudeConversationGone } from './conversation-gone';
+import { claudeBackgroundSessionOf, claudeConfirmsBackgroundMove, resolveClaudeResumableSessionId, stopClaudeBackgroundSession } from './background-sessions';
 import { configuredModelFromClaudeCommand, buildModelCapabilityFields, humanizeClaudeModelId, toClaudeModelArgument } from './model-display-name';
 import { ClaudeSessionHistoryParser } from './session-history-parser';
 import type {
@@ -328,6 +329,16 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly supportsCallerSessionId = true;
   /** `claude --resume <id> -- "<prompt>"`: the resumed session runs the prompt as its next turn. */
   readonly resumePromptDelivery = 'command-line' as const;
+  /**
+   * `claude` with no prompt opens the same interactive session `claude -- "<prompt>"`
+   * does, at an empty input box, and a prompt typed or pasted there is the
+   * conversation's first message. Only on the fullscreen renderer, whose input
+   * box is in the alternate screen: the classic one never enters it, so the
+   * spawn could never tell its input box from a screen drawn before it.
+   */
+  firstPromptMayBeTyped(options: SpawnCommandOptions): boolean {
+    return this.commandBuilder.drawsInAlternateScreen(options);
+  }
   // A Claude installed in a WSL distro, configured by its \\wsl.localhost path:
   // run in the distro's shell, its hooks through the WSL transport, its trust,
   // settings and transcripts in the distro's home (cli-target.ts).
@@ -478,6 +489,15 @@ export class ClaudeAdapter implements AgentAdapter {
       parseStatus: ClaudeStatusParser.parseStatus,
       parseEvent: ClaudeStatusParser.parseEvent,
       isFullRewrite: true,
+      // Every process started with this session's --settings writes the same
+      // status.json, and Claude Code's background daemon starts more than one
+      // (a spare beside the moved conversation). A status id change is a
+      // conversation switch only once a SessionStart that moves the
+      // conversation named it.
+      parseSessionStart: ClaudeStatusParser.parseSessionStart,
+      // `/bg` moves the conversation into a background session and `/fork`
+      // copies it there, with identical hooks: background-sessions.ts.
+      confirmsBackgroundMove: claudeConfirmsBackgroundMove,
     },
     // Background-session fallback - see the comment block above. Append-mode
     // (isFullRewrite: false): the transcript is append-only JSONL.
@@ -620,6 +640,21 @@ export class ClaudeAdapter implements AgentAdapter {
     place?: CliPlace | null;
   }): Promise<boolean> {
     return proveClaudeConversationGone(params);
+  }
+
+  /** `/bg` moves a task's conversation into a background session its terminal does not own: background-sessions.ts. */
+  stopBackgroundSession(options: { agentSessionId: string; cliPath: string }): Promise<boolean> {
+    return stopClaudeBackgroundSession(options);
+  }
+
+  /** A fork into a background session resumes by its predecessor until its first turn: background-sessions.ts. */
+  resolveResumableSessionId(options: { agentSessionId: string; cwd: string; place?: CliPlace | null }): Promise<string> {
+    return resolveClaudeResumableSessionId(options);
+  }
+
+  /** `/bg` ends the transcript it moved out of by naming the session it moved into: background-sessions.ts. */
+  backgroundSessionOf(options: { agentSessionId: string; cwd: string; place?: CliPlace | null }): Promise<string | null> {
+    return claudeBackgroundSessionOf(options);
   }
 
   async parseTranscript(
