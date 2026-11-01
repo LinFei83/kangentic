@@ -16,7 +16,7 @@
       "autoSpawn": true,
       "permissionMode": "plan",
       "modelOverride": "opus",
-      "effortOverride": "xhigh",
+      "effortOverride": "high",
       "planApproval": "automatic",
       "planExitTarget": "Executing"
     },
@@ -27,7 +27,7 @@
       "autoSpawn": true,
       "permissionMode": "auto",
       "modelOverride": "opus",
-      "effortOverride": "xhigh",
+      "effortOverride": "high",
       "automations": {
         "onTurnEnd": [
           {
@@ -53,7 +53,7 @@
       "autoSpawn": true,
       "permissionMode": "auto",
       "modelOverride": "opus",
-      "effortOverride": "xhigh",
+      "effortOverride": "high",
       "sessionTarget": "isolated",
       "sessionSpawnStrategy": "always_spawn_new",
       "automations": {
