@@ -52,11 +52,12 @@ of them before your first PR, but those files are the source of truth if anythin
 ### Working with a coding agent
 
 Claude Code and Cursor read the same instructions. Both load `AGENTS.md` (Claude Code through the
-import in `CLAUDE.md`), and both load the skills in `.claude/skills/` and the subagents in
-`.claude/agents/`. Cursor cannot read `.claude/rules/`, so `npm run cursor:rules` writes a copy of
-each rule to `.cursor/rules/`. `npm install` and `npm start` run it too, so the copies stay current
-without a manual step. They are gitignored: edit the rule in `.claude/rules/`, never the copy. How it
-fits together: [docs/contributing/agent-instructions.md](docs/contributing/agent-instructions.md).
+import in `CLAUDE.md`), and both load the skills in `.claude/skills/`. Cursor cannot use
+`.claude/rules/` or `.claude/agents/` as written, so `npm run cursor:rules` writes a copy of each
+rule to `.cursor/rules/` and of each subagent to `.cursor/agents/`. `npm install` and `npm start` run
+it too, so the copies stay current without a manual step. They are gitignored: edit the file in
+`.claude/`, never the copy. How it fits together:
+[docs/contributing/agent-instructions.md](docs/contributing/agent-instructions.md).
 
 ### Project Structure
 

@@ -1,7 +1,7 @@
 ---
 type: Guide
 title: Shared agent instructions
-description: "How Claude Code and Cursor read one set of instructions in this repo: AGENTS.md imported by CLAUDE.md, the skills and subagents both load from .claude/, the Cursor rules generated from .claude/rules/ and why they are gitignored, and what is still unverified in Cursor."
+description: "How Claude Code and Cursor read one set of instructions in this repo: AGENTS.md imported by CLAUDE.md, the skills both load from .claude/, the Cursor rules and subagents generated from .claude/ and why they are gitignored, and what is still unverified in Cursor."
 tags: [contributing, agents, claude-code, cursor, rules]
 sources:
   - resource: scripts/cursor-rules.js
@@ -12,8 +12,8 @@ sources:
 # Shared agent instructions
 
 Claude Code and Cursor both work in this repository, and both read the same instructions. Each file
-has one home. The one thing Cursor cannot read in place, the rules, is generated for it rather than
-copied by hand.
+has one home. The two things Cursor cannot use as written, the rules and the subagents, are
+generated for it rather than copied by hand, and `.claude/` stays exactly as Claude Code wants it.
 
 ## What each tool reads
 
@@ -29,10 +29,12 @@ copied by hand.
   The cost is the few hundred characters of `CLAUDE.md`.
 - **`.claude/skills/`** is read by both. Cursor loads it for compatibility and requires a `name` in
   each skill's frontmatter, so every `SKILL.md` names its directory.
-- **`.claude/agents/`** is read by both. Cursor documents `name`, `description`, `model`, `readonly`
-  and `is_background`, and no `tools` field, so the eight agents whose `tools:` is only
-  `Read, Glob, Grep` also carry `readonly: true`. Claude Code ignores a subagent key it does not
-  recognize, without an error.
+- **`.claude/agents/`** is read by Claude Code as written, with `model: haiku` or `sonnet` routing
+  the cheaper checks. Cursor loads it too, but a contributor's run on Cursor showed three problems:
+  `model: haiku` started Claude Haiku 4.5 and stopped when the account could not use it, a subagent
+  with no model chosen ran on the file's model and not the session's, and the multi-line
+  `description: |` printed as the character `|`. Cursor prefers `.cursor/agents/` for the same name,
+  so `scripts/cursor-rules.js` writes a copy there.
 - **`.claude/rules/`** is read only by Claude Code. Cursor reads `.mdc` files in `.cursor/rules/`
   and nothing else, so `scripts/cursor-rules.js` writes them.
 
@@ -48,9 +50,11 @@ Windows clone checks a committed symlink out as a one-line text file unless `cor
 
 A hand copy of `.claude/` under `.cursor/` was tried first. Nothing kept it in sync, two notes
 needed hand mirroring within a day, and Cursor gives `.cursor/agents/` precedence over
-`.claude/agents/` for the same name, so a stale copy would silently replace the live agent.
+`.claude/agents/` for the same name, so a stale copy would silently replace the live agent. The
+generated subagents use that same precedence on purpose. They are rewritten on every install and
+start, and each carries a marker, so a copy cannot go stale.
 
-## The generated Cursor rules
+## The generated Cursor rules and agents
 
 `scripts/cursor-rules.js` writes `.cursor/rules/<name>.mdc` for every `.claude/rules/<name>.md`,
 subfolders included:
@@ -63,16 +67,34 @@ subfolders included:
   rather than the copy.
 - Rules in `CLAUDE_CODE_ONLY_RULES` get no copy. Today that is `bash-single-command.md`.
 
+It also writes `.cursor/agents/<name>.md` for every `.claude/agents/<name>.md`:
+
+- `name` is kept. `description` is flattened to one quoted line, so a `|` block no longer prints as
+  `|`. `model` is always `inherit`, so the subagent runs on the session's model.
+- `readonly: true` is set when the agent's `tools:` name only `Read`, `Glob` and `Grep`
+  (`READ_ONLY_TOOLS` in the script). Cursor documents no `tools` field, and `readonly` is how a
+  read-only agent stays read-only there. The flag is derived, not stored in `.claude/agents/`, so
+  those files carry no Cursor-only key. An agent with other tools, or none listed, is not marked.
+- `tools:`, `effort:` and the original `model:` are left out. The prompt body is copied byte for
+  byte, after the same marker comment.
+- Cursor then runs every subagent on the session's model. Claude Code keeps the `haiku` and
+  `sonnet` routing, because it reads `.claude/agents/`.
+
 It runs from three places: `npm run cursor:rules`, `prepare` (every `npm install`, which a fresh
 task worktree needs before anything else), and `scripts/dev.js` (every `npm start`, which catches a
-pull that changed a rule with no reinstall). It rewrites a file only when its text changed. It
-removes a generated file whose rule is gone, and leaves any `.mdc` a developer wrote by hand.
+pull that changed a rule or agent with no reinstall). It rewrites a file only when its text changed.
+It removes a generated file whose source is gone. It never overwrites or removes a file a developer
+wrote by hand, including one with the name of a generated file: only a file that carries the
+generated marker is its to rewrite.
 
 The output is gitignored on purpose. A committed copy would need a parity test, and then every edit
-to a team rule would have to rerun the script or fail CI. What CI checks instead is the translation:
-`tests/unit/cursor-rules.test.ts` translates every live rule, so a rule the translator cannot carry
-fails there first. It refuses a rule with no `# Rule:` title and a `paths:` entry holding a comma or
-a brace, since a comma-separated list cannot carry either. Split such an entry into one per pattern.
+to a team rule or agent would have to rerun the script or fail CI. What CI checks instead is the
+translation: `tests/unit/cursor-rules.test.ts` translates every live rule and agent, so one the
+translator cannot carry fails there first. It refuses a rule with no `# Rule:` title, a `paths:`
+entry holding a comma or a brace (a comma-separated list cannot carry either, so split such an entry
+into one per pattern), and an agent with no description or a name that is not lowercase letters and
+hyphens. The script reads the few frontmatter keys it needs itself, so it adds no YAML dependency
+to `prepare`.
 
 A new rule that binds only Claude Code goes in two places: `CLAUDE_CODE_ONLY_RULES` in the script,
 and the "Always-on rules (Claude Code only)" list in `CLAUDE.md`.
@@ -87,8 +109,9 @@ one floor.
 
 ## Working in Cursor
 
-`npm install` writes the rules. After a pull that changed `.claude/rules/`, `npm start` or
-`npm run cursor:rules` refreshes them. Edit the rule under `.claude/rules/`, never the copy.
+`npm install` writes the rules and the subagents. After a pull that changed `.claude/rules/` or
+`.claude/agents/`, `npm start` or `npm run cursor:rules` refreshes them. Edit the file under
+`.claude/`, never the copy.
 
 `.cursor/mcp.json` is not committed. Kangentic's own Cursor adapter merges its MCP entry into that
 file while a Cursor session runs in the folder, so a committed copy would show as changed for the
@@ -96,9 +119,15 @@ whole session. A file the adapter creates itself, it keeps out of `git status`.
 
 ## Not yet verified in Cursor
 
-- How Cursor treats `model: sonnet` and `model: haiku` in `.claude/agents/`. It documents only
-  `inherit` and its own model ids.
-- Whether `readonly: true` holds the eight read-only agents to read-only in practice.
+Checked by a contributor on Cursor with a non-Claude session model, against the first version of
+this setup (`.claude/agents/` loaded as written): `readonly: true` blocked a `Write` from
+`doc-auditor`, with Cursor's own "ask mode" wording. The shared instructions, the generated rules
+and the skills loaded as described.
+
+Still to confirm against the generated subagents:
+
+- That the subagent list shows each agent's description and model, and that an agent with no model
+  chosen runs on the session's model.
 - Whether the Cursor editor, not only its CLI, reads the root `CLAUDE.md`, and whether it expands
   the `@AGENTS.md` line. Its docs state the CLI behavior only.
 - Whether Cursor picks up a rule generated after its session started, as when an agent runs

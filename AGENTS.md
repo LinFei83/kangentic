@@ -290,8 +290,10 @@ indexes it and Cursor gets no copy.
 agent's own uncommitted instructions file, never in a committed one.
 
 **Other conventions (workflow, not extracted to rules):**
-- Skills live in `.claude/skills/` and subagents in `.claude/agents/`. Claude Code and Cursor both
-  load them from there, so there is no second copy to keep in sync.
+- Skills live in `.claude/skills/` and subagents in `.claude/agents/`. Claude Code reads both
+  as written, and Cursor loads the skills from there too. Cursor reads generated subagent copies in
+  `.cursor/agents/` (`model: inherit`, a one-line description, `readonly` for a read-only agent),
+  which `npm run cursor:rules` writes with the rules. Edit the `.claude/agents/` file, never the copy.
 - Prefer editing existing files over creating new ones.
 - When adding or updating tests, use the `/test` command to ensure correct tier classification.
 - A plain **local commit** (snapshot work in progress, protect changes before `/preview`) goes

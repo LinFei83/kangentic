@@ -161,8 +161,9 @@ e2e-timings*.json
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 kangentic.local.json
-# Cursor's copy of .claude/rules/, written by scripts/cursor-rules.js on npm install and npm start.
+# Cursor's copy of .claude/rules/ and .claude/agents/, written by scripts/cursor-rules.js on npm install and npm start.
 .cursor/rules/
+.cursor/agents/
 # Local VS Code multi-root workspace. It is per machine and must not be committed.
 kangentic.code-workspace
 # Dogfood launcher shortcut (scripts/dogfood-launcher.ps1 -CreateShortcut). It carries this

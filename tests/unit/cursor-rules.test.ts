@@ -2,16 +2,57 @@ import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CLAUDE_CODE_ONLY_RULES, translateRuleToCursor, writeCursorRules } from '../../scripts/cursor-rules.js';
+import {
+  CLAUDE_CODE_ONLY_RULES,
+  READ_ONLY_TOOLS,
+  translateAgentToCursor,
+  translateRuleToCursor,
+  writeCursorRules,
+} from '../../scripts/cursor-rules.js';
 import { collectRuleFiles, parsePathGlobs } from '../../scripts/lib/claude-rules.js';
 
-// scripts/cursor-rules.js writes Cursor's copy of .claude/rules/ into a gitignored .cursor/rules/.
-// Nothing commits that copy, so nothing can drift out of a parity check against it. What this file
-// pins instead is the translation itself, and that every live rule translates: a rule the
-// translator cannot carry would otherwise fail only on a developer's next npm install.
+// scripts/cursor-rules.js writes Cursor's copy of .claude/rules/ and .claude/agents/ into a
+// gitignored .cursor/. Nothing commits that copy, so nothing can drift out of a parity check against
+// it. What this file pins instead is the translation itself, and that every live rule and agent
+// translates: one the translator cannot carry would otherwise fail only on a developer's next
+// npm install.
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const RULES_DIR = path.join(REPO_ROOT, '.claude', 'rules');
+const AGENTS_DIR = path.join(REPO_ROOT, '.claude', 'agents');
+
+/** A subagent the way .claude/agents/ writes one: a block scalar description, haiku, read tools. */
+const READ_ONLY_AGENT = [
+  '---',
+  'name: example-auditor',
+  'description: |',
+  '  Audits an example.',
+  '',
+  '  Use after a change to the example.',
+  '  <example>',
+  '  User: "check it" -> spawn it.',
+  '  </example>',
+  'model: haiku',
+  'effort: medium',
+  'tools: Read, Glob, Grep',
+  '---',
+  '',
+  '# Example Auditor',
+  '',
+  'Body line.',
+  '',
+].join('\n');
+
+const WRITING_AGENT = [
+  '---',
+  'name: example-builder',
+  'description: Builds an example, editing files and running commands.',
+  'model: sonnet',
+  'tools: Read, Write, Edit, Glob, Grep, Bash',
+  '---',
+  '# Example Builder',
+  '',
+].join('\n');
 
 const PATH_SCOPED_RULE = [
   '---',
@@ -83,6 +124,121 @@ describe('translateRuleToCursor', () => {
     const withBrace = PATH_SCOPED_RULE.replace('tests/ui/**', '"tests/{ui,e2e}/**"');
     expect(() => translateRuleToCursor(withComma, 'comma.md')).toThrow(/comma\.md.*comma or a brace/);
     expect(() => translateRuleToCursor(withBrace, 'brace.md')).toThrow(/brace\.md.*comma or a brace/);
+  });
+});
+
+describe('translateAgentToCursor', () => {
+  it('flattens a block scalar description to one quoted line', () => {
+    const translated = translateAgentToCursor(READ_ONLY_AGENT, 'example-auditor.md');
+    expect(translated).toContain(
+      'description: "Audits an example. Use after a change to the example. <example> User: \\"check it\\" -> spawn it. </example>"\n',
+    );
+  });
+
+  it('writes model: inherit and drops the original model, effort and tools', () => {
+    const frontmatter = translateAgentToCursor(READ_ONLY_AGENT, 'example-auditor.md').split('\n---\n')[0];
+    expect(frontmatter).toContain('\nmodel: inherit');
+    expect(frontmatter).not.toMatch(/haiku|sonnet|effort|tools:/);
+    expect(frontmatter.split('\n').filter((line) => line.startsWith('model:'))).toHaveLength(1);
+  });
+
+  it('keeps the name and puts the generated marker before the body', () => {
+    const translated = translateAgentToCursor(READ_ONLY_AGENT, 'example-auditor.md');
+    expect(translated.startsWith('---\nname: example-auditor\n')).toBe(true);
+    expect(translated).toContain(
+      '---\n<!-- Generated from .claude/agents/example-auditor.md by scripts/cursor-rules.js.',
+    );
+  });
+
+  it('copies the prompt body after the frontmatter byte for byte', () => {
+    const body = READ_ONLY_AGENT.slice(READ_ONLY_AGENT.indexOf('\n# Example Auditor'));
+    expect(translateAgentToCursor(READ_ONLY_AGENT, 'example-auditor.md').endsWith(`-->\n${body}`)).toBe(true);
+  });
+
+  it('marks an agent whose tools are only read tools as readonly', () => {
+    expect(translateAgentToCursor(READ_ONLY_AGENT, 'example-auditor.md')).toContain('\nreadonly: true\n---\n');
+  });
+
+  it('does not mark an agent that can write, edit or run commands, or one with no tools line', () => {
+    expect(translateAgentToCursor(WRITING_AGENT, 'example-builder.md')).not.toContain('readonly');
+    const noTools = WRITING_AGENT.replace(/^tools:.*\n/m, '');
+    expect(translateAgentToCursor(noTools, 'example-builder.md')).not.toContain('readonly');
+    for (const tool of ['Write', 'Edit', 'Bash', 'SomeNewTool']) {
+      const withTool = READ_ONLY_AGENT.replace('tools: Read, Glob, Grep', `tools: Read, Glob, Grep, ${tool}`);
+      expect(translateAgentToCursor(withTool, 'example-auditor.md'), tool).not.toContain('readonly');
+    }
+  });
+
+  it('reads tools written as a YAML list or a flow list', () => {
+    const asList = READ_ONLY_AGENT.replace('tools: Read, Glob, Grep', 'tools:\n  - Read\n  - Glob\n  - Grep');
+    const asFlow = READ_ONLY_AGENT.replace('tools: Read, Glob, Grep', 'tools: [Read, Glob, Grep]');
+    expect(translateAgentToCursor(asList, 'example-auditor.md')).toContain('\nreadonly: true\n');
+    expect(translateAgentToCursor(asFlow, 'example-auditor.md')).toContain('\nreadonly: true\n');
+  });
+
+  it('reads a plain, a double-quoted and a single-quoted description the same way', () => {
+    const plain = WRITING_AGENT;
+    const doubleQuoted = WRITING_AGENT.replace(/^description:.*$/m, 'description: "Builds an example, editing files and running commands."');
+    const singleQuoted = WRITING_AGENT.replace(/^description:.*$/m, "description: 'Builds an example, editing files and running commands.'");
+    const expected = translateAgentToCursor(plain, 'example-builder.md');
+    expect(translateAgentToCursor(doubleQuoted, 'example-builder.md')).toBe(expected);
+    expect(translateAgentToCursor(singleQuoted, 'example-builder.md')).toBe(expected);
+  });
+
+  it('reads a CRLF agent the same way and keeps its line endings', () => {
+    const translated = translateAgentToCursor(READ_ONLY_AGENT.replace(/\n/g, '\r\n'), 'example-auditor.md');
+    expect(translated).toContain('\r\nmodel: inherit\r\nreadonly: true\r\n---\r\n');
+    expect(translated).not.toMatch(/[^\r]\n/);
+  });
+
+  it('refuses an agent with no frontmatter, no description, or a name Cursor rejects, naming the file', () => {
+    expect(() => translateAgentToCursor('# Just a body\n', 'bare.md')).toThrow(/agents\/bare\.md has no frontmatter/);
+    const noDescription = WRITING_AGENT.replace(/^description:.*\n/m, '');
+    expect(() => translateAgentToCursor(noDescription, 'quiet.md')).toThrow(/agents\/quiet\.md has no description/);
+    const badName = WRITING_AGENT.replace('name: example-builder', 'name: Example_Builder');
+    expect(() => translateAgentToCursor(badName, 'loud.md')).toThrow(/agents\/loud\.md.*"Example_Builder".*lowercase/);
+  });
+});
+
+describe('the live .claude/agents/ corpus', () => {
+  const agentFiles = fs.readdirSync(AGENTS_DIR).filter((fileName) => fileName.endsWith('.md'));
+
+  it('finds agents to check, so the checks below cannot pass on an empty list', () => {
+    expect(agentFiles.length).toBeGreaterThanOrEqual(10);
+  });
+
+  it('translates every agent to one named, described, inheriting subagent', () => {
+    for (const fileName of agentFiles) {
+      const translated = translateAgentToCursor(fs.readFileSync(path.join(AGENTS_DIR, fileName), 'utf-8'), fileName);
+      const frontmatter = translated.split('\n---\n')[0].split('\n');
+      expect(frontmatter[1], fileName).toBe(`name: ${fileName.replace(/\.md$/, '')}`);
+      expect(frontmatter[2], fileName).toMatch(/^description: ".{20,}"$/);
+      expect(frontmatter[3], fileName).toBe('model: inherit');
+      // Only the keys Cursor documents, so nothing Claude Code specific leaks into its copy.
+      const keys = frontmatter.slice(1).map((line) => line.split(':')[0]);
+      expect(keys.every((key) => ['name', 'description', 'model', 'readonly'].includes(key)), fileName).toBe(true);
+    }
+  });
+
+  it('marks exactly the agents whose tools line names only read tools as readonly', () => {
+    let readOnlyCount = 0;
+    for (const fileName of agentFiles) {
+      const source = fs.readFileSync(path.join(AGENTS_DIR, fileName), 'utf-8');
+      const toolsLine = source.match(/^tools: (.+)$/m);
+      const tools = toolsLine === null ? [] : toolsLine[1].split(',').map((tool) => tool.trim());
+      const expectedReadOnly = tools.length > 0 && tools.every((tool) => READ_ONLY_TOOLS.includes(tool));
+      const translated = translateAgentToCursor(source, fileName);
+      expect(translated.split('\n---\n')[0].includes('\nreadonly: true'), fileName).toBe(expectedReadOnly);
+      if (expectedReadOnly) readOnlyCount++;
+    }
+    expect(readOnlyCount, 'at least the review and audit agents are read-only').toBeGreaterThanOrEqual(5);
+  });
+
+  it('carries no Cursor-only key in .claude/agents/, which Claude Code reads as written', () => {
+    for (const fileName of agentFiles) {
+      const frontmatter = fs.readFileSync(path.join(AGENTS_DIR, fileName), 'utf-8').split('\n---')[0];
+      expect(/^readonly:/m.test(frontmatter), `${fileName} sets readonly: it is derived from tools: instead`).toBe(false);
+    }
   });
 });
 
@@ -177,6 +333,60 @@ describe('writeCursorRules', () => {
     fs.rmSync(path.join(projectDir, '.claude', 'rules', 'always.md'), { force: true });
     expect(writeCursorRules(projectDir)).toEqual({ total: 1, written: 0, removed: 0 });
     expect(fs.readFileSync(sameName, 'utf-8')).toBe(ownText);
+  });
+
+  function makeProjectWithAgents(): string {
+    const projectDir = makeProject();
+    const agentsDir = path.join(projectDir, '.claude', 'agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, 'example-auditor.md'), READ_ONLY_AGENT);
+    fs.writeFileSync(path.join(agentsDir, 'example-builder.md'), WRITING_AGENT);
+    return projectDir;
+  }
+
+  it('writes one .cursor/agents file per agent beside the rules, and counts both', () => {
+    const projectDir = makeProjectWithAgents();
+    const agentsOutput = path.join(projectDir, '.cursor', 'agents');
+    expect(writeCursorRules(projectDir)).toEqual({ total: 4, written: 4, removed: 0 });
+    expect(fs.readFileSync(path.join(agentsOutput, 'example-auditor.md'), 'utf-8'))
+      .toBe(translateAgentToCursor(READ_ONLY_AGENT, 'example-auditor.md'));
+    expect(fs.existsSync(path.join(agentsOutput, 'example-builder.md'))).toBe(true);
+    expect(writeCursorRules(projectDir)).toEqual({ total: 4, written: 0, removed: 0 });
+  });
+
+  it('writes no agents and does not fail when the project has no .claude/agents/', () => {
+    const projectDir = makeProject();
+    expect(writeCursorRules(projectDir)).toEqual({ total: 2, written: 2, removed: 0 });
+    expect(fs.existsSync(path.join(projectDir, '.cursor', 'agents'))).toBe(false);
+  });
+
+  it('never overwrites or removes a hand-written subagent, even one named like a generated one', () => {
+    const projectDir = makeProjectWithAgents();
+    const agentsOutput = path.join(projectDir, '.cursor', 'agents');
+    fs.mkdirSync(agentsOutput, { recursive: true });
+    const sameName = path.join(agentsOutput, 'example-auditor.md');
+    const unrelated = path.join(agentsOutput, 'mine.md');
+    const ownText = '---\nname: example-auditor\ndescription: my own\nmodel: inherit\n---\nMy own prompt.\n';
+    fs.writeFileSync(sameName, ownText);
+    fs.writeFileSync(unrelated, '---\nname: mine\ndescription: another of mine\n---\nPrompt.\n');
+
+    expect(writeCursorRules(projectDir)).toEqual({ total: 3, written: 3, removed: 0 });
+    expect(fs.readFileSync(sameName, 'utf-8')).toBe(ownText);
+
+    fs.rmSync(path.join(projectDir, '.claude', 'agents', 'example-auditor.md'), { force: true });
+    expect(writeCursorRules(projectDir)).toEqual({ total: 3, written: 0, removed: 0 });
+    expect(fs.readFileSync(sameName, 'utf-8')).toBe(ownText);
+    expect(fs.existsSync(unrelated)).toBe(true);
+  });
+
+  it('removes a generated subagent whose agent is gone', () => {
+    const projectDir = makeProjectWithAgents();
+    const agentsOutput = path.join(projectDir, '.cursor', 'agents');
+    writeCursorRules(projectDir);
+    fs.rmSync(path.join(projectDir, '.claude', 'agents', 'example-builder.md'), { force: true });
+    expect(writeCursorRules(projectDir)).toEqual({ total: 3, written: 0, removed: 1 });
+    expect(fs.existsSync(path.join(agentsOutput, 'example-builder.md'))).toBe(false);
+    expect(fs.existsSync(path.join(agentsOutput, 'example-auditor.md'))).toBe(true);
   });
 });
 

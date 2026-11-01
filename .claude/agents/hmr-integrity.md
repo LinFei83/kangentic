@@ -25,7 +25,6 @@ description: |
   </example>
 model: haiku
 tools: Read, Glob, Grep
-readonly: true
 ---
 
 # HMR & Store Registration Validator

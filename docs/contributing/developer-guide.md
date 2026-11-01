@@ -235,7 +235,7 @@ the tree incomplete and installs again.
 
 The esbuild externals (`better-sqlite3`, `node-pty`, `sherpa-onnx-node`, `sqlite-vec`, `@huggingface/transformers`, `font-list`, `koffi`, plus `electron` itself) are not bundled. They load at runtime from `node_modules`. The list is declared identically in `scripts/build.js` and `scripts/dev.js`, so change one and change the other. Everything else, `simple-git` included, is bundled. Getting an external into a packaged build is a separate question, covered under Packaging below.
 
-`dev.js` also refreshes Cursor's copy of the team rules on every start (`writeCursorRules` from `scripts/cursor-rules.js`, which `prepare` runs on every `npm install` too), so a pull that changed `.claude/rules/` reaches Cursor without a reinstall. A failure there only warns. See [Shared agent instructions](agent-instructions.md).
+`dev.js` also refreshes Cursor's copy of the team rules and subagents on every start (`writeCursorRules` from `scripts/cursor-rules.js`, which `prepare` runs on every `npm install` too), so a pull that changed `.claude/rules/` or `.claude/agents/` reaches Cursor without a reinstall. A failure there only warns. See [Shared agent instructions](agent-instructions.md).
 
 Flags:
 - `--port=<n>` - override Vite port

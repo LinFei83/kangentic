@@ -498,17 +498,18 @@ async function start() {
   copyExternalScripts(projectDir);
   console.log('[dev] Copied external scripts (bridges + adapter plugins)');
 
-  // Cursor's copy of .claude/rules/ (scripts/cursor-rules.js), refreshed on
-  // every start so a pull that changed a rule reaches Cursor without a
-  // reinstall. A failure only warns: a rule the translator cannot carry must not
-  // stop the dev server, and tests/unit/cursor-rules.test.ts fails on it in CI.
+  // Cursor's copy of .claude/rules/ and .claude/agents/ (scripts/cursor-rules.js),
+  // refreshed on every start so a pull that changed a rule or agent reaches
+  // Cursor without a reinstall. A failure only warns: a rule or agent the
+  // translator cannot carry must not stop the dev server, and
+  // tests/unit/cursor-rules.test.ts fails on it in CI.
   try {
     const cursorRules = writeCursorRules(projectDir);
     if (cursorRules.written + cursorRules.removed > 0) {
-      console.log(`[dev] Refreshed Cursor rules (${cursorRules.written} written, ${cursorRules.removed} removed)`);
+      console.log(`[dev] Refreshed Cursor rules and agents (${cursorRules.written} written, ${cursorRules.removed} removed)`);
     }
   } catch (cursorRulesError) {
-    console.warn('[dev] could not refresh .cursor/rules/:', cursorRulesError);
+    console.warn('[dev] could not refresh .cursor/:', cursorRulesError);
   }
 
   // The MCP server is now hosted in-process by Electron main (see

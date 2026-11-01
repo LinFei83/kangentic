@@ -30,7 +30,6 @@ description: |
   -> Spawn ipc-auditor to verify the mock matches the real API surface.
   </example>
 tools: Read, Glob, Grep
-readonly: true
 ---
 
 # IPC Layer Consistency Auditor
