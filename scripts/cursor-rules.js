@@ -7,11 +7,13 @@
  * Claude Code reads `.claude/` itself. Cursor reads rules only as `.mdc` files in `.cursor/rules/`,
  * with its own frontmatter (`description`, `globs`, `alwaysApply`), and an `@file` mention in a
  * rule is read on demand, never inlined, so a stub pointing at the real rule would load nothing.
- * Cursor does load `.claude/agents/`, but it takes `model: sonnet` or `model: haiku` as a model it
- * must start (and stops when the account cannot), and it prints a multi-line `description: |` as
- * the character `|`. Cursor prefers `.cursor/agents/` over `.claude/agents/` for the same name, so
- * a generated copy with `model: inherit` and a one-line description wins where it matters, and
- * `.claude/agents/` stays exactly as Claude Code wants it.
+ * Cursor does load `.claude/agents/`, but its docs name only `inherit` or a specific model ID for
+ * `model`, so `sonnet` and `haiku` are not values it documents. One contributor's run on Cursor
+ * started Claude Haiku 4.5 for `haiku` and stopped when the account could not use it, and listed a
+ * multi-line `description: |` as the character `|`. Cursor prefers `.cursor/agents/` over
+ * `.claude/agents/` for the same name (its subagents doc says so), so a generated copy with
+ * `model: inherit` and a one-line description wins where it matters, and `.claude/agents/` stays
+ * exactly as Claude Code wants it.
  *
  * The copies are generated and gitignored rather than committed: a committed copy would need a
  * parity test, and every edit to a rule or agent would then have to rerun this script or fail CI.

@@ -30,11 +30,16 @@ generated for it rather than copied by hand, and `.claude/` stays exactly as Cla
 - **`.claude/skills/`** is read by both. Cursor loads it for compatibility and requires a `name` in
   each skill's frontmatter, so every `SKILL.md` names its directory.
 - **`.claude/agents/`** is read by Claude Code as written, with `model: haiku` or `sonnet` routing
-  the cheaper checks. Cursor loads it too, but a contributor's run on Cursor showed three problems:
+  the cheaper checks. Cursor loads it too, but its docs name only `inherit` or a specific model ID
+  for `model` and give no format for `description`, and a contributor's run on Cursor showed three
+  problems:
   `model: haiku` started Claude Haiku 4.5 and stopped when the account could not use it, a subagent
   with no model chosen ran on the file's model and not the session's, and the multi-line
-  `description: |` printed as the character `|`. Cursor prefers `.cursor/agents/` for the same name,
-  so `scripts/cursor-rules.js` writes a copy there.
+  `description: |` printed as the character `|`. Those are observations, and a third-party tutorial
+  reports an unlisted model value silently falling back to `inherit` instead, so what Cursor does
+  with `haiku` is not settled. The generated copy avoids the question by never naming a model.
+  Cursor's subagents doc says `.cursor/` wins over `.claude/` for the same name, so
+  `scripts/cursor-rules.js` writes a copy there.
 - **`.claude/rules/`** is read only by Claude Code. Cursor reads `.mdc` files in `.cursor/rules/`
   and nothing else, so `scripts/cursor-rules.js` writes them.
 
