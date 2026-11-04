@@ -1,7 +1,7 @@
 ---
 type: Guide
 title: Tasks
-description: "The task lifecycle: the New Task dialog (Column Settings or Agent Override, Board Profiles, model and effort pins, pasted images), what spawning, moving between active columns, Done and Return to To Do each do to the session and worktree, the card context menu, and the completed task view."
+description: "The task lifecycle: the New Task dialog (Work or Discuss, Column Settings or Agent Override, Board Profiles, model and effort pins, pasted images), what spawning, moving between active columns, Done and Return to To Do each do to the session and worktree, the card context menu, and the completed task view."
 tags: [tasks, lifecycle, profiles, done]
 sources:
   - resource: src/renderer/components/dialogs/NewTaskDialog.tsx
@@ -12,7 +12,7 @@ sources:
 
 ## Create a Task
 
-Click the **+** button on any column header, or **New Task** in the backlog toolbar. Enter a title and optional description. A **Name from prompt** button beside the title suggests one from the description, and a task still carrying a placeholder title such as `fix` is renamed for you the first time its agent stops for you after its first 30 seconds, with a Task renamed toast. Both work only when an Automation agent is set up in Settings > Workflows. You can set a priority level, add labels, and attach files (images, documents, or any file type) by pasting from the clipboard or dragging files onto the dialog. Attachments are included in the agent's prompt.
+Click the **+** button on any column header, or **New Task** in the backlog toolbar. Enter a title and optional description. Choose **Work** (the default: implement on the current board path) or **Discuss** (explore first; a fresh spawn opens with `/opsx-explore`, and you propose the OpenSpec change yourself when the discussion is enough). A **Name from prompt** button beside the title suggests one from the description, and a task still carrying a placeholder title such as `fix` is renamed for you the first time its agent stops for you after its first 30 seconds, with a Task renamed toast. Both work only when an Automation agent is set up in Settings > Workflows. You can set a priority level, add labels, and attach files (images, documents, or any file type) by pasting from the clipboard or dragging files onto the dialog. Attachments are included in the agent's prompt.
 
 Pasted screenshots are capped at a 2000px long edge, which bounds a multi-monitor grab without costing the detail an agent needs to read small text. Oversized pastes are re-encoded as WebP, stepping quality down until each image lands under a ~1.5MB target, so a large grab is not rejected by the API. Small pastes (under 500KB), GIFs, SVGs, and PNGs already inside the cap are attached as-is.
 

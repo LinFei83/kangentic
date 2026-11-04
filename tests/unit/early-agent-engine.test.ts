@@ -546,6 +546,13 @@ describe('agentStartsFirstOnEnter', () => {
     expect(automationRepo.getForTrigger).toHaveBeenCalledWith('column-1', 'enter', 'regular');
   });
 
+  it('asks for the change list when appliesTo is change', () => {
+    const { engine, automationRepo } = engineWithEnterRows([]);
+
+    expect(engine.agentStartsFirstOnEnter(column, 'change')).toBe(true);
+    expect(automationRepo.getForTrigger).toHaveBeenCalledWith('column-1', 'enter', 'change');
+  });
+
   it.each([
     { type: 'send_message', startsFirst: true },
     { type: 'run_script', startsFirst: false },

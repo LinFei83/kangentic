@@ -634,6 +634,11 @@ msgstr "Impossibile aggiornare da {baseBranch}"
 msgid "Cancel"
 msgstr "Annulla"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Change"
+msgstr ""
+
 #: src/renderer/components/dialogs/LeftoverProcessesDialog.tsx
 #, fuzzy
 msgid "Change in Settings"
@@ -1214,6 +1219,11 @@ msgstr "Scarta"
 msgid "Discard unsaved changes?"
 msgstr "Scartare le modifiche non salvate?"
 
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Discuss"
+msgstr ""
+
 #: src/renderer/components/dialogs/ConfirmDialog.tsx
 #, fuzzy
 msgid "Don't ask again"
@@ -1362,6 +1372,10 @@ msgstr "Espandi tutto"
 #, fuzzy
 msgid "Expand changes"
 msgstr "Espandi modifiche"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/changes/FileTreePanel.tsx
 #, fuzzy
@@ -1571,6 +1585,10 @@ msgstr "Anteprima immagine"
 #, fuzzy
 msgid "Image sent at lower quality"
 msgstr "Immagine inviata a qualità inferiore"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Implement on the current board path. No OpenSpec change."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/CompletedChangesEmpty.tsx
 #, fuzzy
@@ -2173,6 +2191,10 @@ msgstr "Apri cartella dell'albero di lavoro"
 msgid "Opens this part of the conversation"
 msgstr "Apre questa parte della conversazione"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "OpenSpec change cards. Empty means nothing runs."
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Other tasks wait in this column and start in the order they arrived."
 msgstr ""
@@ -2374,6 +2396,11 @@ msgstr "Esegui invece rebase o merge nella sessione."
 #, fuzzy
 msgid "Refresh PR"
 msgstr "Aggiorna PR"
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Regular"
+msgstr ""
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 #, fuzzy
@@ -3340,6 +3367,10 @@ msgstr "Dove va l'attività quando l'agente esce dalla modalità Plan."
 msgid "Whether you approve each plan or Kangentic does. A workflow task can override it for itself."
 msgstr "Indica se approvi tu ogni piano o lo fa Kangentic. Un'attività del flusso di lavoro può sovrascriverlo per sé."
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Which cards these automations run for"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Which conversation this column uses"
 msgstr ""
@@ -3358,6 +3389,19 @@ msgstr "Esempi di caratteri jolly. {rows}"
 #, fuzzy
 msgid "Window limit reached"
 msgstr "Limite di finestre raggiunto"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Work"
+msgstr ""
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Work and discuss cards."
+msgstr ""
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Work or discuss"
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 #, fuzzy

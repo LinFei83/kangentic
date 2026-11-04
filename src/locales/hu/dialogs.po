@@ -634,6 +634,11 @@ msgstr "Nem lehet frissíteni innen: {baseBranch}"
 msgid "Cancel"
 msgstr "Mégse"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Change"
+msgstr ""
+
 #: src/renderer/components/dialogs/LeftoverProcessesDialog.tsx
 #, fuzzy
 msgid "Change in Settings"
@@ -1214,6 +1219,11 @@ msgstr "Elvetés"
 msgid "Discard unsaved changes?"
 msgstr "Elveti a nem mentett módosításokat?"
 
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Discuss"
+msgstr ""
+
 #: src/renderer/components/dialogs/ConfirmDialog.tsx
 #, fuzzy
 msgid "Don't ask again"
@@ -1362,6 +1372,10 @@ msgstr "Összes kibontása"
 #, fuzzy
 msgid "Expand changes"
 msgstr "Módosítások kibontása"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/changes/FileTreePanel.tsx
 #, fuzzy
@@ -1571,6 +1585,10 @@ msgstr "Kép előnézete"
 #, fuzzy
 msgid "Image sent at lower quality"
 msgstr "A kép gyengébb minőségben lett elküldve"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Implement on the current board path. No OpenSpec change."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/CompletedChangesEmpty.tsx
 #, fuzzy
@@ -2173,6 +2191,10 @@ msgstr "Munkafa mappájának megnyitása"
 msgid "Opens this part of the conversation"
 msgstr "Megnyitja a beszélgetés ezen részét"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "OpenSpec change cards. Empty means nothing runs."
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Other tasks wait in this column and start in the order they arrived."
 msgstr ""
@@ -2374,6 +2396,11 @@ msgstr "Inkább a munkamenetben végezzen rebase-t vagy merge-et."
 #, fuzzy
 msgid "Refresh PR"
 msgstr "PR frissítése"
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Regular"
+msgstr ""
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 #, fuzzy
@@ -3340,6 +3367,10 @@ msgstr "Ahová a feladat kerül, amikor az ügynök kilép a tervezési módból
 msgid "Whether you approve each plan or Kangentic does. A workflow task can override it for itself."
 msgstr "Ön hagyja jóvá az egyes terveket, vagy a Kangentic. Egy munkafolyamat-feladat ezt felülbírálhatja a saját maga számára."
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Which cards these automations run for"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Which conversation this column uses"
 msgstr ""
@@ -3358,6 +3389,19 @@ msgstr "Helyettesítő karakteres példák. {rows}"
 #, fuzzy
 msgid "Window limit reached"
 msgstr "Ablakkorlát elérve"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Work"
+msgstr ""
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Work and discuss cards."
+msgstr ""
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Work or discuss"
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 #, fuzzy

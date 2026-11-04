@@ -18,7 +18,8 @@ import { resolveBrowserAutomationConfig } from '../../browser/browser-automation
 import { buildSessionHistoryReference } from '../../agent/handoff/session-history-reference';
 import { DEFAULT_AGENT, NEVER_AUTO_SPAWN_ROLES } from '../../../shared/types';
 import type { Task, Swimlane, Project, AutoCommandMode } from '../../../shared/types';
-import { OPENSPEC_EXPLORE_COMMAND } from '../../../shared/openspec-commands';
+import { OPENSPEC_EXPLORE_COMMAND, OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE } from '../../../shared/openspec-commands';
+import { loadOpenspecXmlForTask } from '../../openspec/openspec-xml';
 import { showAutomationNotification } from '../../automations/shared/show-automation-notification';
 import { reportAutomationFailures } from './automation-failures';
 import type { IpcContext } from '../ipc-context';
@@ -44,7 +45,7 @@ import {
   settleClaimFromReport,
   type HeldClaim,
 } from '../../held-messages/held-messages';
-import type { AgentStartReport } from '../../automations/automation-runner';
+import { appliesToForTask, type AgentStartReport } from '../../automations/automation-runner';
 import { emitSpawnProgress, createProgressCallback, clearSpawnProgress } from '../../transition-engine/spawn-progress';
 import { ensureTaskWorktree, ensureTaskBranchCheckout, notifyConversationExpired, notifySpawnBlocked, type InitScriptMode } from './task-git';
 import { createExpiredRecapSources } from '../../transition-engine/expired-recap-sources';
@@ -165,7 +166,7 @@ export function openspecExplorePromptPrefix(input: {
   if (existing.trimStart().startsWith(OPENSPEC_EXPLORE_COMMAND)) {
     return undefined;
   }
-  return OPENSPEC_EXPLORE_COMMAND;
+  return `${OPENSPEC_EXPLORE_COMMAND}\n\n${OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE}`;
 }
 
 /** The run log's reason for a column message not sent because the task's conversation expired. */
@@ -401,11 +402,18 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
   // is resolved once per spawn (board config -> project/global config ->
   // 'main') so {{baseBranch}} matches resolveDefaultBaseBranch everywhere else
   // it's used, rather than resolving empty for the ~99% of tasks with no
-  // per-task base_branch override.
+  // per-task base_branch override. {{openspec_xml}} is pre-loaded here because
+  // resolvers are sync and git show is not.
+  const defaultBaseBranch = resolveDefaultBaseBranch(context, options.projectPath);
+  const openspecXml = await loadOpenspecXmlForTask({
+    task,
+    projectPath: options.projectPath ?? null,
+    defaultBranch: defaultBaseBranch,
+  });
   const resolveAutoCommandVars = (currentTask: Task): Record<string, string> =>
     resolveTaskTemplateVars({
       task: currentTask,
-      defaultBaseBranch: resolveDefaultBaseBranch(context, options.projectPath),
+      defaultBaseBranch,
       attachmentPaths: options.attachments?.getPathsForTask(currentTask.id) ?? [],
       devPort: getDevPortForTask(currentTask.id),
       projectPath: options.projectPath ?? null,
@@ -414,6 +422,7 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       // keywords in this context.
       move: null,
       workflow: readWorkflowPromptFacts(currentTask, options.projectId ?? null),
+      openspecXml,
     });
 
   /**
@@ -1375,7 +1384,7 @@ export function createEarlyAgentLauncher(input: {
       const engine = createTransitionEngine(
         context, input.automations, input.automationRuns, tasks, sessionRepo, input.attachments, input.projectId, input.projectPath,
       );
-      if (!engine.agentStartsFirstOnEnter(toLane)) return null;
+      if (!engine.agentStartsFirstOnEnter(toLane, appliesToForTask(task))) return null;
       const project = context.projectRepo.getById(input.projectId);
       const { task: previewTask, resolution } = previewSpawnPreamble({
         task,

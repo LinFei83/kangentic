@@ -44,13 +44,16 @@ import { resolveColumn, listActiveSwimlanes } from './column-resolver';
 import { needsRunningWorkCheck, refuseRunningWork, teardownOfColumn } from './running-work-guard';
 import { resolveTask } from './task-resolver';
 import { agentRegistry } from '../agent-registry';
+import { appliesToForTask } from '../../automations/automation-runner';
 import type { CommandContext, CommandHandler, CommandResponse } from './types';
 import type {
+  AutomationAppliesTo,
   AutomationConfig,
   AutomationRunCheck,
   AutomationTrigger,
   AutomationType,
   ColumnAutomation,
+  Swimlane,
 } from '../../../shared/types';
 
 /** How many run rows one read returns before the caller has to narrow. */
@@ -83,33 +86,17 @@ export const handleListAutomations: CommandHandler = (
       continue;
     }
     lines.push(`${column.name}:`);
-    for (const trigger of AUTOMATION_TRIGGERS) {
-      const group = rows
-        .filter((row) => row.trigger === trigger)
-        .sort((left, right) => left.position - right.position);
-      if (group.length === 0) continue;
-      lines.push(`  ${englishText(AUTOMATION_TRIGGER_LABELS[trigger])}:`);
-      for (const row of group) {
-        // `canColumnRun` is the same predicate the runner uses, so a row this
-        // says is blocked is a row that will be recorded skipped. Reporting it
-        // here is what stops an agent writing a message onto a column whose
-        // agent never starts and believing it took effect.
-        const runnable = canColumnRun(row.type, { autoSpawn: column.auto_spawn, role: column.role }, row.trigger);
-        const flags = [
-          row.enabled ? null : 'switched off',
-          runnable.ok ? null : `cannot run: ${englishText(runnable.reason)}`,
-        ].filter((flag): flag is string => flag !== null);
-        // The sentence names only the verb and its one required value, as the
-        // row's second line does. Everything the panel shows as a mark (the
-        // send timing, Move to column's message, the Condition, the Frequency)
-        // follows in words, since an agent reads this text and not `data`.
-        const marks = describeAutomationMarksInWords(row, englishI18n);
-        lines.push(
-          `    ${row.position + 1}. ${row.name} (${row.type}) ${describeAutomation(row.type, row.config, englishI18n)}`
-          + (marks !== null ? ` (${marks})` : '')
-          + (flags.length > 0 ? ` [${flags.join('; ')}]` : ''),
-        );
+    const regularRows = rows.filter((row) => row.applies_to !== 'change');
+    const changeRows = rows.filter((row) => row.applies_to === 'change');
+    if (changeRows.length === 0) {
+      emitTriggerGroups(lines, regularRows, column, '  ');
+    } else {
+      if (regularRows.length > 0) {
+        lines.push('  Regular:');
+        emitTriggerGroups(lines, regularRows, column, '    ');
       }
+      lines.push('  Change:');
+      emitTriggerGroups(lines, changeRows, column, '    ');
     }
     data.push(...rows.map((row) => serializeRow(row, column.name)));
   }
@@ -142,7 +129,10 @@ export const handleSetAutomations: CommandHandler = (
   }
 
   const parsed: AutomationWriteInput[] = [];
-  const names = new Set<string>();
+  const namesByList: Record<AutomationAppliesTo, Set<string>> = {
+    regular: new Set<string>(),
+    change: new Set<string>(),
+  };
   const warnings: string[] = [];
 
   // Ids this column already owns. A supplied id is honored only if it is one of
@@ -167,17 +157,20 @@ export const handleSetAutomations: CommandHandler = (
     if (!name) {
       return { success: false, error: `${where} has no name. Every automation needs one. Nothing was saved.` };
     }
-    // The unique index is COLLATE NOCASE, so a case-only difference is a
-    // duplicate at the database and has to be refused here, where the caller
-    // can still be told which row.
+    const appliesToResult = parseAppliesTo(entry.appliesTo ?? entry.applies_to, where);
+    if (!appliesToResult.ok) return { success: false, error: `${appliesToResult.error} Nothing was saved.` };
+    const appliesTo = appliesToResult.value;
+    // The unique index is (swimlane_id, applies_to, name COLLATE NOCASE), so
+    // a case-only difference on the SAME list is a duplicate at the database
+    // and has to be refused here. Regular and Change may share a name.
     const key = name.toLowerCase();
-    if (names.has(key)) {
+    if (namesByList[appliesTo].has(key)) {
       return {
         success: false,
-        error: `${where}: "${name}" repeats a name already used on this column. Names are unique per column, ignoring case. Nothing was saved.`,
+        error: `${where}: "${name}" repeats a name already used on this column's ${appliesTo} list. Names are unique per list, ignoring case. Nothing was saved.`,
       };
     }
-    names.add(key);
+    namesByList[appliesTo].add(key);
 
     const rawType = typeof entry.type === 'string' ? entry.type : '';
     if (isRetiredActionType(rawType)) {
@@ -288,6 +281,7 @@ export const handleSetAutomations: CommandHandler = (
       condition,
       final_line: finalLine,
       max_runs: normalizeMaxRuns(typeof entry.maxRuns === 'number' ? entry.maxRuns : null),
+      applies_to: appliesTo,
     });
   }
 
@@ -371,9 +365,11 @@ export const handleRunAutomation: CommandHandler = async (
 
   const rows = new AutomationRepository(db).listForColumn(columnResolution.swimlane.id);
   const wanted = automationName.trim().toLowerCase();
-  const automation = rows.find((row) => row.name.trim().toLowerCase() === wanted);
-  if (!automation) {
-    const available = rows.map((row) => row.name).join(', ');
+  const nameMatches = rows.filter((row) => row.name.trim().toLowerCase() === wanted);
+  if (nameMatches.length === 0) {
+    const available = rows.map((row) => (
+      row.applies_to === 'change' ? `${row.name} (change)` : row.name
+    )).join(', ');
     return {
       success: false,
       error: `"${columnResolution.swimlane.name}" has no automation named "${automationName}".`
@@ -387,6 +383,19 @@ export const handleRunAutomation: CommandHandler = async (
   const selector = String(params.task);
   const task = resolveTask(new TaskRepository(db), selector.replace(/^#/, ''));
   if (!task) return { success: false, error: `No task matches "${selector}". Pass a task id or its #number.` };
+
+  const appliesToResult = parseAppliesTo(params.appliesTo ?? params.applies_to, 'appliesTo');
+  if (!appliesToResult.ok) return { success: false, error: appliesToResult.error };
+  const requestedAppliesTo = appliesToResult.explicit ? appliesToResult.value : appliesToForTask(task);
+  const automation = nameMatches.find((row) => row.applies_to === requestedAppliesTo)
+    ?? (!appliesToResult.explicit && nameMatches.length === 1 ? nameMatches[0] : undefined);
+  if (!automation) {
+    const available = nameMatches.map((row) => `${row.name} (${row.applies_to})`).join(', ');
+    return {
+      success: false,
+      error: `"${automationName}" is on more than one list. Pass appliesTo: "regular" or "change". It has: ${available}.`,
+    };
+  }
 
   // A Move to column row run by hand on another task reaches the same teardown
   // as `kangentic_move_task`, so it answers to the same guard. At a turn end the
@@ -493,7 +502,60 @@ function serializeRow(row: ColumnAutomation, columnName: string): Record<string,
     condition: row.condition,
     finalLine: row.final_line,
     maxRuns: row.max_runs,
+    appliesTo: row.applies_to,
     ...row.config,
+  };
+}
+
+function emitTriggerGroups(
+  lines: string[],
+  rows: ColumnAutomation[],
+  column: Pick<Swimlane, 'auto_spawn' | 'role'>,
+  indent: string,
+): void {
+  for (const trigger of AUTOMATION_TRIGGERS) {
+    const group = rows
+      .filter((row) => row.trigger === trigger)
+      .sort((left, right) => left.position - right.position);
+    if (group.length === 0) continue;
+    lines.push(`${indent}${englishText(AUTOMATION_TRIGGER_LABELS[trigger])}:`);
+    for (const row of group) {
+      // `canColumnRun` is the same predicate the runner uses, so a row this
+      // says is blocked is a row that will be recorded skipped. Reporting it
+      // here is what stops an agent writing a message onto a column whose
+      // agent never starts and believing it took effect.
+      const runnable = canColumnRun(row.type, { autoSpawn: column.auto_spawn, role: column.role }, row.trigger);
+      const flags = [
+        row.enabled ? null : 'switched off',
+        runnable.ok ? null : `cannot run: ${englishText(runnable.reason)}`,
+      ].filter((flag): flag is string => flag !== null);
+      // The sentence names only the verb and its one required value, as the
+      // row's second line does. Everything the panel shows as a mark (the
+      // send timing, Move to column's message, the Condition, the Frequency)
+      // follows in words, since an agent reads this text and not `data`.
+      const marks = describeAutomationMarksInWords(row, englishI18n);
+      lines.push(
+        `${indent}  ${row.position + 1}. ${row.name} (${row.type}) ${describeAutomation(row.type, row.config, englishI18n)}`
+        + (marks !== null ? ` (${marks})` : '')
+        + (flags.length > 0 ? ` [${flags.join('; ')}]` : ''),
+      );
+    }
+  }
+}
+
+function parseAppliesTo(
+  value: unknown,
+  where: string,
+): { ok: true; value: AutomationAppliesTo; explicit: boolean } | { ok: false; error: string } {
+  if (value === undefined || value === null || value === '') {
+    return { ok: true, value: 'regular', explicit: false };
+  }
+  if (value === 'regular' || value === 'change') {
+    return { ok: true, value, explicit: true };
+  }
+  return {
+    ok: false,
+    error: `${where}: appliesTo must be "regular" or "change".`,
   };
 }
 

@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Board config files
-description: How kangentic.json and kangentic.local.json define the shared board, which way each sync runs, how a hand edit ghosts or deletes a column, the file schema with its onEnter, onTurnEnd and onExit arrays, which bad rows are skipped, and where Shortcuts and Board Profiles are stored.
+description: How kangentic.json and kangentic.local.json define the shared board, which way each sync runs, how a hand edit ghosts or deletes a column, the file schema with its onEnter, onTurnEnd and onExit arrays and optional nested change lists, which bad rows are skipped, and where Shortcuts and Board Profiles are stored.
 tags: [board, kangentic-json, sync, profiles, shortcuts]
 sources:
   - resource: src/main/config/board-config/
@@ -222,7 +222,12 @@ Ghost columns are invisible on the board but still exist in the database. Once a
         ],
         "onExit": [
           { "name": "Archive the log", "type": "run_script", "enabled": false, "script": "scripts/archive.sh" }
-        ]
+        ],
+        "change": {
+          "onEnter": [
+            { "name": "Review", "type": "send_message", "message": "/code-review {{baseBranch}}" }
+          ]
+        }
       }
     }
   ],
@@ -266,11 +271,14 @@ leave plans approving on every other machine. To Do and Done always apply as Man
 cannot change it.
 
 **Automations nest under the column that owns them, as three named arrays** (`onEnter`,
-`onTurnEnd`, `onExit`). Array order IS the run order within its group, an empty group is an absent
-key, and the type's own fields sit flat on the row beside `name`, `type`, `enabled`, `condition`,
-`finalLine` and `maxRuns` rather than under a `with` object. Those six keys are reserved:
+`onTurnEnd`, `onExit`) for Regular cards (work and discuss). An optional nested `change` object
+holds the same three arrays for OpenSpec change cards. Array order IS the run order within its
+group, an empty group is an absent key, and an empty `change` object is omitted. The type's own
+fields sit flat on the row beside `name`, `type`, `enabled`, `condition`, `finalLine` and `maxRuns`
+rather than under a `with` object. Those six keys are reserved:
 `automation-manifest-reserved-keys.test.ts` fails an adapter that declares a field colliding with
-one, which is what keeps the flat shape safe as the reserved set grows.
+one, which is what keeps the flat shape safe as the reserved set grows. A Board Profile does not
+overlay automations. Names are unique per list, so Regular and Change may share a name.
 
 `enabled` is omitted when true, so a switched-off row is the only one that carries it; `condition`,
 `finalLine` and `maxRuns` are omitted when off. There is no `on` key, because the array a row sits
@@ -317,7 +325,8 @@ board:
   warning; the row still runs. A row with both a `condition` and a `finalLine` keeps the
   `finalLine`, with a warning. A `finalLine` with no letter, number or `*` is kept, with a
   warning: no last line can match it, so the row never runs.
-- A second row with a name already used in the same column is renamed (`Notify 2`).
+- A second row with a name already used in the same list is renamed (`Notify 2`). Regular and
+  Change may share a name.
 - An `automations` value that is not an object, or an `onEnter` / `onTurnEnd` / `onExit` that is not a list
   (`{}`, or a single row written without brackets), keeps that column's current automations
   untouched. Treating it as empty would delete the column's rows, and on project open the export

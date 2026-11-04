@@ -34,7 +34,8 @@ const AUTOMATION_TYPE_VALUES: [string, ...string[]] = [FIRST_STABLE_TYPE, ...OTH
  */
 const AUTOMATION_ROW_SCHEMA = z.object({
   id: z.string().optional().describe('Existing automation id, to keep this row\'s identity and run history across the write. Omit for a new row. Read one from kangentic_list_automations.'),
-  name: z.string().max(200).describe('Label for this automation, unique on its column ignoring case. Shown in the Column Manager and in the run log.'),
+  name: z.string().max(200).describe('Label for this automation, unique on its list (regular or change) ignoring case. Regular and Change may share a name. Shown in the Column Manager and in the run log.'),
+  appliesTo: z.enum(['regular', 'change']).optional().describe('Which list this row belongs to: "regular" (work and discuss cards) or "change" (OpenSpec change cards). Defaults to "regular". Names are unique per list, so the two lists may share a name.'),
   type: z.enum(AUTOMATION_TYPE_VALUES).describe('What this automation does. send_message types a message at the column\'s agent; run_script runs a shell script in the task\'s worktree; webhook calls a URL; notify raises a desktop notification; move_to_column (on "turn_end" only) moves the task to another column with a message for the agent there, and ends the list.'),
   on: z.enum(AUTOMATION_TRIGGERS).optional().describe('When it runs: "enter" as a task ENTERS this column, "turn_end" each time the column\'s agent FINISHES A TURN there, "exit" as the task LEAVES. Defaults to "enter". To Do and Done can only run exit automations.'),
   enabled: z.boolean().optional().describe('Defaults to true. A switched-off automation stays in the list and is skipped.'),
@@ -88,7 +89,7 @@ export function registerAutomationTools(
   server.registerTool(
     'kangentic_list_automations',
     {
-      description: 'Read what happens when a task enters a column, each time its agent finishes a turn there, and when it leaves: the ordered On task enter, On agent turn end and On task exit automations, their types, settings, Conditions (an agent\'s judgment, or a Text match on the agent\'s final line) and Frequency limits, and whether each one can actually run. Omit `column` to read the whole board, which is the right first call for "what does this board do". Pair with kangentic_set_automations to change them.',
+      description: 'Read what happens when a task enters a column, each time its agent finishes a turn there, and when it leaves: the ordered On task enter, On agent turn end and On task exit automations, their types, settings, Conditions (an agent\'s judgment, or a Text match on the agent\'s final line) and Frequency limits, and whether each one can actually run. Each column has a Regular list (work and discuss cards) and a Change list (OpenSpec change cards). Omit `column` to read the whole board, which is the right first call for "what does this board do". Pair with kangentic_set_automations to change them.',
       inputSchema: z.object({
         column: z.string().optional().describe('Column name (case-insensitive, e.g. "Code Review"). Omit to read every column.'),
         project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
@@ -104,7 +105,7 @@ export function registerAutomationTools(
   server.registerTool(
     'kangentic_set_automations',
     {
-      description: 'Replace one column\'s automations WHOLESALE. The array you pass becomes that column\'s entire list, in order, so read the current rows with kangentic_list_automations first and send them back with your change applied. Pass [] to remove them all. Array order is the run order within each trigger group. Carry each existing row\'s `id` through so it keeps its identity and run history; a row with no id is created fresh. Names must be unique within the column, ignoring case.',
+      description: 'Replace one column\'s automations WHOLESALE. The array you pass becomes that column\'s entire list, in order, so read the current rows with kangentic_list_automations first and send them back with your change applied. Pass [] to remove them all. Array order is the run order within each trigger group. Carry each existing row\'s `id` through so it keeps its identity and run history; a row with no id is created fresh. Names must be unique within each list (regular or change), ignoring case. Pass appliesTo: "change" for a change-card row; omitted is regular.',
       inputSchema: z.object({
         column: z.string().describe('Column name (case-insensitive) whose automations to replace.'),
         automations: z.array(AUTOMATION_ROW_SCHEMA).max(50).describe('The column\'s complete new list, in run order. This REPLACES what is there.'),
@@ -147,15 +148,17 @@ export function registerAutomationTools(
         column: z.string().describe('Column name the automation belongs to.'),
         automation: z.string().describe('Automation name on that column (case-insensitive). Read the names from kangentic_list_automations.'),
         task: z.string().describe('Task id or #number to run it against.'),
+        appliesTo: z.enum(['regular', 'change']).optional().describe('Which list to run from when both Regular and Change have this name. Omit to use the list that matches the task (change cards use Change, everything else Regular), or the only match if the name is on one list.'),
         project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
       }),
       annotations: MUTATING_ANNOTATIONS,
     },
     // The caller rides the context, never the params (see `CommandContext.callerKind`).
-    async ({ column, automation, task, project }) => withProject(resolver, project, (ctx) => callHandler('run_automation', {
+    async ({ column, automation, task, appliesTo, project }) => withProject(resolver, project, (ctx) => callHandler('run_automation', {
       column,
       automation,
       task,
+      appliesTo,
     }, { ...ctx, callerKind: 'agent', callerTaskId }, 'Failed to run the automation')),
   );
 }

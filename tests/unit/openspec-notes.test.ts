@@ -4,7 +4,11 @@
  */
 import { describe, it, expect } from 'vitest';
 import { englishText } from '../../src/shared/i18n/english';
-import { OPENSPEC_EXPLORE_COMMAND } from '../../src/shared/openspec-commands';
+import {
+  OPENSPEC_ARCHIVE_COMMAND,
+  OPENSPEC_EXPLORE_COMMAND,
+  OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE,
+} from '../../src/shared/openspec-commands';
 import { openspecNoteDescriptor } from '../../src/shared/openspec-notes';
 
 describe('openspecNoteDescriptor', () => {
@@ -36,5 +40,7 @@ describe('openspecNoteDescriptor', () => {
 describe('OPENSPEC_EXPLORE_COMMAND', () => {
   it('is the Cursor form, not the canonical colon form', () => {
     expect(OPENSPEC_EXPLORE_COMMAND).toBe('/opsx-explore');
+    expect(OPENSPEC_ARCHIVE_COMMAND).toBe('/opsx-archive');
+    expect(OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE).toContain('default branch');
   });
 });

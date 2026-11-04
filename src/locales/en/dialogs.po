@@ -515,6 +515,11 @@ msgstr "Can't update from {baseBranch}"
 msgid "Cancel"
 msgstr "Cancel"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Change"
+msgstr "Change"
+
 #: src/renderer/components/dialogs/LeftoverProcessesDialog.tsx
 msgid "Change in Settings"
 msgstr "Change in Settings"
@@ -989,6 +994,11 @@ msgstr "Discard"
 msgid "Discard unsaved changes?"
 msgstr "Discard unsaved changes?"
 
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Discuss"
+msgstr "Discuss"
+
 #: src/renderer/components/dialogs/ConfirmDialog.tsx
 msgid "Don't ask again"
 msgstr "Don't ask again"
@@ -1110,6 +1120,10 @@ msgstr "Expand all"
 #: src/renderer/components/dialogs/task-detail/changes/ChangesPanel.tsx
 msgid "Expand changes"
 msgstr "Expand changes"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
+msgstr "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
 
 #: src/renderer/components/dialogs/task-detail/changes/FileTreePanel.tsx
 msgctxt "column header"
@@ -1279,6 +1293,10 @@ msgstr "Image preview"
 #: src/renderer/components/dialogs/image-compress.ts
 msgid "Image sent at lower quality"
 msgstr "Image sent at lower quality"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Implement on the current board path. No OpenSpec change."
+msgstr "Implement on the current board path. No OpenSpec change."
 
 #: src/renderer/components/dialogs/task-detail/completed/CompletedChangesEmpty.tsx
 msgid "Indexing is off, so no commits are linked"
@@ -1768,6 +1786,10 @@ msgstr "Open worktree folder"
 msgid "Opens this part of the conversation"
 msgstr "Opens this part of the conversation"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "OpenSpec change cards. Empty means nothing runs."
+msgstr "OpenSpec change cards. Empty means nothing runs."
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Other tasks wait in this column and start in the order they arrived."
 msgstr "Other tasks wait in this column and start in the order they arrived."
@@ -1933,6 +1955,11 @@ msgstr "Rebase or merge it in the session instead."
 #: src/renderer/components/dialogs/task-detail/TaskDetailHeader.tsx
 msgid "Refresh PR"
 msgstr "Refresh PR"
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Regular"
+msgstr "Regular"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Removal staged"
@@ -2718,6 +2745,10 @@ msgstr "Where the task goes when the agent exits Plan mode."
 msgid "Whether you approve each plan or Kangentic does. A workflow task can override it for itself."
 msgstr "Whether you approve each plan or Kangentic does. A workflow task can override it for itself."
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Which cards these automations run for"
+msgstr "Which cards these automations run for"
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Which conversation this column uses"
 msgstr "Which conversation this column uses"
@@ -2733,6 +2764,19 @@ msgstr "Wildcard examples. {rows}"
 #: src/renderer/components/dialogs/task-detail/changes/open-file-window.ts
 msgid "Window limit reached"
 msgstr "Window limit reached"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Work"
+msgstr "Work"
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Work and discuss cards."
+msgstr "Work and discuss cards."
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Work or discuss"
+msgstr "Work or discuss"
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 msgid "Workflow step"

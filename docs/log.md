@@ -1,5 +1,14 @@
 # Log
 
+## 2026-11-04
+
+**OpenSpec board cards.** New concept `integrations/openspec.md` for the scan
+of default-branch committed `openspec/changes/`, note evaluation, HEAD watcher,
+spawn-time `{{openspec_xml}}`, and archive that stamps `archived` without
+moving the card to Done. `columns-and-automations.md` and `board-config.md`
+now name the Regular and Change lists. `automation-tools.md` names `appliesTo`
+and per-list uniqueness. `tasks.md` names Work and Discuss.
+
 ## 2026-10-31
 
 **New audit:** `audits/spare-worktree-audit.md`, the measured decision on keeping a pre-installed

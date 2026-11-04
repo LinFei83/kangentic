@@ -14,7 +14,9 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Task, Swimlane, SessionRecord } from '../../src/shared/types';
-import { OPENSPEC_EXPLORE_COMMAND } from '../../src/shared/openspec-commands';
+import { OPENSPEC_EXPLORE_COMMAND, OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE } from '../../src/shared/openspec-commands';
+
+const DISCUSS_PREFIX = `${OPENSPEC_EXPLORE_COMMAND}\n\n${OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE}`;
 
 vi.mock('../../src/main/transition-engine/agent-resolver', () => ({
   resolveTargetAgent: vi.fn(() => ({ agent: 'claude', isHandoff: false })),
@@ -43,8 +45,10 @@ function prefixFor(overrides: Partial<Parameters<typeof openspecExplorePromptPre
 }
 
 describe('openspecExplorePromptPrefix', () => {
-  it('returns /opsx-explore for a discuss card on a fresh spawn', () => {
-    expect(prefixFor()).toBe(OPENSPEC_EXPLORE_COMMAND);
+  it('returns /opsx-explore plus the default-branch note for a discuss card on a fresh spawn', () => {
+    expect(prefixFor()).toBe(DISCUSS_PREFIX);
+    expect(prefixFor()).toContain(OPENSPEC_EXPLORE_COMMAND);
+    expect(prefixFor()).toContain(OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE);
   });
 
   it('returns undefined on a resume', () => {
@@ -204,7 +208,7 @@ describe('spawnAgent OpenSpec explore prefix', () => {
   it('passes /opsx-explore as the prompt prefix on a discuss fresh spawn', async () => {
     const deps = makeDeps({ resumeRecord: undefined, taskFields: { task_intent: 'discuss' } });
     await runSpawn(deps);
-    expect(promptPrefixArg(deps.engine)).toBe(OPENSPEC_EXPLORE_COMMAND);
+    expect(promptPrefixArg(deps.engine)).toBe(DISCUSS_PREFIX);
   });
 
   it('does not prepend on a discuss resume', async () => {

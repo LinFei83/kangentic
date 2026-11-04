@@ -1,7 +1,7 @@
 ---
 type: Guide
 title: Columns and automations
-description: "Editing a column in the Column Manager (agent, model, effort and permission overrides, Plan approval, After Plan Mode, Isolated session) and its automations: the five types, the enter, turn end and exit triggers, Condition and Frequency, Run again, and Pause automations per task."
+description: "Editing a column in the Column Manager (agent, model, effort and permission overrides, Plan approval, After Plan Mode, Isolated session) and its automations: Regular and Change lists, the five types, the enter, turn end and exit triggers, Condition and Frequency, Run again, and Pause automations per task."
 tags: [columns, automations, triggers, plan-mode]
 sources:
   - resource: src/renderer/components/dialogs/board-manager/
@@ -61,9 +61,11 @@ column's own count. Its task window shows the whole line, and each row opens its
 ## Automations
 
 What a column does when a task enters it, each time its agent finishes a turn there, and when it
-leaves. Each column owns one ordered list, split into **On task enter**, **On agent turn end** and
-**On task exit**, and each row has its own switch. A row belongs to one column; there is no sharing
-and no library.
+leaves. Each column owns two ordered lists, Regular and Change, each split into **On task enter**,
+**On agent turn end** and **On task exit**, and each row has its own switch. Regular runs for work
+and discuss cards. Change runs for OpenSpec change cards. An empty Change list means nothing
+auto-runs for those cards in that column. A row belongs to one column and one list; there is no
+sharing and no library. A Board Profile does not overlay automations.
 
 Five types:
 
@@ -84,7 +86,7 @@ disabled, with the reason.
 rule: **Trigger** (when it runs), **Condition**, **Frequency**, and **Action** (the type and its own
 fields). The pencil does the same, for a pointer that is already over it; the grip, the switch and
 the trash keep their own jobs and do not open it. A name is required and must be unique on its
-column. Every text field takes template variables: type `{{` to pick one, or use the **Template
+list. Regular and Change may share a name. Every text field takes template variables: type `{{` to pick one, or use the **Template
 variable** button. A known variable is highlighted; an unknown one is flagged and sent as written.
 
 **Condition and Frequency.** Any row can carry a **Condition**, and the Condition card picks how

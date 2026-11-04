@@ -634,6 +634,11 @@ msgstr "Nie można zaktualizować z {baseBranch}"
 msgid "Cancel"
 msgstr "Anuluj"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Change"
+msgstr ""
+
 #: src/renderer/components/dialogs/LeftoverProcessesDialog.tsx
 #, fuzzy
 msgid "Change in Settings"
@@ -1214,6 +1219,11 @@ msgstr "Odrzuć"
 msgid "Discard unsaved changes?"
 msgstr "Odrzucić niezapisane zmiany?"
 
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Discuss"
+msgstr ""
+
 #: src/renderer/components/dialogs/ConfirmDialog.tsx
 #, fuzzy
 msgid "Don't ask again"
@@ -1362,6 +1372,10 @@ msgstr "Rozwiń wszystko"
 #, fuzzy
 msgid "Expand changes"
 msgstr "Rozwiń zmiany"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/changes/FileTreePanel.tsx
 #, fuzzy
@@ -1571,6 +1585,10 @@ msgstr "Podgląd obrazu"
 #, fuzzy
 msgid "Image sent at lower quality"
 msgstr "Obraz wysłano w niższej jakości"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Implement on the current board path. No OpenSpec change."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/CompletedChangesEmpty.tsx
 #, fuzzy
@@ -2173,6 +2191,10 @@ msgstr "Otwórz folder drzewa roboczego"
 msgid "Opens this part of the conversation"
 msgstr "Otwiera tę część konwersacji"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "OpenSpec change cards. Empty means nothing runs."
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Other tasks wait in this column and start in the order they arrived."
 msgstr ""
@@ -2374,6 +2396,11 @@ msgstr "Zamiast tego wykonaj rebase lub scal w sesji."
 #, fuzzy
 msgid "Refresh PR"
 msgstr "Odśwież PR"
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Regular"
+msgstr ""
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 #, fuzzy
@@ -3340,6 +3367,10 @@ msgstr "Dokąd trafia zadanie, gdy agent wyjdzie z trybu planowania."
 msgid "Whether you approve each plan or Kangentic does. A workflow task can override it for itself."
 msgstr "Czy każdy plan zatwierdzasz Ty, czy Kangentic. Zadanie przepływu pracy może to nadpisać dla siebie."
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Which cards these automations run for"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Which conversation this column uses"
 msgstr ""
@@ -3358,6 +3389,19 @@ msgstr "Przykłady symboli wieloznacznych. {rows}"
 #, fuzzy
 msgid "Window limit reached"
 msgstr "Osiągnięto limit okien"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Work"
+msgstr ""
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Work and discuss cards."
+msgstr ""
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Work or discuss"
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 #, fuzzy

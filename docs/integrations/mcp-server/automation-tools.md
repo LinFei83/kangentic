@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Column automation tools
-description: "Column automations over MCP: the five automation types and their fields, the condition, finalLine and maxRuns guards, which rows can never run and why, and the list_automations, set_automations, get_automation_runs and run_automation tools."
+description: "Column automations over MCP: the five automation types and their fields, Regular and Change lists with appliesTo, the condition, finalLine and maxRuns guards, which rows can never run and why, and the list_automations, set_automations, get_automation_runs and run_automation tools."
 tags: [mcp, automations, columns]
 sources:
   - resource: src/main/agent/mcp-http/automation-tools.ts
@@ -15,8 +15,10 @@ sources:
 ## Column automations
 
 What a column does when a task enters it, each time its agent finishes a turn there, and when it
-leaves. Each column owns one ordered list, split into three groups (`on`: `enter`, `turn_end`,
-`exit`), and each row has its own switch. Five types ship:
+leaves. Each column owns two ordered lists, Regular (work and discuss cards) and Change (OpenSpec
+change cards), each split into three groups (`on`: `enter`, `turn_end`, `exit`), and each row has
+its own switch. Pass `appliesTo`: `"change"` for a change-card row; omitted is `"regular"`. Five
+types ship:
 
 | Type | What it does | Fields |
 |------|--------------|--------|
@@ -91,8 +93,10 @@ board do": a board-wide read answers it once instead of one call per column.
 | `project` | string | No | Project name or UUID. Omit for the active project. |
 
 Each row reports its `id`, `name`, `type`, `on`, `position`, `enabled`, `condition`, `finalLine`,
-`maxRuns`, and the type's own fields. `condition`, `finalLine` and `maxRuns` are null when the row
-has none. A row that cannot run as things stand is flagged with the reason.
+`maxRuns`, `appliesTo`, and the type's own fields. `condition`, `finalLine` and `maxRuns` are null
+when the row has none. `appliesTo` is `"regular"` or `"change"`. A row that cannot run as things
+stand is flagged with the reason. When both lists have rows, the text groups them under Regular
+and Change.
 
 The text lists each row on one line: its name, its type, and the sentence the Column Manager shows
 (the verb and the one required value), then every option the panel shows as a mark, in words, in
@@ -119,11 +123,13 @@ change applied. Pass `[]` to remove them all.
 | `automations` | array | Yes | The column's complete new list, in run order. Max 50. |
 | `project` | string | No | Project name or UUID. Omit for the active project. |
 
-Each entry takes `name` (required, unique within the column ignoring case), `type`, an optional
-`on` (`enter` by default, or `turn_end` or `exit`), an optional `enabled` (true by default), an
-optional `condition` or `finalLine` and an optional `maxRuns` (all off by default), an optional
-`id`, and the type's own fields flat on the object. The `on` key belongs to this tool's input
-only: `kangentic.json` stores the same rows in one array per trigger and has no `on` key (see
+Each entry takes `name` (required, unique within its list ignoring case), `type`, an optional
+`appliesTo` (`"regular"` by default, or `"change"`), an optional `on` (`enter` by default, or
+`turn_end` or `exit`), an optional `enabled` (true by default), an optional `condition` or
+`finalLine` and an optional `maxRuns` (all off by default), an optional `id`, and the type's own
+fields flat on the object. Regular and Change may share a name. The `on` key belongs to this
+tool's input only: `kangentic.json` stores the same rows in one array per trigger under the
+column, with change-card rows nested under `change`, and has no `on` key (see
 [Configuration cascade](../../settings/cascade.md#column-automations)).
 
 ```json
@@ -205,6 +211,7 @@ to the same [running-work guard](task-tools.md#running-work-guard) as `kangentic
 | `column` | string | Yes | Column the automation belongs to (case-insensitive) |
 | `automation` | string | Yes | Automation name on that column (case-insensitive) |
 | `task` | string | Yes | Task ID (numeric display ID or UUID) to run it against |
+| `appliesTo` | string | No | `"regular"` or `"change"` when both lists share the name. Omit to use the list that matches the task, or the only match. |
 | `project` | string | No | Project name or UUID. Omit for the active project. |
 
 Current state, not the state of the move that first ran it. A task can have moved twice since a

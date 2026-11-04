@@ -43,6 +43,7 @@ import { agentRegistry } from '../agent/agent-registry';
 import { AgentCliNotFoundError } from '../agent/shared/agent-cli-not-found';
 import { appendCallerSession } from '../agent/mcp-http/caller-url';
 import { getDevPortForTask } from '../dev-ports/dev-port-allocator';
+import { loadOpenspecXmlForTask } from '../openspec/openspec-xml';
 import { retireRecord } from './session-lifecycle';
 import { resolveEffectivePermissionMode } from './spawn-preamble';
 import { resolveSpawnIntent } from './spawn-intent';
@@ -289,24 +290,33 @@ export class TransitionEngine {
   async resumeSuspendedSession(task: Task, permissionOverride?: PermissionMode | null, skipPromptTemplate?: boolean, resumePrompt?: string, signal?: AbortSignal, agentOverride?: string, handoffPromptPrefix?: string, spawnOverrides?: SpawnOverrides): Promise<SpawnOutcome> {
     signal?.throwIfAborted();
     const attachmentPaths = this.attachmentRepo?.getPathsForTask(task.id) ?? [];
+    const engineConfig = this.getConfig();
     // {{task_xml}} wraps title/description in a <task> envelope (Anthropic +
     // OpenAI guidance for clear data/instruction boundaries). The XML body
     // uses the RAW description so multi-line markdown content survives end
     // to end - quoteArg's `multiline: true` opt-in keeps newlines through
     // shell delivery. The legacy `{{description}}` prose var stays sanitized
     // so user-customized single-line templates don't break.
+    // {{openspec_xml}} is pre-loaded because resolvers are sync and git show
+    // is not. Regular cards skip git and resolve empty.
+    const openspecXml = await loadOpenspecXmlForTask({
+      task,
+      projectPath: engineConfig.projectPath,
+      defaultBranch: engineConfig.gitConfig.defaultBaseBranch,
+    });
     const templateVars = resolveTaskTemplateVars({
       task,
-      defaultBaseBranch: this.getConfig().gitConfig.defaultBaseBranch,
+      defaultBaseBranch: engineConfig.gitConfig.defaultBaseBranch,
       attachmentPaths,
       devPort: getDevPortForTask(task.id),
-      projectPath: this.getConfig().projectPath,
-      projectName: this.getConfig().projectName ?? null,
+      projectPath: engineConfig.projectPath,
+      projectName: engineConfig.projectName ?? null,
       // A spawn prompt is not a move, so the four move keywords resolve empty
       // here and the picker does not offer them in this context.
       move: null,
       // A workflow task's <workflow> block; null for every other task.
-      workflow: readWorkflowPromptFacts(task, this.getConfig().projectId),
+      workflow: readWorkflowPromptFacts(task, engineConfig.projectId),
+      openspecXml,
     });
     return this.executeSpawnAgent({
       promptTemplate: skipPromptTemplate ? undefined : DEFAULT_SPAWN_PROMPT_TEMPLATE,
@@ -370,9 +380,9 @@ export class TransitionEngine {
    */
   agentStartsFirstOnEnter(column: Pick<Swimlane, 'id'>, appliesTo: AutomationAppliesTo = 'regular'): boolean {
     if (!this.automationRepo) return true;
-    // Defaults to the regular list: this helper has no task, and the spawn
-    // path that calls it (agent-spawn.ts) is owned by a sibling lane. Pass
-    // `appliesToForTask(task)` once that caller has a change card.
+    // Defaults to the regular list when the caller has no task. The spawn
+    // path that calls it (createEarlyAgentLauncher) passes
+    // `appliesToForTask(task)` so a change card reads the change list.
     const first = this.automationRepo.getForTrigger(column.id, 'enter', appliesTo)[0];
     return first === undefined || automationNeedsAgent(first.type);
   }
@@ -631,6 +641,11 @@ export class TransitionEngine {
     spawnOverrides?: SpawnOverrides,
   ): Promise<SpawnOutcome> {
     const engineConfig = this.getConfig();
+    const openspecXml = await loadOpenspecXmlForTask({
+      task,
+      projectPath: engineConfig.projectPath,
+      defaultBranch: engineConfig.gitConfig.defaultBaseBranch,
+    });
     const templateVars = resolveTaskTemplateVars({
       task,
       defaultBaseBranch: engineConfig.gitConfig.defaultBaseBranch,
@@ -640,6 +655,7 @@ export class TransitionEngine {
       projectName: engineConfig.projectName ?? null,
       move: null,
       workflow: readWorkflowPromptFacts(task, engineConfig.projectId),
+      openspecXml,
     });
     return this.executeSpawnAgent(config, task, templateVars, permissionOverride, undefined, signal, agentOverride, undefined, spawnOverrides);
   }

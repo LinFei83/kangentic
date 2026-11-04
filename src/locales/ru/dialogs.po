@@ -634,6 +634,11 @@ msgstr "Не удалось обновить из {baseBranch}"
 msgid "Cancel"
 msgstr "Отмена"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Change"
+msgstr ""
+
 #: src/renderer/components/dialogs/LeftoverProcessesDialog.tsx
 #, fuzzy
 msgid "Change in Settings"
@@ -1214,6 +1219,11 @@ msgstr "Отменить"
 msgid "Discard unsaved changes?"
 msgstr "Отменить несохранённые изменения?"
 
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Discuss"
+msgstr ""
+
 #: src/renderer/components/dialogs/ConfirmDialog.tsx
 #, fuzzy
 msgid "Don't ask again"
@@ -1362,6 +1372,10 @@ msgstr "Развернуть все"
 #, fuzzy
 msgid "Expand changes"
 msgstr "Развернуть изменения"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/changes/FileTreePanel.tsx
 #, fuzzy
@@ -1571,6 +1585,10 @@ msgstr "Предпросмотр изображения"
 #, fuzzy
 msgid "Image sent at lower quality"
 msgstr "Изображение отправлено в сниженном качестве"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Implement on the current board path. No OpenSpec change."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/CompletedChangesEmpty.tsx
 #, fuzzy
@@ -2173,6 +2191,10 @@ msgstr "Открыть папку рабочего дерева"
 msgid "Opens this part of the conversation"
 msgstr "Открывает эту часть диалога"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "OpenSpec change cards. Empty means nothing runs."
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Other tasks wait in this column and start in the order they arrived."
 msgstr ""
@@ -2374,6 +2396,11 @@ msgstr "Выполните rebase или merge в сеансе."
 #, fuzzy
 msgid "Refresh PR"
 msgstr "Обновить PR"
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Regular"
+msgstr ""
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 #, fuzzy
@@ -3340,6 +3367,10 @@ msgstr "Куда перемещается задача, когда агент в
 msgid "Whether you approve each plan or Kangentic does. A workflow task can override it for itself."
 msgstr "Кто утверждает каждый план: вы или Kangentic. Задача в рабочем процессе может переопределить это для себя."
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Which cards these automations run for"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Which conversation this column uses"
 msgstr ""
@@ -3358,6 +3389,19 @@ msgstr "Примеры подстановочных знаков. {rows}"
 #, fuzzy
 msgid "Window limit reached"
 msgstr "Достигнут лимит окон"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Work"
+msgstr ""
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Work and discuss cards."
+msgstr ""
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Work or discuss"
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 #, fuzzy

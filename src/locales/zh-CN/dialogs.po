@@ -515,6 +515,11 @@ msgstr "无法从 {baseBranch} 更新"
 msgid "Cancel"
 msgstr "取消"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Change"
+msgstr ""
+
 #: src/renderer/components/dialogs/LeftoverProcessesDialog.tsx
 msgid "Change in Settings"
 msgstr "在设置中更改"
@@ -989,6 +994,11 @@ msgstr "丢弃"
 msgid "Discard unsaved changes?"
 msgstr "丢弃未保存的更改？"
 
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Discuss"
+msgstr ""
+
 #: src/renderer/components/dialogs/ConfirmDialog.tsx
 msgid "Don't ask again"
 msgstr "不再询问"
@@ -1110,6 +1120,10 @@ msgstr "全部展开"
 #: src/renderer/components/dialogs/task-detail/changes/ChangesPanel.tsx
 msgid "Expand changes"
 msgstr "展开更改"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/changes/FileTreePanel.tsx
 msgctxt "column header"
@@ -1279,6 +1293,10 @@ msgstr "图像预览"
 #: src/renderer/components/dialogs/image-compress.ts
 msgid "Image sent at lower quality"
 msgstr "图片已按较低质量发送"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Implement on the current board path. No OpenSpec change."
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/CompletedChangesEmpty.tsx
 msgid "Indexing is off, so no commits are linked"
@@ -1768,6 +1786,10 @@ msgstr "打开工作树文件夹"
 msgid "Opens this part of the conversation"
 msgstr "打开对话的此部分"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "OpenSpec change cards. Empty means nothing runs."
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Other tasks wait in this column and start in the order they arrived."
 msgstr ""
@@ -1933,6 +1955,11 @@ msgstr "请改为在会话中变基或合并。"
 #: src/renderer/components/dialogs/task-detail/TaskDetailHeader.tsx
 msgid "Refresh PR"
 msgstr "刷新 PR"
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgctxt "automation list"
+msgid "Regular"
+msgstr ""
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Removal staged"
@@ -2718,6 +2745,10 @@ msgstr "智能体退出计划模式后，任务去往何处。"
 msgid "Whether you approve each plan or Kangentic does. A workflow task can override it for itself."
 msgstr "每个计划由你批准，还是由 Kangentic 批准。工作流任务可为自身覆盖此设置。"
 
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Which cards these automations run for"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Which conversation this column uses"
 msgstr ""
@@ -2733,6 +2764,19 @@ msgstr "通配符示例。{rows}"
 #: src/renderer/components/dialogs/task-detail/changes/open-file-window.ts
 msgid "Window limit reached"
 msgstr "窗口数量已达上限"
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgctxt "task intent"
+msgid "Work"
+msgstr ""
+
+#: src/renderer/components/dialogs/board-manager/AutomationsPane.tsx
+msgid "Work and discuss cards."
+msgstr ""
+
+#: src/renderer/components/dialogs/NewTaskDialog.tsx
+msgid "Work or discuss"
+msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 msgid "Workflow step"

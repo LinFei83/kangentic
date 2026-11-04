@@ -252,6 +252,39 @@ describe('automation MCP commands', () => {
       expect(automations.listForColumn(executingId())).toHaveLength(0);
     });
 
+    it('allows the same name on the regular and change lists', () => {
+      const response = handleSetAutomations({
+        column: 'Executing',
+        automations: [
+          { name: 'Message', type: 'send_message', message: '/code-review' },
+          { name: 'Message', type: 'send_message', message: '/opsx-apply', appliesTo: 'change' },
+        ],
+      }, context);
+
+      expect(response.success).toBe(true);
+      const rows = automations.listForColumn(executingId());
+      expect(rows).toHaveLength(2);
+      expect(rows.find((row) => row.applies_to === 'regular')).toMatchObject({
+        name: 'Message',
+        config: { message: '/code-review' },
+      });
+      expect(rows.find((row) => row.applies_to === 'change')).toMatchObject({
+        name: 'Message',
+        config: { message: '/opsx-apply' },
+      });
+    });
+
+    it('refuses an unknown appliesTo and saves nothing', () => {
+      const response = handleSetAutomations({
+        column: 'Executing',
+        automations: [{ name: 'Review', type: 'send_message', message: '/a', appliesTo: 'both' }],
+      }, context);
+
+      expect(response.success).toBe(false);
+      expect(response.error).toContain('appliesTo');
+      expect(automations.listForColumn(executingId())).toHaveLength(0);
+    });
+
     it('refuses a nameless row and saves nothing', () => {
       const response = handleSetAutomations({
         column: 'Executing',
@@ -500,7 +533,31 @@ describe('automation MCP commands', () => {
       expect(response.message).toContain('Review');
       expect(response.message).toContain('send_message');
       const rows = (response.data as { automations: Array<Record<string, unknown>> }).automations;
-      expect(rows[0]).toMatchObject({ name: 'Review', type: 'send_message', on: 'enter', message: '/code-review' });
+      expect(rows[0]).toMatchObject({
+        name: 'Review',
+        type: 'send_message',
+        on: 'enter',
+        message: '/code-review',
+        appliesTo: 'regular',
+      });
+    });
+
+    it('lists Regular and Change separately when both exist', () => {
+      handleSetAutomations({
+        column: 'Executing',
+        automations: [
+          { name: 'Message', type: 'send_message', message: '/regular' },
+          { name: 'Message', type: 'send_message', message: '/change', appliesTo: 'change' },
+        ],
+      }, context);
+
+      const response = handleListAutomations({ column: 'Executing' }, context);
+      expect(response.message).toContain('Regular:');
+      expect(response.message).toContain('Change:');
+      const rows = (response.data as { automations: Array<Record<string, unknown>> }).automations;
+      expect(rows).toHaveLength(2);
+      expect(rows.find((row) => row.appliesTo === 'regular')).toMatchObject({ message: '/regular' });
+      expect(rows.find((row) => row.appliesTo === 'change')).toMatchObject({ message: '/change' });
     });
 
     it('reads the whole board when no column is named', () => {
@@ -831,6 +888,38 @@ describe('automation MCP commands', () => {
       );
       expect(response.success).toBe(false);
       expect(response.error).toContain('not available');
+    });
+
+    it('runs the list that matches the task when Regular and Change share a name', async () => {
+      handleSetAutomations({
+        column: 'Executing',
+        automations: [
+          { name: 'Review', type: 'send_message', message: '/regular' },
+          { name: 'Review', type: 'send_message', message: '/change', appliesTo: 'change' },
+        ],
+      }, context);
+      const columnId = executingId();
+      const now = '2026-11-04T00:00:00.000Z';
+      db.prepare('INSERT INTO tasks (id, title, description, swimlane_id, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run('task-regular', 'Regular task', '', columnId, 0, now, now);
+      db.prepare('INSERT INTO tasks (id, title, description, swimlane_id, position, created_at, updated_at, card_kind, openspec_change) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run('task-change', 'Change task', '', columnId, 1, now, now, 'change', 'add-login');
+      const listed = handleListAutomations({ column: 'Executing' }, context);
+      const listedRows = (listed.data as { automations: Array<{ id: string; appliesTo: string }> }).automations;
+      const regularId = listedRows.find((row) => row.appliesTo === 'regular')?.id;
+      const changeId = listedRows.find((row) => row.appliesTo === 'change')?.id;
+
+      await handleRunAutomation({ column: 'Executing', automation: 'Review', task: 'task-regular' }, context);
+      expect(runAutomation).toHaveBeenCalledWith(regularId, 'task-regular');
+      runAutomation.mockClear();
+      await handleRunAutomation({ column: 'Executing', automation: 'Review', task: 'task-change' }, context);
+      expect(runAutomation).toHaveBeenCalledWith(changeId, 'task-change');
+      runAutomation.mockClear();
+      await handleRunAutomation(
+        { column: 'Executing', automation: 'Review', task: 'task-regular', appliesTo: 'change' },
+        context,
+      );
+      expect(runAutomation).toHaveBeenCalledWith(changeId, 'task-regular');
     });
   });
 });

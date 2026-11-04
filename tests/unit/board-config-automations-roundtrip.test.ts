@@ -12,6 +12,8 @@
  * Real better-sqlite3, the driver production uses.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import type DatabaseType from 'better-sqlite3';
 import type { AutomationWriteInput, BoardColumnAutomations, BoardColumnConfig, BoardConfig } from '../../src/shared/types';
 
@@ -1086,5 +1088,60 @@ describe('planColumnAutomations with a malformed container', () => {
     expect(nullAutomations.keepExisting).toBe(false);
     expect(nullAutomations.rows).toEqual([]);
     expect(nullAutomations.warnings).toEqual([]);
+  });
+});
+
+describe('this repo kangentic.json OpenSpec change lists', () => {
+  const config = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, '../../kangentic.json'), 'utf8'),
+  ) as BoardConfig;
+
+  function columnNamed(name: string): BoardColumnConfig {
+    const found = config.columns.find((entry) => entry.name === name);
+    if (!found) throw new Error(`missing column ${name}`);
+    return found;
+  }
+
+  it('leaves To Do and Planning with no change list and no auto-propose', () => {
+    expect(columnNamed('To Do').automations).toBeUndefined();
+    expect(columnNamed('Planning').automations).toBeUndefined();
+  });
+
+  it('copies Executing, Code Review and Testing regular lists onto change', () => {
+    for (const name of ['Executing', 'Code Review', 'Testing']) {
+      const automations = columnNamed(name).automations;
+      expect(automations?.change?.onEnter).toEqual(automations?.onEnter);
+      expect(automations?.change?.onTurnEnd).toEqual(automations?.onTurnEnd);
+      expect(automations?.change?.onExit).toEqual(automations?.onExit);
+    }
+  });
+
+  it('archives a Merge change card after PR: merged, then Done on OpenSpec: archived', () => {
+    const merge = columnNamed('Merge').automations;
+    expect(merge?.onTurnEnd).toEqual([
+      {
+        name: 'Finish',
+        type: 'move_to_column',
+        finalLine: 'PR: merged',
+        maxRuns: 1,
+        targetColumn: 'Done',
+      },
+    ]);
+    expect(merge?.change?.onEnter).toEqual(merge?.onEnter);
+    const changeTurnEnd = merge?.change?.onTurnEnd ?? [];
+    expect(changeTurnEnd[0]).toMatchObject({
+      name: 'Archive OpenSpec change',
+      type: 'send_message',
+      finalLine: 'PR: merged',
+      maxRuns: 1,
+    });
+    expect(String(changeTurnEnd[0]?.message)).toContain('/opsx-archive');
+    expect(changeTurnEnd[1]).toMatchObject({
+      name: 'Finish',
+      type: 'move_to_column',
+      finalLine: 'OpenSpec: archived',
+      maxRuns: 1,
+      targetColumn: 'Done',
+    });
   });
 });

@@ -78,6 +78,13 @@ export interface TaskTemplateContext {
    * call site that forgot it would resolve it empty with nothing to say so.
    */
   workflow: WorkflowXmlInput | null;
+  /**
+   * Pre-loaded `{{openspec_xml}}` for a change-card spawn. Callers fill this
+   * asynchronously (`loadOpenspecXmlForTask`) because resolvers stay sync.
+   * Omitted or empty is a regular card, or a spawn that has not loaded yet,
+   * which drop-and-collapse removes.
+   */
+  openspecXml?: string | null;
 }
 
 type TaskTemplateResolver = (ctx: TaskTemplateContext) => string;
@@ -95,9 +102,10 @@ export const TASK_TEMPLATE_RESOLVERS: Record<TaskTemplateVarName, TaskTemplateRe
   // A leading newline so it sits on its own line after `{{task_xml}}` in the
   // default prompt; empty (and dropped) for a task outside a workflow.
   workflow_xml: ({ workflow }) => (workflow ? `\n${buildWorkflowXml(workflow)}` : ''),
-  // Wave 0 stub: empty so drop-and-collapse removes it on a regular card.
-  // Wave 2 (or 1B) fills this from default-branch `git show` of the change.
-  openspec_xml: () => '',
+  // Pre-loaded on the spawn path from default-branch git. Empty (and dropped)
+  // for a regular card, a missing change, or a sync interpolator that did
+  // not load it (column automations).
+  openspec_xml: ({ openspecXml }) => openspecXml ?? '',
   title: ({ task }) => sanitizeForPty(task.title),
   description: ({ task }) => {
     const clean = sanitizeForPty(task.description);

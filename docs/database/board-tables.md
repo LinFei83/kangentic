@@ -237,6 +237,11 @@ it. `openspec_change` is the change directory name on a change card, and the sca
 `openspecNoteDescriptor`. Both OpenSpec columns are NULL on a regular card. Existing rows default
 to a regular work card with no OpenSpec fields.
 
+The scan reads default-branch committed `openspec/changes/` only. Uncommitted files do not create
+cards. Archive stamps `archived` and does not move the card to Done. Missing OpenSpec CLI still
+creates the card with `missing`. This first version does not hard-block drags for a note. See
+[OpenSpec board cards](../integrations/openspec.md).
+
 ## schema_meta table
 
 Key/value flags for data migrations that cannot answer "have I run" from the data itself.

@@ -386,6 +386,17 @@ describe('createEarlyAgentLauncher: what it will not launch', () => {
     expect(sessionRepositoryState.getLatestForTask).toHaveBeenCalledWith(TASK_ID);
     expect(engineSpies.agentStartsFirstOnEnter).toHaveBeenCalledTimes(1);
     expect(engineSpies.agentStartsFirstOnEnter.mock.calls[0][0]).toMatchObject({ id: LANE_ID });
+    expect(engineSpies.agentStartsFirstOnEnter.mock.calls[0][1]).toBe('regular');
+    expect(engineSpies.launchEarlyAgent).not.toHaveBeenCalled();
+  });
+
+  it('asks the change list when the task is a change card', async () => {
+    engineSpies.agentStartsFirstOnEnter.mockReturnValue(false);
+    const { launch } = buildLauncher({ task: makeTask({ card_kind: 'change' }) });
+
+    await expect(launch(WORKTREE_PATH)).resolves.toBeNull();
+
+    expect(engineSpies.agentStartsFirstOnEnter.mock.calls[0][1]).toBe('change');
     expect(engineSpies.launchEarlyAgent).not.toHaveBeenCalled();
   });
 

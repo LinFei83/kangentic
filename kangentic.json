@@ -14,9 +14,12 @@
       "icon": "map",
       "color": "#8b5cf6",
       "autoSpawn": true,
-      "permissionMode": "plan",
-      "modelOverride": "opus",
+      "permissionMode": "acceptEdits",
+      "agentOverride": "cursor",
+      "modelOverride": "cursor-grok-4.6-high",
       "effortOverride": "high",
+      "sessionTarget": "isolated",
+      "sessionSpawnStrategy": "always_spawn_new",
       "planApproval": "automatic",
       "planExitTarget": "Executing"
     },
@@ -25,8 +28,8 @@
       "name": "Executing",
       "icon": "square-terminal",
       "autoSpawn": true,
-      "permissionMode": "auto",
-      "modelOverride": "opus",
+      "permissionMode": "acceptEdits",
+      "modelOverride": "cursor-grok-4.6-high",
       "effortOverride": "high",
       "automations": {
         "onTurnEnd": [
@@ -42,7 +45,23 @@
             "type": "send_message",
             "message": "Check your last message for findings, recommendations or follow-up changes you have not applied yet, and apply them here in this task, not as follow-up tasks. Skip anything already filed as a task on the board, and never delete or move one. Where one needs a decision, take your recommended option and name the alternative. If there are none, say so. Either way, end your turn with a short summary and the line \"Findings: applied\"."
           }
-        ]
+        ],
+        "change": {
+          "onTurnEnd": [
+            {
+              "name": "On to Code Review",
+              "type": "move_to_column",
+              "finalLine": "Findings: applied",
+              "maxRuns": 4,
+              "targetColumn": "Code Review"
+            },
+            {
+              "name": "Apply findings",
+              "type": "send_message",
+              "message": "Check your last message for findings, recommendations or follow-up changes you have not applied yet, and apply them here in this task, not as follow-up tasks. Skip anything already filed as a task on the board, and never delete or move one. Where one needs a decision, take your recommended option and name the alternative. If there are none, say so. Either way, end your turn with a short summary and the line \"Findings: applied\"."
+            }
+          ]
+        }
       }
     },
     {
@@ -51,8 +70,8 @@
       "icon": "code",
       "color": "#f59e0b",
       "autoSpawn": true,
-      "permissionMode": "auto",
-      "modelOverride": "opus",
+      "permissionMode": "acceptEdits",
+      "modelOverride": "cursor-grok-4.6-high",
       "effortOverride": "high",
       "sessionTarget": "isolated",
       "sessionSpawnStrategy": "always_spawn_new",
@@ -81,7 +100,34 @@
             "maxRuns": 1,
             "targetColumn": "Testing"
           }
-        ]
+        ],
+        "change": {
+          "onEnter": [
+            {
+              "name": "Message",
+              "type": "send_message",
+              "message": "/code-review {{baseBranch}}",
+              "mode": "immediate"
+            }
+          ],
+          "onTurnEnd": [
+            {
+              "name": "Back for revisions",
+              "type": "move_to_column",
+              "finalLine": "Verdict: Blocked",
+              "maxRuns": 3,
+              "targetColumn": "Executing",
+              "message": "Code Review sent this back. Do the numbered steps above its verdict, commit, then end your turn.\n\n{{agentReply}}"
+            },
+            {
+              "name": "On to Testing",
+              "type": "move_to_column",
+              "finalLine": "Verdict: Ready",
+              "maxRuns": 1,
+              "targetColumn": "Testing"
+            }
+          ]
+        }
       }
     },
     {
@@ -90,8 +136,8 @@
       "icon": "flask-conical",
       "color": "#06b6d4",
       "autoSpawn": true,
-      "permissionMode": "auto",
-      "modelOverride": "sonnet",
+      "permissionMode": "acceptEdits",
+      "modelOverride": "cursor-grok-4.6-high",
       "effortOverride": "high",
       "automations": {
         "onEnter": [
@@ -110,7 +156,26 @@
             "maxRuns": 1,
             "targetColumn": "Merge"
           }
-        ]
+        ],
+        "change": {
+          "onEnter": [
+            {
+              "name": "Message",
+              "type": "send_message",
+              "message": "/pull-request",
+              "mode": "immediate"
+            }
+          ],
+          "onTurnEnd": [
+            {
+              "name": "On to Merge",
+              "type": "move_to_column",
+              "finalLine": "PR: ready to merge",
+              "maxRuns": 1,
+              "targetColumn": "Merge"
+            }
+          ]
+        }
       }
     },
     {
@@ -119,8 +184,8 @@
       "icon": "merge",
       "color": "#f97316",
       "autoSpawn": true,
-      "permissionMode": "auto",
-      "modelOverride": "sonnet",
+      "permissionMode": "acceptEdits",
+      "modelOverride": "cursor-grok-4.6-high",
       "effortOverride": "high",
       "automations": {
         "onEnter": [
@@ -139,7 +204,34 @@
             "maxRuns": 1,
             "targetColumn": "Done"
           }
-        ]
+        ],
+        "change": {
+          "onEnter": [
+            {
+              "name": "Message",
+              "type": "send_message",
+              "message": "/merge-pull-request",
+              "mode": "immediate"
+            }
+          ],
+          "onTurnEnd": [
+            {
+              "name": "Archive OpenSpec change",
+              "type": "send_message",
+              "finalLine": "PR: merged",
+              "maxRuns": 1,
+              "mode": "immediate",
+              "message": "/opsx-archive\n\nWhen the OpenSpec change is archived, or was already archived, end your turn with the line \"OpenSpec: archived\"."
+            },
+            {
+              "name": "Finish",
+              "type": "move_to_column",
+              "finalLine": "OpenSpec: archived",
+              "maxRuns": 1,
+              "targetColumn": "Done"
+            }
+          ]
+        }
       }
     },
     {
@@ -150,5 +242,5 @@
       "color": "#10b981"
     }
   ],
-  "_modifiedBy": "7ef4fd0cb484"
+  "_modifiedBy": "bbb843c69b13"
 }
