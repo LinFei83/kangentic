@@ -45,6 +45,13 @@ const ALLOWED_FS_WATCH_SITES: Record<string, { calls: number; reason: string }> 
       + 'sit on paths a worktree removal destroys, so they are released ahead of '
       + 'the delete via releaseUnder, driven by setWorktreeRemovingListener.',
   },
+  'openspec/head-watcher.ts': {
+    calls: 2,
+    reason:
+      'Git dir HEAD/packed-refs plus logs/HEAD, mirroring DiffWatcher metadata '
+      + 'without the working-tree watch. Released by openspecScanScheduler.stop '
+      + 'on project switch, delete, relocate, and shutdown.',
+  },
   'mobile-bridge/dev-quick-pair.ts': {
     calls: 1,
     reason:

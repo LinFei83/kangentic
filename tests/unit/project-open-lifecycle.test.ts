@@ -215,6 +215,10 @@ vi.mock('../../src/main/git/git-fetch-scheduler', () => ({
   gitFetchScheduler: { startForProject: vi.fn(), stop: vi.fn() },
 }));
 
+vi.mock('../../src/main/openspec/scan-scheduler', () => ({
+  openspecScanScheduler: { startForProject: vi.fn(), stop: vi.fn() },
+}));
+
 vi.mock('../../src/main/retrieval/retrieval-service', () => ({
   retrievalService: { startForProject: vi.fn(), stop: vi.fn(), reconcileEmbedWorker: vi.fn() },
 }));
@@ -295,6 +299,7 @@ import { reportHandledError } from '../../src/main/analytics/error-reporting';
 import fs from '../../src/main/git/original-fs';
 import { isShuttingDown } from '../../src/main/shutdown-state';
 import { gitFetchScheduler } from '../../src/main/git/git-fetch-scheduler';
+import { openspecScanScheduler } from '../../src/main/openspec/scan-scheduler';
 import { getProjectDb, getExistingProjectDb } from '../../src/main/db/database';
 import { retrievalClient } from '../../src/main/retrieval/retrieval-client';
 import { repairToolBreakdownDurations } from '../../src/main/ipc/helpers/tool-breakdown-repair';
@@ -555,6 +560,11 @@ describe('PROJECT_OPEN cold-open block (registerProjectHandlers)', () => {
 
     expect(vi.mocked(gitFetchScheduler.startForProject)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(gitFetchScheduler.startForProject)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: project.id, path: project.path }),
+    );
+    expect(vi.mocked(openspecScanScheduler.startForProject)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(openspecScanScheduler.startForProject)).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ id: project.id, path: project.path }),
     );
@@ -964,6 +974,7 @@ describe('PROJECT_OPEN cold-open block (registerProjectHandlers)', () => {
     await cleanupProject(asIpcContext(context), project.id, project.path);
 
     expect(vi.mocked(gitFetchScheduler.stop)).toHaveBeenCalledWith(project.id);
+    expect(vi.mocked(openspecScanScheduler.stop)).toHaveBeenCalledWith(project.id);
   });
 
   it('cleanupProject takes a project whose folder is gone out of its workflows, and ends its workflow agents', async () => {

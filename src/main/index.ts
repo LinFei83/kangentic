@@ -88,6 +88,7 @@ import type { PtyKillReport } from './pty/shutdown/session-shutdown';
 import { isProcessAlive } from './shared/process-liveness';
 import { prRefreshScheduler } from './pr/pr-refresh-scheduler';
 import { gitFetchScheduler } from './git/git-fetch-scheduler';
+import { openspecScanScheduler } from './openspec/scan-scheduler';
 import { retrievalService } from './retrieval/retrieval-service';
 import { lineCountClient } from './git/line-count/line-count-client';
 import { retrievalClient } from './retrieval/retrieval-client';
@@ -2511,6 +2512,7 @@ function getShutdownDependencies() {
       // .unref()'d, but clear them explicitly so no tick fires mid-shutdown).
       prRefreshScheduler.stop();
       gitFetchScheduler.stop();
+      openspecScanScheduler.stop();
       // Stop conversation-memory indexing synchronously: drop pending finalize
       // timers and abandon any in-flight sweep (recovered on next open).
       retrievalService.dispose();

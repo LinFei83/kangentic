@@ -42,6 +42,7 @@ import { isShuttingDown } from '../../shutdown-state';
 import { runWithProjectLogContext } from '../../diagnostics/project-log-context';
 import { prRefreshScheduler } from '../../pr/pr-refresh-scheduler';
 import { gitFetchScheduler } from '../../git/git-fetch-scheduler';
+import { openspecScanScheduler } from '../../openspec/scan-scheduler';
 import { retrievalService } from '../../retrieval/retrieval-service';
 import { retrievalClient } from '../../retrieval/retrieval-client';
 import { repairToolBreakdownDurations } from '../helpers/tool-breakdown-repair';
@@ -144,6 +145,7 @@ export async function cleanupProject(context: IpcContext, projectId: string, pro
   // paths tear them down.
   prRefreshScheduler.stop(projectId);
   gitFetchScheduler.stop(projectId);
+  openspecScanScheduler.stop(projectId);
   retrievalService.stop(projectId);
   // Its toasts would name tasks of a board that no longer exists.
   clearConversationExpired(projectId);
@@ -1104,6 +1106,7 @@ export function registerProjectHandlers(context: IpcContext): void {
     // PR merged off-app while away is reflected on return; the sweep is deferred
     // off the IPC critical path and the queue is torn down on switch/delete/shutdown.
     prRefreshScheduler.startForProject(context, project);
+    openspecScanScheduler.startForProject(context, project);
 
     // Background remote-tracking refresh, same lifecycle: an immediate deferred
     // `git fetch --all --prune` so every "behind" count is measured against
@@ -1191,6 +1194,9 @@ export function registerProjectHandlers(context: IpcContext): void {
   });
 
   ipcMain.handle(IPC.PROJECT_RELOCATE, async (_, id: string, newPath: string, options?: ProjectRelocateOptions) => {
+    // Release the OpenSpec HEAD watch before the folder moves. Windows cannot
+    // rename a directory while fs.watch holds a handle inside it.
+    openspecScanScheduler.stop(id);
     return relocateProject(context, id, newPath, options);
   });
 

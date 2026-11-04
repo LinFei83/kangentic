@@ -121,6 +121,10 @@ vi.mock('../../src/main/git/git-fetch-scheduler', () => ({
   gitFetchScheduler: { startForProject: vi.fn(), stop: vi.fn() },
 }));
 
+vi.mock('../../src/main/openspec/scan-scheduler', () => ({
+  openspecScanScheduler: { startForProject: vi.fn(), stop: vi.fn() },
+}));
+
 vi.mock('../../src/main/retrieval/retrieval-service', () => ({
   retrievalService: { startForProject: vi.fn(), stop: vi.fn(), reconcileEmbedWorker: vi.fn() },
 }));
