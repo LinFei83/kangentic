@@ -1000,7 +1000,7 @@ describe('the workflow step and the turn it judged', () => {
       // The rows of this column, for this trigger: not another column's, and not
       // the enter or exit rows, which say nothing about where a turn end sends the task.
       expect(hoisted.getForTrigger).toHaveBeenCalledTimes(1);
-      expect(hoisted.getForTrigger).toHaveBeenCalledWith('lane-review', 'turn_end');
+      expect(hoisted.getForTrigger).toHaveBeenCalledWith('lane-review', 'turn_end', 'regular');
     });
   });
 

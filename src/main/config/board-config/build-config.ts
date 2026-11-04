@@ -1,5 +1,5 @@
 import { SwimlaneRepository } from '../../db/repositories/swimlane-repository';
-import { AutomationRepository } from '../../db/repositories/automation-repository';
+import { AutomationRepository, normalizeAppliesTo } from '../../db/repositories/automation-repository';
 import { getProjectDb } from '../../db/database';
 import type {
   AutomationTrigger,
@@ -139,6 +139,11 @@ export function buildBoardConfigFromDb(params: {
  * several that have to be kept in step. A group with no rows is an absent key,
  * and a column with no automations at all serializes to nothing.
  *
+ * Regular-card rows (work and discuss) stay on the top-level three keys.
+ * Change-card rows sit under `change`, omitted when that list is empty. Board
+ * Profiles never overlay either list: they live in `profiles` and this builder
+ * copies that array through as-is.
+ *
  * Only fields the type actually declares are written, so a config key left
  * behind by a type change (a script's retired `workingDir`, a webhook body kept
  * while the draft was briefly a notification) does not leak into a file the team
@@ -156,7 +161,24 @@ function serializeAutomations(
   automations: ColumnAutomation[],
   existing: Record<string, unknown> | null,
 ): BoardColumnAutomations | undefined {
+  const regular = automations.filter((automation) => normalizeAppliesTo(automation.applies_to) !== 'change');
+  const changeRows = automations.filter((automation) => normalizeAppliesTo(automation.applies_to) === 'change');
+  const regularExisting = existing ? omitKey(existing, 'change') : null;
+  const changeExisting = isPlainObject(existing?.change) ? existing.change : null;
+
+  const result = serializeTriggerGroups(regular, regularExisting);
+  const change = serializeTriggerGroups(changeRows, changeExisting);
+  if (Object.keys(change).length > 0) result.change = change;
+  return Object.keys(result).length > 0 ? (result as BoardColumnAutomations) : undefined;
+}
+
+/** The three trigger arrays, plus any file keys this build does not know. */
+function serializeTriggerGroups(
+  automations: ColumnAutomation[],
+  existing: Record<string, unknown> | null,
+): Record<string, unknown> {
   const result: Record<string, unknown> = {};
+  const knownKeys = new Set<string>(Object.values(AUTOMATION_TRIGGER_FILE_KEYS));
   for (const trigger of AUTOMATION_TRIGGERS) {
     const fileKey = AUTOMATION_TRIGGER_FILE_KEYS[trigger];
     const existingGroup = Array.isArray(existing?.[fileKey]) ? (existing?.[fileKey] as unknown[]) : [];
@@ -164,12 +186,19 @@ function serializeAutomations(
     if (group.length > 0) result[fileKey] = group;
   }
   if (existing) {
-    const knownKeys = new Set<string>(Object.values(AUTOMATION_TRIGGER_FILE_KEYS));
     for (const [key, value] of Object.entries(existing)) {
       if (!knownKeys.has(key) && value !== undefined) result[key] = value;
     }
   }
-  return Object.keys(result).length > 0 ? (result as BoardColumnAutomations) : undefined;
+  return result;
+}
+
+function omitKey(record: Record<string, unknown>, key: string): Record<string, unknown> {
+  const next: Record<string, unknown> = {};
+  for (const [entryKey, value] of Object.entries(record)) {
+    if (entryKey !== key) next[entryKey] = value;
+  }
+  return next;
 }
 
 function serializeGroup(

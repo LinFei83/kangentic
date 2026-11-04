@@ -543,7 +543,7 @@ describe('agentStartsFirstOnEnter', () => {
     const { engine, automationRepo } = engineWithEnterRows([]);
 
     expect(engine.agentStartsFirstOnEnter(column)).toBe(true);
-    expect(automationRepo.getForTrigger).toHaveBeenCalledWith('column-1', 'enter');
+    expect(automationRepo.getForTrigger).toHaveBeenCalledWith('column-1', 'enter', 'regular');
   });
 
   it.each([

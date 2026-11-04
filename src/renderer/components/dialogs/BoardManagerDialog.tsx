@@ -45,7 +45,7 @@ import {
   type AutomationDraft,
   type AutomationDraftsByColumn,
 } from './board-manager/automation-drafts';
-import type { AutomationTrigger, AutomationType } from '../../../shared/types';
+import type { AutomationAppliesTo, AutomationTrigger, AutomationType } from '../../../shared/types';
 import { agentCannotApprovePlans } from '../../../shared/plan-approval';
 import { canTriggerRun } from '../../../shared/automation-manifest';
 import { translateText } from '../../i18n/translate';
@@ -1007,7 +1007,12 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
   const [automationOriginals, setAutomationOriginals] = useState<AutomationDraftsByColumn>(() => draftsByColumn(automations));
   const [automationDrafts, setAutomationDrafts] = useState<AutomationDraftsByColumn>(() => draftsByColumn(automations));
   const [editing, setEditing] = useState<{ columnId: string; rowId: string; isNew: boolean } | null>(null);
-  const [pickerOpenFor, setPickerOpenFor] = useState<{ columnId: string; trigger: AutomationTrigger; anchor: HTMLElement } | null>(null);
+  const [pickerOpenFor, setPickerOpenFor] = useState<{
+    columnId: string;
+    trigger: AutomationTrigger;
+    anchor: HTMLElement;
+    appliesTo: AutomationAppliesTo;
+  } | null>(null);
   const [automationsTouched, setAutomationsTouched] = useState(false);
   // The store refresh, during render on the render where `automations` first
   // differs from the array last synced (the same pattern as the column sync
@@ -2577,7 +2582,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
                   const before = (automationOriginals[draft.id] ?? []).find((candidate) => candidate.id === row.id);
                   return !before || isColumnDirty([before], [row]);
                 }}
-                onAdd={(trigger, anchor) => setPickerOpenFor({ columnId: draft.id, trigger, anchor })}
+                onAdd={(trigger, anchor, appliesTo) => setPickerOpenFor({ columnId: draft.id, trigger, anchor, appliesTo })}
                 onEdit={(row) => setEditing({ columnId: draft.id, rowId: row.id, isNew: false })}
                 onDelete={(row) => mutateRows(draft.id, (rows) => removeRow(rows, row.id))}
                 onToggle={(row, enabled) => mutateRows(draft.id, (rows) => setRowEnabled(rows, row.id, enabled))}
@@ -2606,7 +2611,7 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
             .map((id) => ({ column: drafts[id]!, drafts: rowsForColumn(id) }))
             .filter((entry) => entry.drafts.length > 0)}
           onPickType={(type: AutomationType) => {
-            const created = makeNewAutomation(type, pickerOpenFor.trigger);
+            const created = makeNewAutomation(type, pickerOpenFor.trigger, pickerOpenFor.appliesTo);
             mutateRows(pickerOpenFor.columnId, (rows) => appendRow(rows, created));
             // Opens straight into the dialog with the name selected: the picker
             // adds a row before it has a real name, and leaving one behind
@@ -2623,7 +2628,8 @@ export function BoardManagerDialog({ initialColumnId, seedNewDraft, addDraftRequ
               // "On enter" row from the "On exit" Add button is a normal thing
               // to do; taking `source.trigger` landed it back in On enter.
               pickerOpenFor.trigger,
-              takenNamesFor(rowsForColumn(pickerOpenFor.columnId)),
+              takenNamesFor(rowsForColumn(pickerOpenFor.columnId), undefined, pickerOpenFor.appliesTo),
+              pickerOpenFor.appliesTo,
             );
             mutateRows(pickerOpenFor.columnId, (rows) => appendRow(rows, copied));
             setPickerOpenFor(null);

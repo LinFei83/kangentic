@@ -145,7 +145,14 @@ async function readColumnRows(columnName: string): ReturnType<typeof readRows> {
 /** Seed a column's automations directly, bypassing the dialog. */
 async function seedColumn(
   columnName: string,
-  rows: Array<{ name: string; type: string; trigger: string; enabled?: boolean; config?: Record<string, unknown> }>,
+  rows: Array<{
+    name: string;
+    type: string;
+    trigger: string;
+    enabled?: boolean;
+    config?: Record<string, unknown>;
+    applies_to?: 'regular' | 'change';
+  }>,
 ): Promise<void> {
   await page.evaluate(async ({ name, seeded }) => {
     const lanes = await window.electronAPI.swimlanes.list();
@@ -162,6 +169,7 @@ async function seedColumn(
         position: 0,
         enabled: row.enabled !== false,
         config: row.config ?? {},
+        applies_to: row.applies_to === 'change' ? 'change' : 'regular',
         created_at: '',
         updated_at: '',
       })),
@@ -1094,6 +1102,51 @@ test.describe('Column automations', () => {
     const rows = await readColumnRows('Executing');
     expect(rows.sort((left, right) => left.position - right.position).map((entry) => entry.name))
       .toEqual(['Second', 'First']);
+  });
+
+  // ── Regular / Change lists ─────────────────────────────────────────────────
+
+  test('switches Regular and Change lists, and the two may share a name', async () => {
+    await seedColumn('Executing', [
+      { name: 'Review', type: 'send_message', trigger: 'enter', config: { message: '/code-review' }, applies_to: 'regular' },
+      { name: 'Review', type: 'send_message', trigger: 'enter', config: { message: '/opsx-apply' }, applies_to: 'change' },
+    ]);
+    await openColumn('Executing');
+
+    const toggle = dialog().locator('[data-testid="column-automations-applies-to"]');
+    await expect(toggle).toBeVisible();
+    await expect(dialog().locator('[data-testid="column-automations-applies-to-regular"]')).toHaveAttribute('aria-checked', 'true');
+    await expect(row('Review')).toBeVisible();
+    await expect(row('Review')).toHaveAttribute('data-applies-to', 'regular');
+    await expect(dialog().locator('[data-testid="column-automation-row"]')).toHaveCount(1);
+
+    await dialog().locator('[data-testid="column-automations-applies-to-change"]').click();
+    await expect(dialog().locator('[data-testid="column-automations-applies-to-change"]')).toHaveAttribute('aria-checked', 'true');
+    await expect(row('Review')).toBeVisible();
+    await expect(row('Review')).toHaveAttribute('data-applies-to', 'change');
+    await expect(dialog().locator('[data-testid="column-automation-row"]')).toHaveCount(1);
+  });
+
+  test('adds a Change automation without colliding with the Regular name', async () => {
+    await seedColumn('Executing', [
+      { name: 'Review', type: 'send_message', trigger: 'enter', config: { message: '/code-review' } },
+    ]);
+    await openColumn('Executing');
+
+    await dialog().locator('[data-testid="column-automations-applies-to-change"]').click();
+    await addThroughPicker('enter', 'send_message');
+    await editDialog().locator('[data-testid="edit-automation-name"]').fill('Review');
+    await editDialog().locator('[data-testid="automation-config-message"]').fill('/opsx-apply');
+    await editDialog().locator('[data-testid="edit-automation-done"]').click();
+    await expect(editDialog()).toBeHidden();
+    await expect(row('Review')).toHaveAttribute('data-applies-to', 'change');
+
+    await saveManager();
+    const rows = await readColumnRows('Executing');
+    expect(rows.map((entry) => [entry.applies_to, entry.name]).sort()).toEqual([
+      ['change', 'Review'],
+      ['regular', 'Review'],
+    ]);
   });
 
   // ── Ported: the template picker escapes the NESTED dialog ─────────────────

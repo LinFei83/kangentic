@@ -25,6 +25,7 @@ import { translateText } from '../../../i18n/translate';
 import { conditionKindsAsStored } from '../../../../shared/final-line-match';
 import { TEMPLATE_VARIABLE_PATTERN } from '../../../../shared/task-template-vars';
 import type {
+  AutomationAppliesTo,
   AutomationConfig,
   AutomationTrigger,
   AutomationType,
@@ -56,12 +57,25 @@ export interface AutomationDraft {
   final_line: string | null;
   /** Frequency: the most runs on one task. Null: no limit. */
   max_runs: number | null;
+  /**
+   * Which card kind this row runs for. Unique names are per set, so Regular
+   * and Change may share a name.
+   */
+  applies_to: AutomationAppliesTo;
 }
 
 export type AutomationDraftsByColumn = Record<string, AutomationDraft[]>;
 
 /** The groups, in the order the pane stacks them and a task meets them. */
 export const TRIGGERS: readonly AutomationTrigger[] = AUTOMATION_TRIGGERS;
+
+/** Regular (work and discuss) then Change, the order the pane's segment lists them. */
+export const APPLIES_TO_SETS: readonly AutomationAppliesTo[] = ['regular', 'change'];
+
+/** `'change'` is the change-card list; anything else (including omitted) is regular. */
+export function draftAppliesTo(draft: Pick<AutomationDraft, 'applies_to'> | undefined): AutomationAppliesTo {
+  return draft?.applies_to === 'change' ? 'change' : 'regular';
+}
 
 /**
  * A draft id no saved row can hold and no other draft can collide with.
@@ -96,6 +110,7 @@ export function toDraft(automation: ColumnAutomation): AutomationDraft {
     // its main process, so that pairing is real for one restart.
     final_line: automation.final_line ?? null,
     max_runs: automation.max_runs,
+    applies_to: automation.applies_to === 'change' ? 'change' : 'regular',
   };
 }
 
@@ -119,8 +134,15 @@ export function describeDraft(draft: AutomationDraft): string {
   return describeAutomation(draft.type, draft.config, i18n);
 }
 
-export function rowsFor(drafts: AutomationDraft[], trigger: AutomationTrigger): AutomationDraft[] {
-  return drafts.filter((draft) => draft.trigger === trigger);
+export function rowsFor(
+  drafts: AutomationDraft[],
+  trigger: AutomationTrigger,
+  appliesTo?: AutomationAppliesTo,
+): AutomationDraft[] {
+  return drafts.filter((draft) => (
+    draft.trigger === trigger
+    && (appliesTo === undefined || draftAppliesTo(draft) === appliesTo)
+  ));
 }
 
 // --- creating ---------------------------------------------------------------
@@ -133,7 +155,11 @@ export function defaultConfigForType(type: AutomationType): AutomationConfig {
   return config as AutomationConfig;
 }
 
-export function makeNewAutomation(type: AutomationType, trigger: AutomationTrigger): AutomationDraft {
+export function makeNewAutomation(
+  type: AutomationType,
+  trigger: AutomationTrigger,
+  appliesTo: AutomationAppliesTo = 'regular',
+): AutomationDraft {
   return {
     id: newDraftId(),
     // Named for the type rather than left blank: a blank name blocks Save, and
@@ -149,6 +175,7 @@ export function makeNewAutomation(type: AutomationType, trigger: AutomationTrigg
     condition: null,
     final_line: null,
     max_runs: null,
+    applies_to: appliesTo === 'change' ? 'change' : 'regular',
   };
 }
 
@@ -157,7 +184,12 @@ export function makeNewAutomation(type: AutomationType, trigger: AutomationTrigg
  * link back. The picker says so, because "copy" and "share" are the two things a
  * user could reasonably expect and only one of them is true here.
  */
-export function copyAutomation(source: AutomationDraft, trigger: AutomationTrigger, takenNames: string[]): AutomationDraft {
+export function copyAutomation(
+  source: AutomationDraft,
+  trigger: AutomationTrigger,
+  takenNames: string[],
+  appliesTo: AutomationAppliesTo = 'regular',
+): AutomationDraft {
   return {
     id: newDraftId(),
     name: uniqueName(source.name, takenNames),
@@ -168,6 +200,9 @@ export function copyAutomation(source: AutomationDraft, trigger: AutomationTrigg
     condition: source.condition,
     final_line: source.final_line,
     max_runs: source.max_runs,
+    // The set being added to, not the source's. Copying a change row into
+    // Regular makes a regular row.
+    applies_to: appliesTo === 'change' ? 'change' : 'regular',
   };
 }
 
@@ -219,11 +254,16 @@ export function moveRow(
   if (offered && !offered.includes(trigger)) return drafts;
 
   const others = drafts.filter((draft) => draft.id !== id);
-  const destination = others.filter((draft) => draft.trigger === trigger);
+  const appliesTo = draftAppliesTo(moving);
+  const destination = others.filter((draft) => draft.trigger === trigger && draftAppliesTo(draft) === appliesTo);
   const clamped = Math.max(0, Math.min(indexInGroup, destination.length));
   destination.splice(clamped, 0, { ...moving, trigger });
 
-  return TRIGGERS.flatMap((group) => (group === trigger ? destination : others.filter((draft) => draft.trigger === group)));
+  return TRIGGERS.flatMap((group) => APPLIES_TO_SETS.flatMap((set) => (
+    group === trigger && set === appliesTo
+      ? destination
+      : others.filter((draft) => draft.trigger === group && draftAppliesTo(draft) === set)
+  )));
 }
 
 /**
@@ -282,8 +322,16 @@ export function findEmptyName(drafts: AutomationDraft[]): AutomationDraft | null
   return drafts.find((draft) => draft.name.trim() === '') ?? null;
 }
 
-export function takenNamesFor(drafts: AutomationDraft[], exceptId?: string): string[] {
-  return drafts.filter((draft) => draft.id !== exceptId).map((draft) => draft.name);
+export function takenNamesFor(
+  drafts: AutomationDraft[],
+  exceptId?: string,
+  appliesTo?: AutomationAppliesTo,
+): string[] {
+  const except = exceptId ? drafts.find((draft) => draft.id === exceptId) : undefined;
+  const set = appliesTo ?? draftAppliesTo(except);
+  return drafts
+    .filter((draft) => draft.id !== exceptId && draftAppliesTo(draft) === set)
+    .map((draft) => draft.name);
 }
 
 // --- runnability and counts -------------------------------------------------
@@ -367,6 +415,7 @@ export function serializeAutomation(draft: AutomationDraft): string {
     config,
     ...draftConditionKinds(draft),
     max_runs: normalizeDraftMaxRuns(draft.max_runs),
+    applies_to: draftAppliesTo(draft),
   });
 }
 
@@ -512,6 +561,7 @@ export function toWriteInput(draft: AutomationDraft): AutomationWriteInput {
     config: config as AutomationConfig,
     ...draftConditionKinds(draft),
     max_runs: normalizeDraftMaxRuns(draft.max_runs),
+    applies_to: draftAppliesTo(draft),
   };
 }
 

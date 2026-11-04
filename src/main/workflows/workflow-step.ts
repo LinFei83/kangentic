@@ -11,6 +11,7 @@ import type { OpenBackgroundShell } from '../activity-engine/open-work-ledger';
 import { checkAutomationConditions, type ConditionCheckCall } from '../automations/condition-check/condition-check';
 import type { ConditionPromptInput, ConditionPromptRow } from '../automations/condition-check/condition-prompt';
 import { resolveMoveTarget, routeOf } from '../automations/move-target';
+import { appliesToForTask } from '../automations/automation-runner';
 import { hasFinalLine } from '../automations/row-guards';
 import {
   describeStepRoute,
@@ -223,7 +224,7 @@ export function workflowStepApplies(task: Pick<Task, 'workflow_id' | 'workflow_p
 function columnExitRows(repos: ReturnType<typeof getProjectRepos>, columns: readonly Swimlane[], column: Swimlane, task: Task): StepExitRow[] {
   const facts = { autoSpawn: column.auto_spawn, role: column.role };
   const exitRows: StepExitRow[] = [];
-  for (const row of repos.automations.getForTrigger(column.id, 'turn_end')) {
+  for (const row of repos.automations.getForTrigger(column.id, 'turn_end', appliesToForTask(task))) {
     if (!hasFinalLine(row) || !automationMovesTask(row.type) || !canColumnRun(row.type, facts, 'turn_end').ok) continue;
     const target = resolveMoveTarget(columns, column.id, automationMoveTargetName(row.type, row.config), routeOf(task));
     exitRows.push({ finalLine: row.final_line, target: target.ok ? target.column : null });

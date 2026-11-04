@@ -60,6 +60,10 @@ function draft(overrides: Partial<AutomationDraft> = {}): AutomationDraft {
     trigger: 'enter',
     enabled: true,
     config: { url: 'https://example.com' },
+    condition: null,
+    final_line: null,
+    max_runs: null,
+    applies_to: 'regular',
     ...overrides,
   };
 }
@@ -74,6 +78,10 @@ function automation(overrides: Partial<ColumnAutomation> = {}): ColumnAutomation
     position: 0,
     enabled: true,
     config: { url: 'https://example.com' },
+    condition: null,
+    final_line: null,
+    max_runs: null,
+    applies_to: 'regular',
     created_at: '2026-01-01T00:00:00.000Z',
     updated_at: '2026-01-01T00:00:00.000Z',
     ...overrides,
@@ -155,6 +163,17 @@ describe('ordering', () => {
     expect(rowsFor(moved, 'enter').map((row) => row.name)).toEqual(['Two', 'One']);
   });
 
+  it('reorders Regular without mixing in a Change row of the same trigger', () => {
+    const mixed = [
+      draft({ id: 'r1', name: 'Regular one', trigger: 'enter', applies_to: 'regular' }),
+      draft({ id: 'c1', name: 'Change one', trigger: 'enter', applies_to: 'change' }),
+      draft({ id: 'r2', name: 'Regular two', trigger: 'enter', applies_to: 'regular' }),
+    ];
+    const moved = moveRow(mixed, 'r2', 'enter', 0);
+    expect(rowsFor(moved, 'enter', 'regular').map((row) => row.name)).toEqual(['Regular two', 'Regular one']);
+    expect(rowsFor(moved, 'enter', 'change').map((row) => row.name)).toEqual(['Change one']);
+  });
+
   // The drop index is the half of a drag that a rendered test caught and no
   // type could: taking it from the group with the dragged row already removed
   // is right going UP and wrong going DOWN, so the bug hid behind half the
@@ -225,6 +244,29 @@ describe('naming', () => {
 
   it('lists the names a dialog must check against', () => {
     expect(takenNamesFor(list, 'a1')).toEqual(['Notify']);
+  });
+
+  it('treats uniqueness as per set, so Regular and Change may share a name', () => {
+    const mixed = [
+      draft({ id: 'a1', name: 'Review', applies_to: 'regular' }),
+      draft({ id: 'a2', name: 'Review', applies_to: 'change' }),
+      draft({ id: 'a3', name: 'Archive', applies_to: 'change' }),
+    ];
+
+    expect(takenNamesFor(mixed, 'a1')).toEqual([]);
+    expect(takenNamesFor(mixed, 'a2')).toEqual(['Archive']);
+    expect(takenNamesFor(mixed, undefined, 'change')).toEqual(['Review', 'Archive']);
+    expect(findNameConflict(
+      takenNamesFor(mixed, 'a1').map((name, index) => ({ id: `taken:${index}`, name })),
+      'Review',
+    )).toBeNull();
+  });
+
+  it('stamps a new row and a copy with the destination set', () => {
+    expect(makeNewAutomation('webhook', 'enter').applies_to).toBe('regular');
+    expect(makeNewAutomation('webhook', 'enter', 'change').applies_to).toBe('change');
+    const copied = copyAutomation(draft({ applies_to: 'change' }), 'enter', [], 'regular');
+    expect(copied.applies_to).toBe('regular');
   });
 });
 
@@ -349,6 +391,11 @@ describe('saving', () => {
     const created = makeNewAutomation('webhook', 'enter');
     expect(toWriteInput(created).id).toBeUndefined();
     expect(toWriteInput(draft({ id: 'a1' })).id).toBe('a1');
+  });
+
+  it('writes applies_to so a Save keeps Regular and Change as separate lists', () => {
+    expect(toWriteInput(draft()).applies_to).toBe('regular');
+    expect(toWriteInput(draft({ applies_to: 'change' })).applies_to).toBe('change');
   });
 
   it('writes only the chosen type keys, so a stray key never reaches the file', () => {

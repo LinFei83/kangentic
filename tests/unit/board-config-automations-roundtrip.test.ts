@@ -71,6 +71,7 @@ describe('kangentic.json automations round-trip', () => {
 
     expect(column?.automations?.onEnter?.map((row) => row.name)).toEqual(['Setup', 'Review']);
     expect(column?.automations?.onExit?.map((row) => row.name)).toEqual(['Archive']);
+    expect(column?.automations?.change).toBeUndefined();
     // Only `false` is written: an absent key means enabled.
     expect(column?.automations?.onEnter?.[0].enabled).toBeUndefined();
     expect(column?.automations?.onExit?.[0].enabled).toBe(false);
@@ -138,6 +139,62 @@ describe('kangentic.json automations round-trip', () => {
     const second = build();
 
     expect(second.columns).toEqual(first.columns);
+  });
+
+  it('writes change rows under a nested change object and round-trips both lists', () => {
+    const { lanes, automations } = freshDatabase();
+    const executing = lanes.list().find((lane) => lane.name === 'Executing')!;
+    automations.replaceForColumn(executing.id, [
+      {
+        name: 'Review', type: 'send_message', trigger: 'enter', enabled: true,
+        config: { message: '/code-review' }, applies_to: 'regular',
+      },
+      {
+        name: 'Review', type: 'send_message', trigger: 'enter', enabled: true,
+        config: { message: '/opsx-apply' }, applies_to: 'change',
+      },
+      {
+        name: 'Archive', type: 'run_script', trigger: 'exit', enabled: true,
+        config: { script: 'openspec archive' }, applies_to: 'change',
+      },
+    ]);
+
+    const exported = build();
+    const column = columnNamed(exported, 'Executing');
+    expect(column?.automations?.onEnter?.map((row) => row.name)).toEqual(['Review']);
+    expect(column?.automations?.onEnter?.[0]).toMatchObject({ message: '/code-review' });
+    expect(column?.automations?.change?.onEnter?.map((row) => row.name)).toEqual(['Review']);
+    expect(column?.automations?.change?.onEnter?.[0]).toMatchObject({ message: '/opsx-apply' });
+    expect(column?.automations?.change?.onExit?.map((row) => row.name)).toEqual(['Archive']);
+    expect(column?.automations?.onExit).toBeUndefined();
+
+    applyBoardConfigToDb('p1', exported);
+    expect(automations.getForTrigger(executing.id, 'enter', 'regular').map((row) => row.name)).toEqual(['Review']);
+    expect(automations.getForTrigger(executing.id, 'enter', 'change').map((row) => row.name)).toEqual(['Review']);
+    expect(automations.getForTrigger(executing.id, 'exit', 'change').map((row) => row.name)).toEqual(['Archive']);
+    expect(automations.getForTrigger(executing.id, 'exit', 'regular')).toEqual([]);
+  });
+
+  it('omits an empty change object, and an omitted change applies as no change rows', () => {
+    const { lanes, automations } = freshDatabase();
+    const executing = lanes.list().find((lane) => lane.name === 'Executing')!;
+    automations.replaceForColumn(executing.id, [
+      {
+        name: 'Review', type: 'send_message', trigger: 'enter', enabled: true,
+        config: { message: '/code-review' }, applies_to: 'regular',
+      },
+      {
+        name: 'Start', type: 'send_message', trigger: 'enter', enabled: true,
+        config: { message: '/opsx-apply' }, applies_to: 'change',
+      },
+    ]);
+
+    const config = build();
+    delete columnNamed(config, 'Executing')!.automations!.change;
+    applyBoardConfigToDb('p1', config);
+
+    const rows = automations.listForColumn(executing.id);
+    expect(rows.map((row) => [row.applies_to, row.name])).toEqual([['regular', 'Review']]);
   });
 
   describe('On agent turn end, Condition and Frequency', () => {
@@ -890,6 +947,45 @@ describe('planColumnAutomations name dedup', () => {
     expect(plan.rows.map((row) => row.name)).toEqual(['Notify', 'Wrap up']);
     expect(plan.warnings).toHaveLength(0);
   });
+
+  it('lets regular and change lists share a name', () => {
+    const plan = planColumnAutomations({
+      name: 'Executing',
+      automations: {
+        onEnter: [{ name: 'Review', type: 'send_message', message: '/code-review' }],
+        change: {
+          onEnter: [{ name: 'Review', type: 'send_message', message: '/opsx-apply' }],
+        },
+      },
+    });
+
+    expect(plan.rows.map((row) => [row.applies_to, row.name, row.config])).toEqual([
+      ['regular', 'Review', { message: '/code-review' }],
+      ['change', 'Review', { message: '/opsx-apply' }],
+    ]);
+    expect(plan.warnings).toHaveLength(0);
+  });
+
+  it('renames a duplicate name inside the change list, not against regular', () => {
+    const plan = planColumnAutomations({
+      name: 'Executing',
+      automations: {
+        onEnter: [{ name: 'Notify', type: 'send_message', message: '/regular' }],
+        change: {
+          onEnter: [{ name: 'Notify', type: 'send_message', message: '/change-enter' }],
+          onExit: [{ name: 'Notify', type: 'send_message', message: '/change-exit' }],
+        },
+      },
+    });
+
+    expect(plan.rows.map((row) => [row.applies_to, row.trigger, row.name])).toEqual([
+      ['regular', 'enter', 'Notify'],
+      ['change', 'enter', 'Notify'],
+      ['change', 'exit', 'Notify 2'],
+    ]);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toContain('Notify 2');
+  });
 });
 
 // Also with no database underneath it: the DESKTOP-1H throw lives in the planner.
@@ -944,6 +1040,26 @@ describe('planColumnAutomations with a malformed container', () => {
     expect(plan.rows).toEqual([]);
     expect(plan.warnings).toHaveLength(1);
     expect(plan.warnings[0]).toContain('"Executing"');
+  });
+
+  it('keeps the column when change is not an object', () => {
+    const plan = planFor({ onEnter: [], change: 'x' });
+
+    expect(plan.keepExisting).toBe(true);
+    expect(plan.rows).toEqual([]);
+    expect(plan.warnings).toHaveLength(1);
+    expect(plan.warnings[0]).toContain('change');
+  });
+
+  it('keeps the column when a change group is not a list', () => {
+    const plan = planFor({
+      onEnter: [{ name: 'Setup', type: 'run_script', script: 'npm ci' }],
+      change: { onEnter: { name: 'Start', type: 'send_message', message: '/go' } },
+    });
+
+    expect(plan.keepExisting).toBe(true);
+    expect(plan.rows).toEqual([]);
+    expect(plan.warnings[0]).toContain('change.onEnter');
   });
 
   it('skips a row that is not an object and keeps the rest of the group', () => {

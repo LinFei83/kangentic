@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { canColumnRun, EXIT_GROUP_BUDGET_MS } from '../../shared/automation-manifest';
 import { englishText } from '../../shared/i18n/english';
 import { matchFinalLine, type FinalLineMatch } from '../../shared/final-line-match';
-import type { AutomationRunStatus, ColumnAutomation, Swimlane } from '../../shared/types';
+import type { AutomationAppliesTo, AutomationRunStatus, ColumnAutomation, Swimlane, Task } from '../../shared/types';
 import type { AutomationRunRepository, RunConditionAnswer } from '../db/repositories/automation-run-repository';
 import { automationRegistry, type AutomationRegistry } from './automation-registry';
 import type { ConditionCheckLimits } from './condition-check/condition-check';
@@ -34,6 +34,16 @@ import {
  * The runner never throws for an automation's sake. It rethrows exactly one
  * thing: an abort of the move itself, which is the caller's business.
  */
+
+/**
+ * Which automation list a task runs. `'change'` cards use the change list.
+ * Everything else (work, discuss, or a row with no `card_kind`) uses regular.
+ * Callers of `getForTrigger` MUST pass this. The two-argument form defaults to
+ * `'regular'` and would run the wrong list for a change card.
+ */
+export function appliesToForTask(task: Pick<Task, 'card_kind'>): AutomationAppliesTo {
+  return task.card_kind === 'change' ? 'change' : 'regular';
+}
 
 export interface AutomationRunOutcome {
   /** The `automation_runs` row this execution wrote. */

@@ -12,7 +12,7 @@
  * guarantees are exercised without a PTY, a network, or a database.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { AGENT_PAUSED_REASON, runAutomations } from '../../src/main/automations/automation-runner';
+import { AGENT_PAUSED_REASON, appliesToForTask, runAutomations } from '../../src/main/automations/automation-runner';
 import { AutomationRegistry } from '../../src/main/automations/automation-registry';
 import {
   AutomationPermanentError,
@@ -130,6 +130,14 @@ function registryOf(...adapters: AutomationAdapter[]): AutomationRegistry {
 }
 
 // --- tests ----------------------------------------------------------------
+
+describe('appliesToForTask', () => {
+  it('selects the change list only for a change card', () => {
+    expect(appliesToForTask({ card_kind: 'change' })).toBe('change');
+    expect(appliesToForTask({ card_kind: 'regular' })).toBe('regular');
+    expect(appliesToForTask({} as Pick<Task, 'card_kind'>)).toBe('regular');
+  });
+});
 
 describe('one row failing', () => {
   it('does not stop the rest of the list', async () => {

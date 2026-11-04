@@ -15,7 +15,8 @@ import type {
   NotificationInput,
   SessionResumer,
 } from '../../shared/types';
-import { runAutomations, SENT_WITH_THE_MOVE, type AgentStartReport, type AutomationRunSummary } from '../automations/automation-runner';
+import { appliesToForTask, runAutomations, SENT_WITH_THE_MOVE, type AgentStartReport, type AutomationRunSummary } from '../automations/automation-runner';
+import type { AutomationAppliesTo } from '../../shared/types';
 import { automationNeedsAgent, canTaskRunAutomations } from '../../shared/automation-manifest';
 import { englishText } from '../../shared/i18n/english';
 import type { AutomationContext } from '../automations/shared/automation-adapter';
@@ -347,7 +348,7 @@ export class TransitionEngine {
     const empty: AutomationRunSummary = { outcomes: [], failures: [], startedAgent: false };
     if (!this.automationRepo || !this.automationRunRepo) return empty;
 
-    const all = this.automationRepo.getForTrigger(column.id, trigger);
+    const all = this.automationRepo.getForTrigger(column.id, trigger, appliesToForTask(task));
     const automations = all.filter((row) => (!options.onlyIds || options.onlyIds.has(row.id))
       && (!options.onlyRowsNeedingAgent || automationNeedsAgent(row.type)));
     if (automations.length === 0) return empty;
@@ -367,9 +368,12 @@ export class TransitionEngine {
    * agent row) runs first: such a row may prepare what the agent reads at
    * launch, so an agent may not start ahead of it (`launchEarlyAgent`'s caller).
    */
-  agentStartsFirstOnEnter(column: Pick<Swimlane, 'id'>): boolean {
+  agentStartsFirstOnEnter(column: Pick<Swimlane, 'id'>, appliesTo: AutomationAppliesTo = 'regular'): boolean {
     if (!this.automationRepo) return true;
-    const first = this.automationRepo.getForTrigger(column.id, 'enter')[0];
+    // Defaults to the regular list: this helper has no task, and the spawn
+    // path that calls it (agent-spawn.ts) is owned by a sibling lane. Pass
+    // `appliesToForTask(task)` once that caller has a change card.
+    const first = this.automationRepo.getForTrigger(column.id, 'enter', appliesTo)[0];
     return first === undefined || automationNeedsAgent(first.type);
   }
 

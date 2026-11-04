@@ -2379,20 +2379,25 @@
             return left.position - right.position;
           })
           .map(function (row) {
-            return Object.assign({}, row, { config: Object.assign({}, row.config) });
+            return Object.assign({}, row, {
+              config: Object.assign({}, row.config),
+              applies_to: row.applies_to === 'change' ? 'change' : 'regular',
+            });
           });
       },
       replaceForColumn: async function (swimlaneId, rows) {
         // Mirrors the repository: whole-column delete-and-insert, with position
-        // assigned PER TRIGGER so the two groups never interleave.
+        // assigned PER (trigger, applies_to) so the two lists never interleave.
         automations = automations.filter(function (row) {
           return row.swimlane_id !== swimlaneId;
         });
-        var nextPosition = { enter: 0, turn_end: 0, exit: 0 };
+        var nextPosition = {};
         (rows || []).forEach(function (row) {
           // A trigger the repository would not know is stored as 'enter', the
           // column's original and default group; the other two are kept as sent.
           var trigger = AUTOMATION_TRIGGER_ORDER.indexOf(row.trigger) >= 0 ? row.trigger : 'enter';
+          var appliesTo = row.applies_to === 'change' ? 'change' : 'regular';
+          var positionKey = trigger + '\n' + appliesTo;
           // One Condition kind per row, a Text match on a turn end only: the
           // repository's backstop, mirrored so a spec reads back what the app would.
           var finalLine = trigger === 'turn_end' && typeof row.final_line === 'string' && row.final_line.trim() !== ''
@@ -2404,7 +2409,7 @@
             name: row.name,
             type: row.type,
             trigger: trigger,
-            position: nextPosition[trigger],
+            position: nextPosition[positionKey] || 0,
             enabled: row.enabled !== false,
             config: Object.assign({}, row.config),
             // Null when absent, as the repository returns it. `undefined` is not
@@ -2416,10 +2421,11 @@
             condition: finalLine === null && typeof row.condition === 'string' && row.condition.trim() !== '' ? row.condition.trim() : null,
             final_line: finalLine,
             max_runs: Number.isFinite(row.max_runs) && Math.floor(row.max_runs) >= 1 ? Math.floor(row.max_runs) : null,
+            applies_to: appliesTo,
             created_at: now(),
             updated_at: now(),
           });
-          nextPosition[trigger] += 1;
+          nextPosition[positionKey] = (nextPosition[positionKey] || 0) + 1;
         });
         return automations.filter(function (row) {
           return row.swimlane_id === swimlaneId;

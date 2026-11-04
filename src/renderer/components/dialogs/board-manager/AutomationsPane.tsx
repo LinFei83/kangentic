@@ -1,6 +1,7 @@
-import React, { useCallback, useMemo, useRef } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { Columns3Cog, GripVertical, Pencil, Plus, Trash2 } from 'lucide-react';
 import { Trans, useLingui } from '@lingui/react/macro';
+import { msg } from '@lingui/core/runtime-macro';
 import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, type CollisionDetection, type DragEndEvent, type Modifier } from '@dnd-kit/core';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
@@ -8,7 +9,9 @@ import { AUTOMATION_MANIFEST, AUTOMATION_TRIGGER_LABELS, canTriggerRun } from '.
 import { translateText } from '../../../i18n/translate';
 import { i18n } from '@lingui/core';
 import { describeAutomationMarks, describeAutomationSentence } from '../../../../shared/automation-describe';
-import type { AutomationTrigger, Swimlane } from '../../../../shared/types';
+import type { AutomationAppliesTo, AutomationTrigger, Swimlane } from '../../../../shared/types';
+import { SegmentedControl, type SegmentedControlOption } from '../../SegmentedControl';
+import { cachePerCatalog } from '../../../i18n/catalog-cache';
 import { Tooltip } from '../../Tooltip';
 import { useHmrGeneration } from '../../../utils/hmr-generation';
 import { IntentKeyboardSensor } from '../../../utils/intent-keyboard-sensor';
@@ -21,10 +24,31 @@ import {
   TRIGGERS,
   canRunRow,
   columnFacts,
+  draftAppliesTo,
   dropIndexFor,
   rowsFor,
   type AutomationDraft,
 } from './automation-drafts';
+
+/**
+ * Cached until the catalog changes. This pane sits in a dialog that re-renders
+ * on every keystroke in Name, and `SegmentedControl` keys its measuring effect
+ * on the options array.
+ */
+const appliesToOptions = cachePerCatalog((): readonly SegmentedControlOption<AutomationAppliesTo>[] => [
+  {
+    value: 'regular',
+    label: translateText(msg({ message: 'Regular', context: 'automation list' })),
+    tip: translateText(msg`Work and discuss cards.`),
+    testId: 'column-automations-applies-to-regular',
+  },
+  {
+    value: 'change',
+    label: translateText(msg({ message: 'Change', context: 'automation list' })),
+    tip: translateText(msg`OpenSpec change cards. Empty means nothing runs.`),
+    testId: 'column-automations-applies-to-change',
+  },
+]);
 
 /**
  * A row's second line, the sentence. Muted and set 3px under the name rather
@@ -71,7 +95,7 @@ export interface AutomationsPaneProps {
    * now be an editor for a value nothing reads.
    */
   readOnly: boolean;
-  onAdd: (trigger: AutomationTrigger, anchor: HTMLElement) => void;
+  onAdd: (trigger: AutomationTrigger, anchor: HTMLElement, appliesTo: AutomationAppliesTo) => void;
   onEdit: (draft: AutomationDraft) => void;
   onDelete: (draft: AutomationDraft) => void;
   onToggle: (draft: AutomationDraft, enabled: boolean) => void;
@@ -145,6 +169,12 @@ function clampToBounds(
 export function AutomationsPane(props: AutomationsPaneProps) {
   const { column } = props;
   const { t } = useLingui();
+  const [appliesTo, setAppliesTo] = useState<AutomationAppliesTo>('regular');
+  const visibleDrafts = useMemo(
+    () => props.drafts.filter((draft) => draftAppliesTo(draft) === appliesTo),
+    [props.drafts, appliesTo],
+  );
+  const paneProps: AutomationsPaneProps = { ...props, drafts: visibleDrafts };
   // Pattern C: a DndContext's internal subscriptions go stale across a Fast
   // Refresh, so it is re-keyed on the HMR generation.
   const hmrGeneration = useHmrGeneration();
@@ -166,7 +196,7 @@ export function AutomationsPane(props: AutomationsPaneProps) {
 
   const clampToGroup = useCallback<Modifier>(({ transform, draggingNodeRect, active, scrollableAncestorRects }) => {
     if (!draggingNodeRect) return { ...transform, x: 0 };
-    const activeRow = props.drafts.find((draft) => draft.id === String(active?.id));
+    const activeRow = visibleDrafts.find((draft) => draft.id === String(active?.id));
     const list = activeRow ? groupLists.current[activeRow.trigger] : null;
     const scroller = scrollableAncestorRects[0];
 
@@ -191,7 +221,7 @@ export function AutomationsPane(props: AutomationsPaneProps) {
     if (!bounds) return { ...transform, x: 0 };
 
     return clampToBounds(transform, draggingNodeRect, bounds);
-  }, [props.drafts]);
+  }, [visibleDrafts]);
 
   const modifiers = useMemo(() => [clampToGroup], [clampToGroup]);
 
@@ -219,10 +249,10 @@ export function AutomationsPane(props: AutomationsPaneProps) {
    * sensible.
    */
   const collisionDetection: CollisionDetection = (args) => {
-    const activeRow = props.drafts.find((draft) => draft.id === String(args.active.id));
+    const activeRow = visibleDrafts.find((draft) => draft.id === String(args.active.id));
     if (!activeRow) return closestCenter(args);
     const sameGroup = args.droppableContainers.filter((container) => {
-      const row = props.drafts.find((draft) => draft.id === String(container.id));
+      const row = visibleDrafts.find((draft) => draft.id === String(container.id));
       return row?.trigger === activeRow.trigger;
     });
     return closestCenter({ ...args, droppableContainers: sameGroup });
@@ -234,13 +264,13 @@ export function AutomationsPane(props: AutomationsPaneProps) {
     const activeId = String(active.id);
     const overId = String(over.id);
 
-    const activeRow = props.drafts.find((draft) => draft.id === activeId);
-    const overRow = props.drafts.find((draft) => draft.id === overId);
+    const activeRow = visibleDrafts.find((draft) => draft.id === activeId);
+    const overRow = visibleDrafts.find((draft) => draft.id === overId);
     // The collision filter should already have made this impossible; the guard
     // is here so a future collision strategy cannot quietly reopen it.
     if (!activeRow || !overRow || activeRow.trigger !== overRow.trigger) return;
 
-    props.onReorder(activeId, activeRow.trigger, dropIndexFor(props.drafts, activeRow.trigger, overId));
+    props.onReorder(activeId, activeRow.trigger, dropIndexFor(visibleDrafts, activeRow.trigger, overId));
   };
 
   // The explanation rides the header's info icon rather than a line of copy
@@ -260,6 +290,18 @@ export function AutomationsPane(props: AutomationsPaneProps) {
         <DisabledSectionNotice reason={t`Automations are shared by every profile. Switch to Default to edit them.`} />
       )}
 
+      <div className="pt-2 pb-1">
+        <SegmentedControl
+          options={appliesToOptions()}
+          value={appliesTo}
+          onChange={setAppliesTo}
+          quiet
+          tight
+          ariaLabel={t`Which cards these automations run for`}
+          testId="column-automations-applies-to"
+        />
+      </div>
+
       <DndContext
         key={hmrGeneration}
         sensors={sensors}
@@ -273,7 +315,8 @@ export function AutomationsPane(props: AutomationsPaneProps) {
               key={trigger}
               trigger={trigger}
               registerList={(node) => { groupLists.current[trigger] = node; }}
-              {...props}
+              {...paneProps}
+              onAdd={(groupTrigger, anchor) => props.onAdd(groupTrigger, anchor, appliesTo)}
               column={column}
             />
           ))}
@@ -283,9 +326,10 @@ export function AutomationsPane(props: AutomationsPaneProps) {
   );
 }
 
-function AutomationGroup({ trigger, registerList, ...props }: AutomationsPaneProps & {
+function AutomationGroup({ trigger, registerList, ...props }: Omit<AutomationsPaneProps, 'onAdd'> & {
   trigger: AutomationTrigger;
   registerList: (node: HTMLUListElement | null) => void;
+  onAdd: (trigger: AutomationTrigger, anchor: HTMLElement) => void;
 }) {
   const { t } = useLingui();
   const rows = rowsFor(props.drafts, trigger);
@@ -329,7 +373,10 @@ function AutomationGroup({ trigger, registerList, ...props }: AutomationsPanePro
   );
 }
 
-function AddAutomationButton({ trigger, onAdd }: { trigger: AutomationTrigger; onAdd: AutomationsPaneProps['onAdd'] }) {
+function AddAutomationButton({ trigger, onAdd }: {
+  trigger: AutomationTrigger;
+  onAdd: (trigger: AutomationTrigger, anchor: HTMLElement) => void;
+}) {
   return (
     <button
       type="button"
@@ -380,6 +427,7 @@ function AutomationRow({
       data-name={draft.name}
       data-index={index}
       data-trigger={draft.trigger}
+      data-applies-to={draftAppliesTo(draft)}
       data-enabled={draft.enabled ? 'true' : 'false'}
       data-can-run={runnable.ok ? 'true' : 'false'}
       // EVERY row draws the same control surface as the rest of the page: the

@@ -14,7 +14,7 @@ import { reportAutomationFailures } from '../../ipc/helpers/automation-failures'
 import { showAutomationNotification } from '../shared/show-automation-notification';
 import { createProgressCallback, clearSpawnProgress } from '../../transition-engine/spawn-progress';
 import { waitForTurnCompletion, type TurnCompletionResult } from '../../transition-engine/turn-completion';
-import { frequencyLimitReason } from '../automation-runner';
+import { appliesToForTask, frequencyLimitReason } from '../automation-runner';
 import { hasCondition, hasFinalLine, needsAgentReply } from '../row-guards';
 import { automationRegistry } from '../automation-registry';
 import { resolveMoveTarget, routeOf } from '../move-target';
@@ -605,7 +605,7 @@ async function runPass(context: IpcContext, request: PassRequest): Promise<void>
 
   // The fast path: most columns have no turn-end rows, and most tasks are in
   // no workflow.
-  const rows = repos.automations.getForTrigger(column.id, 'turn_end');
+  const rows = repos.automations.getForTrigger(column.id, 'turn_end', appliesToForTask(task));
   const stepApplies = workflowStepApplies(task, payload.projectId);
   if (rows.length === 0 && !stepApplies) return;
   // Off a running workflow, a held turn end runs nothing: the column's rows
@@ -828,7 +828,7 @@ async function settleHeldMove(
         if (step === undefined || (step !== 'newer-turn' && step.verdict === 'move-failed')) restoreHeldMove(task.id, heldMove);
         return 'handled';
       }
-      const row = repos.automations.getForTrigger(column.id, 'turn_end').find((candidate) => candidate.id === heldMove.rowId);
+      const row = repos.automations.getForTrigger(column.id, 'turn_end', appliesToForTask(task)).find((candidate) => candidate.id === heldMove.rowId);
       // The row was deleted since: the ordinary pass judges the reply.
       if (!row) return 'judge';
       const outcomeOfRows = await runRows(context, payload, {

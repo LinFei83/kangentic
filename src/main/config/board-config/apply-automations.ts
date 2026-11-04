@@ -1,4 +1,5 @@
 import type {
+  AutomationAppliesTo,
   AutomationConfig,
   AutomationTrigger,
   AutomationType,
@@ -109,12 +110,23 @@ export function planColumnAutomations(column: BoardColumnConfig): ColumnAutomati
 
   if (column.automations) {
     const fileAutomations = column.automations;
-    const groups = Object.fromEntries(
-      AUTOMATION_TRIGGERS.map((trigger) => [trigger, fileAutomations[AUTOMATION_TRIGGER_FILE_KEYS[trigger]]]),
-    ) as Record<AutomationTrigger, unknown>;
-    const malformedKeys = AUTOMATION_TRIGGERS
-      .filter((trigger) => isMalformedList(groups[trigger]))
-      .map((trigger) => AUTOMATION_TRIGGER_FILE_KEYS[trigger]);
+    // Board Profiles never overlay these lists: they live in `profiles` and
+    // only fold strategy (agent, model, session). Regular and change lists
+    // both belong to the column.
+    const changeRaw: unknown = (fileAutomations as { change?: unknown }).change;
+    if (changeRaw !== undefined && changeRaw !== null && !isJsonObject(changeRaw)) {
+      warnings.push(
+        `In "${column.name}", change must be an object with ${listFileKeys()} lists. Kept the column's current automations.`,
+      );
+      return { rows, warnings, keepExisting: true };
+    }
+
+    const regularGroups = triggerGroupsOf(fileAutomations);
+    const changeGroups = changeRaw === undefined || changeRaw === null ? null : triggerGroupsOf(changeRaw);
+    const malformedKeys = [
+      ...malformedGroupKeys(regularGroups),
+      ...(changeGroups ? malformedGroupKeys(changeGroups, 'change') : []),
+    ];
     if (malformedKeys.length > 0) {
       const verb = malformedKeys.length === 1 ? 'must be a list' : 'must be lists';
       warnings.push(
@@ -123,31 +135,17 @@ export function planColumnAutomations(column: BoardColumnConfig): ColumnAutomati
       return { rows, warnings, keepExisting: true };
     }
 
-    // Names are unique PER COLUMN, across both groups, because that is what
-    // `idx_column_automations_name` enforces. A hand-written or teammate-authored
-    // file can easily carry "Notify" on enter and "Notify" on exit; left alone
-    // that throws inside `applyBoardConfigToDb`'s transaction and fails the
-    // WHOLE board reconcile on project open, not just this column. Renamed with
-    // a warning instead, matching how every other malformed row in `readRow` is
-    // handled: the file is reported, never allowed to take the board down.
-    const takenNames: string[] = [];
-    for (const trigger of AUTOMATION_TRIGGERS) {
-      const group = groups[trigger];
-      if (!Array.isArray(group)) continue;
-      for (const entry of group as unknown[]) {
-        const row = readRow(entry, trigger, column.name, warnings);
-        if (!row) continue;
-        const deduped = uniqueName(row.name, takenNames);
-        if (deduped !== row.name) {
-          warnings.push(
-            `"${column.name}" has more than one automation named "${row.name}". Renamed the later one to "${deduped}".`,
-          );
-          row.name = deduped;
-        }
-        takenNames.push(row.name);
-        rows.push(row);
-      }
-    }
+    // Names are unique per (column, applies_to), matching
+    // `idx_column_automations_name`. Regular and change lists may share a
+    // name. Within one list, names are unique across onEnter / onTurnEnd /
+    // onExit. A hand-written file can easily carry "Notify" on enter and
+    // "Notify" on exit of the same list; left alone that throws inside
+    // `applyBoardConfigToDb`'s transaction and fails the WHOLE board
+    // reconcile on project open, not just this column. Renamed with a
+    // warning instead, matching how every other malformed row in `readRow`
+    // is handled: the file is reported, never allowed to take the board down.
+    readTriggerGroups(regularGroups, 'regular', column.name, warnings, rows);
+    if (changeGroups) readTriggerGroups(changeGroups, 'change', column.name, warnings, rows);
   }
 
   // The legacy message. Applied only when the column declares no automations of
@@ -164,10 +162,55 @@ export function planColumnAutomations(column: BoardColumnConfig): ColumnAutomati
       enabled: true,
       config: { message: legacyMessage, mode: column.autoCommandMode ?? 'immediate' },
       final_line: null,
+      applies_to: 'regular',
     });
   }
 
   return { rows, warnings, keepExisting: false };
+}
+
+function triggerGroupsOf(container: Record<string, unknown> | BoardColumnConfig['automations']): Record<AutomationTrigger, unknown> {
+  const record = container as Record<string, unknown>;
+  return Object.fromEntries(
+    AUTOMATION_TRIGGERS.map((trigger) => [trigger, record[AUTOMATION_TRIGGER_FILE_KEYS[trigger]]]),
+  ) as Record<AutomationTrigger, unknown>;
+}
+
+function malformedGroupKeys(groups: Record<AutomationTrigger, unknown>, prefix?: string): string[] {
+  return AUTOMATION_TRIGGERS
+    .filter((trigger) => isMalformedList(groups[trigger]))
+    .map((trigger) => {
+      const fileKey = AUTOMATION_TRIGGER_FILE_KEYS[trigger];
+      return prefix ? `${prefix}.${fileKey}` : fileKey;
+    });
+}
+
+function readTriggerGroups(
+  groups: Record<AutomationTrigger, unknown>,
+  appliesTo: AutomationAppliesTo,
+  columnName: string,
+  warnings: string[],
+  rows: AutomationWriteInput[],
+): void {
+  const takenNames: string[] = [];
+  for (const trigger of AUTOMATION_TRIGGERS) {
+    const group = groups[trigger];
+    if (!Array.isArray(group)) continue;
+    for (const entry of group as unknown[]) {
+      const row = readRow(entry, trigger, columnName, warnings);
+      if (!row) continue;
+      row.applies_to = appliesTo;
+      const deduped = uniqueName(row.name, takenNames);
+      if (deduped !== row.name) {
+        warnings.push(
+          `"${columnName}" has more than one automation named "${row.name}". Renamed the later one to "${deduped}".`,
+        );
+        row.name = deduped;
+      }
+      takenNames.push(row.name);
+      rows.push(row);
+    }
+  }
 }
 
 function readRow(
