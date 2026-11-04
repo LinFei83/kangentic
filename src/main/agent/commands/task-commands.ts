@@ -36,7 +36,7 @@ import { WorktreeManager } from '../../git/worktree-manager';
 import { isGitRepo } from '../../git/git-checks';
 import { isSafeBranchName } from '../../git/push-command';
 import type { CommandContext, CommandHandler, CommandResponse } from './types';
-import { NEVER_AUTO_SPAWN_ROLES, type Task, type TaskUpdateInput, type PermissionMode, type PlanApproval, type TaskRunMode, type Swimlane } from '../../../shared/types';
+import { NEVER_AUTO_SPAWN_ROLES, type Task, type TaskIntent, type TaskUpdateInput, type PermissionMode, type PlanApproval, type TaskRunMode, type Swimlane } from '../../../shared/types';
 import { applyAutomationsHoldChange } from '../../workflows/workflow-task-hold';
 
 export const TASK_DESCRIPTION_MAX_LENGTH = 50_000;
@@ -212,6 +212,7 @@ async function describeBranchConflict(
 }
 
 const AUTOMATIONS_DISABLED_PARAM_ERROR = 'automationsDisabled must be true or false.';
+const TASK_INTENT_PARAM_ERROR = 'intent must be "work" or "discuss".';
 
 /**
  * The automations switch parameter, or null when omitted. Checked here rather
@@ -221,6 +222,16 @@ const AUTOMATIONS_DISABLED_PARAM_ERROR = 'automationsDisabled must be true or fa
 function readAutomationsDisabledParam(value: unknown): boolean | null | 'invalid' {
   if (value === undefined || value === null) return null;
   return typeof value === 'boolean' ? value : 'invalid';
+}
+
+/**
+ * Create-time Work / Discuss intent, or null when omitted. Checked here rather
+ * than trusted to zod: the mobile bridge hands raw wire params straight to the
+ * handler. Omitted defaults to work in `TaskRepository.create`.
+ */
+function readTaskIntentParam(value: unknown): TaskIntent | null | 'invalid' {
+  if (value === undefined || value === null || value === '') return null;
+  return value === 'work' || value === 'discuss' ? value : 'invalid';
 }
 
 export const handleCreateTask: CommandHandler = async (
@@ -249,6 +260,8 @@ export const handleCreateTask: CommandHandler = async (
   const prNumber = (params.prNumber as number | null | undefined) ?? null;
   const automationsDisabled = readAutomationsDisabledParam(params.automationsDisabled);
   if (automationsDisabled === 'invalid') return { success: false, error: AUTOMATIONS_DISABLED_PARAM_ERROR };
+  const taskIntent = readTaskIntentParam(params.intent);
+  if (taskIntent === 'invalid') return { success: false, error: TASK_INTENT_PARAM_ERROR };
 
   // Observability for the "labels dropped on a large description" bug
   // (task #229). Logs what `labels` actually reached the handler. If it is
@@ -352,6 +365,7 @@ export const handleCreateTask: CommandHandler = async (
     ...(profileId ? { profile_id: profileId } : {}),
     ...(runMode ? { run_mode: runMode } : {}),
     ...(automationsDisabled === true ? { automations_disabled: true } : {}),
+    ...(taskIntent ? { task_intent: taskIntent } : {}),
   });
 
   // A review task names the PR it is about up front, so the linker's pr_number

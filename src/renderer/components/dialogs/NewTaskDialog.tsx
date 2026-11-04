@@ -1,5 +1,7 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { FolderOpen, Pencil, Plus, X } from 'lucide-react';
+import { i18n } from '@lingui/core';
+import { msg } from '@lingui/core/runtime-macro';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useBoardStore } from '../../stores/board-store';
 import { useConfigStore } from '../../stores/config-store';
@@ -27,12 +29,15 @@ import {
   type PermissionMode,
   type Project,
   type ProjectGroup,
+  type TaskIntent,
   type TaskRunMode,
   type WorkflowTaskInput,
   type WorkflowTaskRunSettings,
 } from '../../../shared/types';
 import { WORKFLOW_REFUSAL_MESSAGES } from '../../../shared/workflow-refusals';
 import { translateText } from '../../i18n/translate';
+import { cachePerCatalog } from '../../i18n/catalog-cache';
+import { SegmentedControl, type SegmentedControlOption } from '../SegmentedControl';
 import { isPermissionMode } from '../../../shared/workflow-run-settings';
 import { runSettingsFrom, showsPlannedTaskRows, type WorkflowTaskInitial } from './workflow-task-form';
 import { DescriptionEditor } from '../DescriptionEditor';
@@ -80,6 +85,26 @@ const NEW_TASK_ENTITY_ID = 'new-task-dialog';
 
 /** A new task starts with nothing pinned: base, branch name, and worktree all inherit. */
 const EMPTY_BRANCH_SETTINGS: BranchSettingsInitial = { baseBranch: '', customBranchName: '', useWorktree: null };
+
+/**
+ * Work / Discuss at create time. Cached until the catalog changes:
+ * `SegmentedControl` keys its measuring effect on the `options` array, so a
+ * fresh array per keystroke in the title would re-measure the thumb.
+ */
+const TASK_INTENT_OPTIONS = cachePerCatalog((): readonly SegmentedControlOption<TaskIntent>[] => [
+  {
+    value: 'work',
+    label: i18n._(msg({ message: 'Work', context: 'task intent' })),
+    tip: i18n._(msg`Implement on the current board path. No OpenSpec change.`),
+    testId: 'new-task-intent-work',
+  },
+  {
+    value: 'discuss',
+    label: i18n._(msg({ message: 'Discuss', context: 'task intent' })),
+    tip: i18n._(msg`Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough.`),
+    testId: 'new-task-intent-discuss',
+  },
+]);
 
 /** The registered projects in the sidebar's order: each group's by position, groups by position, then the ungrouped. */
 function projectsInSidebarOrder(projects: readonly Project[], groups: readonly ProjectGroup[]): Project[] {
@@ -136,6 +161,9 @@ export function NewTaskDialog({ swimlaneId, onClose, workflow }: NewTaskDialogPr
   // real form state here rather than local state inside AdvancedOverridesSection
   // - which is also what lets `isDirty` below see it.
   const [runMode, setRunMode] = useState<TaskRunMode>(initialRun.run_mode);
+  // Create-time only. Hidden for a workflow task. Default matches the
+  // repository: a regular card that follows the current board path.
+  const [taskIntent, setTaskIntent] = useState<TaskIntent>('work');
 
   // A workflow task's board: the project picker, first in the form. It starts
   // on the planned task's board, or the workflow's own (the open project). A
@@ -226,6 +254,7 @@ export function NewTaskDialog({ swimlaneId, onClose, workflow }: NewTaskDialogPr
     || agentOverride !== (initialRun.agent_override ?? '') || modelOverride !== (initialRun.model_override ?? '')
     || effortOverride !== (initialRun.effort_override ?? '') || permissionOverride !== (initialRun.permission_mode ?? '')
     || profileId !== initialRun.profile_id || runMode !== initialRun.run_mode
+    || taskIntent !== 'work'
     || (workflow !== undefined && (
       taskProjectId !== initialProjectId
       || baseBranch.trim() !== (initialRun.base_branch ?? '')
@@ -465,6 +494,7 @@ export function NewTaskDialog({ swimlaneId, onClose, workflow }: NewTaskDialogPr
         // choice, not an absent one, and it is the half of the pair that carries
         // no pins to imply it.
         run_mode: runMode,
+        task_intent: taskIntent,
         ...(attachments.length > 0 ? {
           pendingAttachments: attachments.map((attachment) => ({
             filename: attachment.filename,
@@ -614,6 +644,15 @@ export function NewTaskDialog({ swimlaneId, onClose, workflow }: NewTaskDialogPr
             />
 
             {!workflow && (<>
+            <SegmentedControl
+              ariaLabel={t`Work or discuss`}
+              testId="new-task-intent"
+              quiet
+              value={taskIntent}
+              onChange={setTaskIntent}
+              options={TASK_INTENT_OPTIONS()}
+            />
+
             <TaskBranchRow
               customBranchName={customBranchName}
               setCustomBranchName={setCustomBranchName}

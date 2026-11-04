@@ -620,6 +620,64 @@ test.describe('To Do Edit Branch Config', () => {
   });
 });
 
+// Work / Discuss at create time. State is read from aria-checked, never from
+// a styling class (cross-platform-parity.md). Hidden for a workflow task, which
+// this board-path spec does not open.
+test.describe('Task intent', () => {
+  test('offers Work and Discuss, with Work selected by default', async () => {
+    await openNewTaskDialog();
+
+    const group = page.locator('[data-testid="new-task-intent"]');
+    await expect(group).toBeVisible();
+    await expect(group).toHaveAttribute('role', 'radiogroup');
+    await expect(page.locator('[data-testid="new-task-intent-work"]')).toHaveText('Work');
+    await expect(page.locator('[data-testid="new-task-intent-discuss"]')).toHaveText('Discuss');
+    await expect(page.locator('[data-testid="new-task-intent-work"]')).toHaveAttribute('aria-checked', 'true');
+    await expect(page.locator('[data-testid="new-task-intent-discuss"]')).toHaveAttribute('aria-checked', 'false');
+
+    await closeDialog();
+  });
+
+  test('choosing Discuss selects it and deselects Work', async () => {
+    await openNewTaskDialog();
+
+    await page.locator('[data-testid="new-task-intent-discuss"]').click();
+
+    await expect(page.locator('[data-testid="new-task-intent-discuss"]')).toHaveAttribute('aria-checked', 'true');
+    await expect(page.locator('[data-testid="new-task-intent-work"]')).toHaveAttribute('aria-checked', 'false');
+
+    // Discuss is a dirty create-time choice, so Escape asks before discarding.
+    await page.keyboard.press('Escape');
+    await page.locator('button:has-text("Discard")').click();
+    await page.locator('input[placeholder="Task title"]').waitFor({ state: 'hidden', timeout: 2000 });
+  });
+
+  test('created task receives task_intent work when the control is untouched', async () => {
+    await openNewTaskDialog();
+    await page.locator('input[placeholder="Task title"]').fill('Default Intent Task');
+    await page.locator('button[type="submit"]:has-text("Create")').click();
+    await page.locator('input[placeholder="Task title"]').waitFor({ state: 'hidden', timeout: 3000 });
+
+    const taskData = await page.evaluate(() => window.electronAPI.tasks.list());
+    const task = taskData.find((candidate: { title: string }) => candidate.title === 'Default Intent Task');
+    expect(task).toBeDefined();
+    expect(task.task_intent).toBe('work');
+  });
+
+  test('created task receives task_intent discuss when Discuss is chosen', async () => {
+    await openNewTaskDialog();
+    await page.locator('input[placeholder="Task title"]').fill('Discuss Intent Task');
+    await page.locator('[data-testid="new-task-intent-discuss"]').click();
+    await page.locator('button[type="submit"]:has-text("Create")').click();
+    await page.locator('input[placeholder="Task title"]').waitFor({ state: 'hidden', timeout: 3000 });
+
+    const taskData = await page.evaluate(() => window.electronAPI.tasks.list());
+    const task = taskData.find((candidate: { title: string }) => candidate.title === 'Discuss Intent Task');
+    expect(task).toBeDefined();
+    expect(task.task_intent).toBe('discuss');
+  });
+});
+
 test.describe('Save double-submit guard', () => {
   test('Save disables while in flight and calls tasks.update exactly once', async () => {
     const uniqueTitle = `Save Double Submit Guard ${Date.now()}`;

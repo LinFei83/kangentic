@@ -29,6 +29,7 @@ The done-role column is refused. A task created there would be archived off the 
 | `title` | string | Yes | Task title (max 200 chars) |
 | `description` | string | No | Task description, supports markdown (max 50000 chars for a board task; a backlog item is capped at 10000 and an over-cap backlog description is rejected) |
 | `column` | string | No | Target column name (case-insensitive). Defaults to To Do. Pass `"Backlog"` to route to the backlog staging area instead of the board. |
+| `intent` | string | No | `"work"` (default) or `"discuss"`. Discuss is still a regular card; a fresh spawn prepends `/opsx-explore`. This tool cannot create OpenSpec change cards. |
 | `priority` | number | No | Priority: 0=none (default), 1=low, 2=medium, 3=high, 4=urgent. Applies to both board tasks and backlog items. |
 | `labels` | array | No | Labels for categorization. Each entry is a string or `{ name, color }` object with hex color. Applies to both board tasks and backlog items. Call [kangentic_board_summary](task-read-tools.md#kangentic_board_summary) first to see the board's existing label vocabulary. Subject to the large-description drop; see the Labels with a long description note below. |
 | `branchName` | string | No | Custom git branch name. Board tasks only - ignored when routed to the backlog. Recorded on the task and checked out when its worktree is created. Rejected if the branch is already checked out anywhere; see the Branch conflict guard note below. |

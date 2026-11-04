@@ -18,6 +18,7 @@ import { resolveBrowserAutomationConfig } from '../../browser/browser-automation
 import { buildSessionHistoryReference } from '../../agent/handoff/session-history-reference';
 import { DEFAULT_AGENT, NEVER_AUTO_SPAWN_ROLES } from '../../../shared/types';
 import type { Task, Swimlane, Project, AutoCommandMode } from '../../../shared/types';
+import { OPENSPEC_EXPLORE_COMMAND } from '../../../shared/openspec-commands';
 import { showAutomationNotification } from '../../automations/shared/show-automation-notification';
 import { reportAutomationFailures } from './automation-failures';
 import type { IpcContext } from '../ipc-context';
@@ -143,6 +144,29 @@ export function resolveSpawnOverrides(
  * ("<task> did not run its first prompt."). English, as every command text is.
  */
 const OPENING_PROMPT_LABEL = 'its first prompt';
+
+/**
+ * Prefix the engine prepends to a discuss card's opening prompt
+ * (`handoffPromptPrefix`). The interpolated task template owns the prompt slot
+ * on a fresh spawn, so putting the command in `resumePrompt` would leave it
+ * unsent. Resume and handoff leave the conversation as it is. A prompt that
+ * already starts with the command is left alone so it is not sent twice.
+ */
+export function openspecExplorePromptPrefix(input: {
+  taskIntent: Task['task_intent'] | undefined;
+  isFreshSpawn: boolean;
+  isHandoff: boolean;
+  existingPrompt: string | undefined;
+}): string | undefined {
+  if (input.taskIntent !== 'discuss' || !input.isFreshSpawn || input.isHandoff) {
+    return undefined;
+  }
+  const existing = input.existingPrompt ?? '';
+  if (existing.trimStart().startsWith(OPENSPEC_EXPLORE_COMMAND)) {
+    return undefined;
+  }
+  return OPENSPEC_EXPLORE_COMMAND;
+}
 
 /** The run log's reason for a column message not sent because the task's conversation expired. */
 const EXPIRED_CONVERSATION_SKIP_REASON = 'Not sent. The agent\'s conversation had expired, so it started a new one from a recap and is waiting for you.';
@@ -906,15 +930,25 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       // The setup note (the script still running, background mode) rides the
       // engine's prompt prefix, as a handoff's pointer does.
       // A slash command in the prompt slot runs only as the prompt's first
-      // word, so the note stays off it.
+      // word, so the note stays off it. `/opsx-explore` on a discuss card is
+      // the same kind of first-word command, and uses this prefix slot because
+      // a fresh spawn's template otherwise takes the prompt and leaves
+      // `resumePrompt` unsent.
+      const explorePrefix = openspecExplorePromptPrefix({
+        taskIntent: beforeSpawn.task_intent,
+        isFreshSpawn: !canResumeDestination || resolveForceFresh(toLane),
+        isHandoff,
+        existingPrompt: opening.prompt,
+      });
       const setupNote = options.setupStillRunning
+        && !explorePrefix
         && !(promptSlotOpen && opening.prompt && isSlashCommand(opening.prompt))
         ? options.setupStillRunning
         : undefined;
       const outcome = await engine.resumeSuspendedSession(
         beforeSpawn, toLane.permission_mode, skipPromptTemplate, opening.prompt, signal,
         targetAgent,
-        setupNote,
+        explorePrefix ?? setupNote,
         {
           ...resolveSpawnOverrides(beforeSpawn, toLane, project),
           ...(options.resumedBy ? { resumedBy: options.resumedBy } : {}),

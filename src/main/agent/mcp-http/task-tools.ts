@@ -222,6 +222,7 @@ export function registerTaskTools(
         title: z.string().max(200).describe('Task title (max 200 characters)'),
         description: z.string().max(TASK_DESCRIPTION_MAX_LENGTH).optional().describe('Task description. Supports markdown.'),
         column: z.string().optional().describe('Target column name. Defaults to the To Do column on the active board. Use kangentic_list_columns to see board columns. The done-role column is not a valid target here (creating a task there would archive it off the board immediately); create it on the board and move it with kangentic_move_task. Pass "Backlog" (case-insensitive) to create a backlog item instead of a board task. Only route to the backlog when the user explicitly asks for the backlog.'),
+        intent: z.enum(['work', 'discuss']).optional().describe('Whether this is ordinary board work (default) or an OpenSpec discussion. Discuss still creates a regular card; the agent\'s first fresh spawn opens with /opsx-explore. This tool cannot create OpenSpec change cards.'),
         priority: z.number().int().min(0).max(4).optional().describe('Priority: 0=none (default), 1=low, 2=medium, 3=high, 4=urgent. Applies to both board tasks and backlog items.'),
         labels: z.array(z.union([
           z.string(),
@@ -251,7 +252,7 @@ export function registerTaskTools(
       }),
       annotations: MUTATING_ANNOTATIONS,
     },
-    async ({ title, description, column, priority, labels, branchName, baseBranch, useWorktree, attachments, agentOverride, modelOverride, effortOverride, permissionMode, autoCommand, profile, runMode, prUrl, prNumber, automationsDisabled, project }) => withProject(resolver, project, async (ctx, resolved) => {
+    async ({ title, description, column, intent, priority, labels, branchName, baseBranch, useWorktree, attachments, agentOverride, modelOverride, effortOverride, permissionMode, autoCommand, profile, runMode, prUrl, prNumber, automationsDisabled, project }) => withProject(resolver, project, async (ctx, resolved) => {
       // Rejected rather than silently resolved: the repository enforces
       // exclusivity by clearing whichever side the write did not set, so
       // accepting both would quietly discard half of what the caller asked for.
@@ -338,6 +339,7 @@ export function registerTaskTools(
         title,
         description: description ?? '',
         column: column ?? null,
+        intent: intent ?? null,
         priority: priority ?? null,
         labels: labels ?? null,
         branchName: branchName ?? null,
