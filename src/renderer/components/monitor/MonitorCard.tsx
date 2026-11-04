@@ -19,11 +19,16 @@ import {
 import {
   BrowserAliveGlobe,
   NoModelFooter,
+  OpenspecChangeBadge,
+  OpenspecNoteStatus,
   PendingFooter,
   TicketNumber,
+  changeCardEdgeClass,
   taskCardFrameClass,
   useLiveTelemetryUnsupported,
 } from '../board/task-card-view';
+import { useBoardStore } from '../../stores/board-store';
+import { findBoardTask } from '../../utils/board-task-index';
 import { ProjectStripLabel, WorkflowGlyph, WorkflowStepTrack, WorkflowStripLabel } from '../workflows/WorkflowStrip';
 import {
   CardMessageTrail,
@@ -353,6 +358,8 @@ function MonitorDenseCard({ row, onOpen, onContextMenu, hideProject = false }: M
   const activityLine = formatMonitorStatus(row);
   const showTaskNumbers = useConfigStore((state) => state.config.showTaskNumbers);
   const handleContextMenu = useCardContextMenu(row, onContextMenu);
+  const boardTask = useBoardStore((state) => findBoardTask(state.tasks, row.taskId));
+  const isChange = boardTask?.card_kind === 'change';
   return (
     <div
       role="button"
@@ -360,14 +367,23 @@ function MonitorDenseCard({ row, onOpen, onContextMenu, hideProject = false }: M
       onClick={() => onOpen(row)}
       onKeyDown={(event) => { if (event.key === 'Enter') onOpen(row); }}
       onContextMenu={handleContextMenu}
-      className="border border-edge rounded-md bg-surface-raised min-w-0 flex items-stretch overflow-hidden hover:border-edge-input transition-colors cursor-pointer select-none text-left"
+      className={`border border-edge rounded-md bg-surface-raised min-w-0 flex items-stretch overflow-hidden hover:border-edge-input transition-colors cursor-pointer select-none text-left ${changeCardEdgeClass(isChange)}`}
       data-testid="monitor-card"
       data-dense="true"
       data-session-id={row.sessionId}
       data-project-id={row.projectId}
+      data-card-kind={isChange ? 'change' : 'regular'}
     >
       <div className="flex-1 min-w-0 px-2.5 py-1.5 flex items-center gap-2">
         <StateGlyph row={row} variant="row" />
+        {isChange && boardTask?.openspec_change && (
+          <OpenspecChangeBadge
+            name={boardTask.openspec_change}
+            note={boardTask.openspec_note}
+            compact
+            testId="monitor-openspec-change-badge"
+          />
+        )}
         {!hideProject && (
           <span className="text-[11px] text-fg-muted truncate shrink-0 max-w-[18ch]">{row.projectName}</span>
         )}
@@ -456,6 +472,8 @@ function MonitorFullCard({
   // The board card's rule: the agent's well closes its own edge, so the footer's
   // rule goes when the trail sits right above it with no labels between.
   const footerDivider = !(slotKind === 'trail' && row.labels.length === 0);
+  const boardTask = useBoardStore((state) => findBoardTask(state.tasks, row.taskId));
+  const isChange = boardTask?.card_kind === 'change';
 
   return (
     <div
@@ -466,10 +484,11 @@ function MonitorFullCard({
       onContextMenu={handleContextMenu}
       // The board card's frame: its padding by density, and while the agent
       // waits on you, its dimmed border and slow pulse.
-      className={`${taskCardFrameClass({ isHighlighted: false, isIdle: needsUser(row) }, cardDensity)} min-w-0 flex flex-col cursor-pointer select-none transition-colors text-left`}
+      className={`${taskCardFrameClass({ isHighlighted: false, isIdle: needsUser(row), isChangeCard: isChange }, cardDensity)} min-w-0 flex flex-col cursor-pointer select-none transition-colors text-left`}
       data-testid="monitor-card"
       data-session-id={row.sessionId}
       data-project-id={row.projectId}
+      data-card-kind={isChange ? 'change' : 'regular'}
     >
       <MonitorCardStrips row={row} density={cardDensity} />
 
@@ -479,11 +498,20 @@ function MonitorFullCard({
           tip is the whole title. */}
       <div className="flex items-center gap-1.5">
         <StateGlyph row={row} variant="card" />
+        {isChange && boardTask?.openspec_change && (
+          <OpenspecChangeBadge
+            name={boardTask.openspec_change}
+            note={boardTask.openspec_note}
+            compact={isCompact}
+            testId="monitor-openspec-change-badge"
+          />
+        )}
         <Tooltip label={row.taskTitle}>
           <div className="text-sm text-fg font-medium truncate flex-1 min-w-0" data-testid="monitor-card-title">
             {row.taskTitle}
           </div>
         </Tooltip>
+        {!isCompact && isChange && <OpenspecNoteStatus note={boardTask?.openspec_note} testId="monitor-openspec-note" />}
         {showTaskNumbers && row.displayId !== null && (
           <TicketNumber displayId={row.displayId} testId="monitor-card-display-id" className="select-text" />
         )}

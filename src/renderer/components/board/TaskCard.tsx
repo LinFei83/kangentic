@@ -17,7 +17,7 @@ import type { Task } from '../../../shared/types';
 import { TaskContextMenu } from './TaskContextMenu';
 import { ArchivedTaskContextMenu } from './ArchivedTaskContextMenu';
 import { openCompletedTask } from '../dialogs/task-detail/open-completed-task';
-import { TaskCardBody, TaskCardCompactBody, taskCardFrameClass, useTaskCardViewModel } from './task-card-view';
+import { TaskCardBody, TaskCardCompactBody, changeCardEdgeClass, taskCardFrameClass, useTaskCardViewModel } from './task-card-view';
 import { WorkflowTaskCardBody } from './WorkflowTaskCardBody';
 import { DeleteTaskDialog } from './DeleteTaskDialog';
 import { RESTING_TRANSFORM } from './resting-transform';
@@ -248,9 +248,8 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
           onClick={handleClick}
           onContextMenu={handleContextMenu}
           data-task-id={task.id}
-          className={`bg-surface-raised/60 border border-edge/50 rounded-md px-2.5 py-1.5 cursor-grab active:cursor-grabbing select-none hover:border-edge-input transition-colors group/card ${
-            isDragOverlay ? 'shadow-xl' : ''
-          }`}
+          data-card-kind={task.card_kind === 'change' ? 'change' : 'regular'}
+          className={`bg-surface-raised/60 border border-edge/50 rounded-md px-2.5 py-1.5 cursor-grab active:cursor-grabbing select-none hover:border-edge-input transition-colors group/card ${changeCardEdgeClass(view.isChangeCard)} ${isDragOverlay ? 'shadow-xl' : ''}`}
         >
           {cardContent}
         </div>
@@ -286,6 +285,7 @@ const TaskCardInner = function TaskCard({ task, isDragOverlay, compact, onDelete
         onClick={handleClick}
         onContextMenu={handleContextMenu}
         data-task-id={task.id}
+        data-card-kind={task.card_kind === 'change' ? 'change' : 'regular'}
         className={`${taskCardFrameClass(view, boardDensity)} cursor-grab active:cursor-grabbing select-none transition-colors ${isDragOverlay ? 'shadow-xl' : ''}`}
       >
         {cardContent}

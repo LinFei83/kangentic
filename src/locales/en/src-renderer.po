@@ -256,6 +256,14 @@ msgstr "{keptCount, plural, one {# process from {taskCount, plural, other {# tas
 msgid "{minutes}m {seconds}s"
 msgstr "{minutes}m {seconds}s"
 
+#: src/renderer/i18n/openspec-note.ts
+msgid "{name}. {status}"
+msgstr "{name}. {status}"
+
+#: src/renderer/i18n/openspec-note.ts
+msgid "{name}. {status} tasks"
+msgstr "{name}. {status} tasks"
+
 #: src/renderer/components/MarkdownRenderer.tsx
 msgid "{path} has no changes in this view"
 msgstr "{path} has no changes in this view"
@@ -1085,6 +1093,10 @@ msgstr "Open settings"
 #: src/renderer/window-manager/components/ConversationWindow.tsx
 msgid "Open task"
 msgstr "Open task"
+
+#: src/renderer/i18n/openspec-note.ts
+msgid "OpenSpec change: {name}"
+msgstr "OpenSpec change: {name}"
 
 #: src/renderer/components/OptionalTag.tsx
 msgid "Optional"

@@ -314,6 +314,14 @@ msgstr "{keptCount, plural, one {{taskCount, plural, one {# göreve} other {# g�
 msgid "{minutes}m {seconds}s"
 msgstr "{minutes} dk {seconds} sn"
 
+#: src/renderer/i18n/openspec-note.ts
+msgid "{name}. {status}"
+msgstr ""
+
+#: src/renderer/i18n/openspec-note.ts
+msgid "{name}. {status} tasks"
+msgstr ""
+
 #: src/renderer/components/MarkdownRenderer.tsx
 #, fuzzy
 msgid "{path} has no changes in this view"
@@ -1348,6 +1356,10 @@ msgstr "Ayarları aç"
 #, fuzzy
 msgid "Open task"
 msgstr "Görevi aç"
+
+#: src/renderer/i18n/openspec-note.ts
+msgid "OpenSpec change: {name}"
+msgstr ""
 
 #: src/renderer/components/OptionalTag.tsx
 #, fuzzy

@@ -17,6 +17,11 @@ msgstr "{blockedLabel}은(는) 이미 {blockerLabel}을(를) 기다리고 있습
 msgid "{count, plural, one {Blocked by # task...} other {Blocked by # tasks...}}"
 msgstr "{count, plural, other {작업 #개에 의해 차단됨...}}"
 
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec tasks progress"
+msgid "{done}/{total}"
+msgstr ""
+
 #: src/shared/workflow-refusals.ts
 #, fuzzy
 msgid "{label} has passed {columnName}. Its plan approval can no longer change."
@@ -137,6 +142,10 @@ msgstr "워크플로 작업의 <workflow> 블록: 경로, 인접 항목, 턴 판
 msgid "Agent Monitor"
 msgstr "에이전트 모니터"
 
+#: src/shared/task-template-vars.ts
+msgid "An OpenSpec change card's proposal, specs and tasks, wrapped in an <openspec> envelope."
+msgstr ""
+
 #: src/shared/transcript-format.ts
 #, fuzzy
 msgid "Approved automatically"
@@ -152,6 +161,11 @@ msgstr "사용자가 승인함"
 msgctxt "spoken language"
 msgid "Arabic"
 msgstr "아랍어"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Archived"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy
@@ -312,6 +326,10 @@ msgstr "선택한 diff 텍스트를 클립보드에 복사합니다."
 msgid "Copy the selected terminal text (Ctrl+Shift+C always copies). With no selection, Ctrl+C cancels the running command instead."
 msgstr "선택한 터미널 텍스트를 복사합니다(Ctrl+Shift+C는 항상 복사). 선택 영역이 없으면 Ctrl+C는 대신 실행 중인 명령을 취소합니다."
 
+#: src/shared/openspec-notes.ts
+msgid "Could not check"
+msgstr ""
+
 #: src/shared/automation-manifest.ts
 #, fuzzy
 msgctxt "automation field"
@@ -354,6 +372,10 @@ msgstr "네덜란드어"
 #, fuzzy
 msgid "Effective base branch: the task's override, else the project's configured default."
 msgstr "유효 기본 분기: 작업의 재정의 값, 없으면 프로젝트에 구성된 기본값."
+
+#: src/shared/task-template-vars.ts
+msgid "Empty for a regular card."
+msgstr ""
 
 #: src/shared/task-template-vars.ts
 #, fuzzy
@@ -880,6 +902,10 @@ msgstr "워크플로 보기를 엽니다. 워크플로 보기에서 누르면 �
 msgid "Open workflows"
 msgstr "워크플로 열기"
 
+#: src/shared/openspec-notes.ts
+msgid "OpenSpec CLI was not found"
+msgstr ""
+
 #: src/shared/keybindings.ts
 #, fuzzy
 msgctxt "hotkey"
@@ -991,6 +1017,11 @@ msgstr "대기 중..."
 #, fuzzy
 msgid "Quick Find"
 msgstr "빠른 찾기"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Ready"
+msgstr ""
 
 #: src/shared/relay.ts
 #, fuzzy
@@ -1451,6 +1482,10 @@ msgstr "URL"
 #, fuzzy
 msgid "Usage Statistics"
 msgstr "사용 통계"
+
+#: src/shared/openspec-notes.ts
+msgid "Validation did not pass"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy

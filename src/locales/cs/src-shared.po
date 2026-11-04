@@ -17,6 +17,11 @@ msgstr "Úloha {blockedLabel} už čeká na úlohu {blockerLabel}."
 msgid "{count, plural, one {Blocked by # task...} other {Blocked by # tasks...}}"
 msgstr "{count, plural, one {Blokováno # úlohou...} few {Blokováno # úlohami...} many {Blokováno # úlohy...} other {Blokováno # úlohami...}}"
 
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec tasks progress"
+msgid "{done}/{total}"
+msgstr ""
+
 #: src/shared/workflow-refusals.ts
 #, fuzzy
 msgid "{label} has passed {columnName}. Its plan approval can no longer change."
@@ -137,6 +142,10 @@ msgstr "Blok <workflow> úlohy v pracovním postupu: její trasa, sousední úlo
 msgid "Agent Monitor"
 msgstr "Monitor agentů"
 
+#: src/shared/task-template-vars.ts
+msgid "An OpenSpec change card's proposal, specs and tasks, wrapped in an <openspec> envelope."
+msgstr ""
+
 #: src/shared/transcript-format.ts
 #, fuzzy
 msgid "Approved automatically"
@@ -152,6 +161,11 @@ msgstr "Schváleno vámi"
 msgctxt "spoken language"
 msgid "Arabic"
 msgstr "Arabština"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Archived"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy
@@ -312,6 +326,10 @@ msgstr "Zkopíruje vybraný text rozdílu do schránky."
 msgid "Copy the selected terminal text (Ctrl+Shift+C always copies). With no selection, Ctrl+C cancels the running command instead."
 msgstr "Zkopíruje vybraný text terminálu (Ctrl+Shift+C kopíruje vždy). Bez výběru Ctrl+C místo toho zruší spuštěný příkaz."
 
+#: src/shared/openspec-notes.ts
+msgid "Could not check"
+msgstr ""
+
 #: src/shared/automation-manifest.ts
 #, fuzzy
 msgctxt "automation field"
@@ -354,6 +372,10 @@ msgstr "Nizozemština"
 #, fuzzy
 msgid "Effective base branch: the task's override, else the project's configured default."
 msgstr "Platná základní větev: přepsání z úlohy, jinak výchozí větev nastavená v projektu."
+
+#: src/shared/task-template-vars.ts
+msgid "Empty for a regular card."
+msgstr ""
 
 #: src/shared/task-template-vars.ts
 #, fuzzy
@@ -880,6 +902,10 @@ msgstr "Otevřít zobrazení Pracovní postupy; stisknutím v něm se vrátíte 
 msgid "Open workflows"
 msgstr "Otevřít pracovní postupy"
 
+#: src/shared/openspec-notes.ts
+msgid "OpenSpec CLI was not found"
+msgstr ""
+
 #: src/shared/keybindings.ts
 #, fuzzy
 msgctxt "hotkey"
@@ -991,6 +1017,11 @@ msgstr "Ve frontě..."
 #, fuzzy
 msgid "Quick Find"
 msgstr "Rychlé hledání"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Ready"
+msgstr ""
 
 #: src/shared/relay.ts
 #, fuzzy
@@ -1451,6 +1482,10 @@ msgstr "URL"
 #, fuzzy
 msgid "Usage Statistics"
 msgstr "Statistiky využití"
+
+#: src/shared/openspec-notes.ts
+msgid "Validation did not pass"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy

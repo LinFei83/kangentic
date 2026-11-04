@@ -17,6 +17,11 @@ msgstr "{blockedLabel} attende già {blockerLabel}."
 msgid "{count, plural, one {Blocked by # task...} other {Blocked by # tasks...}}"
 msgstr "{count, plural, one {Bloccato da # attività...} many {Bloccato da # di attività...} other {Bloccato da # attività...}}"
 
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec tasks progress"
+msgid "{done}/{total}"
+msgstr ""
+
 #: src/shared/workflow-refusals.ts
 #, fuzzy
 msgid "{label} has passed {columnName}. Its plan approval can no longer change."
@@ -137,6 +142,10 @@ msgstr "Il blocco <workflow> di un'attività del flusso di lavoro: il percorso, 
 msgid "Agent Monitor"
 msgstr "Monitor agenti"
 
+#: src/shared/task-template-vars.ts
+msgid "An OpenSpec change card's proposal, specs and tasks, wrapped in an <openspec> envelope."
+msgstr ""
+
 #: src/shared/transcript-format.ts
 #, fuzzy
 msgid "Approved automatically"
@@ -152,6 +161,11 @@ msgstr "Approvato da te"
 msgctxt "spoken language"
 msgid "Arabic"
 msgstr "Arabo"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Archived"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy
@@ -312,6 +326,10 @@ msgstr "Copia negli appunti il testo del diff selezionato."
 msgid "Copy the selected terminal text (Ctrl+Shift+C always copies). With no selection, Ctrl+C cancels the running command instead."
 msgstr "Copia il testo selezionato nel terminale (Ctrl+Shift+C copia sempre). Senza selezione, Ctrl+C annulla invece il comando in esecuzione."
 
+#: src/shared/openspec-notes.ts
+msgid "Could not check"
+msgstr ""
+
 #: src/shared/automation-manifest.ts
 #, fuzzy
 msgctxt "automation field"
@@ -354,6 +372,10 @@ msgstr "Olandese"
 #, fuzzy
 msgid "Effective base branch: the task's override, else the project's configured default."
 msgstr "Ramo di base effettivo: quello impostato nell'attività, altrimenti quello predefinito configurato nel progetto."
+
+#: src/shared/task-template-vars.ts
+msgid "Empty for a regular card."
+msgstr ""
 
 #: src/shared/task-template-vars.ts
 #, fuzzy
@@ -880,6 +902,10 @@ msgstr "Apri la vista Flussi di lavoro; se premuto lì, torna alla vista di prov
 msgid "Open workflows"
 msgstr "Apri flussi di lavoro"
 
+#: src/shared/openspec-notes.ts
+msgid "OpenSpec CLI was not found"
+msgstr ""
+
 #: src/shared/keybindings.ts
 #, fuzzy
 msgctxt "hotkey"
@@ -991,6 +1017,11 @@ msgstr "In coda..."
 #, fuzzy
 msgid "Quick Find"
 msgstr "Ricerca rapida"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Ready"
+msgstr ""
 
 #: src/shared/relay.ts
 #, fuzzy
@@ -1451,6 +1482,10 @@ msgstr "URL"
 #, fuzzy
 msgid "Usage Statistics"
 msgstr "Statistiche di utilizzo"
+
+#: src/shared/openspec-notes.ts
+msgid "Validation did not pass"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy

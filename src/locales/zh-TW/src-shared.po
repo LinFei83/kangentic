@@ -15,6 +15,11 @@ msgstr "{blockedLabel} 已在等待 {blockerLabel}。"
 msgid "{count, plural, one {Blocked by # task...} other {Blocked by # tasks...}}"
 msgstr "{count, plural, other {受阻於 # 個任務...}}"
 
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec tasks progress"
+msgid "{done}/{total}"
+msgstr ""
+
 #: src/shared/workflow-refusals.ts
 msgid "{label} has passed {columnName}. Its plan approval can no longer change."
 msgstr "{label} 已通過 {columnName}。其計畫核准已無法再變更。"
@@ -111,6 +116,10 @@ msgstr "工作流程任務的 <workflow> 區塊：其路線、相鄰欄，以及
 msgid "Agent Monitor"
 msgstr "代理監控"
 
+#: src/shared/task-template-vars.ts
+msgid "An OpenSpec change card's proposal, specs and tasks, wrapped in an <openspec> envelope."
+msgstr ""
+
 #: src/shared/transcript-format.ts
 msgid "Approved automatically"
 msgstr "已自動核准"
@@ -123,6 +132,11 @@ msgstr "已由你核准"
 msgctxt "spoken language"
 msgid "Arabic"
 msgstr "阿拉伯文"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Archived"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 msgid "At a turn end the turn is over, so it sends at once."
@@ -253,6 +267,10 @@ msgstr "將選取的差異文字複製到剪貼簿。"
 msgid "Copy the selected terminal text (Ctrl+Shift+C always copies). With no selection, Ctrl+C cancels the running command instead."
 msgstr "複製選取的終端機文字（Ctrl+Shift+C 一律會複製）。若未選取任何內容，Ctrl+C 則會取消執行中的命令。"
 
+#: src/shared/openspec-notes.ts
+msgid "Could not check"
+msgstr ""
+
 #: src/shared/automation-manifest.ts
 msgctxt "automation field"
 msgid "Delivery"
@@ -287,6 +305,10 @@ msgstr "荷蘭文"
 #: src/shared/task-template-vars.ts
 msgid "Effective base branch: the task's override, else the project's configured default."
 msgstr "實際生效的基礎分支：任務的覆寫值，否則為專案設定的預設值。"
+
+#: src/shared/task-template-vars.ts
+msgid "Empty for a regular card."
+msgstr ""
 
 #: src/shared/task-template-vars.ts
 msgid "Empty for a task outside a workflow."
@@ -720,6 +742,10 @@ msgstr "開啟工作流程檢視；在該檢視中按下時，返回你原本所
 msgid "Open workflows"
 msgstr "開啟工作流程"
 
+#: src/shared/openspec-notes.ts
+msgid "OpenSpec CLI was not found"
+msgstr ""
+
 #: src/shared/keybindings.ts
 msgctxt "hotkey"
 msgid "Paste"
@@ -812,6 +838,11 @@ msgstr "排入佇列中..."
 #: src/shared/keybindings.ts
 msgid "Quick Find"
 msgstr "快速尋找"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Ready"
+msgstr ""
 
 #: src/shared/relay.ts
 msgid "Relay address cannot contain a backslash."
@@ -1184,6 +1215,10 @@ msgstr "URL"
 #: src/shared/pop-out.ts
 msgid "Usage Statistics"
 msgstr "使用量統計"
+
+#: src/shared/openspec-notes.ts
+msgid "Validation did not pass"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 msgid "Wait for current turn"

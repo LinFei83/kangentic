@@ -10,6 +10,7 @@ import { HeaderActionButton } from '../../HeaderActionButton';
 import { Tooltip } from '../../Tooltip';
 import { IconSlot } from '../../IconSlot';
 import { IsolatedBadge } from '../../IsolatedBadge';
+import { OpenspecChangeBadge, OpenspecNoteStatus } from '../../board/task-card-view';
 import { KebabMenu, KebabMenuItem, KebabMenuDivider } from '../../KebabMenu';
 import { CommandSearchList } from './CommandSearchList';
 import { useHeaderPillOverflow, type HeaderPillSpec } from './useHeaderPillOverflow';
@@ -340,6 +341,21 @@ export function TaskDetailHeader({
             </Tooltip>
           )}
           {isIsolated && <IsolatedBadge data-testid="task-detail-isolated-badge" />}
+          {task.card_kind === 'change' && task.openspec_change && (
+            <OpenspecChangeBadge
+              name={task.openspec_change}
+              note={task.openspec_note}
+              compact={false}
+              testId="task-detail-openspec-badge"
+            />
+          )}
+          {task.card_kind === 'change' && (
+            <OpenspecNoteStatus
+              note={task.openspec_note}
+              testId="task-detail-openspec-note"
+              maxWidthClass="max-w-[12rem]"
+            />
+          )}
         </h2>
       </Tooltip>
 

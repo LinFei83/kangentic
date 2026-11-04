@@ -1,7 +1,13 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { Loader2, CirclePause, Clock, Paperclip, Globe } from 'lucide-react';
+import { Loader2, CirclePause, Clock, Paperclip, Globe, ScrollText } from 'lucide-react';
 import { Trans, useLingui } from '@lingui/react/macro';
+import {
+  isOpenspecArchivedNote,
+  openspecChangeTip,
+  openspecCompactStatusLine,
+  openspecNoteLabel,
+} from '../../i18n/openspec-note';
 import { formatRelativeTime } from '../../lib/datetime';
 import { stripMarkdown } from '../../utils/strip-markdown';
 import { useSessionStore } from '../../stores/session-store';
@@ -150,6 +156,8 @@ export interface TaskCardViewModel {
   showTaskNumbers: boolean;
   /** Set when the task's agent streams no live telemetry, so its footer never waits on a model. */
   liveTelemetryUnsupported: AgentLiveTelemetryUnsupported | undefined;
+  /** An OpenSpec change card: left accent edge plus the ScrollText type badge. */
+  isChangeCard: boolean;
 }
 
 /**
@@ -247,6 +255,7 @@ export function useTaskCardViewModel(task: Task): TaskCardViewModel {
   // Which of the waits the agent is in, so a question, an approval and a
   // finished turn each draw their own mark (`agent-wait.ts`).
   const activityMark = agentActivityMark(displayState.kind === 'running' ? displayState.activity : undefined, activityReason);
+  const isChangeCard = task.card_kind === 'change';
 
   // One object per change, not per render, so a host can skip re-rendering the
   // card's content when nothing in it changed (`TaskCard` does, through every
@@ -271,11 +280,12 @@ export function useTaskCardViewModel(task: Task): TaskCardViewModel {
       cardDensity,
       showTaskNumbers,
       liveTelemetryUnsupported,
+      isChangeCard,
     }),
     [
       sessionId, isHighlighted, isResuming, activityReason, displayState, browserAlive, isIdle, isThinking,
       activityMark, shownTrail, trailMode, labelColors, taskLabels, archivedRelativeTime, cardDensity,
-      showTaskNumbers, liveTelemetryUnsupported,
+      showTaskNumbers, liveTelemetryUnsupported, isChangeCard,
     ],
   );
 }
@@ -287,14 +297,101 @@ export function useTaskCardViewModel(task: Task): TaskCardViewModel {
  * `TaskCardViewModel` (the Agent Monitor's card) draws the same frame.
  */
 export function taskCardFrameClass(
-  view: Pick<TaskCardViewModel, 'isHighlighted' | 'isIdle'>,
+  view: Pick<TaskCardViewModel, 'isHighlighted' | 'isIdle'> & { isChangeCard?: boolean },
   density: AppConfig['cardDensity'],
 ): string {
   const padding = density === 'comfortable' ? 'p-3' : 'p-2.5';
   const border = view.isHighlighted
     ? 'border-[2px] border-fg-faint/60'
     : view.isIdle ? 'border-edge/40' : 'border-edge hover:border-edge-input';
-  return `border rounded-md ${padding} bg-surface-raised ${border}`;
+  const changeEdge = changeCardEdgeClass(view.isChangeCard === true);
+  return `border rounded-md ${padding} bg-surface-raised ${border} ${changeEdge}`;
+}
+
+/** Extra 2px left edge on an OpenSpec change card. No fill or type-size swap. */
+export function changeCardEdgeClass(isChange: boolean): string {
+  return isChange ? 'border-l-2 border-l-accent' : '';
+}
+
+export function isChangeCard(task: Pick<Task, 'card_kind'>): boolean {
+  return task.card_kind === 'change';
+}
+
+/**
+ * The OpenSpec type badge: a 14px ScrollText to the right of ActivityMark.
+ * Compact cards fold the status into this tip's second line instead of drawing
+ * it in the title row.
+ */
+export function OpenspecChangeBadge({
+  name,
+  note,
+  compact,
+  testId = 'openspec-change-badge',
+}: {
+  name: string;
+  note: string | null | undefined;
+  compact: boolean;
+  testId?: string;
+}) {
+  const tip = openspecChangeTip(name);
+  const compactStatus = compact ? openspecCompactStatusLine(name, note) : null;
+  return (
+    <Tooltip label={tip} detail={compactStatus ?? undefined}>
+      <span
+        role="img"
+        aria-label={name}
+        className="text-fg-muted shrink-0 flex"
+        data-testid={testId}
+      >
+        <ScrollText size={14} aria-hidden="true" />
+      </span>
+    </Tooltip>
+  );
+}
+
+/**
+ * Short OpenSpec status on a non-compact title row, left of the ticket number.
+ * The tip is the full sentence only while CSS truncates it, so a label that
+ * already fits is not read twice.
+ */
+export function OpenspecNoteStatus({
+  note,
+  testId = 'openspec-note',
+  maxWidthClass = 'max-w-[7rem]',
+}: {
+  note: string | null | undefined;
+  testId?: string;
+  maxWidthClass?: string;
+}) {
+  const label = openspecNoteLabel(note);
+  const labelRef = useRef<HTMLSpanElement>(null);
+  const [truncated, setTruncated] = useState(false);
+
+  const measure = useCallback(() => {
+    const span = labelRef.current;
+    if (!span) return;
+    setTruncated(span.scrollWidth > span.clientWidth);
+  }, []);
+
+  useLayoutEffect(() => {
+    measure();
+  }, [label, measure]);
+
+  if (label === null) return null;
+
+  const archived = isOpenspecArchivedNote(note);
+  return (
+    <Tooltip label={truncated ? label : ''} describe={false}>
+      <span
+        ref={labelRef}
+        onPointerEnter={measure}
+        className={`text-[11px] truncate ${maxWidthClass} ${archived ? 'text-fg-faint' : 'text-fg-muted'}`}
+        data-testid={testId}
+      >
+        {label}
+      </span>
+    </Tooltip>
+  );
 }
 
 /**
@@ -522,7 +619,15 @@ function TaskCardBodyContent({ task, view, density, hideDisplayId, idleFooter }:
             isThinking={isThinking}
           />
         )}
+        {view.isChangeCard && task.openspec_change && (
+          <OpenspecChangeBadge
+            name={task.openspec_change}
+            note={task.openspec_note}
+            compact={isCompactDensity}
+          />
+        )}
         <div className="text-sm text-fg font-medium truncate flex-1 min-w-0">{task.title}</div>
+        {!isCompactDensity && view.isChangeCard && <OpenspecNoteStatus note={task.openspec_note} />}
         <DisplayIdBadge task={task} view={view} hidden={hideDisplayId} />
         {/* Placement and treatment are documented on `BrowserAliveGlobe`. */}
         {view.browserAlive && <BrowserAliveGlobe testId="task-card-browser-alive" />}
@@ -645,6 +750,13 @@ export function TaskCardCompactBody({ task, view, trailing }: { task: Task; view
   return (
     <>
       <div className="flex items-center gap-2">
+        {view.isChangeCard && task.openspec_change && (
+          <OpenspecChangeBadge
+            name={task.openspec_change}
+            note={task.openspec_note}
+            compact
+          />
+        )}
         <span className="text-sm text-fg-tertiary truncate flex-1" data-testid="compact-title">{task.title}</span>
         <DisplayIdBadge task={task} view={view} />
         {trailing}

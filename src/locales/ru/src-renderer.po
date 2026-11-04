@@ -314,6 +314,14 @@ msgstr "{keptCount, plural, one {# процесс из {taskCount, plural, one {
 msgid "{minutes}m {seconds}s"
 msgstr "{minutes} мин {seconds} с"
 
+#: src/renderer/i18n/openspec-note.ts
+msgid "{name}. {status}"
+msgstr ""
+
+#: src/renderer/i18n/openspec-note.ts
+msgid "{name}. {status} tasks"
+msgstr ""
+
 #: src/renderer/components/MarkdownRenderer.tsx
 #, fuzzy
 msgid "{path} has no changes in this view"
@@ -1348,6 +1356,10 @@ msgstr "Открыть настройки"
 #, fuzzy
 msgid "Open task"
 msgstr "Открыть задачу"
+
+#: src/renderer/i18n/openspec-note.ts
+msgid "OpenSpec change: {name}"
+msgstr ""
 
 #: src/renderer/components/OptionalTag.tsx
 #, fuzzy

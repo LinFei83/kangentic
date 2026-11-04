@@ -17,6 +17,11 @@ msgstr "{blockedLabel} zaten {blockerLabel} görevini bekliyor."
 msgid "{count, plural, one {Blocked by # task...} other {Blocked by # tasks...}}"
 msgstr "{count, plural, one {# görev tarafından engellendi...} other {# görev tarafından engellendi...}}"
 
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec tasks progress"
+msgid "{done}/{total}"
+msgstr ""
+
 #: src/shared/workflow-refusals.ts
 #, fuzzy
 msgid "{label} has passed {columnName}. Its plan approval can no longer change."
@@ -137,6 +142,10 @@ msgstr "İş akışı görevinin <workflow> bloğu: rotası, komşuları ve turl
 msgid "Agent Monitor"
 msgstr "Ajan izleyicisi"
 
+#: src/shared/task-template-vars.ts
+msgid "An OpenSpec change card's proposal, specs and tasks, wrapped in an <openspec> envelope."
+msgstr ""
+
 #: src/shared/transcript-format.ts
 #, fuzzy
 msgid "Approved automatically"
@@ -152,6 +161,11 @@ msgstr "Sizin tarafınızdan onaylandı"
 msgctxt "spoken language"
 msgid "Arabic"
 msgstr "Arapça"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Archived"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy
@@ -312,6 +326,10 @@ msgstr "Seçili fark metnini panoya kopyalayın."
 msgid "Copy the selected terminal text (Ctrl+Shift+C always copies). With no selection, Ctrl+C cancels the running command instead."
 msgstr "Seçili terminal metnini kopyalayın (Ctrl+Shift+C her zaman kopyalar). Seçim yoksa Ctrl+C bunun yerine çalışan komutu iptal eder."
 
+#: src/shared/openspec-notes.ts
+msgid "Could not check"
+msgstr ""
+
 #: src/shared/automation-manifest.ts
 #, fuzzy
 msgctxt "automation field"
@@ -354,6 +372,10 @@ msgstr "Felemenkçe"
 #, fuzzy
 msgid "Effective base branch: the task's override, else the project's configured default."
 msgstr "Geçerli temel dal: görevin geçersiz kılma değeri, yoksa projenin yapılandırılmış varsayılanı."
+
+#: src/shared/task-template-vars.ts
+msgid "Empty for a regular card."
+msgstr ""
 
 #: src/shared/task-template-vars.ts
 #, fuzzy
@@ -880,6 +902,10 @@ msgstr "İş Akışları görünümünü açar; orada basıldığında geldiğin
 msgid "Open workflows"
 msgstr "İş akışlarını aç"
 
+#: src/shared/openspec-notes.ts
+msgid "OpenSpec CLI was not found"
+msgstr ""
+
 #: src/shared/keybindings.ts
 #, fuzzy
 msgctxt "hotkey"
@@ -991,6 +1017,11 @@ msgstr "Sırada..."
 #, fuzzy
 msgid "Quick Find"
 msgstr "Hızlı Bul"
+
+#: src/shared/openspec-notes.ts
+msgctxt "OpenSpec change status"
+msgid "Ready"
+msgstr ""
 
 #: src/shared/relay.ts
 #, fuzzy
@@ -1451,6 +1482,10 @@ msgstr "URL"
 #, fuzzy
 msgid "Usage Statistics"
 msgstr "Kullanım istatistikleri"
+
+#: src/shared/openspec-notes.ts
+msgid "Validation did not pass"
+msgstr ""
 
 #: src/shared/automation-manifest.ts
 #, fuzzy
