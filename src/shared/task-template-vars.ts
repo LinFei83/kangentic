@@ -50,6 +50,7 @@ export const TEMPLATE_VARIABLE_PATTERN = /\{\{(\w+)\}\}/g;
 export const TASK_TEMPLATE_VAR_NAMES = [
   'task_xml',
   'workflow_xml',
+  'openspec_xml',
   'title',
   'description',
   'taskId',
@@ -133,6 +134,13 @@ export const TASK_TEMPLATE_VARS: readonly TaskTemplateVarInfo[] = [
     description: msg`A workflow task's <workflow> block: its route, its neighbours, and how its turns are judged.`,
     contexts: EVERYWHERE,
     availability: msg`Empty for a task outside a workflow.`,
+  },
+  {
+    name: 'openspec_xml',
+    chip: '{{openspec_xml}}',
+    description: msg`An OpenSpec change card's proposal, specs and tasks, wrapped in an <openspec> envelope.`,
+    contexts: EVERYWHERE,
+    availability: msg`Empty for a regular card.`,
   },
   {
     name: 'title',

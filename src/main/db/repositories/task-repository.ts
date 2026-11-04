@@ -48,6 +48,10 @@ function rowToTask(row: TaskRow): Task {
     canvas_y: row.canvas_y ?? null,
     plan_approval: isPlanApproval(row.plan_approval) ? row.plan_approval : null,
     automations_disabled: Boolean(row.automations_disabled),
+    card_kind: row.card_kind === 'change' ? 'change' : 'regular',
+    task_intent: row.task_intent === 'discuss' ? 'discuss' : 'work',
+    openspec_change: row.openspec_change ?? null,
+    openspec_note: row.openspec_note ?? null,
   };
 }
 
@@ -187,6 +191,20 @@ export class TaskRepository {
       WHERE t.branch_name = ? AND t.archived_at IS NULL
       ORDER BY t.updated_at DESC
       LIMIT 1`).get(branchName) as TaskRow | undefined;
+    return row ? rowToTask(row) : undefined;
+  }
+
+  /**
+   * The task whose OpenSpec change directory is `name`, newest `updated_at`
+   * first, archived included. The scan's de-dupe: a Done change card still
+   * owns the name, so a second card is not created. Null `openspec_change`
+   * never matches.
+   */
+  getByOpenspecChange(name: string): Task | undefined {
+    const row = this.db.prepare(`${TaskRepository.SELECT_WITH_COUNT}
+      WHERE t.openspec_change = ?
+      ORDER BY t.updated_at DESC
+      LIMIT 1`).get(name) as TaskRow | undefined;
     return row ? rowToTask(row) : undefined;
   }
 
@@ -438,6 +456,10 @@ export class TaskRepository {
       profile_id: exclusive.profile_id,
       run_mode: exclusive.run_mode,
       automations_disabled: input.automations_disabled ?? false,
+      card_kind: input.card_kind === 'change' ? 'change' : 'regular',
+      task_intent: input.task_intent === 'discuss' ? 'discuss' : 'work',
+      openspec_change: input.openspec_change ?? null,
+      openspec_note: input.openspec_note ?? null,
       workflow_id: input.workflow?.workflow_id ?? null,
       workflow_project_id: input.workflow?.workflow_project_id ?? null,
       route_start_swimlane_id: input.workflow?.route_start_swimlane_id ?? null,
@@ -460,9 +482,9 @@ export class TaskRepository {
     };
 
     this.db.prepare(`
-      INSERT INTO tasks (id, display_id, title, description, swimlane_id, position, agent, session_id, worktree_path, branch_name, pr_number, pr_url, pr_state, pr_merge_readiness, head_sha, external_id, external_source, external_url, base_branch, use_worktree, labels, priority, model_override, effort_override, agent_override, permission_mode, auto_command, profile_id, run_mode, automations_disabled, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(task.id, task.display_id, task.title, task.description, task.swimlane_id, task.position, task.agent, task.session_id, task.worktree_path, task.branch_name, task.pr_number, task.pr_url, task.pr_state, task.pr_merge_readiness, task.head_sha, task.external_id, task.external_source, task.external_url, task.base_branch, task.use_worktree, JSON.stringify(labels), task.priority, task.model_override, task.effort_override, task.agent_override, task.permission_mode, task.auto_command, task.profile_id, task.run_mode, task.automations_disabled ? 1 : 0, task.created_at, task.updated_at);
+      INSERT INTO tasks (id, display_id, title, description, swimlane_id, position, agent, session_id, worktree_path, branch_name, pr_number, pr_url, pr_state, pr_merge_readiness, head_sha, external_id, external_source, external_url, base_branch, use_worktree, labels, priority, model_override, effort_override, agent_override, permission_mode, auto_command, profile_id, run_mode, automations_disabled, card_kind, task_intent, openspec_change, openspec_note, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(task.id, task.display_id, task.title, task.description, task.swimlane_id, task.position, task.agent, task.session_id, task.worktree_path, task.branch_name, task.pr_number, task.pr_url, task.pr_state, task.pr_merge_readiness, task.head_sha, task.external_id, task.external_source, task.external_url, task.base_branch, task.use_worktree, JSON.stringify(labels), task.priority, task.model_override, task.effort_override, task.agent_override, task.permission_mode, task.auto_command, task.profile_id, task.run_mode, task.automations_disabled ? 1 : 0, task.card_kind, task.task_intent, task.openspec_change, task.openspec_note, task.created_at, task.updated_at);
 
     // Only a workflow's Start passes membership, so an ordinary create costs
     // no second statement.
@@ -610,10 +632,10 @@ export class TaskRepository {
     // keeps it, since the commit the branch was cut at has not changed.
     const forgetsBranch = input.branch_name === null ? 1 : 0;
     this.db.prepare(`
-      UPDATE tasks SET title = ?, description = ?, swimlane_id = ?, position = ?, agent = ?, session_id = ?, worktree_path = ?, branch_name = ?, pr_number = ?, pr_url = ?, pr_state = ?, pr_merge_readiness = ?, head_sha = ?, pushed_branch = ?, base_branch = ?, resolved_base_branch = ?, use_worktree = ?, labels = ?, priority = ?, model_override = ?, effort_override = ?, agent_override = ?, permission_mode = ?, profile_id = ?, run_mode = ?, automations_disabled = ?, updated_at = ?,
+      UPDATE tasks SET title = ?, description = ?, swimlane_id = ?, position = ?, agent = ?, session_id = ?, worktree_path = ?, branch_name = ?, pr_number = ?, pr_url = ?, pr_state = ?, pr_merge_readiness = ?, head_sha = ?, pushed_branch = ?, base_branch = ?, resolved_base_branch = ?, use_worktree = ?, labels = ?, priority = ?, model_override = ?, effort_override = ?, agent_override = ?, permission_mode = ?, profile_id = ?, run_mode = ?, automations_disabled = ?, card_kind = ?, task_intent = ?, openspec_change = ?, openspec_note = ?, updated_at = ?,
         fork_point_sha = CASE WHEN ? = 1 THEN NULL ELSE fork_point_sha END
       WHERE id = ?
-    `).run(updated.title, updated.description, updated.swimlane_id, updated.position, updated.agent, updated.session_id, updated.worktree_path, updated.branch_name, updated.pr_number, updated.pr_url, updated.pr_state, updated.pr_merge_readiness, updated.head_sha, updated.pushed_branch, updated.base_branch, updated.resolved_base_branch, updated.use_worktree, JSON.stringify(updated.labels), updated.priority, updated.model_override, updated.effort_override, updated.agent_override, updated.permission_mode, updated.profile_id, updated.run_mode, updated.automations_disabled ? 1 : 0, updated.updated_at, forgetsBranch, updated.id);
+    `).run(updated.title, updated.description, updated.swimlane_id, updated.position, updated.agent, updated.session_id, updated.worktree_path, updated.branch_name, updated.pr_number, updated.pr_url, updated.pr_state, updated.pr_merge_readiness, updated.head_sha, updated.pushed_branch, updated.base_branch, updated.resolved_base_branch, updated.use_worktree, JSON.stringify(updated.labels), updated.priority, updated.model_override, updated.effort_override, updated.agent_override, updated.permission_mode, updated.profile_id, updated.run_mode, updated.automations_disabled ? 1 : 0, updated.card_kind === 'change' ? 'change' : 'regular', updated.task_intent === 'discuss' ? 'discuss' : 'work', updated.openspec_change ?? null, updated.openspec_note ?? null, updated.updated_at, forgetsBranch, updated.id);
 
     return updated;
   }

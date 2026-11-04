@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type {
+  AutomationAppliesTo,
   AutomationConfig,
   AutomationTrigger,
   AutomationType,
@@ -24,6 +25,7 @@ interface AutomationRow {
   condition: string | null;
   final_line: string | null;
   max_runs: number | null;
+  applies_to: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -60,13 +62,24 @@ export class AutomationRepository {
    * The rows the engine will actually run for one column on one trigger, in
    * order. Enabled only: a switched-off automation is skipped, and skipping it
    * here rather than in the engine is what keeps "what runs" a single query.
+   *
+   * `appliesTo` selects which list runs. `'regular'` is work and discuss cards.
+   * `'change'` is OpenSpec change cards. Omitted defaults to `'regular'` so a
+   * two-argument caller keeps the pre-OpenSpec filter. The runner MUST pass
+   * `appliesTo` from the task's `card_kind` (`'change'` -> `'change'`, anything
+   * else -> `'regular'`). The two-argument form on a change card would run the
+   * regular list.
    */
-  getForTrigger(swimlaneId: string, trigger: AutomationTrigger): ColumnAutomation[] {
+  getForTrigger(
+    swimlaneId: string,
+    trigger: AutomationTrigger,
+    appliesTo: AutomationAppliesTo = 'regular',
+  ): ColumnAutomation[] {
     const rows = this.db
       .prepare(
-        'SELECT * FROM column_automations WHERE swimlane_id = ? AND trigger = ? AND enabled = 1 ORDER BY position ASC',
+        'SELECT * FROM column_automations WHERE swimlane_id = ? AND trigger = ? AND applies_to = ? AND enabled = 1 ORDER BY position ASC',
       )
-      .all(swimlaneId, trigger) as AutomationRow[];
+      .all(swimlaneId, trigger, normalizeAppliesTo(appliesTo)) as AutomationRow[];
     return mapRows(rows);
   }
 
@@ -78,8 +91,8 @@ export class AutomationRepository {
    * separate statements would make the unique name index reject an intermediate
    * state that the final state does not have (swapping two names, for instance).
    *
-   * `position` is assigned PER TRIGGER, so each group numbers from 0
-   * independently and the groups can never interleave. That is what makes the
+   * `position` is assigned PER (trigger, applies_to), so each list's groups
+   * number from 0 independently and never interleave. That is what makes the
    * file's arrays and the UI's groups the same thing as the DB's ordering,
    * rather than several orderings that have to be kept in step.
    */
@@ -87,30 +100,49 @@ export class AutomationRepository {
     const now = new Date().toISOString();
     const insert = this.db.prepare(`
       INSERT INTO column_automations
-        (id, swimlane_id, name, type, trigger, position, enabled, config_json, condition, final_line, max_runs, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, swimlane_id, name, type, trigger, position, enabled, config_json, condition, final_line, max_runs, applies_to, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const tx = writeTransaction(this.db, () => {
       // Read the rows first so a row that survives the replace keeps the date it
       // was actually made on, not the date it was last saved.
       const existingRows = this.db.prepare(
-        'SELECT id, name, type, trigger, created_at FROM column_automations WHERE swimlane_id = ?',
-      ).all(swimlaneId) as Array<{ id: string; name: string; type: string; trigger: string; created_at: string }>;
+        'SELECT id, name, type, trigger, applies_to, created_at FROM column_automations WHERE swimlane_id = ?',
+      ).all(swimlaneId) as Array<{
+        id: string;
+        name: string;
+        type: string;
+        trigger: string;
+        applies_to: string | null;
+        created_at: string;
+      }>;
       const existing = new Map(existingRows.map((row) => [row.id, row.created_at]));
       // A writer that carries no ids (the `kangentic.json` apply on every project
       // open, an agent's kangentic_set_automations) keeps the id of the row with
-      // the same name, type and trigger. Frequency and "once per visit" count
-      // runs by id, so a fresh id would hand every guarded row a clean slate.
-      const idByIdentity = new Map(existingRows.map((row) => [automationIdentity(row.name, row.type, row.trigger), row.id]));
+      // the same name, type, trigger and applies_to. Frequency and "once per
+      // visit" count runs by id, so a fresh id would hand every guarded row a
+      // clean slate. applies_to is in the key so the regular and change lists
+      // can share a name without stealing each other's identity.
+      const idByIdentity = new Map(
+        existingRows.map((row) => [
+          automationIdentity(row.name, row.type, row.trigger, normalizeAppliesTo(row.applies_to)),
+          row.id,
+        ]),
+      );
       const explicitIds = new Set(automations.flatMap((automation) => (automation.id ? [automation.id] : [])));
       const usedIds = new Set<string>();
 
       this.db.prepare('DELETE FROM column_automations WHERE swimlane_id = ?').run(swimlaneId);
 
-      const nextPosition: Record<AutomationTrigger, number> = { enter: 0, turn_end: 0, exit: 0 };
+      // Position is per (trigger, applies_to), so the two lists number from 0
+      // independently and never interleave with each other.
+      const nextPosition = new Map<string, number>();
       for (const automation of automations) {
-        const kept = idByIdentity.get(automationIdentity(automation.name, automation.type, automation.trigger));
+        const appliesTo = normalizeAppliesTo(automation.applies_to);
+        const kept = idByIdentity.get(
+          automationIdentity(automation.name, automation.type, automation.trigger, appliesTo),
+        );
         const reusable = kept !== undefined && !explicitIds.has(kept) && !usedIds.has(kept) ? kept : undefined;
         const id = automation.id ?? reusable ?? randomUUID();
         usedIds.add(id);
@@ -118,22 +150,25 @@ export class AutomationRepository {
         // writer already holds to this (the dialog, the file reader, MCP), so
         // this is the backstop, not the rule.
         const kinds = conditionKindsAsStored(automation);
+        const positionKey = `${automation.trigger}\n${appliesTo}`;
+        const position = nextPosition.get(positionKey) ?? 0;
         insert.run(
           id,
           swimlaneId,
           automation.name,
           automation.type,
           automation.trigger,
-          nextPosition[automation.trigger],
+          position,
           automation.enabled ? 1 : 0,
           JSON.stringify(automation.config ?? {}),
           kinds.condition,
           kinds.final_line,
           normalizeMaxRuns(automation.max_runs),
+          appliesTo,
           existing.get(id) ?? now,
           now,
         );
-        nextPosition[automation.trigger] += 1;
+        nextPosition.set(positionKey, position + 1);
       }
     });
     tx();
@@ -195,9 +230,14 @@ export function normalizeFinalLine(finalLine: string | null | undefined, trigger
   return trimmed ? trimmed : null;
 }
 
-/** What makes a row in a column "the same automation" when a writer carries no id. Names are unique per column. */
-function automationIdentity(name: string, type: string, trigger: string): string {
-  return `${name}\n${type}\n${trigger}`;
+/** `'change'` is the change-card list; anything else (including omitted) is regular. */
+export function normalizeAppliesTo(value: string | null | undefined): AutomationAppliesTo {
+  return value === 'change' ? 'change' : 'regular';
+}
+
+/** What makes a row in a column "the same automation" when a writer carries no id. Names are unique per (column, applies_to). */
+function automationIdentity(name: string, type: string, trigger: string, appliesTo: AutomationAppliesTo): string {
+  return `${name}\n${type}\n${trigger}\n${appliesTo}`;
 }
 
 /** A Frequency limit as written is one a writer accepts unchanged: a whole number of at least 1. */
@@ -244,6 +284,7 @@ function mapRow(row: AutomationRow): ColumnAutomation | null {
     condition: normalizeCondition(row.condition),
     final_line: normalizeFinalLine(row.final_line, row.trigger),
     max_runs: normalizeMaxRuns(row.max_runs),
+    applies_to: normalizeAppliesTo(row.applies_to),
     created_at: row.created_at,
     updated_at: row.updated_at,
   };

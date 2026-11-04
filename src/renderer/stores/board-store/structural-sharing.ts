@@ -148,6 +148,10 @@ function taskContentsMatch(previous: Task, next: Task): boolean {
     // The card's strip and its menu row read it, so a write that changes only
     // this field still has to reach the card.
     previous.automations_disabled !== next.automations_disabled ||
+    previous.card_kind !== next.card_kind ||
+    previous.task_intent !== next.task_intent ||
+    previous.openspec_change !== next.openspec_change ||
+    previous.openspec_note !== next.openspec_note ||
     previous.auto_command_state !== next.auto_command_state ||
     previous.auto_command_text !== next.auto_command_text ||
     previous.auto_command_error !== next.auto_command_error ||

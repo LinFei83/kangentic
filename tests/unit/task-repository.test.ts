@@ -255,6 +255,18 @@ describe('TaskRepository SQL contracts', () => {
     });
   });
 
+  describe('getByOpenspecChange', () => {
+    it('looks up openspec_change across archived and active rows, newest first', () => {
+      repo.getByOpenspecChange('add-rate-limiting');
+
+      const statement = tracker.statements.find((s) => s.sql.includes('WHERE t.openspec_change = ?'));
+      expect(statement).toBeDefined();
+      expect(statement!.sql).not.toContain('archived_at');
+      expect(statement!.sql).toContain('ORDER BY t.updated_at DESC');
+      expect(statement!.args).toEqual(['add-rate-limiting']);
+    });
+  });
+
   describe('the PR linker holder lookups', () => {
     // Both must see archived rows. A Done task keeps its PR link and its pushed
     // branch, and the linker's inferred tiers refuse a hit ANY other task on the
@@ -486,6 +498,51 @@ describe('TaskRepository SQL contracts', () => {
 
         expect(task.profile_id).toBe('profile-1');
         expect(task.run_mode).toBe('column_settings');
+      });
+
+      it('defaults card_kind to regular and task_intent to work, and persists them', () => {
+        const task = repo.create({ title: 'T', description: '', swimlane_id: 'lane-1' });
+
+        expect(task.card_kind).toBe('regular');
+        expect(task.task_intent).toBe('work');
+        expect(task.openspec_change).toBeNull();
+        expect(task.openspec_note).toBeNull();
+
+        const insertStatement = tracker.statements.find((statement) => statement.sql.includes('INSERT INTO tasks'));
+        expect(insertStatement).toBeDefined();
+        const columns = extractInsertColumns(insertStatement!.sql);
+        expect(insertStatement!.args[columns.indexOf('card_kind')]).toBe('regular');
+        expect(insertStatement!.args[columns.indexOf('task_intent')]).toBe('work');
+        expect(insertStatement!.args[columns.indexOf('openspec_change')]).toBeNull();
+        expect(insertStatement!.args[columns.indexOf('openspec_note')]).toBeNull();
+      });
+
+      it('persists a change card and a discuss intent when asked', () => {
+        const task = repo.create({
+          title: 'T',
+          description: '',
+          swimlane_id: 'lane-1',
+          card_kind: 'change',
+          task_intent: 'discuss',
+          openspec_change: 'add-rate-limiting',
+          openspec_note: 'ready',
+          externalId: 'add-rate-limiting',
+          externalSource: 'openspec',
+        });
+
+        expect(task.card_kind).toBe('change');
+        expect(task.task_intent).toBe('discuss');
+        expect(task.openspec_change).toBe('add-rate-limiting');
+        expect(task.openspec_note).toBe('ready');
+        expect(task.external_id).toBe('add-rate-limiting');
+        expect(task.external_source).toBe('openspec');
+
+        const insertStatement = tracker.statements.find((statement) => statement.sql.includes('INSERT INTO tasks'));
+        const columns = extractInsertColumns(insertStatement!.sql);
+        expect(insertStatement!.args[columns.indexOf('card_kind')]).toBe('change');
+        expect(insertStatement!.args[columns.indexOf('task_intent')]).toBe('discuss');
+        expect(insertStatement!.args[columns.indexOf('openspec_change')]).toBe('add-rate-limiting');
+        expect(insertStatement!.args[columns.indexOf('openspec_note')]).toBe('ready');
       });
 
       it('persists run_mode in the INSERT statement, not just the returned object', () => {

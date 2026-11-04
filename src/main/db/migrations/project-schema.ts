@@ -2157,6 +2157,46 @@ export function runProjectMigrations(db: Database.Database): void {
   if (!intervalColumnNames.has('reason_kind')) {
     db.exec('ALTER TABLE session_activity_intervals ADD COLUMN reason_kind TEXT DEFAULT NULL');
   }
+
+  // Migration: OpenSpec board cards. Regular vs change on the task, work vs
+  // discuss intent on a regular card, and a second automation list per column
+  // selected by `applies_to`. Defaults keep every existing row a regular work
+  // card on the regular automation list. The unique name index grows
+  // `applies_to` so the two lists may share a name.
+  const openspecTaskColumnNames = new Set(
+    (db.pragma('table_info(tasks)') as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (!openspecTaskColumnNames.has('card_kind')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN card_kind TEXT NOT NULL DEFAULT 'regular'");
+  }
+  if (!openspecTaskColumnNames.has('task_intent')) {
+    db.exec("ALTER TABLE tasks ADD COLUMN task_intent TEXT NOT NULL DEFAULT 'work'");
+  }
+  if (!openspecTaskColumnNames.has('openspec_change')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN openspec_change TEXT DEFAULT NULL');
+  }
+  if (!openspecTaskColumnNames.has('openspec_note')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN openspec_note TEXT DEFAULT NULL');
+  }
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_openspec_change ON tasks(openspec_change) WHERE openspec_change IS NOT NULL',
+  );
+
+  const openspecAutomationColumnNames = new Set(
+    (db.pragma('table_info(column_automations)') as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (!openspecAutomationColumnNames.has('applies_to')) {
+    db.exec("ALTER TABLE column_automations ADD COLUMN applies_to TEXT NOT NULL DEFAULT 'regular'");
+  }
+  const nameIndex = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_column_automations_name'")
+    .get() as { sql: string } | undefined;
+  if (!nameIndex?.sql.includes('applies_to')) {
+    db.exec('DROP INDEX IF EXISTS idx_column_automations_name');
+    db.exec(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_column_automations_name ON column_automations(swimlane_id, applies_to, name COLLATE NOCASE)',
+    );
+  }
 }
 
 /**

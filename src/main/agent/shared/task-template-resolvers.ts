@@ -95,6 +95,9 @@ export const TASK_TEMPLATE_RESOLVERS: Record<TaskTemplateVarName, TaskTemplateRe
   // A leading newline so it sits on its own line after `{{task_xml}}` in the
   // default prompt; empty (and dropped) for a task outside a workflow.
   workflow_xml: ({ workflow }) => (workflow ? `\n${buildWorkflowXml(workflow)}` : ''),
+  // Wave 0 stub: empty so drop-and-collapse removes it on a regular card.
+  // Wave 2 (or 1B) fills this from default-branch `git show` of the change.
+  openspec_xml: () => '',
   title: ({ task }) => sanitizeForPty(task.title),
   description: ({ task }) => {
     const clean = sanitizeForPty(task.description);

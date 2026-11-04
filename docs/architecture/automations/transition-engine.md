@@ -174,7 +174,7 @@ variable" picker and its inline `{{` completion, and this table - see
 entry's `description`, that field is user-facing copy and should stay to one
 line.
 
-26 keywords. 19 resolve wherever there is a task, 5 only in an automation (the
+27 keywords. 20 resolve wherever there is a task, 5 only in an automation (the
 move keywords and `{{agentReply}}`), and 2 only in a workflow agent's first
 message (`{{columns}}` and `{{brief_xml}}`), each marked below. That first
 message (Settings > Workflows) is the third context: it is written before any
@@ -209,6 +209,7 @@ Note what drop-and-collapse means for a FLAG-shaped placeholder in an
 | `{{description}}` | Task description with `: ` prefix when non-empty |
 | `{{task_xml}}` | Task title and description wrapped in a `<task>` envelope (`<title>` / `<description>` children). Default seeded prompt template is `{{task_xml}}{{workflow_xml}}{{attachments}}`, which gives the agent a structured envelope without forcing the user to template it manually. |
 | `{{workflow_xml}}` | A workflow task's `<workflow>` block: the workflow's name, the task's route, the `<column>` it is in as the prompt is built, the tasks it built on (with their branch and PR) and the tasks waiting on it, then how its turns are judged (end a turn only with the column's work done or when only the owner can settle what it is stuck on, and then with the `Needs owner: <the question>` line, for a change from the plan, something the owner must weigh in on, or a decision between options; progress notes go beside the next tool call; `kangentic_move_task` with `"next"`, or, in a column that runs the task in plan mode, that approving the plan moves the task on to the next route column so the agent does not move it itself; `kangentic_mark_background_service` for a background command left running after the turn; and which route columns run in a conversation of their own, an isolated session target: an agent in one is told the main conversation sees only its commits and its final message, and an agent in the main conversation is told those columns do not see it and that it hears what they did when it comes back). Read by the engine (`readWorkflowPromptFacts`, whose `ownConversation` lists those columns) and escaped. Empty, and dropped, for a task outside a workflow, so an ordinary task's default prompt is unchanged. |
+| `{{openspec_xml}}` | An OpenSpec change card's proposal, specs and tasks in an `<openspec>` envelope. Empty, and dropped, for a regular card. Wave 0 declares the keyword; the resolver still returns empty until Wave 2 fills it from the default branch. |
 | `{{taskId}}` | Task UUID |
 | `{{taskNumber}}` | The task's `#N`, the number people say out loud (`display_id`) |
 | `{{projectPath}}` | Main project checkout path (empty if no project is open) - always the base repo, even when the task has a worktree |

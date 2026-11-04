@@ -269,6 +269,36 @@ describe('AutomationRepository', () => {
       expect(automations.getForTrigger(columnId, 'enter').map((row) => row.name)).toEqual(['Enter one', 'Enter two']);
       expect(automations.getForTrigger(columnId, 'exit').map((row) => row.name)).toEqual(['Exit one']);
     });
+
+    it('defaults appliesTo to regular, and the three-argument form filters by list', () => {
+      const { automations, columnId } = setup();
+      automations.replaceForColumn(columnId, [
+        webhook('Regular ping', { trigger: 'enter' }),
+        webhook('Change ping', { trigger: 'enter', applies_to: 'change' }),
+        webhook('Change exit', { trigger: 'exit', applies_to: 'change' }),
+      ]);
+
+      expect(automations.getForTrigger(columnId, 'enter').map((row) => row.name)).toEqual(['Regular ping']);
+      expect(automations.getForTrigger(columnId, 'enter', 'regular').map((row) => row.name)).toEqual(['Regular ping']);
+      expect(automations.getForTrigger(columnId, 'enter', 'change').map((row) => row.name)).toEqual(['Change ping']);
+      expect(automations.getForTrigger(columnId, 'exit', 'change').map((row) => row.name)).toEqual(['Change exit']);
+      expect(automations.getForTrigger(columnId, 'exit', 'regular')).toEqual([]);
+    });
+
+    it('lets the two lists share a name and numbers position per list', () => {
+      const { automations, columnId } = setup();
+      automations.replaceForColumn(columnId, [
+        webhook('Ping', { trigger: 'enter' }),
+        webhook('Ping', { trigger: 'enter', applies_to: 'change' }),
+        webhook('Pong', { trigger: 'enter', applies_to: 'change' }),
+      ]);
+
+      const saved = automations.listForColumn(columnId);
+      const regular = saved.filter((row) => row.applies_to === 'regular');
+      const change = saved.filter((row) => row.applies_to === 'change');
+      expect(regular.map((row) => [row.name, row.position])).toEqual([['Ping', 0]]);
+      expect(change.map((row) => [row.name, row.position])).toEqual([['Ping', 0], ['Pong', 1]]);
+    });
   });
 
   // `resolveMoveTarget` reads a Move to column target trimmed and case-blind, so

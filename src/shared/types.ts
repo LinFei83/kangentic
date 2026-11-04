@@ -516,6 +516,25 @@ export type PRLinkStatus = 'linked' | 'unchanged' | 'not-found' | 'no-anchor' | 
 export type TaskRunMode = 'column_settings' | 'agent_override';
 
 /**
+ * Which kind of board card this task is. Regular cards are created in New Task
+ * (work or discuss). Change cards are created only by the OpenSpec scan.
+ */
+export type TaskCardKind = 'regular' | 'change';
+
+/**
+ * What a regular card is for. `'work'` follows the current board path with no
+ * OpenSpec change. `'discuss'` is still a regular card; a fresh spawn prepends
+ * `/opsx-explore`. Change cards ignore this field.
+ */
+export type TaskIntent = 'work' | 'discuss';
+
+/**
+ * Which automation list a column row belongs to. Regular cards (work and
+ * discuss) run the `'regular'` list. Change cards run the `'change'` list.
+ */
+export type AutomationAppliesTo = 'regular' | 'change';
+
+/**
  * Why a task's last spawn ran WITHOUT a worktree, i.e. in the shared project
  * checkout. Recorded on the task row (`Task.worktree_skip_reason`) at spawn
  * time as ground truth for any surface that would otherwise infer the state
@@ -705,6 +724,28 @@ export interface Task {
    * `CoreTask.held`).
    */
   automations_disabled: boolean;
+  /**
+   * `'regular'` (New Task, work or discuss) or `'change'` (OpenSpec scan only).
+   * Existing rows and omitted creates default to `'regular'`.
+   */
+  card_kind: TaskCardKind;
+  /**
+   * `'work'` or `'discuss'` on a regular card. Change cards ignore this.
+   * Existing rows and omitted creates default to `'work'`.
+   */
+  task_intent: TaskIntent;
+  /**
+   * OpenSpec change directory name. Set only on a change card. Null on a
+   * regular card. The scan's de-dupe key; `TaskRepository.getByOpenspecChange`
+   * looks this up.
+   */
+  openspec_change: string | null;
+  /**
+   * Stable OpenSpec status token written by the scan (`ready`, `tasks:3/12`,
+   * `archived`, `invalid`, `missing`, `error`). Never a sentence. Parsed by
+   * `openspecNoteDescriptor`. Null when the scan has not stamped one.
+   */
+  openspec_note: string | null;
   /**
    * The workflow this task belongs to (`Workflow.id`), or null for an ordinary
    * task. The workflow, and its links, live in its HOME project's database,
@@ -1166,6 +1207,13 @@ export interface ColumnAutomation {
    * holds a review loop to its round-trip limit. Null means no limit.
    */
   max_runs: number | null;
+  /**
+   * Which card kind this row runs for. `'regular'` (work and discuss) or
+   * `'change'`. Names are unique per `(swimlane_id, applies_to)`, so the two
+   * lists may share a name. Existing rows and omitted writes default to
+   * `'regular'`.
+   */
+  applies_to: AutomationAppliesTo;
   created_at: string;
   updated_at: string;
 }
@@ -1189,6 +1237,8 @@ export interface AutomationWriteInput {
   final_line: string | null;
   /** See `ColumnAutomation.max_runs`. Omitted or null: no limit. */
   max_runs?: number | null;
+  /** See `ColumnAutomation.applies_to`. Omitted defaults to `'regular'`. */
+  applies_to?: AutomationAppliesTo;
 }
 
 /**
@@ -5712,6 +5762,14 @@ export interface TaskCreateInput {
   run_mode?: TaskRunMode;
   /** Create the task with its column automations paused (see `Task.automations_disabled`). Omitted means not paused. */
   automations_disabled?: boolean;
+  /** See `Task.card_kind`. Omitted defaults to `'regular'`. New Task never sends `'change'`. */
+  card_kind?: TaskCardKind;
+  /** See `Task.task_intent`. Omitted defaults to `'work'`. Ignored on a change card. */
+  task_intent?: TaskIntent;
+  /** See `Task.openspec_change`. Set only when creating a change card. */
+  openspec_change?: string | null;
+  /** See `Task.openspec_note`. The scan stamps this after create; omitted creates store null. */
+  openspec_note?: string | null;
   /** External origin carried through when promoting an imported backlog item, so import dedup survives promotion. */
   externalId?: string;
   externalSource?: string;
@@ -5773,6 +5831,14 @@ export interface TaskUpdateInput {
   run_mode?: TaskRunMode;
   /** Pause or resume column automations for the task (see `Task.automations_disabled`). On a workflow task it is the task's own hold. */
   automations_disabled?: boolean;
+  /** See `Task.card_kind`. Omitted leaves the stored kind alone. */
+  card_kind?: TaskCardKind;
+  /** See `Task.task_intent`. Omitted leaves the stored intent alone. */
+  task_intent?: TaskIntent;
+  /** See `Task.openspec_change`. Omitted leaves the stored value alone. */
+  openspec_change?: string | null;
+  /** See `Task.openspec_note`. Omitted leaves the stored value alone. */
+  openspec_note?: string | null;
 }
 
 /** Result of `IPC.TASK_RESOLVE_PR` - the on-demand branch->PR resolver. */
@@ -7610,6 +7676,16 @@ export interface BoardColumnAutomations {
   /** Each time the agent working in the column finishes a turn there. */
   onTurnEnd?: BoardAutomationConfig[];
   onExit?: BoardAutomationConfig[];
+  /**
+   * Automations for OpenSpec change cards. The top-level three arrays stay the
+   * regular-card list (work and discuss). Omitted or empty: a change card in
+   * this column runs nothing.
+   */
+  change?: {
+    onEnter?: BoardAutomationConfig[];
+    onTurnEnd?: BoardAutomationConfig[];
+    onExit?: BoardAutomationConfig[];
+  };
 }
 
 export interface BoardActionConfig {

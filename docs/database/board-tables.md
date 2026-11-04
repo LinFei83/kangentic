@@ -116,6 +116,10 @@ Per-column session model (two orthogonal axes; see `src/shared/types.ts` and [Is
 | profile_id | TEXT | | NULL |
 | run_mode | TEXT | NOT NULL | 'column_settings' |
 | automations_disabled | INTEGER | NOT NULL | 0 |
+| card_kind | TEXT | NOT NULL | 'regular' |
+| task_intent | TEXT | NOT NULL | 'work' |
+| openspec_change | TEXT | | NULL |
+| openspec_note | TEXT | | NULL |
 | detail_view_state | TEXT | | NULL |
 | workflow_id | TEXT | | NULL |
 | workflow_project_id | TEXT | | NULL |
@@ -129,7 +133,7 @@ Per-column session model (two orthogonal axes; see `src/shared/types.ts` and [Is
 | created_at | TEXT | NOT NULL | |
 | updated_at | TEXT | NOT NULL | |
 
-Indexes: `idx_tasks_swimlane_position` on (swimlane_id, position), `idx_tasks_display_id` on (display_id) UNIQUE, `idx_tasks_session_id` on (session_id), `idx_tasks_external` on (external_source, external_id), `idx_tasks_workflow` on (workflow_id).
+Indexes: `idx_tasks_swimlane_position` on (swimlane_id, position), `idx_tasks_display_id` on (display_id) UNIQUE, `idx_tasks_session_id` on (session_id), `idx_tasks_external` on (external_source, external_id), `idx_tasks_workflow` on (workflow_id), `idx_tasks_openspec_change` UNIQUE on (openspec_change) WHERE openspec_change IS NOT NULL.
 
 Valid permission_mode values: `default`, `plan`, `acceptEdits`, `dontAsk`, `bypassPermissions`,
 `auto`, or NULL when the task pins none. A set value outranks the column's for the task's whole
@@ -225,6 +229,14 @@ task](../architecture/automations/triggers.md#disabling-automations-for-one-task
 too. A task already in a workflow can carry it: there it is the task's own hold out of its
 workflow.
 
+`card_kind` is `'regular'` (a New Task card, work or discuss) or `'change'` (created only by the
+OpenSpec scan). `task_intent` is `'work'` or `'discuss'` on a regular card; a change card ignores
+it. `openspec_change` is the change directory name on a change card, and the scan's de-dupe key
+(`TaskRepository.getByOpenspecChange`). `openspec_note` is a stable status token (`ready`,
+`tasks:3/12`, `archived`, `invalid`, `missing`, `error`), never a sentence, parsed by
+`openspecNoteDescriptor`. Both OpenSpec columns are NULL on a regular card. Existing rows default
+to a regular work card with no OpenSpec fields.
+
 ## schema_meta table
 
 Key/value flags for data migrations that cannot answer "have I run" from the data itself.
@@ -272,6 +284,7 @@ one column.
 | config_json | TEXT | NOT NULL | |
 | condition | TEXT | | NULL |
 | max_runs | INTEGER | | NULL |
+| applies_to | TEXT | NOT NULL | 'regular' |
 | created_at | TEXT | NOT NULL | |
 | updated_at | TEXT | NOT NULL | |
 | final_line | TEXT | | NULL |
@@ -293,8 +306,13 @@ the most times it may run on one task across every visit since a person last mov
 another column, or it last left Done; NULL means no limit. All three are nullable so a build from
 before them still inserts into a database that has them.
 
-`position` is assigned PER TRIGGER, so each group numbers from 0 independently and the three can
-never interleave.
+`applies_to` is `'regular'` (work and discuss cards) or `'change'` (OpenSpec change cards). The
+engine's `getForTrigger(swimlaneId, trigger, appliesTo)` filters on it. Omitted `appliesTo`
+defaults to `'regular'`; the runner must pass the task's `card_kind`. Existing rows default to
+`'regular'`.
+
+`position` is assigned PER (trigger, applies_to), so each list's groups number from 0
+independently and the two lists never interleave.
 
 The foreign key is genuine and enforced (`database.ts` sets `foreign_keys = ON`). The one on
 `swimlane_transitions.from_swimlane_id` had to be dropped for its `'*'` wildcard; this table has no
@@ -305,11 +323,12 @@ Indices:
 
 - `idx_column_automations_lookup` on (swimlane_id, trigger, position) - the read the engine does on
   every move.
-- `idx_column_automations_name` UNIQUE on (swimlane_id, name COLLATE NOCASE) - what makes per-column
-  name uniqueness TRUE rather than merely validated in the editor, so a hand-edited `kangentic.json`
-  or an MCP write cannot break it. `COLLATE NOCASE` folds ASCII only while the editor's
-  `toLowerCase()` folds Unicode, so the editor rejects a superset, which is the safe direction. The
-  migration dedupes names BEFORE creating this index, or it fails.
+- `idx_column_automations_name` UNIQUE on (swimlane_id, applies_to, name COLLATE NOCASE) - what
+  makes per-list name uniqueness TRUE rather than merely validated in the editor, so a hand-edited
+  `kangentic.json` or an MCP write cannot break it. The two lists on one column may share a name.
+  `COLLATE NOCASE` folds ASCII only while the editor's `toLowerCase()` folds Unicode, so the editor
+  rejects a superset, which is the safe direction. The automations data migration dedupes names
+  BEFORE creating this index, or it fails.
 
 ## automation_runs table
 
