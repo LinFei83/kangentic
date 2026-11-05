@@ -10,7 +10,7 @@
 import type { Task } from '../../shared/types';
 import { openSimpleGit } from '../git/simple-git-client';
 import { escapeXml } from '../agent/shared/prompt-xml';
-import { GIT_LS_TREE_NO_QUOTE, parseGitNameOnlyOutput } from './git-quoted-path';
+import { QUOTEPATH_FALSE_CONFIG, parseGitNameOnlyOutput } from './git-quoted-path';
 
 const CHANGES_TREE = 'openspec/changes';
 
@@ -33,7 +33,7 @@ export function createOpenspecXmlGit(projectPath: string): OpenspecXmlGit {
       return git.raw(['show', spec]);
     },
     async lsTreeFiles(spec) {
-      const output = await git.raw([...GIT_LS_TREE_NO_QUOTE, 'ls-tree', '-r', '--name-only', spec]);
+      const output = await git.raw([...QUOTEPATH_FALSE_CONFIG, 'ls-tree', '-r', '--name-only', spec]);
       return parseGitNameOnlyOutput(output);
     },
   };

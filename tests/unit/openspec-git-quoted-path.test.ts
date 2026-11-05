@@ -40,6 +40,14 @@ describe('decodeGitQuotedPath / parseGitNameOnlyOutput', () => {
     expect(decodeGitQuotedPath('"foo\\nbar"')).toBe('foo\nbar');
   });
 
+  it('re-encodes raw UTF-8 bytes left inside a C-quoted name', () => {
+    // quotepath=false still quotes `"`, and leaves non-ASCII raw in the body.
+    // charCodeAt of 创 is 0x521B; treating it as a byte truncated to 0x1B.
+    const firstCharacter = '创';
+    const remainder = '建测试变更';
+    expect(decodeGitQuotedPath(`"${firstCharacter}\\"${remainder}"`)).toBe(`${firstCharacter}"${remainder}`);
+  });
+
   it('decodes a quoted archive folder that mixes ASCII and octal', () => {
     expect(decodeGitQuotedPath(`"2026-11-04-${QUOTED_CHANGE_NAME.slice(1, -1)}"`)).toBe(
       `2026-11-04-${CHANGE_NAME}`,
@@ -72,8 +80,6 @@ describe('createOpenspecGit / createOpenspecXmlGit against real git', () => {
   beforeEach(() => {
     repository = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'kangentic-openspec-quote-')));
     runGit(repository, ['init', '-b', 'main']);
-    runGit(repository, ['config', 'user.email', 'dev@example.com']);
-    runGit(repository, ['config', 'user.name', 'Dev']);
     const changeDirectory = path.join(repository, 'openspec', 'changes', CHANGE_NAME);
     fs.mkdirSync(path.join(changeDirectory, 'specs'), { recursive: true });
     fs.writeFileSync(path.join(changeDirectory, 'proposal.md'), `# ${CHANGE_NAME}\n\nShip it.\n`);
@@ -115,6 +121,27 @@ describe('createOpenspecGit / createOpenspecXmlGit against real git', () => {
   });
 });
 
+/** The developer's own git config stays out: a global `commit.gpgsign` or `core.hooksPath` would fail a commit here. */
+const GIT_ISOLATION = [
+  '-c', 'user.name=dev', '-c', 'user.email=dev@example.com', '-c', 'core.autocrlf=false',
+  '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=',
+];
+const GIT_TIMEOUT_MS = 30_000;
+
+function gitEnvironment(): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  delete environment.GIT_DIR;
+  delete environment.GIT_WORK_TREE;
+  delete environment.GIT_INDEX_FILE;
+  return environment;
+}
+
 function runGit(cwd: string, args: string[]): string {
-  return execFileSync('git', args, { cwd, windowsHide: true, encoding: 'utf8' });
+  return execFileSync('git', [...GIT_ISOLATION, ...args], {
+    cwd,
+    windowsHide: true,
+    encoding: 'utf8',
+    timeout: GIT_TIMEOUT_MS,
+    env: gitEnvironment(),
+  });
 }
