@@ -882,7 +882,7 @@ msgstr "無法切換分支"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Counts tasks whose agent is working or waiting on you. Max concurrent sessions in Settings still applies."
-msgstr ""
+msgstr "計入代理正在工作或等待你處理的任務。設定中的「最大並行工作階段數」仍然生效。"
 
 #: src/renderer/components/dialogs/board-manager/ProfileNameDialog.tsx
 #: src/renderer/components/dialogs/NewTaskDialog.tsx
@@ -1704,7 +1704,7 @@ msgstr "輪次結束時"
 #: src/renderer/components/dialogs/board-manager/ColumnsOverview.tsx
 msgctxt "board overview column header"
 msgid "One at a time"
-msgstr ""
+msgstr "一次一個"
 
 #: src/renderer/components/dialogs/AdvancedOverridesSection.tsx
 msgid "Only one agent CLI detected - install another to choose"
@@ -1792,7 +1792,7 @@ msgstr ""
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Other tasks wait in this column and start in the order they arrived."
-msgstr ""
+msgstr "其他任務在此欄排隊，依到達順序啟動。"
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 msgctxt "column header"
@@ -2103,7 +2103,7 @@ msgstr "在專案資料夾中執行"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Run one agent in this column at a time"
-msgstr ""
+msgstr "此欄一次只執行一個代理"
 
 #: src/renderer/components/dialogs/PausedForMemoryDialog.tsx
 msgctxt "task status"
