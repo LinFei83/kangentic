@@ -199,7 +199,7 @@ A column's message reaches the agent by more than one mechanism, and they do not
 | 3 | **restart + argv prompt** | Rung 2 exhausted its retries on a *verifiable* command, on an adapter whose resume carries a prompt (`resumePromptDelivery: 'command-line'`) | Guaranteed by the spawn |
 | 4 | **recorded failure + notice** | Rung 3 unavailable or itself failed | Observable |
 
-Rung 1 is the most reliable path and must not be regressed into keystrokes (see `agent-spawn.ts`: a promptless isolated spawn never emits `'thinking'`, so the keystroke scheduler would burn its full 30s fallback and read as "the auto_command never ran").
+Rung 1 is the most reliable path and must not be regressed into keystrokes (see `agent-spawn.ts`: a promptless isolated spawn never emits `'thinking'`, so the keystroke scheduler would burn its full 30s fallback and read as "the auto_command never ran"). When the resume cannot carry the prompt (Cursor types it in), and the card is waiting for a column that runs one agent at a time, the scheduler holds the keystrokes until that session is running and idle. The first `'thinking'` after promotion is the PTY painting the boot screen, not a prompt; keys typed then are lost. The 120s hard timeout starts only once the session is running, so a card can wait in line longer than two minutes without dropping the column's message.
 
 Rung 3 is what makes the guarantee falsifiable rather than aspirational. It routes through `restartSessionForSettingsChange`, which is already allowlisted as a non-first-spawn direct engine call, so escalation adds no new spawn entry point. These constraints hold:
 
@@ -361,7 +361,7 @@ The two contexts solve different problems: `'paste'` confirms one-shot paste sub
 - `tests/unit/terminal-submit.test.ts` - byte contract, prompt-state policy, verification modes, retry recovery, that exhaustion never writes Ctrl+C, the late-flush cases (a submission visible only 900ms or 2300ms after the Enter confirms on a later attempt or in the grace; five swallowed Enters still fail), the prompt hook's confirmation, a burst held by the keys guard, and an Enter that reached a permission prompt.
 - `tests/unit/paste-engine.test.ts` - an automated paste's wait for the keys guard before it writes and before each Enter, and that a person's paste never waits.
 - `tests/unit/mcp-session-send.test.ts` - the `now` refusal on an open prompt or an open tool call.
-- `tests/unit/terminal-submit-scheduler.test.ts` - scheduling, the FIFO queue (no silent drop), deferred mode, escalation, outcome reporting, and the late confirmation at the escalation gate (a verifier that confirms during the wait or on the final check cancels the restart; one that never confirms still restarts; one that throws is a miss on the poll and on the final check alike; a cancelled burst stops polling).
+- `tests/unit/terminal-submit-scheduler.test.ts` - scheduling, the FIFO queue (no silent drop), deferred mode, a queued resume that waits for idle rather than boot-paint thinking, a hard timeout that does not run while the session is still queued, escalation, outcome reporting, and the late confirmation at the escalation gate (a verifier that confirms during the wait or on the final check cancels the restart; one that never confirms still restarts; one that throws is a miss on the poll and on the final check alike; a cancelled burst stops polling).
 - `tests/unit/turn-completion.test.ts` - the two-signal predicate, including the sustained false-idle cases.
 - `tests/unit/prompt-draft-ledger.test.ts` - draft accounting.
 - `tests/unit/auto-command-outcome.test.ts` - what is persisted vs what notifies.
@@ -381,7 +381,7 @@ The two contexts solve different problems: `'paste'` confirms one-shot paste sub
 ## Files
 
 - `src/main/transition-engine/injection-plan.ts` - decides the `restartReason` (`'model'` / `'effort'` / null) for a column transition or column/profile edit, and builds the auto_command sequence (with its verify mode) + verifier; sources the effort delta from the agent's reported level ahead of the session record's `applied_effort`, counting a silent downgrade of the launch level as applied (`resolveReportedEffort` / `resolveSourceEffort`), and the model delta from `applied_model` alone. `resolveTargetSettings` resolves the target side for a move and a ContextBar pick alike.
-- `src/main/transition-engine/terminal-submit-scheduler.ts` - task-keyed lifecycle: the burst FIFO, fresh-spawn wait, deferred wait, escalation, and outcome reporting.
+- `src/main/transition-engine/terminal-submit-scheduler.ts` - task-keyed lifecycle: the burst FIFO, fresh-spawn wait, queued-resume wait for idle, deferred wait, escalation, and outcome reporting.
 - `src/main/automations/turn-end/agent-message-delivery.ts` - the one paste-or-type decision every column message path asks (`shouldPaste`: more than one line or over 1,000 characters, and not a slash command), and the paste after the agent's turn ends.
 - `src/main/transition-engine/turn-completion.ts` - the shared turn-completion predicate.
 - `src/main/pty/terminal-submit.ts` - byte-level engine: `submitContent` (bracketed paste) + `submitKeystrokes` (handshake chain, prompt-state policy, per-command verification).

@@ -51,7 +51,7 @@ and one task's agent runs there while the rest wait their turn.
 
 - An agent holds the column while it is working or waiting on you. A paused or queued task does not.
 - The order is when each task entered the column. Dragging cards within the column does not change it, and a task that leaves joins the end if it comes back.
-- A task that arrives with its agent still running has that agent paused, and on its turn it resumes the same conversation.
+- A task that arrives with its agent still running has that agent paused, and on its turn it resumes the same conversation. The column's On task enter message is typed once that agent is at a prompt, not while it is still drawing its boot screen.
 - Every start and resume waits its turn, and **Max concurrent sessions** in Settings still applies on top.
 - Turning it on stops nothing: agents already running in the column carry on, and the limit applies from the next start.
 
