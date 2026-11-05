@@ -469,6 +469,45 @@ describe('scanOpenspecChanges', () => {
     expect(existing.swimlane_id).toBe('merge-lane');
   });
 
+  it('rewrites a leftover quoted name even when the card is already archived', async () => {
+    const quotedName = '"\\345\\210\\233\\345\\273\\272\\346\\265\\213\\350\\257\\225\\345\\217\\230\\346\\233\\264"';
+    const changeName = '创建测试变更';
+    const existing = makeTask({
+      id: 'task-garbled',
+      openspec_change: quotedName,
+      title: quotedName,
+      description: '',
+      openspec_note: 'archived',
+      swimlane_id: 'merge-lane',
+    });
+    const tasks = makeTasks(new Map([[quotedName, existing]]));
+    await scanOpenspecChanges({
+      project: PROJECT,
+      defaultBranch: 'main',
+      tasks,
+      swimlanes,
+      git: makeGit({
+        dirs: ['archive'],
+        archiveDirs: [`2026-11-04-${changeName}`],
+        files: {
+          [`main:openspec/changes/archive/2026-11-04-${changeName}/proposal.md`]:
+            '# Ship the change\n\nDo the work.\n',
+        },
+      }),
+      lastTreeSha: null,
+      evaluate: async () => 'archived',
+    });
+    expect(tasks.created).toHaveLength(0);
+    expect(tasks.updated).toEqual([{
+      id: 'task-garbled',
+      openspec_note: 'archived',
+      openspec_change: changeName,
+      title: 'Ship the change',
+      description: 'Do the work.',
+    }]);
+    expect(existing.swimlane_id).toBe('merge-lane');
+  });
+
   it('keeps a custom title and description when rewriting a quoted name', async () => {
     const quotedName = '"\\345\\210\\233\\345\\273\\272\\346\\265\\213\\350\\257\\225\\345\\217\\230\\346\\233\\264"';
     const changeName = '创建测试变更';
@@ -502,5 +541,75 @@ describe('scanOpenspecChanges', () => {
     }]);
     expect(existing.title).toBe('Keep this title');
     expect(existing.description).toBe('Keep this description.');
+  });
+
+  it('repairs a quoted title from proposal and keeps a custom description', async () => {
+    const quotedName = '"\\345\\210\\233\\345\\273\\272\\346\\265\\213\\350\\257\\225\\345\\217\\230\\346\\233\\264"';
+    const changeName = '创建测试变更';
+    const existing = makeTask({
+      id: 'task-garbled',
+      openspec_change: quotedName,
+      title: quotedName,
+      description: 'Keep this description.',
+      openspec_note: 'ready',
+    });
+    const tasks = makeTasks(new Map([[quotedName, existing]]));
+    await scanOpenspecChanges({
+      project: PROJECT,
+      defaultBranch: 'main',
+      tasks,
+      swimlanes,
+      git: makeGit({
+        dirs: [changeName],
+        files: {
+          [`main:openspec/changes/${changeName}/proposal.md`]: '# Ship the change\n\nDo the work.\n',
+          [`main:openspec/changes/${changeName}/tasks.md`]: '- [ ] one\n',
+        },
+      }),
+      lastTreeSha: null,
+      evaluate: async () => 'ready',
+    });
+    expect(tasks.created).toHaveLength(0);
+    expect(tasks.updated).toEqual([{
+      id: 'task-garbled',
+      openspec_change: changeName,
+      title: 'Ship the change',
+    }]);
+    expect(existing.description).toBe('Keep this description.');
+  });
+
+  it('fills an empty description from proposal and keeps a custom title', async () => {
+    const quotedName = '"\\345\\210\\233\\345\\273\\272\\346\\265\\213\\350\\257\\225\\345\\217\\230\\346\\233\\264"';
+    const changeName = '创建测试变更';
+    const existing = makeTask({
+      id: 'task-garbled',
+      openspec_change: quotedName,
+      title: 'Keep this title',
+      description: '',
+      openspec_note: 'ready',
+    });
+    const tasks = makeTasks(new Map([[quotedName, existing]]));
+    await scanOpenspecChanges({
+      project: PROJECT,
+      defaultBranch: 'main',
+      tasks,
+      swimlanes,
+      git: makeGit({
+        dirs: [changeName],
+        files: {
+          [`main:openspec/changes/${changeName}/proposal.md`]: '# Ship the change\n\nDo the work.\n',
+          [`main:openspec/changes/${changeName}/tasks.md`]: '- [ ] one\n',
+        },
+      }),
+      lastTreeSha: null,
+      evaluate: async () => 'ready',
+    });
+    expect(tasks.created).toHaveLength(0);
+    expect(tasks.updated).toEqual([{
+      id: 'task-garbled',
+      openspec_change: changeName,
+      description: 'Do the work.',
+    }]);
+    expect(existing.title).toBe('Keep this title');
   });
 });
