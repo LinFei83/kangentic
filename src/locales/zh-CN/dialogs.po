@@ -669,7 +669,7 @@ msgstr "列"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Columns share the task's main conversation unless you give this one its own. An isolated column starts a new conversation on every entry, which suits a code review or any pass that should not inherit the work before it."
-msgstr ""
+msgstr "各列共用任务的主对话，除非你给这一列单独开一段。隔离列每次进入都新开对话，适合代码审查，或任何不该继承前面工作的环节。"
 
 #: src/renderer/components/dialogs/task-detail/QueuedPlaceholder.tsx
 msgid "Command Terminal"
@@ -1392,7 +1392,7 @@ msgstr "主会话"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Main continues the task's conversation, and Isolated starts a new one on every entry."
-msgstr ""
+msgstr "主会话接续任务的对话，隔离则每次进入都新开一段。"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgctxt "plan approval"
@@ -2338,7 +2338,7 @@ msgstr "启动"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Start a new conversation on every entry."
-msgstr ""
+msgstr "每次进入都新开一段对话。"
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Start an agent automatically when a task enters this column."
@@ -2751,7 +2751,7 @@ msgstr ""
 
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Which conversation this column uses"
-msgstr ""
+msgstr "此列使用哪段对话"
 
 #: src/renderer/components/dialogs/board-manager/WildcardExamplesTip.tsx
 msgid "Wildcard examples"
