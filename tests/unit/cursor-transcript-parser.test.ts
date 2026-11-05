@@ -45,6 +45,20 @@ describe('cursorDisplayedUserText', () => {
   it('skips injected context that is not a user turn', () => {
     expect(cursorDisplayedUserText('<available_subagent_types>\n- generalPurpose\n</available_subagent_types>')).toBeNull();
   });
+
+  it('reads the query after a slash-command skill Cursor inlined in front of it', () => {
+    const stored = [
+      '<manually_attached_skills>',
+      'The user has manually attached the following skills to their message.',
+      'Skill Name: pull-request',
+      '</manually_attached_skills>',
+      '<timestamp>Thursday, Nov 5, 2026, 3:53 PM (UTC+8)</timestamp>',
+      '<user_query>',
+      '/pull-request',
+      '</user_query>',
+    ].join('\n');
+    expect(cursorDisplayedUserText(stored)).toBe('/pull-request');
+  });
 });
 
 const SESSION_ID = 'aaaa-bbbb-cccc-dddd';

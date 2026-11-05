@@ -16,9 +16,11 @@ import { cursorDisplayedUserText } from './transcript-parser';
  * Cursor has no hooks Kangentic wires, so this file is what says a turn
  * started and ended. A user line with displayed text is a Prompt (starts
  * the turn and, through ingestEvents, turns the PTY silence timer off
- * before it can idle a still-running turn). `{ type: "turn_ended" }` is
- * an Idle, the same shape a Stop hook uses, so `onTurnEnded` runs the
- * column's On agent turn end automations.
+ * before it can idle a still-running turn). Displayed text includes a
+ * slash command Cursor stored behind `<manually_attached_skills>` (`/pull-request`
+ * from a column). `{ type: "turn_ended" }` is an Idle, the same shape a
+ * Stop hook uses, so `onTurnEnded` runs the column's On agent turn end
+ * automations.
  *
  * Tool starts and ends stay with `--output-format stream-json` on the
  * print path. Emitting them here as well would double-count and wedge

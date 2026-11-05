@@ -21,13 +21,16 @@ const UUIDS_NUMBER_LINES = true;
  * A user line stores the typed text inside tags:
  *
  * ```
+ * <manually_attached_skills>...</manually_attached_skills>   (optional)
  * <timestamp>...</timestamp>
  * <user_query>
  * the typed text
  * </user_query>
  * ```
  *
- * The clock tag and the `user_query` wrapper are removed. A board prompt whose
+ * A slash command the board typed (`/pull-request`) is stored this way: Cursor
+ * inlines the skill first, then the clock, then the query. The skill block, the
+ * clock tag, and the `user_query` wrapper are removed. A board prompt whose
  * whole body is one `<task>` element is unwrapped once more. A user line that
  * is some other leading tag (injected context such as
  * `<available_subagent_types>`) is not a turn and is skipped.
@@ -73,7 +76,11 @@ export function readCursorTranscriptPage(
  * Exported so the wrapper rules stay pinned without a full file read.
  */
 export function cursorDisplayedUserText(text: string): string | null {
-  const withoutClock = text.replace(/^\s*<timestamp>[\s\S]*?<\/timestamp>\s*/, '');
+  const withoutSkills = text.replace(
+    /^\s*<manually_attached_skills>[\s\S]*?<\/manually_attached_skills>\s*/,
+    '',
+  );
+  const withoutClock = withoutSkills.replace(/^\s*<timestamp>[\s\S]*?<\/timestamp>\s*/, '');
   const query = unwrapTag(withoutClock, 'user_query');
   if (query === null) {
     const plain = withoutClock.trim();

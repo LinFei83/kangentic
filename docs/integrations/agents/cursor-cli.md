@@ -113,7 +113,9 @@ A Knowledge Graph answer from a distro starts in a stable folder beside the shar
   exists, else the path the agent itself reported when that file exists. The slug is Cursor's own: non-alphanumeric characters become `-`, runs of dashes
   collapse, and case stays as the working directory was given. View conversation reads that
   JSONL. A user line's `<timestamp>` tag is dropped and not shown as a clock (`ts: 0`,
-  `transcriptHasTimestamps` false), and the `<user_query>` wrapper is removed. A line whose
+  `transcriptHasTimestamps` false), a leading `<manually_attached_skills>` block is dropped,
+  and the `<user_query>` wrapper is removed. A slash command the board typed is stored with
+  the skill inlined in front of the query, so that drop is what starts the turn. A line whose
   whole body is one `<task>` element is unwrapped once more. There is still no
   `command-injection` verifier: the records have no timestamp field, so a confirm cannot bound
   itself to "written after send", and the stored text is not the raw submitted text. See
