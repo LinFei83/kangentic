@@ -187,3 +187,4 @@ tests/captures/fixtures/scrollback-*.json
 *-probe-report.md
 .opencode/plugins/kangentic-activity.mjs
 .opencode/plugins/kangentic-activity.js
+kangentic.json

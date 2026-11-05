@@ -15,4 +15,4 @@ export const OPENSPEC_ARCHIVE_COMMAND = '/opsx-archive';
  * fresh spawn, never as a column automation and never in `description`.
  */
 export const OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE =
-  'Commit any OpenSpec change you propose to the default branch. Scan only sees openspec/changes that are already committed there.';
+  '';
