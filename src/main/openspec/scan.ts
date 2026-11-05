@@ -107,32 +107,62 @@ function findChangeCard(tasks: OpenspecTaskStore, name: string): Task | undefine
   return undefined;
 }
 
-function applyQuotedDirectoryName(
+/** OpenSpec template section names. These are never a change card's title. */
+const OPENSPEC_SECTION_TITLES = new Set([
+  'why',
+  'what changes',
+  'capabilities',
+  'new capabilities',
+  'modified capabilities',
+  'impact',
+  'requirements',
+  'design',
+  'goals',
+  'non-goals',
+]);
+
+function isOpenspecSectionTitle(title: string): boolean {
+  return OPENSPEC_SECTION_TITLES.has(title.trim().toLowerCase());
+}
+
+function shouldRefreshChangeTitle(existing: Task, realName: string): boolean {
+  if (isOpenspecSectionTitle(existing.title)) return true;
+  return existing.openspec_change !== realName && existing.title === existing.openspec_change;
+}
+
+function applyChangeIdentity(
   patch: TaskUpdateInput,
   existing: Task,
   realName: string,
   proposalMarkdown: string | null,
 ): void {
-  patch.openspec_change = realName;
-  const shouldRefreshTitle = existing.title === existing.openspec_change;
-  const shouldRefreshDescription = !existing.description;
-  if (!shouldRefreshTitle && !shouldRefreshDescription) return;
+  if (existing.openspec_change !== realName) patch.openspec_change = realName;
+  const refreshTitle = shouldRefreshChangeTitle(existing, realName);
+  const refreshDescription = !existing.description && existing.openspec_change !== realName;
+  if (!refreshTitle && !refreshDescription) return;
   const parsed = parseProposal(proposalMarkdown ?? '', realName);
-  if (shouldRefreshTitle) patch.title = parsed.title;
-  if (shouldRefreshDescription) patch.description = parsed.description;
+  if (refreshTitle && parsed.title !== existing.title) patch.title = parsed.title;
+  if (refreshDescription) patch.description = parsed.description;
+}
+
+function firstProseParagraph(markdown: string): string {
+  const withoutLeadingHeadings = markdown.replace(/^(?:[ \t]*#{1,6}[ \t]+[^\n]*\n)*/, '');
+  const nextHeading = withoutLeadingHeadings.search(/\n#{1,6}\s+/);
+  const summaryBlock = (
+    nextHeading >= 0 ? withoutLeadingHeadings.slice(0, nextHeading) : withoutLeadingHeadings
+  ).trim();
+  return summaryBlock.split(/\n\s*\n/)[0]?.trim() ?? '';
+}
+
+function whyParagraph(markdown: string): string {
+  const whyHeading = /^#{1,6}\s+Why\s*$/im.exec(markdown);
+  if (!whyHeading || whyHeading.index === undefined) return '';
+  return firstProseParagraph(markdown.slice(whyHeading.index + whyHeading[0].length));
 }
 
 export function parseProposal(markdown: string, fallbackTitle: string): { title: string; description: string } {
-  const headingMatch = /^#{1,6}\s+(.+?)\s*$/m.exec(markdown);
-  const title = headingMatch?.[1]?.trim() || fallbackTitle;
-  let rest = markdown;
-  if (headingMatch && headingMatch.index !== undefined) {
-    rest = markdown.slice(headingMatch.index + headingMatch[0].length);
-  }
-  const nextHeading = rest.search(/\n#{1,6}\s+/);
-  const summaryBlock = (nextHeading >= 0 ? rest.slice(0, nextHeading) : rest).trim();
-  const paragraph = summaryBlock.split(/\n\s*\n/)[0]?.trim() ?? '';
-  return { title, description: paragraph };
+  const description = whyParagraph(markdown) || firstProseParagraph(markdown);
+  return { title: fallbackTitle, description };
 }
 
 function isMissingTreeError(error: unknown): boolean {
@@ -178,7 +208,10 @@ async function readFile(git: OpenspecGitOps, spec: string): Promise<string | nul
  * the tree SHA matches `lastTreeSha`. Existing change cards only get a note
  * write when the token actually changed. A card stored under git's C-quoted
  * directory name is rewritten in place to the real name, so a previous
- * garbled scan does not create a second card. Archive does the same rewrite
+ * garbled scan does not create a second card. New cards use the directory
+ * name as the title and the `## Why` paragraph as the description. A leftover
+ * title that is an OpenSpec section heading (`Why`, `What Changes`, and the
+ * rest) is rewritten to the directory name. Archive does the same rewrite
  * before stamping `archived`, so a later un-archive still sees a real name.
  * Regular and discussion cards are left alone. Archive does not move the
  * card to Done.
@@ -228,16 +261,21 @@ export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Prom
     }
     if (existing.card_kind !== 'change') continue;
     const patch: TaskUpdateInput = { id: existing.id };
-    if (existing.openspec_change !== name) {
-      const shouldRefreshTitle = existing.title === existing.openspec_change;
-      const shouldRefreshDescription = !existing.description;
-      const proposal = shouldRefreshTitle || shouldRefreshDescription
+    const refreshTitle = shouldRefreshChangeTitle(existing, name);
+    const refreshDescription = !existing.description && existing.openspec_change !== name;
+    if (existing.openspec_change !== name || refreshTitle) {
+      const proposal = refreshTitle || refreshDescription
         ? await readFile(input.git, `${treeSpec}/${name}/proposal.md`)
         : null;
-      applyQuotedDirectoryName(patch, existing, name, proposal);
+      applyChangeIdentity(patch, existing, name, proposal);
     }
     if (existing.openspec_note !== note) patch.openspec_note = note;
-    if (patch.openspec_change === undefined && patch.openspec_note === undefined) continue;
+    if (
+      patch.openspec_change === undefined
+      && patch.openspec_note === undefined
+      && patch.title === undefined
+      && patch.description === undefined
+    ) continue;
     const updatedTask = input.tasks.update(patch);
     updated.push(updatedTask.id);
   }
@@ -248,15 +286,20 @@ export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Prom
     const existing = findChangeCard(input.tasks, archivedName);
     if (!existing || existing.card_kind !== 'change') continue;
     const patch: TaskUpdateInput = { id: existing.id, openspec_note: 'archived' };
-    if (existing.openspec_change !== archivedName) {
-      const shouldRefreshTitle = existing.title === existing.openspec_change;
-      const shouldRefreshDescription = !existing.description;
-      const proposal = shouldRefreshTitle || shouldRefreshDescription
+    const refreshTitle = shouldRefreshChangeTitle(existing, archivedName);
+    const refreshDescription = !existing.description && existing.openspec_change !== archivedName;
+    if (existing.openspec_change !== archivedName || refreshTitle) {
+      const proposal = refreshTitle || refreshDescription
         ? await readFile(input.git, `${treeSpec}/${ARCHIVE_DIR}/${directoryName}/proposal.md`)
         : null;
-      applyQuotedDirectoryName(patch, existing, archivedName, proposal);
+      applyChangeIdentity(patch, existing, archivedName, proposal);
     }
-    if (existing.openspec_note === 'archived' && patch.openspec_change === undefined) continue;
+    if (
+      existing.openspec_note === 'archived'
+      && patch.openspec_change === undefined
+      && patch.title === undefined
+      && patch.description === undefined
+    ) continue;
     const updatedTask = input.tasks.update(patch);
     updated.push(updatedTask.id);
   }

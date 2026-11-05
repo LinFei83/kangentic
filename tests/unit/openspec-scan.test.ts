@@ -151,13 +151,29 @@ describe('activeChangeNames / archiveChangeName / parseProposal', () => {
     expect(archiveChangeName('plain-name')).toBe('plain-name');
   });
 
-  it('takes the first heading and the paragraph under it', () => {
+  it('uses the directory name as title and the Why paragraph as description', () => {
     const parsed = parseProposal(
       '# Add rate limiting\n\nCap requests per token.\n\n## Why\n\nBecause.\n',
       'add-rate-limiting',
     );
-    expect(parsed.title).toBe('Add rate limiting');
-    expect(parsed.description).toBe('Cap requests per token.');
+    expect(parsed.title).toBe('add-rate-limiting');
+    expect(parsed.description).toBe('Because.');
+  });
+
+  it('uses the directory name when the proposal starts with ## Why', () => {
+    const parsed = parseProposal(
+      '## Why\n\nNeed a README.\n\n## What Changes\n\n- Add one\n',
+      '更新仓库说明',
+    );
+    expect(parsed.title).toBe('更新仓库说明');
+    expect(parsed.description).toBe('Need a README.');
+  });
+
+  it('uses the first prose paragraph when there is no Why section', () => {
+    expect(parseProposal('# Add rate limiting\n\nCap requests per token.\n', 'add-rate-limiting')).toEqual({
+      title: 'add-rate-limiting',
+      description: 'Cap requests per token.',
+    });
   });
 
   it('falls back to the directory name when proposal has no heading', () => {
@@ -209,7 +225,7 @@ describe('scanOpenspecChanges', () => {
     expect(result.created).toEqual(['created-add-rate-limiting']);
     expect(tasks.created).toEqual([
       {
-        title: 'Add rate limiting',
+        title: 'add-rate-limiting',
         description: 'Cap requests per token.',
         swimlane_id: TODO_ID,
         card_kind: 'change',
@@ -220,6 +236,72 @@ describe('scanOpenspecChanges', () => {
       },
     ]);
     expect(tasks.created[0].task_intent).toBeUndefined();
+  });
+
+  it('creates a card titled with the directory name when proposal starts with ## Why', async () => {
+    const changeName = '更新仓库说明';
+    const tasks = makeTasks();
+    await scanOpenspecChanges({
+      project: PROJECT,
+      defaultBranch: 'main',
+      tasks,
+      swimlanes,
+      git: makeGit({
+        dirs: [changeName],
+        files: {
+          [`main:openspec/changes/${changeName}/proposal.md`]:
+            '## Why\n\nNeed a README.\n\n## What Changes\n\n- Add one\n',
+          [`main:openspec/changes/${changeName}/tasks.md`]: '- [ ] one\n',
+        },
+      }),
+      lastTreeSha: null,
+      evaluate: async () => 'ready',
+    });
+    expect(tasks.created).toEqual([
+      {
+        title: changeName,
+        description: 'Need a README.',
+        swimlane_id: TODO_ID,
+        card_kind: 'change',
+        openspec_change: changeName,
+        openspec_note: 'ready',
+        externalSource: 'openspec',
+        externalId: changeName,
+      },
+    ]);
+  });
+
+  it('rewrites a leftover Why title on an already-named card', async () => {
+    const changeName = '更新仓库说明';
+    const existing = makeTask({
+      id: 'task-why',
+      openspec_change: changeName,
+      title: 'Why',
+      description: 'Need a README.',
+      openspec_note: 'ready',
+    });
+    const tasks = makeTasks(new Map([[changeName, existing]]));
+    await scanOpenspecChanges({
+      project: PROJECT,
+      defaultBranch: 'main',
+      tasks,
+      swimlanes,
+      git: makeGit({
+        dirs: [changeName],
+        files: {
+          [`main:openspec/changes/${changeName}/proposal.md`]:
+            '## Why\n\nNeed a README.\n\n## What Changes\n\n- Add one\n',
+        },
+      }),
+      lastTreeSha: null,
+      evaluate: async () => 'ready',
+    });
+    expect(tasks.created).toHaveLength(0);
+    expect(tasks.updated).toEqual([{
+      id: 'task-why',
+      title: changeName,
+    }]);
+    expect(existing.description).toBe('Need a README.');
   });
 
   it('still creates a card when evaluate stamps missing (CLI absent)', async () => {
@@ -394,7 +476,7 @@ describe('scanOpenspecChanges', () => {
     expect(tasks.updated).toEqual([{
       id: 'task-garbled',
       openspec_change: changeName,
-      title: 'Ship the change',
+      title: changeName,
       description: 'Do the work.',
       openspec_note: 'ready',
     }]);
@@ -463,7 +545,7 @@ describe('scanOpenspecChanges', () => {
       id: 'task-garbled',
       openspec_note: 'archived',
       openspec_change: changeName,
-      title: 'Ship the change',
+      title: changeName,
       description: 'Do the work.',
     }]);
     expect(existing.swimlane_id).toBe('merge-lane');
@@ -502,7 +584,7 @@ describe('scanOpenspecChanges', () => {
       id: 'task-garbled',
       openspec_note: 'archived',
       openspec_change: changeName,
-      title: 'Ship the change',
+      title: changeName,
       description: 'Do the work.',
     }]);
     expect(existing.swimlane_id).toBe('merge-lane');
@@ -543,7 +625,7 @@ describe('scanOpenspecChanges', () => {
     expect(existing.description).toBe('Keep this description.');
   });
 
-  it('repairs a quoted title from proposal and keeps a custom description', async () => {
+  it('repairs a quoted title to the directory name and keeps a custom description', async () => {
     const quotedName = '"\\345\\210\\233\\345\\273\\272\\346\\265\\213\\350\\257\\225\\345\\217\\230\\346\\233\\264"';
     const changeName = '创建测试变更';
     const existing = makeTask({
@@ -573,7 +655,7 @@ describe('scanOpenspecChanges', () => {
     expect(tasks.updated).toEqual([{
       id: 'task-garbled',
       openspec_change: changeName,
-      title: 'Ship the change',
+      title: changeName,
     }]);
     expect(existing.description).toBe('Keep this description.');
   });
