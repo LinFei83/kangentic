@@ -30,11 +30,18 @@ once, then `head-watcher.ts` watches `.git/HEAD`, `packed-refs`, and
 does not create a card.
 
 Each scan starts with `git rev-parse <defaultBranch>:openspec/changes`. An
-unchanged tree SHA returns without listing. For each directory under
-`openspec/changes/` (except `archive/` and names that start with a dot) it
-upserts a task with `card_kind` `change`, `external_source` `openspec`, and
-`openspec_change` equal to the directory name. New cards land in To Do.
-Regular and discuss cards are left alone.
+unchanged tree SHA returns without listing. `ls-tree` runs with
+`core.quotepath=false`, and a leftover C-quoted name (octal bytes in quotes)
+is decoded before it becomes `openspec_change` or is passed to
+`openspec validate`, so a non-ASCII directory keeps its real name. For each
+directory under `openspec/changes/` (except `archive/` and names that start
+with a dot) it upserts a task with `card_kind` `change`,
+`external_source` `openspec`, and `openspec_change` equal to the directory
+name. New cards land in To Do. A card already stored under git's C-quoted
+directory name is rewritten in place to the real name, including its title
+when the title was that quoted string. If a real-name card already exists,
+the leftover quoted row is left alone. Regular and discuss cards are left
+alone.
 
 `evaluate-change.ts` maps CLI validate plus `tasks.md` checkbox counts onto a
 stable `openspec_note` token (`ready`, `tasks:3/12`, `archived`, `invalid`,
@@ -43,10 +50,12 @@ stable `openspec_note` token (`ready`, `tasks:3/12`, `archived`, `invalid`,
 ## Archive
 
 A directory that has moved to `openspec/changes/archive/` stamps the existing
-card `archived`. Archive does **not** move the card to Done. Board Done still
-means the PR merged. This board's Merge change list sends `/opsx-archive`
-after `PR: merged`, then moves to Done on `OpenSpec: archived`. Regular Merge
-still goes to Done on `PR: merged`.
+card `archived`. A leftover quoted `openspec_change` is rewritten to the real
+name first, including the title when it still equals that quoted string.
+Archive does **not** move the card to Done. Board Done still means the PR
+merged. This board's Merge change list sends `/opsx-archive` after
+`PR: merged`, then moves to Done on `OpenSpec: archived`. Regular Merge still
+goes to Done on `PR: merged`.
 
 ## `{{openspec_xml}}`
 

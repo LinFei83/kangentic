@@ -3,9 +3,11 @@
  *
  * Uncommitted workspace files do not count. Listing, proposal text, and
  * `tasks.md` checkbox counts all come from `git ls-tree` / `git show` of the
- * default branch. If Planning proposes in an isolated worktree, the agent
- * must commit that directory to the default branch. That belongs in the
- * discussion card's opening, not in a column automation.
+ * default branch. `ls-tree` is run with `core.quotepath=false` and leftover
+ * C-quoted names are decoded, so a non-ASCII directory keeps its real name.
+ * If Planning proposes in an isolated worktree, the agent must commit that
+ * directory to the default branch. That belongs in the discussion card's
+ * opening, not in a column automation.
  */
 import { IPC } from '../../shared/ipc-channels';
 import type { Project, Task, TaskCreateInput, TaskUpdateInput } from '../../shared/types';
@@ -23,6 +25,11 @@ import {
   type OpenspecCliRunner,
   type OpenspecNoteToken,
 } from './evaluate-change';
+import {
+  QUOTEPATH_FALSE_CONFIG,
+  gitQuotedPathAliases,
+  parseGitNameOnlyOutput,
+} from './git-quoted-path';
 
 export const OPENSPEC_CHANGES_TREE = 'openspec/changes';
 const ARCHIVE_DIR = 'archive';
@@ -69,8 +76,8 @@ export function createOpenspecGit(projectPath: string): OpenspecGitOps {
       return (await git.raw(['rev-parse', spec])).trim();
     },
     async lsTreeDirs(spec: string) {
-      const output = await git.raw(['ls-tree', '-d', '--name-only', spec]);
-      return output.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+      const output = await git.raw([...QUOTEPATH_FALSE_CONFIG, 'ls-tree', '-d', '--name-only', spec]);
+      return parseGitNameOnlyOutput(output);
     },
     async show(spec: string) {
       return git.raw(['show', spec]);
@@ -90,6 +97,29 @@ export function activeChangeNames(directoryNames: string[]): string[] {
 export function archiveChangeName(directoryName: string): string {
   const match = ARCHIVE_DATED_NAME.exec(directoryName);
   return match ? match[2] : directoryName;
+}
+
+function findChangeCard(tasks: OpenspecTaskStore, name: string): Task | undefined {
+  for (const key of gitQuotedPathAliases(name)) {
+    const found = tasks.getByOpenspecChange(key);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function applyQuotedDirectoryName(
+  patch: TaskUpdateInput,
+  existing: Task,
+  realName: string,
+  proposalMarkdown: string | null,
+): void {
+  patch.openspec_change = realName;
+  const shouldRefreshTitle = existing.title === existing.openspec_change;
+  const shouldRefreshDescription = !existing.description;
+  if (!shouldRefreshTitle && !shouldRefreshDescription) return;
+  const parsed = parseProposal(proposalMarkdown ?? '', realName);
+  if (shouldRefreshTitle) patch.title = parsed.title;
+  if (shouldRefreshDescription) patch.description = parsed.description;
 }
 
 export function parseProposal(markdown: string, fallbackTitle: string): { title: string; description: string } {
@@ -146,8 +176,12 @@ async function readFile(git: OpenspecGitOps, spec: string): Promise<string | nul
 /**
  * One scan of default-branch `openspec/changes/`. Returns immediately when
  * the tree SHA matches `lastTreeSha`. Existing change cards only get a note
- * write when the token actually changed. Regular and discussion cards are
- * left alone. Archive stamps `archived` and does not move the card to Done.
+ * write when the token actually changed. A card stored under git's C-quoted
+ * directory name is rewritten in place to the real name, so a previous
+ * garbled scan does not create a second card. Archive does the same rewrite
+ * before stamping `archived`, so a later un-archive still sees a real name.
+ * Regular and discussion cards are left alone. Archive does not move the
+ * card to Done.
  */
 export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Promise<ScanOpenspecChangesResult> {
   const treeSpec = `${input.defaultBranch}:${OPENSPEC_CHANGES_TREE}`;
@@ -169,13 +203,12 @@ export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Prom
   const archivedChildren = children.includes(ARCHIVE_DIR)
     ? await readDirs(input.git, `${treeSpec}/${ARCHIVE_DIR}`)
     : [];
-  const archivedNames = new Set(archivedChildren.map(archiveChangeName));
 
   const todoLane = input.swimlanes.list().find((lane) => lane.role === 'todo');
 
   for (const name of activeNames) {
     const note = await input.evaluate(name, false, await readFile(input.git, `${treeSpec}/${name}/tasks.md`));
-    const existing = input.tasks.getByOpenspecChange(name);
+    const existing = findChangeCard(input.tasks, name);
     if (!existing) {
       if (!todoLane) continue;
       const proposal = await readFile(input.git, `${treeSpec}/${name}/proposal.md`);
@@ -194,17 +227,37 @@ export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Prom
       continue;
     }
     if (existing.card_kind !== 'change') continue;
-    if (existing.openspec_note === note) continue;
-    const updatedTask = input.tasks.update({ id: existing.id, openspec_note: note });
+    const patch: TaskUpdateInput = { id: existing.id };
+    if (existing.openspec_change !== name) {
+      const shouldRefreshTitle = existing.title === existing.openspec_change;
+      const shouldRefreshDescription = !existing.description;
+      const proposal = shouldRefreshTitle || shouldRefreshDescription
+        ? await readFile(input.git, `${treeSpec}/${name}/proposal.md`)
+        : null;
+      applyQuotedDirectoryName(patch, existing, name, proposal);
+    }
+    if (existing.openspec_note !== note) patch.openspec_note = note;
+    if (patch.openspec_change === undefined && patch.openspec_note === undefined) continue;
+    const updatedTask = input.tasks.update(patch);
     updated.push(updatedTask.id);
   }
 
-  for (const archivedName of archivedNames) {
+  for (const directoryName of archivedChildren) {
+    const archivedName = archiveChangeName(directoryName);
     if (activeNames.includes(archivedName)) continue;
-    const existing = input.tasks.getByOpenspecChange(archivedName);
+    const existing = findChangeCard(input.tasks, archivedName);
     if (!existing || existing.card_kind !== 'change') continue;
-    if (existing.openspec_note === 'archived') continue;
-    const updatedTask = input.tasks.update({ id: existing.id, openspec_note: 'archived' });
+    const patch: TaskUpdateInput = { id: existing.id, openspec_note: 'archived' };
+    if (existing.openspec_change !== archivedName) {
+      const shouldRefreshTitle = existing.title === existing.openspec_change;
+      const shouldRefreshDescription = !existing.description;
+      const proposal = shouldRefreshTitle || shouldRefreshDescription
+        ? await readFile(input.git, `${treeSpec}/${ARCHIVE_DIR}/${directoryName}/proposal.md`)
+        : null;
+      applyQuotedDirectoryName(patch, existing, archivedName, proposal);
+    }
+    if (existing.openspec_note === 'archived' && patch.openspec_change === undefined) continue;
+    const updatedTask = input.tasks.update(patch);
     updated.push(updatedTask.id);
   }
 
