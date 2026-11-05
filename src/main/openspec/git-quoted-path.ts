@@ -5,8 +5,10 @@
  * each byte as `\nnn` octal, so `创建测试变更` becomes
  * `"\345\210\233\345\273\272\346\265\213\350\257\225\345\217\230\346\233\264"`.
  * Callers that treat that string as an OpenSpec change name fail validate
- * and show a garbled title. `-c core.quotepath=false` stops the quoting;
- * this decoder still recovers a leftover quoted line.
+ * and show a garbled title. `-c core.quotepath=false` stops quoting high
+ * bytes. Git still C-quotes a name that contains `"`, `\`, or a newline,
+ * and leaves those high bytes raw inside the quotes. The decoder recovers
+ * both that form and a leftover octal-quoted line from `quotepath=true`.
  */
 
 const C_ESCAPE_BYTES: Record<string, number> = {
@@ -21,13 +23,14 @@ const C_ESCAPE_BYTES: Record<string, number> = {
   '\\': 0x5c,
 };
 
-/** Prefix for `git.raw` so `ls-tree --name-only` emits UTF-8 names, not octal. */
-export const GIT_LS_TREE_NO_QUOTE: readonly string[] = ['-c', 'core.quotepath=false'];
+/** `-c` prefix for `git.raw`, before the subcommand. */
+export const QUOTEPATH_FALSE_CONFIG: readonly string[] = ['-c', 'core.quotepath=false'];
 
 /**
  * Decode one `ls-tree --name-only` line. Unquoted names pass through.
  * A C-quoted line (`"..."`) is unescaped: octal `\nnn` bytes become UTF-8,
- * and the usual C escapes (`\n`, `\t`, `\\`, `\"`) match git's quote.c.
+ * literal non-ASCII is re-encoded as UTF-8 bytes, and the usual C escapes
+ * (`\n`, `\t`, `\\`, `\"`) match git's quote.c.
  */
 export function decodeGitQuotedPath(rawPath: string): string {
   const trimmedPath = rawPath.trim();
@@ -39,8 +42,11 @@ export function decodeGitQuotedPath(rawPath: string): string {
   let cursor = 0;
   while (cursor < quotedBody.length) {
     if (quotedBody[cursor] !== '\\') {
-      decodedBytes.push(quotedBody.charCodeAt(cursor));
-      cursor += 1;
+      const codePoint = quotedBody.codePointAt(cursor);
+      if (codePoint === undefined) break;
+      const character = String.fromCodePoint(codePoint);
+      decodedBytes.push(...Buffer.from(character, 'utf8'));
+      cursor += character.length;
       continue;
     }
     const escapeCharacter = quotedBody[cursor + 1];

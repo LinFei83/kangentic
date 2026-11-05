@@ -50,10 +50,12 @@ stable `openspec_note` token (`ready`, `tasks:3/12`, `archived`, `invalid`,
 ## Archive
 
 A directory that has moved to `openspec/changes/archive/` stamps the existing
-card `archived`. Archive does **not** move the card to Done. Board Done still
-means the PR merged. This board's Merge change list sends `/opsx-archive`
-after `PR: merged`, then moves to Done on `OpenSpec: archived`. Regular Merge
-still goes to Done on `PR: merged`.
+card `archived`. A leftover quoted `openspec_change` is rewritten to the real
+name first, including the title when it still equals that quoted string.
+Archive does **not** move the card to Done. Board Done still means the PR
+merged. This board's Merge change list sends `/opsx-archive` after
+`PR: merged`, then moves to Done on `OpenSpec: archived`. Regular Merge still
+goes to Done on `PR: merged`.
 
 ## `{{openspec_xml}}`
 
