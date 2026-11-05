@@ -25,7 +25,11 @@ import {
   type OpenspecCliRunner,
   type OpenspecNoteToken,
 } from './evaluate-change';
-import { GIT_LS_TREE_NO_QUOTE, parseGitNameOnlyOutput } from './git-quoted-path';
+import {
+  GIT_LS_TREE_NO_QUOTE,
+  gitQuotedPathAliases,
+  parseGitNameOnlyOutput,
+} from './git-quoted-path';
 
 export const OPENSPEC_CHANGES_TREE = 'openspec/changes';
 const ARCHIVE_DIR = 'archive';
@@ -95,6 +99,14 @@ export function archiveChangeName(directoryName: string): string {
   return match ? match[2] : directoryName;
 }
 
+function findChangeCard(tasks: OpenspecTaskStore, name: string): Task | undefined {
+  for (const key of gitQuotedPathAliases(name)) {
+    const found = tasks.getByOpenspecChange(key);
+    if (found) return found;
+  }
+  return undefined;
+}
+
 export function parseProposal(markdown: string, fallbackTitle: string): { title: string; description: string } {
   const headingMatch = /^#{1,6}\s+(.+?)\s*$/m.exec(markdown);
   const title = headingMatch?.[1]?.trim() || fallbackTitle;
@@ -149,8 +161,10 @@ async function readFile(git: OpenspecGitOps, spec: string): Promise<string | nul
 /**
  * One scan of default-branch `openspec/changes/`. Returns immediately when
  * the tree SHA matches `lastTreeSha`. Existing change cards only get a note
- * write when the token actually changed. Regular and discussion cards are
- * left alone. Archive stamps `archived` and does not move the card to Done.
+ * write when the token actually changed. A card stored under git's C-quoted
+ * directory name is rewritten in place to the real name, so a previous
+ * garbled scan does not create a second card. Regular and discussion cards
+ * are left alone. Archive stamps `archived` and does not move the card to Done.
  */
 export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Promise<ScanOpenspecChangesResult> {
   const treeSpec = `${input.defaultBranch}:${OPENSPEC_CHANGES_TREE}`;
@@ -178,7 +192,7 @@ export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Prom
 
   for (const name of activeNames) {
     const note = await input.evaluate(name, false, await readFile(input.git, `${treeSpec}/${name}/tasks.md`));
-    const existing = input.tasks.getByOpenspecChange(name);
+    const existing = findChangeCard(input.tasks, name);
     if (!existing) {
       if (!todoLane) continue;
       const proposal = await readFile(input.git, `${treeSpec}/${name}/proposal.md`);
@@ -197,17 +211,32 @@ export async function scanOpenspecChanges(input: ScanOpenspecChangesInput): Prom
       continue;
     }
     if (existing.card_kind !== 'change') continue;
-    if (existing.openspec_note === note) continue;
-    const updatedTask = input.tasks.update({ id: existing.id, openspec_note: note });
+    const patch: TaskUpdateInput = { id: existing.id };
+    if (existing.openspec_change !== name) {
+      patch.openspec_change = name;
+      const shouldRefreshTitle = existing.title === existing.openspec_change;
+      const shouldRefreshDescription = !existing.description;
+      if (shouldRefreshTitle || shouldRefreshDescription) {
+        const proposal = await readFile(input.git, `${treeSpec}/${name}/proposal.md`);
+        const parsed = parseProposal(proposal ?? '', name);
+        if (shouldRefreshTitle) patch.title = parsed.title;
+        if (shouldRefreshDescription) patch.description = parsed.description;
+      }
+    }
+    if (existing.openspec_note !== note) patch.openspec_note = note;
+    if (patch.openspec_change === undefined && patch.openspec_note === undefined) continue;
+    const updatedTask = input.tasks.update(patch);
     updated.push(updatedTask.id);
   }
 
   for (const archivedName of archivedNames) {
     if (activeNames.includes(archivedName)) continue;
-    const existing = input.tasks.getByOpenspecChange(archivedName);
+    const existing = findChangeCard(input.tasks, archivedName);
     if (!existing || existing.card_kind !== 'change') continue;
-    if (existing.openspec_note === 'archived') continue;
-    const updatedTask = input.tasks.update({ id: existing.id, openspec_note: 'archived' });
+    const patch: TaskUpdateInput = { id: existing.id, openspec_note: 'archived' };
+    if (existing.openspec_change !== archivedName) patch.openspec_change = archivedName;
+    if (existing.openspec_note === 'archived' && patch.openspec_change === undefined) continue;
+    const updatedTask = input.tasks.update(patch);
     updated.push(updatedTask.id);
   }
 

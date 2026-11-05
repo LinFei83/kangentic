@@ -74,3 +74,44 @@ export function parseGitNameOnlyOutput(output: string): string[] {
     .map((line) => decodeGitQuotedPath(line))
     .filter((name) => name.length > 0);
 }
+
+/**
+ * The C-quoted form default `core.quotepath` prints for `pathName`. ASCII
+ * names that need no quoting are returned as-is. Used to find a change card
+ * stored under the quoted directory name from before listing was decoded.
+ */
+export function encodeGitQuotedPath(pathName: string): string {
+  const pathBytes = Buffer.from(pathName, 'utf8');
+  let needsQuote = pathBytes.length === 0;
+  let quotedBody = '';
+  for (const pathByte of pathBytes) {
+    if (pathByte === 0x22) {
+      needsQuote = true;
+      quotedBody += '\\"';
+      continue;
+    }
+    if (pathByte === 0x5c) {
+      needsQuote = true;
+      quotedBody += '\\\\';
+      continue;
+    }
+    if (pathByte < 0x20 || pathByte >= 0x7f) {
+      needsQuote = true;
+      quotedBody += `\\${pathByte.toString(8).padStart(3, '0')}`;
+      continue;
+    }
+    quotedBody += String.fromCharCode(pathByte);
+  }
+  return needsQuote ? `"${quotedBody}"` : pathName;
+}
+
+/**
+ * Lookup keys for one change directory: the real name, then the C-quoted
+ * form a previous scan may have stored. Real name first so a rewritten card
+ * wins over a leftover quoted row.
+ */
+export function gitQuotedPathAliases(pathName: string): string[] {
+  const quotedPath = encodeGitQuotedPath(pathName);
+  if (quotedPath === pathName) return [pathName];
+  return [pathName, quotedPath];
+}
