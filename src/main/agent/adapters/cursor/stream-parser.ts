@@ -51,7 +51,7 @@ interface TuiStatus {
  *   {"type":"tool_call","subtype":"started","call_id":"...","tool_call":{...}}
  *   {"type":"tool_call","subtype":"completed","call_id":"...","tool_call":{...}}
  *
- * Terminal result event (carries duration; optional cost surface):
+ * Terminal result event (the print path's turn end; carries duration):
  *   {"type":"result","subtype":"success","duration_ms":5234,...}
  *
  * Cursor uses a single `model` string (e.g. "Claude 4 Sonnet") with no
@@ -146,13 +146,17 @@ export class CursorStreamParser implements StreamOutputParser {
           tool: toolName,
           detail: toolName,
         });
-      } else if (type === 'result' && subtype === 'success') {
-        const durationMs = entry.duration_ms;
-        if (typeof durationMs === 'number' && durationMs > 0) {
-          usage = {
-            ...usage,
-            cost: { totalCostUsd: 0, totalDurationMs: durationMs },
-          };
+      } else if (type === 'result') {
+        events = events ?? [];
+        events.push({ ts: Date.now(), type: EventType.Idle });
+        if (subtype === 'success') {
+          const durationMs = entry.duration_ms;
+          if (typeof durationMs === 'number' && durationMs > 0) {
+            usage = {
+              ...usage,
+              cost: { totalCostUsd: 0, totalDurationMs: durationMs },
+            };
+          }
         }
       }
     }

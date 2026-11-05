@@ -77,10 +77,26 @@ describe('CursorStreamParser', () => {
     expect(result?.events?.[1]).toMatchObject({ type: EventType.ToolEnd, tool: 'read' });
   });
 
-  it('captures duration_ms from the terminal result event', () => {
+  it('captures duration_ms from the terminal result event and emits Idle', () => {
     const parser = new CursorStreamParser();
     const result = parser.parseTelemetry(`${resultLine}\n`);
     expect(result?.usage?.cost?.totalDurationMs).toBe(5234);
+    expect(result?.events).toHaveLength(1);
+    expect(result?.events?.[0]).toMatchObject({ type: EventType.Idle });
+  });
+
+  it('emits Idle on a result that is not success, with no duration', () => {
+    const parser = new CursorStreamParser();
+    const errorResult = JSON.stringify({
+      type: 'result',
+      subtype: 'error',
+      is_error: true,
+      session_id: 'c6b62c6f-7ead-4fd6-9922-e952131177ff',
+    });
+    const result = parser.parseTelemetry(`${errorResult}\n`);
+    expect(result?.usage).toBeUndefined();
+    expect(result?.events).toHaveLength(1);
+    expect(result?.events?.[0]).toMatchObject({ type: EventType.Idle });
   });
 
   it('returns null for chunks with no recognized telemetry', () => {
@@ -166,6 +182,7 @@ describe('CursorStreamParser', () => {
     expect(result?.events?.map((event) => event.type)).toEqual([
       EventType.ToolStart,
       EventType.ToolEnd,
+      EventType.Idle,
     ]);
   });
 

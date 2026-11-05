@@ -10,6 +10,7 @@ sources:
   - resource: src/main/agent/adapters/cursor/stream-parser.ts
   - resource: src/main/agent/adapters/cursor/session-paths.ts
   - resource: src/main/agent/adapters/cursor/transcript-parser.ts
+  - resource: src/main/agent/adapters/cursor/session-history-parser.ts
   - resource: src/main/agent/adapters/cursor/capability-discovery.ts
 ---
 # Cursor CLI
@@ -84,7 +85,7 @@ A Knowledge Graph answer from a distro starts in a stable folder beside the shar
 
 ## Limitations
 
-- No hooks wired and no structured status pipeline (PTY silence timer only). The CLI does run hooks: it reads the same `<project>/.cursor/hooks.json` and `~/.cursor/hooks.json` as the editor, and Cursor's forum lists `beforeShellExecution`, `afterShellExecution`, `afterFileEdit`, `postToolUse`, `stop` and `sessionStart` as working in the CLI, with reports of hooks not firing on some Linux and Windows builds. Kangentic wires none. None of those events marks a wait on the user either (its AskQuestion tool raises no hook, stream event or file), so a Cursor wait stays on the envelope (GitHub #452). Interactive occupancy and the live model are read from the TUI status bar (`Composer 2.5 · 7.8%`) in `stream-parser.ts`, not from a statusline command. `agent about` is only the seed until that bar paints.
+- No hooks wired and no structured status pipeline. The CLI does run hooks: it reads the same `<project>/.cursor/hooks.json` and `~/.cursor/hooks.json` as the editor, and Cursor's forum lists `beforeShellExecution`, `afterShellExecution`, `afterFileEdit`, `postToolUse`, `stop` and `sessionStart` as working in the CLI, with reports of hooks not firing on some Linux and Windows builds. Kangentic wires none. Turn end comes from the `agent-transcripts` JSONL instead (`session-history-parser.ts`): a user line is a Prompt, `{ type: "turn_ended" }` is an Idle, so a Cursor column offers On agent turn end. A print start's stream-json `result` event is the same Idle, sooner than the file. None of Cursor's own hook events marks a wait on the user (its AskQuestion tool raises no hook, stream event or file), so a Cursor wait stays on the envelope (GitHub #452). Interactive occupancy and the live model are read from the TUI status bar (`Composer 2.5 · 7.8%`) in `stream-parser.ts`, not from a statusline command. `agent about` is only the seed until that bar paints.
 - No settings merge. Workspace trust is the `--trust` flag on every spawn except confirm-changes (and on those resumes), not a file Kangentic writes. Confirm-changes leaves Cursor's own prompt so the user can decide.
 - Kangentic's MCP server reaches every session through the project's `.cursor/mcp.json` (a static
   `${env:...}` entry beside the user's servers, `project-mcp-config.ts`) and `--approve-mcps`, which

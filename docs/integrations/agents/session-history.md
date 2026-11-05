@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Adapter session history
-description: "The native session history files Kangentic tails for telemetry: reader attach and parse flow, the SessionHistoryParseResult contract, Codex, Gemini and Claude file formats, where a Claude transcript is found when its cwd changed, the Claude status-file pipeline, the per-agent resume map, the /clear fork reconcile, known gaps, and how to add a parser."
+description: "The native session history files Kangentic tails for telemetry: reader attach and parse flow, the SessionHistoryParseResult contract, Codex, Gemini, Claude and Cursor file formats, where a Claude transcript is found when its cwd changed, the Claude status-file pipeline, the per-agent resume map, the /clear fork reconcile, known gaps, and how to add a parser."
 tags: [session-history, telemetry, resume, parsers]
 sources:
   - resource: src/main/pty/readers/session-history-reader.ts
@@ -27,6 +27,7 @@ sources:
   - resource: src/main/agent/adapters/grok/session-history-parser.ts
   - resource: src/main/agent/adapters/opencode/session-history-parser.ts
   - resource: src/main/agent/adapters/aider/session-history-parser.ts
+  - resource: src/main/agent/adapters/cursor/session-history-parser.ts
   - resource: src/main/transition-engine/resume-id-reconcile.ts
   - resource: src/main/transition-engine/resume-cwd-migration.ts
   - resource: src/main/transition-engine/resume-conversation-guard.ts
@@ -57,7 +58,7 @@ Runtime flow:
 1. An agent adapter declares a `sessionHistory` block in its `runtime` strategy (`src/shared/types.ts` - `AdapterRuntimeStrategy.sessionHistory`).
 2. On PTY spawn, the adapter's full runtime strategy is stored on `ManagedSession.agentParser` - SessionManager does nothing session-history-specific.
 3. The agent's session ID is captured via one of four paths (whichever fires first):
-   - **Spawn-time short-circuit** (caller-owned IDs): when the adapter declares `supportsCallerSessionId = true`, the spawn pipeline pre-generates a UUID and passes it via `SpawnSessionInput.agentSessionId`. `session-spawn-flow.ts` calls `sessionHistoryReader.attach(...)` directly during spawn. Used by Claude (when `runtime.sessionHistory` is wired), Qwen, Kimi, Grok, and Gemini (whose spawn-time `locate` waits up to 30 s, since its chat file appears only once the CLI has booted).
+   - **Spawn-time short-circuit** (caller-owned IDs): when the adapter declares `supportsCallerSessionId = true`, the spawn pipeline pre-generates a UUID and passes it via `SpawnSessionInput.agentSessionId`. `session-spawn-flow.ts` calls `sessionHistoryReader.attach(...)` directly during spawn. Used by Claude (when `runtime.sessionHistory` is wired), Qwen, Kimi, Grok, and Gemini (whose spawn-time `locate` waits up to 30 s, since its chat file appears only once the CLI has booted). Cursor's interactive start is the same attach: `create-chat` names the id before launch, and locate polls for about 60 s because that chat writes nothing until the first turn.
    - `runtime.sessionId.fromHook` (Gemini hook stdin)
    - `runtime.sessionId.fromOutput` (PTY scraper)
    - `runtime.sessionId.fromFilesystem` (Codex rollout directory scan)
@@ -730,11 +731,31 @@ Decisions:
 - Kangentic does not set `CLAUDE_CODE_DISABLE_AGENT_VIEW`, which would turn `/bg` off for task
   sessions. That would block a Claude Code feature the user chose to use.
 
+## Cursor
+
+**File path**: `~/.cursor/projects/<cwd-slug>/agent-transcripts/<sessionId>/<sessionId>.jsonl`
+
+**Format**: append-only JSONL. One JSON object per line. CRLF or LF line endings tolerated. `isFullRewrite: false`. A WSL Cursor keeps the file under that distro's home; locate rebuilds the place from `cliTarget`.
+
+**Parser**: `src/main/agent/adapters/cursor/session-history-parser.ts`
+
+**Locate**: polls for about 60 s. An interactive start knows the id at spawn (`create-chat`) before the file exists. A print start captures the id from the stream-json init event, then attaches the same way.
+
+### Line entries we depend on
+
+| Line | Effect |
+|---|---|
+| `{ role: "user", message: { content: [{ type: "text", text }] } }` with displayed text (`cursorDisplayedUserText`: the `<user_query>` wrapper, a leading `<timestamp>` tag dropped) | Prompt. Starts the turn and turns the PTY silence timer off so a quiet compile cannot idle the session before `turn_ended` lands. |
+| `{ type: "turn_ended" }` | Idle. Ends the turn the way a Stop hook does, so `onTurnEnded` runs the column's On agent turn end automations. |
+| assistant lines, injected-context user lines (`<available_subagent_types>` and the like) | Ignored. Tool starts and ends stay with stream-json on a print start; emitting them here would double-count. |
+
+A print start also emits Idle from the stream-json `result` event (`stream-parser.ts`), which usually lands before the transcript line. A second Idle on an already-idle session is a no-op.
+
 ## Known gaps
 
 ### WSL on Windows
 
-A CLI configured by its `\\wsl.localhost\<distro>\...` path keeps its history in the distro, and Kangentic reads it through the distro's share. Aider is the one whose file sits in the cwd on the Windows drive, read as before. The session row's `cli_target` records the distro home's share path (`homeUnc`) and the agent home overrides the distro's shell sets, such as `CODEX_HOME`. Each parser's `locate()` rebuilds a place from it (`placeFromStored`) and looks under that home: Claude's `~/.claude/projects/<slug>/`, with the slug built from the `/mnt` path the CLI ran in, Codex's `<CODEX_HOME>/sessions/<date>/`, and the Gemini, Qwen Code and Grok folders. `FileWatcher` (`src/main/pty/readers/file-watcher.ts`) tails the file with a one-second poll that runs beside `fs.watch` whether or not the native watcher fires, which is why tailing over the share works. Background readers skip a stopped distro, since reading its share would start it (`mayReadPlaceUnattended`). The conversation indexer and the transcript archive read it on a later pass, and the Command Terminal's Earlier list keeps the row without looking. OpenCode is the exception. Its SQLite WAL cannot be read over the share, so Kangentic asks the distro's own CLI (`opencode session list`, `opencode export`), as [OpenCode](opencode.md#wsl) describes. A Windows CLI run through a WSL shell has no `cli_target`, and its files stay in this machine's home, where they are read as before.
+A CLI configured by its `\\wsl.localhost\<distro>\...` path keeps its history in the distro, and Kangentic reads it through the distro's share. Aider is the one whose file sits in the cwd on the Windows drive, read as before. The session row's `cli_target` records the distro home's share path (`homeUnc`) and the agent home overrides the distro's shell sets, such as `CODEX_HOME`. Each parser's `locate()` rebuilds a place from it (`placeFromStored`) and looks under that home: Claude's `~/.claude/projects/<slug>/`, with the slug built from the `/mnt` path the CLI ran in, Codex's `<CODEX_HOME>/sessions/<date>/`, Cursor's `~/.cursor/projects/<slug>/agent-transcripts/`, and the Gemini, Qwen Code and Grok folders. `FileWatcher` (`src/main/pty/readers/file-watcher.ts`) tails the file with a one-second poll that runs beside `fs.watch` whether or not the native watcher fires, which is why tailing over the share works. Background readers skip a stopped distro, since reading its share would start it (`mayReadPlaceUnattended`). The conversation indexer and the transcript archive read it on a later pass, and the Command Terminal's Earlier list keeps the row without looking. OpenCode is the exception. Its SQLite WAL cannot be read over the share, so Kangentic asks the distro's own CLI (`opencode session list`, `opencode export`), as [OpenCode](opencode.md#wsl) describes. A Windows CLI run through a WSL shell has no `cli_target`, and its files stay in this machine's home, where they are read as before.
 
 Two gaps remain. A worktree rename does not move a cwd-keyed CLI's history in a distro, such as Claude's. [Migrate-on-resume](#migrate-on-resume-after-a-worktree-rename-not-the-canresumesession-guard) logs and skips it, so that resume reports "No conversation found". Project relocation (`onProjectRelocated`) also rewrites only this machine's files. For an OpenCode session in a distro, the Conversation viewer gets no pages and handoff gets no history file.
 

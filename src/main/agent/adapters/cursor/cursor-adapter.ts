@@ -26,6 +26,7 @@ import {
 } from './answer-workspace';
 import { cursorProjectMcpConfigProblem, removeCursorProjectMcpConfig, writeCursorProjectMcpConfig } from './project-mcp-config';
 import { locateCursorTranscriptFile, resolveCursorTranscriptReadPath } from './session-paths';
+import { CursorSessionHistoryParser } from './session-history-parser';
 import { parseCursorTranscript, readCursorTranscriptPage } from './transcript-parser';
 import type { AgentAdapter, AgentInfo, AnswerFromContextOptions, ParsedTranscript, SpawnCommandOptions, SettingsChangeSpec, SummarizeOptions, TranscriptPageReadRequest, TranscriptPageReadResult } from '../../agent-adapter';
 import type {
@@ -418,36 +419,43 @@ export class CursorAdapter implements AgentAdapter {
   }
 
   /**
-   * Runtime strategy: Cursor CLI has no hooks and no caller-owned session
-   * IDs. Its `agent-transcripts` JSONL feeds the conversation viewer (the
-   * transcript methods below), not live telemetry. Every runtime signal
-   * comes from the PTY stream: the NDJSON of `--output-format stream-json`
-   * (active by default - see `defaultPermission`), or the TUI status bar of
-   * an interactive session.
+   * Runtime strategy: Cursor CLI has no hooks Kangentic wires. Activity
+   * comes from the `agent-transcripts` JSONL (a Prompt on each user
+   * line, an Idle on `turn_ended`) and, on a print start, from the
+   * NDJSON of `--output-format stream-json`. Interactive TUI status
+   * (`Composer 2.5 · 7.8%`) is still parsed from the PTY so the board
+   * card does not sit at 0% and the model pill is the live TUI name,
+   * not the spawn-time `about` seed.
    *
-   * - Activity: tool_call started/completed events from streamOutput
-   *   drive Thinking/Idle through the activity state machine, with PTY
-   *   silence-timer fallback for any interactive sessions.
+   * - Activity: `hooksAndPty` so the first history Prompt (or a
+   *   stream-json ToolStart) turns the PTY silence timer off. Silence
+   *   must not idle a turn that later writes `turn_ended`, or that Idle
+   *   is a no-op and On agent turn end never runs.
    * - Session ID: parsed from the same NDJSON init event that carries
    *   the model:
    *     {"type":"system","subtype":"init","session_id":"<uuid>",
    *      "model":"<display>",...}
    * - streamOutput: same init event populates SessionUsage.model so
-   *   ContextBar can lift its "Starting agent..." spinner. Interactive
-   *   TUI status (`Composer 2.5 · 7.8%`) is parsed from the same stream
-   *   so the board card does not sit at 0% and the model pill is the
-   *   live TUI name, not the spawn-time `about` seed.
+   *   ContextBar can lift its "Starting agent..." spinner. A print
+   *   start's terminal `result` event is also an Idle, faster than
+   *   waiting for the transcript's `turn_ended`.
    */
   readonly runtime: AdapterRuntimeStrategy = {
-    // Only terminal silence says a turn ended.
-    reportsTurnEnd: false,
-    activity: ActivityDetection.pty(),
+    // Its transcript `turn_ended` (and a print start's stream-json
+    // `result`) reaches the engine as an Idle event.
+    reportsTurnEnd: true,
+    activity: ActivityDetection.hooksAndPty(),
     sessionId: {
       fromOutput(data: string): string | null {
         const initMatch = data.match(/"session_id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/);
         if (initMatch) return initMatch[1];
         return null;
       },
+    },
+    sessionHistory: {
+      locate: CursorSessionHistoryParser.locate,
+      parse: CursorSessionHistoryParser.parse,
+      isFullRewrite: false,
     },
     streamOutput: {
       createParser: () => new CursorStreamParser(),

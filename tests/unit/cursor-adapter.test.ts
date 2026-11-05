@@ -747,8 +747,12 @@ describe('CursorAdapter', () => {
   // ── Runtime strategy ──────────────────────────────────────────────────────
 
   describe('runtime', () => {
-    it('uses pty activity detection', () => {
-      expect(adapter.runtime.activity.kind).toBe('pty');
+    it('uses hooksAndPty activity detection', () => {
+      expect(adapter.runtime.activity.kind).toBe('hooks_and_pty');
+    });
+
+    it('reports turn end from the transcript Idle', () => {
+      expect(adapter.runtime.reportsTurnEnd).toBe(true);
     });
 
     it('has session ID capture via fromOutput', () => {
@@ -756,8 +760,9 @@ describe('CursorAdapter', () => {
       expect(adapter.runtime.sessionId!.fromOutput).toBeDefined();
     });
 
-    it('has no session history', () => {
-      expect(adapter.runtime.sessionHistory).toBeUndefined();
+    it('tails agent-transcripts for Prompt and turn_ended', () => {
+      expect(adapter.runtime.sessionHistory).toBeDefined();
+      expect(adapter.runtime.sessionHistory!.isFullRewrite).toBe(false);
     });
 
     it('has no status file', () => {
