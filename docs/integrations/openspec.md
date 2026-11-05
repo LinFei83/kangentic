@@ -30,11 +30,14 @@ once, then `head-watcher.ts` watches `.git/HEAD`, `packed-refs`, and
 does not create a card.
 
 Each scan starts with `git rev-parse <defaultBranch>:openspec/changes`. An
-unchanged tree SHA returns without listing. For each directory under
-`openspec/changes/` (except `archive/` and names that start with a dot) it
-upserts a task with `card_kind` `change`, `external_source` `openspec`, and
-`openspec_change` equal to the directory name. New cards land in To Do.
-Regular and discuss cards are left alone.
+unchanged tree SHA returns without listing. `ls-tree` runs with
+`core.quotepath=false`, and a leftover C-quoted name (octal bytes in quotes)
+is decoded before it becomes `openspec_change` or is passed to
+`openspec validate`, so a non-ASCII directory keeps its real name. For each
+directory under `openspec/changes/` (except `archive/` and names that start
+with a dot) it upserts a task with `card_kind` `change`,
+`external_source` `openspec`, and `openspec_change` equal to the directory
+name. New cards land in To Do. Regular and discuss cards are left alone.
 
 `evaluate-change.ts` maps CLI validate plus `tasks.md` checkbox counts onto a
 stable `openspec_note` token (`ready`, `tasks:3/12`, `archived`, `invalid`,

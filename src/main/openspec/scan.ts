@@ -3,9 +3,11 @@
  *
  * Uncommitted workspace files do not count. Listing, proposal text, and
  * `tasks.md` checkbox counts all come from `git ls-tree` / `git show` of the
- * default branch. If Planning proposes in an isolated worktree, the agent
- * must commit that directory to the default branch. That belongs in the
- * discussion card's opening, not in a column automation.
+ * default branch. `ls-tree` is run with `core.quotepath=false` and leftover
+ * C-quoted names are decoded, so a non-ASCII directory keeps its real name.
+ * If Planning proposes in an isolated worktree, the agent must commit that
+ * directory to the default branch. That belongs in the discussion card's
+ * opening, not in a column automation.
  */
 import { IPC } from '../../shared/ipc-channels';
 import type { Project, Task, TaskCreateInput, TaskUpdateInput } from '../../shared/types';
@@ -23,6 +25,7 @@ import {
   type OpenspecCliRunner,
   type OpenspecNoteToken,
 } from './evaluate-change';
+import { GIT_LS_TREE_NO_QUOTE, parseGitNameOnlyOutput } from './git-quoted-path';
 
 export const OPENSPEC_CHANGES_TREE = 'openspec/changes';
 const ARCHIVE_DIR = 'archive';
@@ -69,8 +72,8 @@ export function createOpenspecGit(projectPath: string): OpenspecGitOps {
       return (await git.raw(['rev-parse', spec])).trim();
     },
     async lsTreeDirs(spec: string) {
-      const output = await git.raw(['ls-tree', '-d', '--name-only', spec]);
-      return output.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+      const output = await git.raw([...GIT_LS_TREE_NO_QUOTE, 'ls-tree', '-d', '--name-only', spec]);
+      return parseGitNameOnlyOutput(output);
     },
     async show(spec: string) {
       return git.raw(['show', spec]);
