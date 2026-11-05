@@ -304,6 +304,39 @@ describe('scanOpenspecChanges', () => {
     expect(existing.description).toBe('Need a README.');
   });
 
+  it('rewrites a leftover What Changes title on an already-named card', async () => {
+    const changeName = '更新仓库说明';
+    const existing = makeTask({
+      id: 'task-what-changes',
+      openspec_change: changeName,
+      title: 'What Changes',
+      description: 'Need a README.',
+      openspec_note: 'ready',
+    });
+    const tasks = makeTasks(new Map([[changeName, existing]]));
+    await scanOpenspecChanges({
+      project: PROJECT,
+      defaultBranch: 'main',
+      tasks,
+      swimlanes,
+      git: makeGit({
+        dirs: [changeName],
+        files: {
+          [`main:openspec/changes/${changeName}/proposal.md`]:
+            '## Why\n\nNeed a README.\n\n## What Changes\n\n- Add one\n',
+        },
+      }),
+      lastTreeSha: null,
+      evaluate: async () => 'ready',
+    });
+    expect(tasks.created).toHaveLength(0);
+    expect(tasks.updated).toEqual([{
+      id: 'task-what-changes',
+      title: changeName,
+    }]);
+    expect(existing.description).toBe('Need a README.');
+  });
+
   it('still creates a card when evaluate stamps missing (CLI absent)', async () => {
     const git = makeGit({
       dirs: ['add-rate-limiting'],
@@ -425,6 +458,43 @@ describe('scanOpenspecChanges', () => {
     });
     expect(tasks.created).toHaveLength(0);
     expect(tasks.updated).toEqual([{ id: 'task-1', openspec_note: 'archived' }]);
+    expect(existing.swimlane_id).toBe('merge-lane');
+  });
+
+  it('rewrites a leftover Why title when stamping archived', async () => {
+    const changeName = '更新仓库说明';
+    const existing = makeTask({
+      id: 'task-why-archive',
+      openspec_change: changeName,
+      title: 'Why',
+      description: 'Need a README.',
+      openspec_note: 'tasks:12/12',
+      swimlane_id: 'merge-lane',
+    });
+    const tasks = makeTasks(new Map([[changeName, existing]]));
+    await scanOpenspecChanges({
+      project: PROJECT,
+      defaultBranch: 'main',
+      tasks,
+      swimlanes,
+      git: makeGit({
+        dirs: ['archive'],
+        archiveDirs: [`2026-11-04-${changeName}`],
+        files: {
+          [`main:openspec/changes/archive/2026-11-04-${changeName}/proposal.md`]:
+            '## Why\n\nNeed a README.\n\n## What Changes\n\n- Add one\n',
+        },
+      }),
+      lastTreeSha: null,
+      evaluate: async () => 'archived',
+    });
+    expect(tasks.created).toHaveLength(0);
+    expect(tasks.updated).toEqual([{
+      id: 'task-why-archive',
+      openspec_note: 'archived',
+      title: changeName,
+    }]);
+    expect(existing.description).toBe('Need a README.');
     expect(existing.swimlane_id).toBe('merge-lane');
   });
 
