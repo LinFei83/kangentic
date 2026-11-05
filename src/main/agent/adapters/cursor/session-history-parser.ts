@@ -32,8 +32,13 @@ import { cursorDisplayedUserText } from './transcript-parser';
  * spawn-time attach. A WSL Cursor keeps the file under that distro's
  * home (`placeFromStored`).
  *
- * Append-only JSONL. Resume appends to the same file. No timestamps in
- * the records, so events use Date.now().
+ * Conversation lines append. The trailing `{ type: "turn_ended" }` does
+ * not: the next turn overwrites it with a longer user line, so the file
+ * grows without shrinking. The session-history reader rewinds to the
+ * previous JSONL record when an append does not start on `{`, or that
+ * Prompt is dropped and the later Idle lands on an already-idle session
+ * (On agent turn end never runs). No timestamps in the records, so
+ * events use Date.now().
  */
 export class CursorSessionHistoryParser {
   static async locate(options: {

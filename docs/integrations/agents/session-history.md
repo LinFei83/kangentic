@@ -66,7 +66,7 @@ Runtime flow:
    See [Adapter types and capability discovery](adapter-types.md#adapterruntimestrategy) for the full table.
 4. When `notifyAgentSessionId` fires (one of the latter three paths), SessionManager reads `session.agentParser?.runtime?.sessionHistory` and, if present, calls `sessionHistoryReader.attach(...)`. The spawn-time short-circuit calls `attach()` directly, bypassing the notify chain to avoid a DB ordering hazard with `recoverStaleSessionId`. `attach()` is idempotent, so a later capture pathway firing the full chain is harmless. A `detach()` cancels an attach still in flight (each attach holds a token, and the detach drops it), so an `attach()` right after it starts clean: that is how a conversation a SessionStart moved to (`followsSessionStartMoves`) gets its tail.
 5. `SessionHistoryReader.attach()` calls `hook.locate({ agentSessionId, cwd })`, instantiates a `FileWatcher` on the resolved path, and triggers an initial read. A null locate falls back to the PTY tracker, except for an attach with `waitForFile` (a moved conversation, whose file appears with its first prompt), which repeats the hook's locate, with a 1 s pause between rounds, for as long as the session runs.
-6. Each file-change event reads new content (append-mode cursor for JSONL, whole-file re-read for JSON) and dispatches to `sessionHistory.parse(content, mode)`.
+6. Each file-change event reads new content (append-mode cursor for JSONL, whole-file re-read for JSON) and dispatches to `sessionHistory.parse(content, mode)`. An append whose chunk does not start on `{` rewinds to the previous JSONL record, so a writer that overwrites a trailing marker without shrinking the file (Cursor's `turn_ended`) does not drop the new Prompt.
 7. The resulting `SessionHistoryParseResult` flows through `dispatchSessionHistoryResult()` into the generic callback primitives (`onUsageUpdate`, `onEvents`, `onActivity`, `onFirstTelemetry`) that SessionManager wired to SessionTelemetry at construction time.
 8. On the first successful dispatch, `onFirstTelemetry` fires, which calls into `SessionTelemetry`'s PTY-tracker suppression - PtyActivityTracker stops contributing activity signals for the rest of the session. An adapter whose history file carries only part of the activity picture sets `sessionHistory.suppressesPtyFallback: false` (Codex, whose rollout reports background commands, interrupts and failed turns beside its hooks), and neither the first read nor a turn-initiating event it reports turns the tracker off.
 
@@ -735,7 +735,7 @@ Decisions:
 
 **File path**: `~/.cursor/projects/<cwd-slug>/agent-transcripts/<sessionId>/<sessionId>.jsonl`
 
-**Format**: append-only JSONL. One JSON object per line. CRLF or LF line endings tolerated. `isFullRewrite: false`. A WSL Cursor keeps the file under that distro's home; locate rebuilds the place from `cliTarget`.
+**Format**: JSONL, one JSON object per line. CRLF or LF line endings tolerated. `isFullRewrite: false`. Conversation lines append. The trailing `{ type: "turn_ended" }` is overwritten when the next turn starts, so the file can grow without shrinking and the byte cursor can land inside the new user line. The session-history reader rewinds to the previous JSONL record when an append does not start on `{`. A WSL Cursor keeps the file under that distro's home; locate rebuilds the place from `cliTarget`.
 
 **Parser**: `src/main/agent/adapters/cursor/session-history-parser.ts`
 

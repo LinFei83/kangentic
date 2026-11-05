@@ -70,6 +70,54 @@ export interface SessionHistoryAttachOptions {
 /** The pause between two `locate` rounds of a `waitForFile` attach. */
 const WAIT_FOR_FILE_RETRY_MS = 1_000;
 
+/**
+ * How far an append that did not start on `{` walks back for the previous
+ * newline. Cursor's trailing `turn_ended` replacement tears about 40 bytes
+ * into the next user line; a 64 KB window covers that without rereading the
+ * whole file. No newline in the window: a fresh watcher rereads from 0, a
+ * resume watcher keeps the torn chunk so pre-suspend lines stay unparsed.
+ */
+const JSONL_REWIND_LOOKBACK_BYTES = 64 * 1024;
+
+/** True when `chunk` begins a JSONL object record, optional leading whitespace included. */
+export function jsonlChunkStartsAtRecord(chunk: string): boolean {
+  const start = chunk.search(/\S/);
+  return start !== -1 && chunk.charAt(start) === '{';
+}
+
+async function readFileSlice(filePath: string, start: number, end: number): Promise<string> {
+  const length = end - start;
+  if (length <= 0) return '';
+  const buffer = Buffer.alloc(length);
+  const handle = await fsPromises.open(filePath, 'r');
+  try {
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return buffer.toString('utf-8', 0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Byte offset of the JSONL line that contains `cursor`, or 0 when a fresh
+ * watcher cannot find a newline in the lookback. A resume watcher returns
+ * `cursor` itself when no newline is found, so the torn chunk is parsed as
+ * before rather than walking into pre-suspend history.
+ */
+async function previousJsonlRecordOffset(
+  filePath: string,
+  cursor: number,
+  startedAtEnd: boolean,
+): Promise<number> {
+  if (cursor <= 0) return 0;
+  const lookback = Math.min(cursor, JSONL_REWIND_LOOKBACK_BYTES);
+  const windowStart = cursor - lookback;
+  const window = await readFileSlice(filePath, windowStart, cursor);
+  const lastNewline = window.lastIndexOf('\n');
+  if (lastNewline === -1) return startedAtEnd ? cursor : 0;
+  return windowStart + lastNewline + 1;
+}
+
 interface WatcherState {
   watcher: FileWatcher;
   filePath: string;
@@ -313,16 +361,33 @@ export class SessionHistoryReader {
           state.cursor = resetTo;
         }
         if (stat.size <= state.cursor) return;
-        const length = stat.size - state.cursor;
-        const buffer = Buffer.alloc(length);
-        const handle = await fsPromises.open(state.filePath, 'r');
-        try {
-          await handle.read(buffer, 0, length, state.cursor);
-        } finally {
-          await handle.close();
+        const readFrom = state.cursor;
+        chunk = await readFileSlice(state.filePath, readFrom, stat.size);
+        if (this.states.get(sessionId) !== state) return;
+        // Cursor (and any JSONL writer that replaces a trailing marker then
+        // continues) can grow the file without shrinking it: the old
+        // `turn_ended` line is overwritten by a longer user line, and the
+        // byte cursor now sits inside that line. The torn prefix is not a
+        // record, so the Prompt is dropped and the later Idle lands on an
+        // already-idle session, which does not run On agent turn end. Rewind
+        // to the start of the line the cursor landed in.
+        if (chunk.length > 0 && !jsonlChunkStartsAtRecord(chunk) && readFrom > 0) {
+          const rewindTo = await previousJsonlRecordOffset(
+            state.filePath,
+            readFrom,
+            state.startedAtEnd,
+          );
+          if (this.states.get(sessionId) !== state) return;
+          if (rewindTo < readFrom) {
+            console.log(
+              `[session-history] ${sessionId.slice(0, 8)} append did not start on a JSONL record; `
+              + `rewound ${readFrom - rewindTo} bytes`,
+            );
+            chunk = await readFileSlice(state.filePath, rewindTo, stat.size);
+            if (this.states.get(sessionId) !== state) return;
+          }
         }
         state.cursor = stat.size;
-        chunk = buffer.toString('utf-8');
         mode = 'append';
       }
       // Detached while the read was out.

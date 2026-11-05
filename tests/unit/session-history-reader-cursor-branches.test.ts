@@ -1,5 +1,5 @@
 /**
- * Deterministic, fully-mocked-fs coverage for two SessionHistoryReader
+ * Deterministic, fully-mocked-fs coverage for SessionHistoryReader
  * cursor-tracking branches in `processChange()` that
  * tests/unit/session-history-reader.test.ts cannot reach: that file uses
  * REAL fs and a real FileWatcher, and its own comments note "we can't
@@ -80,8 +80,8 @@ vi.mock('node:fs', () => ({
       const fileDescriptor = mockOpenSync(...args);
       return {
         read: async (buffer: Buffer, offset: number, length: number, position: number) => {
-          mockReadSync(fileDescriptor, buffer, offset, length, position);
-          return { bytesRead: length, buffer };
+          const bytesRead = mockReadSync(fileDescriptor, buffer, offset, length, position);
+          return { bytesRead, buffer };
         },
         close: async () => {
           mockCloseSync(fileDescriptor);
@@ -91,8 +91,26 @@ vi.mock('node:fs', () => ({
   },
 }));
 
-import { SessionHistoryReader, type SessionHistoryReaderCallbacks } from '../../src/main/pty/readers/session-history-reader';
+import {
+  SessionHistoryReader,
+  jsonlChunkStartsAtRecord,
+  type SessionHistoryReaderCallbacks,
+} from '../../src/main/pty/readers/session-history-reader';
 import type { SessionHistoryParseResult } from '../../src/shared/types';
+
+const CURSOR_TURN_ENDED = '{"type":"turn_ended","status":"success"}\n';
+
+function cursorTranscriptLine(role: 'user' | 'assistant', text: string): string {
+  const body = role === 'user' ? `<user_query>\n${text}\n</user_query>` : text;
+  return JSON.stringify({
+    role,
+    message: { content: [{ type: 'text', text: body }] },
+  });
+}
+
+function cursorTurn(userText: string, assistantText: string): string {
+  return `${cursorTranscriptLine('user', userText)}\n${cursorTranscriptLine('assistant', assistantText)}\n${CURSOR_TURN_ENDED}`;
+}
 
 describe('SessionHistoryReader cursor-tracking branches (fully-mocked fs)', () => {
   let callbacks: SessionHistoryReaderCallbacks;
@@ -153,12 +171,12 @@ describe('SessionHistoryReader cursor-tracking branches (fully-mocked fs)', () =
 
     // The session appends 300 bytes (500 -> 800). Normal forward read.
     statQueue.push({ size: 800 });
-    readQueue.push('A'.repeat(300));
+    readQueue.push('{' + 'A'.repeat(299));
     fireWatch();
     await vi.advanceTimersByTimeAsync(50); // flush FileWatcher's debounce
 
     expect(parse).toHaveBeenCalledTimes(1);
-    expect(parse.mock.calls[0][0]).toBe('A'.repeat(300));
+    expect(parse.mock.calls[0][0]).toBe('{' + 'A'.repeat(299));
     expect(mockReadSync.mock.calls[0][3]).toBe(300); // length
     expect(mockReadSync.mock.calls[0][4]).toBe(500); // position
 
@@ -176,12 +194,12 @@ describe('SessionHistoryReader cursor-tracking branches (fully-mocked fs)', () =
     // had wrongly reset to 0, this read would request position 0 / length
     // 250 instead of position 200 / length 50.
     statQueue.push({ size: 250 });
-    readQueue.push('B'.repeat(50));
+    readQueue.push('{' + 'B'.repeat(49));
     fireWatch();
     await vi.advanceTimersByTimeAsync(50);
 
     expect(parse).toHaveBeenCalledTimes(2);
-    expect(parse.mock.calls[1][0]).toBe('B'.repeat(50));
+    expect(parse.mock.calls[1][0]).toBe('{' + 'B'.repeat(49));
     expect(mockReadSync.mock.calls[1][3]).toBe(50); // length - proves cursor was reset to 200, not 0
     expect(mockReadSync.mock.calls[1][4]).toBe(200); // position - proves cursor was reset to 200, not 0
   });
@@ -264,12 +282,12 @@ describe('SessionHistoryReader cursor-tracking branches (fully-mocked fs)', () =
     // length 950 - re-surfacing the stale pre-suspend tail this flag exists
     // to suppress.
     statQueue.push({ size: 950 });
-    readQueue.push('C'.repeat(50));
+    readQueue.push('{' + 'C'.repeat(49));
     fireWatch();
     await vi.advanceTimersByTimeAsync(50);
 
     expect(parse).toHaveBeenCalledTimes(1);
-    expect(parse.mock.calls[0][0]).toBe('C'.repeat(50));
+    expect(parse.mock.calls[0][0]).toBe('{' + 'C'.repeat(49));
     expect(mockReadSync.mock.calls[0][3]).toBe(50); // length - proves cursor anchored to 900, not 0
     expect(mockReadSync.mock.calls[0][4]).toBe(900); // position - proves cursor anchored to 900, not 0
   });
@@ -297,12 +315,142 @@ describe('SessionHistoryReader cursor-tracking branches (fully-mocked fs)', () =
     // A subsequent read starts at the immediately-anchored cursor (500),
     // not at a deferred re-anchor.
     statQueue.push({ size: 550 });
-    readQueue.push('D'.repeat(50));
+    readQueue.push('{' + 'D'.repeat(49));
     fireWatch();
     await vi.advanceTimersByTimeAsync(50);
 
     expect(parse).toHaveBeenCalledTimes(1);
     expect(mockReadSync.mock.calls[0][4]).toBe(500); // position
     expect(mockReadSync.mock.calls[0][3]).toBe(50); // length
+  });
+
+  // ---------------------------------------------------------------------
+  // Branch (c): a JSONL append that does not start on `{` rewinds to the
+  // previous record. Cursor overwrites the trailing `turn_ended` with a
+  // longer user line, so the file grows without shrinking and the byte
+  // cursor lands inside that line.
+  // ---------------------------------------------------------------------
+
+  it('rewinds a torn JSONL append to the previous record when Cursor replaces trailing turn_ended', async () => {
+    const filePath = '/fake/cursor.jsonl';
+    const parse = vi.fn((content: string) => ({ usage: null, events: [], activity: null }) as SessionHistoryParseResult);
+
+    const prefix = `${cursorTranscriptLine('user', 'first')}\n${cursorTranscriptLine('assistant', 'done')}\n`;
+    const turn1 = prefix + CURSOR_TURN_ENDED;
+    const turn2 = cursorTurn('second', 'Findings: applied');
+    const after = prefix + turn2;
+    const torn = after.slice(turn1.length);
+
+    expect(after.length).toBeGreaterThan(turn1.length);
+    expect(jsonlChunkStartsAtRecord(torn)).toBe(false);
+
+    statQueue.push({ size: turn1.length });
+    readQueue.push(turn1);
+
+    await reader.attach({
+      sessionId: 'session-cursor-overwrite',
+      agentSessionId: 'agent-uuid',
+      cwd: '/fake',
+      hook: { locate: async () => filePath, parse, isFullRewrite: false },
+    });
+
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse.mock.calls[0][0]).toBe(turn1);
+
+    // lookback window is [0, turn1.length); resync starts at prefix.length.
+    statQueue.push({ size: after.length });
+    readQueue.push(torn);
+    readQueue.push(after.slice(0, turn1.length));
+    readQueue.push(after.slice(prefix.length));
+    fireWatch();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(parse).toHaveBeenCalledTimes(2);
+    expect(parse.mock.calls[1][0]).toBe(turn2);
+    expect(parse.mock.calls[1][1]).toBe('append');
+    expect(mockReadSync).toHaveBeenCalledTimes(4);
+    expect(mockReadSync.mock.calls[1][4]).toBe(turn1.length);
+    expect(mockReadSync.mock.calls[2][4]).toBe(0);
+    expect(mockReadSync.mock.calls[3][4]).toBe(prefix.length);
+    expect(mockReadSync.mock.calls[3][3]).toBe(turn2.length);
+  });
+
+  it('a resume watcher rewinds a torn JSONL append to the previous newline, not to 0', async () => {
+    const filePath = '/fake/cursor.jsonl';
+    const parse = vi.fn((content: string) => ({ usage: null, events: [], activity: null }) as SessionHistoryParseResult);
+
+    const prefix = `${cursorTranscriptLine('user', 'first')}\n${cursorTranscriptLine('assistant', 'done')}\n`;
+    const turn1 = prefix + CURSOR_TURN_ENDED;
+    const turn2 = cursorTurn('second', 'Findings: applied');
+    const after = prefix + turn2;
+    const torn = after.slice(turn1.length);
+
+    statQueue.push({ size: turn1.length });
+    statQueue.push({ size: turn1.length });
+
+    await reader.attach({
+      sessionId: 'session-cursor-resume-overwrite',
+      agentSessionId: 'agent-uuid',
+      cwd: '/fake',
+      hook: { locate: async () => filePath, parse, isFullRewrite: false },
+      startAtEnd: true,
+    });
+
+    expect(parse).not.toHaveBeenCalled();
+
+    statQueue.push({ size: after.length });
+    readQueue.push(torn);
+    readQueue.push(after.slice(0, turn1.length));
+    readQueue.push(after.slice(prefix.length));
+    fireWatch();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse.mock.calls[0][0]).toBe(turn2);
+    expect(mockReadSync.mock.calls[2][4]).toBe(prefix.length);
+    expect(mockReadSync.mock.calls[2][4]).not.toBe(0);
+  });
+
+  it('a clean JSONL append that starts on `{` does not rewind', async () => {
+    const filePath = '/fake/rollout.jsonl';
+    const parse = vi.fn((content: string) => ({ usage: null, events: [], activity: null }) as SessionHistoryParseResult);
+    const first = '{"t":"a"}\n';
+    const second = '{"t":"b"}\n';
+
+    statQueue.push({ size: first.length });
+    readQueue.push(first);
+
+    await reader.attach({
+      sessionId: 'session-clean-append',
+      agentSessionId: 'agent-uuid',
+      cwd: '/fake',
+      hook: { locate: async () => filePath, parse, isFullRewrite: false },
+    });
+
+    expect(parse).toHaveBeenCalledTimes(1);
+
+    statQueue.push({ size: first.length + second.length });
+    readQueue.push(second);
+    fireWatch();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(parse).toHaveBeenCalledTimes(2);
+    expect(parse.mock.calls[1][0]).toBe(second);
+    expect(mockReadSync).toHaveBeenCalledTimes(2);
+    expect(mockReadSync.mock.calls[1][4]).toBe(first.length);
+  });
+});
+
+describe('jsonlChunkStartsAtRecord', () => {
+  it('accepts a JSON object record, including leading whitespace', () => {
+    expect(jsonlChunkStartsAtRecord('{"type":"turn_ended"}')).toBe(true);
+    expect(jsonlChunkStartsAtRecord('  {"type":"turn_ended"}')).toBe(true);
+    expect(jsonlChunkStartsAtRecord('\n{"type":"turn_ended"}')).toBe(true);
+  });
+
+  it('rejects a torn line, empty input, and whitespace-only input', () => {
+    expect(jsonlChunkStartsAtRecord('"type":"text"')).toBe(false);
+    expect(jsonlChunkStartsAtRecord('')).toBe(false);
+    expect(jsonlChunkStartsAtRecord('   ')).toBe(false);
   });
 });

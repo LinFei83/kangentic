@@ -455,6 +455,8 @@ export class CursorAdapter implements AgentAdapter {
     sessionHistory: {
       locate: CursorSessionHistoryParser.locate,
       parse: CursorSessionHistoryParser.parse,
+      // Conversation lines append; Cursor replaces the trailing
+      // `turn_ended` in place. The reader rewinds a torn JSONL line.
       isFullRewrite: false,
     },
     streamOutput: {
