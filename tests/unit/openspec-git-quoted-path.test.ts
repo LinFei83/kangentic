@@ -14,6 +14,8 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   decodeGitQuotedPath,
+  encodeGitQuotedPath,
+  gitQuotedPathAliases,
   parseGitNameOnlyOutput,
 } from '../../src/main/openspec/git-quoted-path';
 import { createOpenspecGit } from '../../src/main/openspec/scan';
@@ -50,6 +52,17 @@ describe('decodeGitQuotedPath / parseGitNameOnlyOutput', () => {
       'archive',
       'add-rate-limiting',
     ]);
+  });
+
+  it('encodes a Chinese directory the way default git quotepath prints it', () => {
+    expect(encodeGitQuotedPath(CHANGE_NAME)).toBe(QUOTED_CHANGE_NAME);
+    expect(encodeGitQuotedPath('add-rate-limiting')).toBe('add-rate-limiting');
+    expect(decodeGitQuotedPath(encodeGitQuotedPath(CHANGE_NAME))).toBe(CHANGE_NAME);
+  });
+
+  it('looks up the real name before the quoted leftover', () => {
+    expect(gitQuotedPathAliases(CHANGE_NAME)).toEqual([CHANGE_NAME, QUOTED_CHANGE_NAME]);
+    expect(gitQuotedPathAliases('add-rate-limiting')).toEqual(['add-rate-limiting']);
   });
 });
 

@@ -37,7 +37,11 @@ is decoded before it becomes `openspec_change` or is passed to
 directory under `openspec/changes/` (except `archive/` and names that start
 with a dot) it upserts a task with `card_kind` `change`,
 `external_source` `openspec`, and `openspec_change` equal to the directory
-name. New cards land in To Do. Regular and discuss cards are left alone.
+name. New cards land in To Do. A card already stored under git's C-quoted
+directory name is rewritten in place to the real name, including its title
+when the title was that quoted string. If a real-name card already exists,
+the leftover quoted row is left alone. Regular and discuss cards are left
+alone.
 
 `evaluate-change.ts` maps CLI validate plus `tasks.md` checkbox counts onto a
 stable `openspec_note` token (`ready`, `tasks:3/12`, `archived`, `invalid`,
