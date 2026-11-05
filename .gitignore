@@ -188,3 +188,4 @@ tests/captures/fixtures/scrollback-*.json
 .opencode/plugins/kangentic-activity.mjs
 .opencode/plugins/kangentic-activity.js
 kangentic.json
+.cursor/plans/
