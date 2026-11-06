@@ -994,7 +994,7 @@ msgstr "捨棄"
 msgid "Discard unsaved changes?"
 msgstr "要捨棄未儲存的變更嗎？"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Discuss"
 msgstr ""
@@ -1121,7 +1121,7 @@ msgstr "全部展開"
 msgid "Expand changes"
 msgstr "展開變更"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
 msgstr ""
 
@@ -1261,6 +1261,10 @@ msgstr "每個任務可執行的次數。"
 msgid "How this task runs"
 msgstr "此任務的執行方式"
 
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "How this task starts"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Icon"
 msgstr "圖示"
@@ -1294,7 +1298,7 @@ msgstr "影像預覽"
 msgid "Image sent at lower quality"
 msgstr "已以較低品質傳送圖片"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Implement on the current board path. No OpenSpec change."
 msgstr ""
 
@@ -2765,7 +2769,7 @@ msgstr "萬用字元範例。{rows}"
 msgid "Window limit reached"
 msgstr "已達視窗數量上限"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Work"
 msgstr ""
@@ -2774,8 +2778,12 @@ msgstr ""
 msgid "Work and discuss cards."
 msgstr ""
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
-msgid "Work or discuss"
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work implements on the board path, and Discuss explores first with /opsx-explore."
+msgstr ""
+
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work starts the agent on this board with no OpenSpec change. Discuss opens with /opsx-explore so you can talk the change through first, then propose it yourself when the discussion is enough."
 msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx

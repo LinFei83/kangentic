@@ -8,12 +8,13 @@ import { DescriptionEditor } from '../../DescriptionEditor';
 import { TaskPriorWork } from '../../knowledge-graph/TaskPriorWork';
 import { NameFromPromptButton } from '../../NameFromPromptButton';
 import { AdvancedOverridesSection } from '../AdvancedOverridesSection';
+import { TaskIntentChoice } from '../TaskIntentChoice';
 import { AttachmentChipStrip } from '../AttachmentChipStrip';
 import { isImageMediaType } from '../attachment-utils';
 import { useTaskDetailHost } from './task-detail-host';
 import type { AttachmentsState } from './useAttachments';
 import type { BranchConfigState } from './useBranchConfig';
-import type { Task, TaskRunMode } from '../../../../shared/types';
+import type { Task, TaskIntent, TaskRunMode } from '../../../../shared/types';
 
 interface TaskDetailEditFormProps {
   task: Task;
@@ -38,6 +39,8 @@ interface TaskDetailEditFormProps {
   setProfileId: (value: string | null) => void;
   runMode: TaskRunMode;
   setRunMode: (value: TaskRunMode) => void;
+  taskIntent: TaskIntent;
+  setTaskIntent: (value: TaskIntent) => void;
   setPermissionOverride: (value: string) => void;
   attachments: AttachmentsState;
   branchConfig: BranchConfigState;
@@ -69,6 +72,8 @@ export function TaskDetailEditForm({
   setProfileId,
   runMode,
   setRunMode,
+  taskIntent,
+  setTaskIntent,
   setPermissionOverride,
   attachments,
   branchConfig,
@@ -138,6 +143,13 @@ export function TaskDetailEditForm({
         setLabels={setLabels}
         testIdPrefix="task-"
       />
+      {!isSessionActive && !isArchived && isInTodo && task.card_kind !== 'change' && (
+        <TaskIntentChoice
+          value={taskIntent}
+          onChange={setTaskIntent}
+          testId="task-intent"
+        />
+      )}
       {!isInTodo && (
         <Field label={<span className="flex items-center gap-1"><GitPullRequest size={12} /><Trans>Pull Request</Trans></span>}>
           <input

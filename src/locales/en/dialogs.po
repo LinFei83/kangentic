@@ -994,7 +994,7 @@ msgstr "Discard"
 msgid "Discard unsaved changes?"
 msgstr "Discard unsaved changes?"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Discuss"
 msgstr "Discuss"
@@ -1121,7 +1121,7 @@ msgstr "Expand all"
 msgid "Expand changes"
 msgstr "Expand changes"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
 msgstr "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
 
@@ -1261,6 +1261,10 @@ msgstr "How many times it can run on a task."
 msgid "How this task runs"
 msgstr "How this task runs"
 
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "How this task starts"
+msgstr "How this task starts"
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Icon"
 msgstr "Icon"
@@ -1294,7 +1298,7 @@ msgstr "Image preview"
 msgid "Image sent at lower quality"
 msgstr "Image sent at lower quality"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Implement on the current board path. No OpenSpec change."
 msgstr "Implement on the current board path. No OpenSpec change."
 
@@ -2765,7 +2769,7 @@ msgstr "Wildcard examples. {rows}"
 msgid "Window limit reached"
 msgstr "Window limit reached"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Work"
 msgstr "Work"
@@ -2774,9 +2778,13 @@ msgstr "Work"
 msgid "Work and discuss cards."
 msgstr "Work and discuss cards."
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
-msgid "Work or discuss"
-msgstr "Work or discuss"
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work implements on the board path, and Discuss explores first with /opsx-explore."
+msgstr "Work implements on the board path, and Discuss explores first with /opsx-explore."
+
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work starts the agent on this board with no OpenSpec change. Discuss opens with /opsx-explore so you can talk the change through first, then propose it yourself when the discussion is enough."
+msgstr "Work starts the agent on this board with no OpenSpec change. Discuss opens with /opsx-explore so you can talk the change through first, then propose it yourself when the discussion is enough."
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 msgid "Workflow step"

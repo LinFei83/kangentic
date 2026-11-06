@@ -61,7 +61,7 @@ import { registerWindowCloser, unregisterWindowCloser } from '../store/window-cl
 import { isWindowDormant } from '../store/types';
 import { classifySnapZone, nextSnap } from '../dnd/snap-zones';
 import type { SnapDirection } from '../dnd/snap-zones';
-import type { Task, ShortcutConfig, TaskRunMode, SessionDisplayState } from '../../../shared/types';
+import type { Task, ShortcutConfig, TaskIntent, TaskRunMode, SessionDisplayState } from '../../../shared/types';
 
 interface TaskDetailWindowProps {
   task: Task;
@@ -193,6 +193,7 @@ export function TaskDetailWindow({
   const [permissionOverride, setPermissionOverride] = useState(task.permission_mode ?? '');
   const [profileId, setProfileId] = useState<string | null>(task.profile_id ?? null);
   const [runMode, setRunMode] = useState<TaskRunMode>(task.run_mode);
+  const [taskIntent, setTaskIntent] = useState<TaskIntent>(task.task_intent === 'discuss' ? 'discuss' : 'work');
   const [isEditing, setIsEditing] = useState(!!initialEdit);
   const [descriptionPeekOpen, setDescriptionPeekOpen] = useState(false);
   // The workflow panel (#732 board 9), for a task in a workflow. It sits beside
@@ -325,6 +326,7 @@ export function TaskDetailWindow({
     permissionOverride,
     profileId,
     runMode,
+    taskIntent,
     setTitle,
     setDescription,
     setPrUrl,
@@ -336,6 +338,7 @@ export function TaskDetailWindow({
     setPermissionOverride,
     setProfileId,
     setRunMode,
+    setTaskIntent,
     setIsEditing,
     branchConfig,
     session: sessionState.session,
@@ -425,11 +428,12 @@ export function TaskDetailWindow({
     || permissionOverride !== (task.permission_mode ?? '')
     || profileId !== (task.profile_id ?? null)
     || runMode !== task.run_mode
+    || taskIntent !== (task.task_intent === 'discuss' ? 'discuss' : 'work')
     || JSON.stringify(labels) !== JSON.stringify(task.labels ?? [])
     || branchConfig.baseBranch !== (task.base_branch || '')
     || branchConfig.customBranchName !== (task.branch_name || '')
     || branchConfig.useWorktree !== (task.use_worktree != null ? Boolean(task.use_worktree) : null)
-  ), [title, description, prUrl, priority, agentOverride, modelOverride, effortOverride, permissionOverride, profileId, runMode, labels, branchConfig.baseBranch, branchConfig.customBranchName, branchConfig.useWorktree, task]);
+  ), [title, description, prUrl, priority, agentOverride, modelOverride, effortOverride, permissionOverride, profileId, runMode, taskIntent, labels, branchConfig.baseBranch, branchConfig.customBranchName, branchConfig.useWorktree, task]);
 
   // The single guarded close used by every close affordance. Guards close
   // gestures (header X, Escape, panel.close) while editing with unsaved
@@ -970,6 +974,8 @@ export function TaskDetailWindow({
                   setProfileId={setProfileId}
                   runMode={runMode}
                   setRunMode={setRunMode}
+                  taskIntent={taskIntent}
+                  setTaskIntent={setTaskIntent}
                   setPermissionOverride={setPermissionOverride}
                   attachments={attachments}
                   branchConfig={branchConfig}

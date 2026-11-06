@@ -231,13 +231,14 @@ export function DescriptionEditor({
           with a definite height to distribute the editor absorbs all the
           leftover space and this floor stops mattering.
 
-          160 restores the vertical footprint the editor had before the
-          full-width Write/Preview tab strip was removed (that strip was ~29px on
-          top of a 120px body), plus a few pixels. Do not raise it much further:
-          at 280 a To Do task with attachments had to be scrolled to reach its
-          own run-mode controls. */}
+          128 is the floor that still fits a To Do edit form after How this
+          task starts (the Work/Discuss ChoiceCard) landed above the branch
+          row. 160 was the footprint after the Write/Preview tab strip came
+          off (~29px on a 120px body, plus a few pixels). Do not raise it
+          much further: at 280 a To Do task with attachments had to be
+          scrolled to reach its own run-mode controls. */}
       <div
-        className="relative w-full bg-surface-control flex-1 min-h-[160px] overflow-hidden"
+        className="relative w-full bg-surface-control flex-1 min-h-[128px] overflow-hidden"
         data-testid="description-editor-body"
       >
         <textarea
@@ -293,7 +294,7 @@ export function DescriptionEditor({
               <span className="block text-sm text-fg-faint">{placeholder}</span>
             </div>
             {/* A single compact row, not a stacked panel: the editor rests at
-                160px, so the old 20px icon over its own line of text took up
+                128px, so the old 20px icon over its own line of text took up
                 roughly half the box for a secondary hint. */}
             <div className="absolute inset-0 flex items-center justify-center">
               {/* `fg-muted`, not `fg-disabled`: this is an instruction, and at

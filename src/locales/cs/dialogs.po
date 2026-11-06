@@ -1219,7 +1219,7 @@ msgstr "Zahodit"
 msgid "Discard unsaved changes?"
 msgstr "Zahodit neuložené změny?"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Discuss"
 msgstr ""
@@ -1373,7 +1373,7 @@ msgstr "Rozbalit vše"
 msgid "Expand changes"
 msgstr "Rozbalit změny"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
 msgstr ""
 
@@ -1545,6 +1545,10 @@ msgstr "Kolikrát se může u úlohy spustit."
 msgid "How this task runs"
 msgstr "Jak se tento úkol spouští"
 
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "How this task starts"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 #, fuzzy
 msgid "Icon"
@@ -1586,7 +1590,7 @@ msgstr "Náhled obrázku"
 msgid "Image sent at lower quality"
 msgstr "Obrázek odeslán v nižší kvalitě"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Implement on the current board path. No OpenSpec change."
 msgstr ""
 
@@ -3390,7 +3394,7 @@ msgstr "Příklady zástupných znaků. {rows}"
 msgid "Window limit reached"
 msgstr "Dosažen limit oken"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Work"
 msgstr ""
@@ -3399,8 +3403,12 @@ msgstr ""
 msgid "Work and discuss cards."
 msgstr ""
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
-msgid "Work or discuss"
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work implements on the board path, and Discuss explores first with /opsx-explore."
+msgstr ""
+
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work starts the agent on this board with no OpenSpec change. Discuss opens with /opsx-explore so you can talk the change through first, then propose it yourself when the discussion is enough."
 msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx

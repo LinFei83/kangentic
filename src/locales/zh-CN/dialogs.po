@@ -994,7 +994,7 @@ msgstr "丢弃"
 msgid "Discard unsaved changes?"
 msgstr "丢弃未保存的更改？"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Discuss"
 msgstr ""
@@ -1121,9 +1121,9 @@ msgstr "全部展开"
 msgid "Expand changes"
 msgstr "展开更改"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
-msgstr ""
+msgstr "先探索。Agent 以 /opsx-explore 打开。讨论够了再自己提出改动。"
 
 #: src/renderer/components/dialogs/task-detail/changes/FileTreePanel.tsx
 msgctxt "column header"
@@ -1261,6 +1261,10 @@ msgstr "每个任务可运行的次数。"
 msgid "How this task runs"
 msgstr "此任务的运行方式"
 
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "How this task starts"
+msgstr "此任务的开始方式"
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 msgid "Icon"
 msgstr "图标"
@@ -1294,9 +1298,9 @@ msgstr "图像预览"
 msgid "Image sent at lower quality"
 msgstr "图片已按较低质量发送"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Implement on the current board path. No OpenSpec change."
-msgstr ""
+msgstr "在当前看板路径上实施，不走 OpenSpec 变更。"
 
 #: src/renderer/components/dialogs/task-detail/completed/CompletedChangesEmpty.tsx
 msgid "Indexing is off, so no commits are linked"
@@ -2765,7 +2769,7 @@ msgstr "通配符示例。{rows}"
 msgid "Window limit reached"
 msgstr "窗口数量已达上限"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Work"
 msgstr ""
@@ -2774,9 +2778,13 @@ msgstr ""
 msgid "Work and discuss cards."
 msgstr ""
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
-msgid "Work or discuss"
-msgstr ""
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work implements on the board path, and Discuss explores first with /opsx-explore."
+msgstr "Work 在当前看板路径上实施，Discuss 先用 /opsx-explore 探索。"
+
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work starts the agent on this board with no OpenSpec change. Discuss opens with /opsx-explore so you can talk the change through first, then propose it yourself when the discussion is enough."
+msgstr "Work 在这块看板上启动 agent，不走 OpenSpec 变更。Discuss 先打开 /opsx-explore，讨论够了再自己提出改动。"
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx
 msgid "Workflow step"

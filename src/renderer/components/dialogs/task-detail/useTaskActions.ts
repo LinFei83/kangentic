@@ -6,7 +6,7 @@ import { msg } from '@lingui/core/runtime-macro';
 import { useToastStore } from '../../../stores/toast-store';
 import { useTaskDetailHost } from './task-detail-host';
 import { sendToBacklogAsksFirst } from '../../../utils/send-to-backlog-confirm';
-import type { Task, Session, AgentCommand, Swimlane, PermissionMode, TaskRunMode } from '../../../../shared/types';
+import type { Task, Session, AgentCommand, Swimlane, PermissionMode, TaskIntent, TaskRunMode } from '../../../../shared/types';
 import type { useBranchConfig } from './useBranchConfig';
 import { hasSessionLifecycle } from '../../../utils/task-progress';
 import { prNumberFromUrl } from '../../../../shared/pr-url';
@@ -91,6 +91,8 @@ export function useTaskActions(input: {
   profileId: string | null;
   /** Which run-mode branch the edit form has selected (see `Task.run_mode`). */
   runMode: TaskRunMode;
+  /** Work / Discuss. Shown only on a To Do regular card that has not started. */
+  taskIntent: TaskIntent;
   setTitle: Dispatch<SetStateAction<string>>;
   setDescription: Dispatch<SetStateAction<string>>;
   setPrUrl: Dispatch<SetStateAction<string>>;
@@ -102,6 +104,7 @@ export function useTaskActions(input: {
   setPermissionOverride: Dispatch<SetStateAction<string>>;
   setProfileId: Dispatch<SetStateAction<string | null>>;
   setRunMode: Dispatch<SetStateAction<TaskRunMode>>;
+  setTaskIntent: Dispatch<SetStateAction<TaskIntent>>;
   setIsEditing: Dispatch<SetStateAction<boolean>>;
 
   // Branch config hook
@@ -326,6 +329,7 @@ export function useTaskActions(input: {
     // profile) the user just abandoned.
     input.setProfileId(input.task.profile_id ?? null);
     input.setRunMode(input.task.run_mode);
+    input.setTaskIntent(input.task.task_intent === 'discuss' ? 'discuss' : 'work');
     input.branchConfig.resetToTask();
     input.setIsEditing(false);
   };
@@ -376,6 +380,11 @@ export function useTaskActions(input: {
     try {
       const needsSwitchBranch = (input.task.worktree_path && branchChanged) || enablingWorktree;
       const prFields = buildPrFields();
+      // Same gate as TaskDetailEditForm: only a To Do regular card that has
+      // not started shows Work / Discuss, so only that write includes it.
+      const showsTaskIntent = input.isInTodo && !input.isSessionActive && !input.isArchived
+        && input.task.card_kind !== 'change';
+      const taskIntentFields = showsTaskIntent ? { task_intent: input.taskIntent } : {};
 
       // Per-task overrides: empty string in the form maps to null in the DB.
       // Always include them in the payload (even when unchanged) so a user
@@ -417,7 +426,8 @@ export function useTaskActions(input: {
             || (input.effortOverride || null) !== input.task.effort_override
             || (input.permissionOverride || null) !== input.task.permission_mode
             || (input.profileId ?? null) !== input.task.profile_id
-            || input.runMode !== input.task.run_mode) {
+            || input.runMode !== input.task.run_mode
+            || (showsTaskIntent && input.taskIntent !== (input.task.task_intent === 'discuss' ? 'discuss' : 'work'))) {
             await host.updateTask({
               id: input.task.id,
               title: input.title,
@@ -426,6 +436,7 @@ export function useTaskActions(input: {
               priority: input.priority,
               ...prFields,
               ...overrideFields,
+              ...taskIntentFields,
             });
           }
           await host.refresh();
@@ -447,6 +458,7 @@ export function useTaskActions(input: {
           priority: input.priority,
           ...prFields,
           ...overrideFields,
+          ...taskIntentFields,
         };
 
         if (!input.isSessionActive && !input.isArchived) {

@@ -1,7 +1,5 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { FolderOpen, Pencil, Plus, X } from 'lucide-react';
-import { i18n } from '@lingui/core';
-import { msg } from '@lingui/core/runtime-macro';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useBoardStore } from '../../stores/board-store';
 import { useConfigStore } from '../../stores/config-store';
@@ -21,6 +19,7 @@ import { maximizedDialogLayout, MaximizeToggleButton } from './dialog-maximize';
 import { TaskBranchRow } from './TaskBranchRow';
 import { PriorityLabelsRow } from './PriorityLabelsRow';
 import { DialogFooterActions } from './DialogFooterActions';
+import { TaskIntentChoice } from './TaskIntentChoice';
 import { AdvancedOverridesSection } from './AdvancedOverridesSection';
 import { Combobox } from './Combobox';
 import { useBranchSettings, type BranchSettingsInitial } from '../../hooks/useBranchSettings';
@@ -36,8 +35,6 @@ import {
 } from '../../../shared/types';
 import { WORKFLOW_REFUSAL_MESSAGES } from '../../../shared/workflow-refusals';
 import { translateText } from '../../i18n/translate';
-import { cachePerCatalog } from '../../i18n/catalog-cache';
-import { SegmentedControl, type SegmentedControlOption } from '../SegmentedControl';
 import { isPermissionMode } from '../../../shared/workflow-run-settings';
 import { runSettingsFrom, showsPlannedTaskRows, type WorkflowTaskInitial } from './workflow-task-form';
 import { DescriptionEditor } from '../DescriptionEditor';
@@ -85,26 +82,6 @@ const NEW_TASK_ENTITY_ID = 'new-task-dialog';
 
 /** A new task starts with nothing pinned: base, branch name, and worktree all inherit. */
 const EMPTY_BRANCH_SETTINGS: BranchSettingsInitial = { baseBranch: '', customBranchName: '', useWorktree: null };
-
-/**
- * Work / Discuss at create time. Cached until the catalog changes:
- * `SegmentedControl` keys its measuring effect on the `options` array, so a
- * fresh array per keystroke in the title would re-measure the thumb.
- */
-const TASK_INTENT_OPTIONS = cachePerCatalog((): readonly SegmentedControlOption<TaskIntent>[] => [
-  {
-    value: 'work',
-    label: i18n._(msg({ message: 'Work', context: 'task intent' })),
-    tip: i18n._(msg`Implement on the current board path. No OpenSpec change.`),
-    testId: 'new-task-intent-work',
-  },
-  {
-    value: 'discuss',
-    label: i18n._(msg({ message: 'Discuss', context: 'task intent' })),
-    tip: i18n._(msg`Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough.`),
-    testId: 'new-task-intent-discuss',
-  },
-]);
 
 /** The registered projects in the sidebar's order: each group's by position, groups by position, then the ungrouped. */
 function projectsInSidebarOrder(projects: readonly Project[], groups: readonly ProjectGroup[]): Project[] {
@@ -644,13 +621,10 @@ export function NewTaskDialog({ swimlaneId, onClose, workflow }: NewTaskDialogPr
             />
 
             {!workflow && (<>
-            <SegmentedControl
-              ariaLabel={t`Work or discuss`}
-              testId="new-task-intent"
-              quiet
+            <TaskIntentChoice
               value={taskIntent}
               onChange={setTaskIntent}
-              options={TASK_INTENT_OPTIONS()}
+              testId="new-task-intent"
             />
 
             <TaskBranchRow

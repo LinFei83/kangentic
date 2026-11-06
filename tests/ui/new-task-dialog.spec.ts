@@ -635,6 +635,19 @@ test.describe('Task intent', () => {
     await expect(page.locator('[data-testid="new-task-intent-work"]')).toHaveAttribute('aria-checked', 'true');
     await expect(page.locator('[data-testid="new-task-intent-discuss"]')).toHaveAttribute('aria-checked', 'false');
 
+    // ChoiceCard: title and description on the left, the segmented control on
+    // the right. Relative x, not a pixel delta (cross-platform-parity.md).
+    const label = page.getByText('How this task starts');
+    await expect(label).toBeVisible();
+    await expect(page.getByText(
+      'Work implements on the board path, and Discuss explores first with /opsx-explore.',
+    )).toBeVisible();
+    const labelBox = await label.boundingBox();
+    const controlBox = await group.boundingBox();
+    expect(labelBox).not.toBeNull();
+    expect(controlBox).not.toBeNull();
+    expect(controlBox!.x).toBeGreaterThan(labelBox!.x);
+
     await closeDialog();
   });
 
@@ -675,6 +688,36 @@ test.describe('Task intent', () => {
     const task = taskData.find((candidate: { title: string }) => candidate.title === 'Discuss Intent Task');
     expect(task).toBeDefined();
     expect(task.task_intent).toBe('discuss');
+  });
+
+  test('To Do edit shows the saved intent and persists a change', async () => {
+    const uniqueTitle = `Intent Edit ${Date.now()}`;
+    await createTask(page, uniqueTitle);
+
+    const taskCard = page.locator('[data-testid="swimlane"]').locator(`text=${uniqueTitle}`).first();
+    await taskCard.click();
+    const detailDialog = page.locator('[data-testid="task-detail-dialog"]');
+    await detailDialog.waitFor({ state: 'visible' });
+
+    const group = detailDialog.locator('[data-testid="task-intent"]');
+    await expect(group).toBeVisible();
+    await expect(detailDialog.getByText('How this task starts')).toBeVisible();
+    await expect(detailDialog.locator('[data-testid="task-intent-work"]')).toHaveAttribute('aria-checked', 'true');
+
+    await detailDialog.locator('[data-testid="task-intent-discuss"]').click();
+    await detailDialog.locator('button', { hasText: /^Save$/ }).click();
+    await detailDialog.waitFor({ state: 'hidden', timeout: 3000 });
+
+    const taskData = await page.evaluate(() => window.electronAPI.tasks.list());
+    const task = taskData.find((candidate: { title: string }) => candidate.title === uniqueTitle);
+    expect(task).toBeDefined();
+    expect(task.task_intent).toBe('discuss');
+
+    await taskCard.click();
+    await detailDialog.waitFor({ state: 'visible' });
+    await expect(detailDialog.locator('[data-testid="task-intent-discuss"]')).toHaveAttribute('aria-checked', 'true');
+    await page.keyboard.press('Escape');
+    await detailDialog.waitFor({ state: 'hidden', timeout: 3000 });
   });
 });
 

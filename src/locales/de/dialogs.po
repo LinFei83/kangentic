@@ -1219,7 +1219,7 @@ msgstr "Verwerfen"
 msgid "Discard unsaved changes?"
 msgstr "Nicht gespeicherte Änderungen verwerfen?"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Discuss"
 msgstr ""
@@ -1373,7 +1373,7 @@ msgstr "Alle aufklappen"
 msgid "Expand changes"
 msgstr "Änderungen erweitern"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Explore first. The agent opens with /opsx-explore. Propose the change yourself when the discussion is enough."
 msgstr ""
 
@@ -1545,6 +1545,10 @@ msgstr "Wie oft sie für eine Aufgabe ausgeführt werden kann."
 msgid "How this task runs"
 msgstr "Ausführung dieser Aufgabe"
 
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "How this task starts"
+msgstr ""
+
 #: src/renderer/components/dialogs/BoardManagerDialog.tsx
 #, fuzzy
 msgid "Icon"
@@ -1586,7 +1590,7 @@ msgstr "Bildvorschau"
 msgid "Image sent at lower quality"
 msgstr "Bild in geringerer Qualität gesendet"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgid "Implement on the current board path. No OpenSpec change."
 msgstr ""
 
@@ -3390,7 +3394,7 @@ msgstr "Platzhalterbeispiele. {rows}"
 msgid "Window limit reached"
 msgstr "Fensterlimit erreicht"
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
 msgctxt "task intent"
 msgid "Work"
 msgstr ""
@@ -3399,8 +3403,12 @@ msgstr ""
 msgid "Work and discuss cards."
 msgstr ""
 
-#: src/renderer/components/dialogs/NewTaskDialog.tsx
-msgid "Work or discuss"
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work implements on the board path, and Discuss explores first with /opsx-explore."
+msgstr ""
+
+#: src/renderer/components/dialogs/TaskIntentChoice.tsx
+msgid "Work starts the agent on this board with no OpenSpec change. Discuss opens with /opsx-explore so you can talk the change through first, then propose it yourself when the discussion is enough."
 msgstr ""
 
 #: src/renderer/components/dialogs/task-detail/completed/UsageTab.tsx

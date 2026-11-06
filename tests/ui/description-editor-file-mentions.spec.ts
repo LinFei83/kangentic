@@ -174,7 +174,7 @@ test.describe('DescriptionEditor file mentions', () => {
 
     // "@r" matches every entry in the mock file list (see mock-electron-api.js's
     // MOCK_PROJECT_ENTRIES), so the menu renders enough rows to exceed the
-    // editor's fixed 160px body - the scenario DescriptionMentionMenu's
+    // editor's fixed 128px body - the scenario DescriptionMentionMenu's
     // `max-h-[min(20rem,calc(100%-1.5rem))]` cap exists for. The menu is
     // bottom-anchored and grows upward, so without that cap its top edge runs
     // above the editor body's top edge and gets sliced by the body's own
@@ -185,7 +185,7 @@ test.describe('DescriptionEditor file mentions', () => {
     const menu = page.locator('[data-testid="description-mention-menu"]');
     await expect(menu).toBeVisible();
     // A floor, not an exact count: the point is only that enough rows render
-    // to overflow the 160px body (six rows at ~40px each already clears it
+    // to overflow the 128px body (six rows at ~40px each already clears it
     // with room to spare - the pre-fix overshoot measured 93px), not the
     // precise size of MOCK_PROJECT_ENTRIES, which other mention tests are
     // free to grow.
