@@ -18,7 +18,7 @@ import { setSpawnStaleNote, beginSpawnStaleProbe, touchSpawnStaleProbe } from '.
 import { isShuttingDown } from '../../shutdown-state';
 import { AgentCliNotFoundError } from '../../agent/shared/agent-cli-not-found';
 import { DEFAULT_AGENT, type ConversationExpiredNotice, type Project, type SpawnWarningKind, type Swimlane, type Task, type WorktreeSkipReason } from '../../../shared/types';
-import { discussCardSkipsWorktreeInPlanning, isDiscussCard } from '../../../shared/worktree-choice';
+import { discussCardSkipsWorktreeInPlanning } from '../../../shared/worktree-choice';
 import { sendToRenderer } from '../send-to-renderer';
 import { queueConversationExpired } from './pending-conversation-expired';
 import { getProjectRepos } from './project-repos';
@@ -497,19 +497,13 @@ export async function ensureTaskWorktree(
     onWaitProgress?: (info: GitWaitProgress) => void;
     projectId?: string | null;
     initScript?: InitScriptMode;
-    /**
-     * The destination column already loaded from this project's DB. Create and
-     * auto-spawn have it; pass it so discuss-plan does not look the column up
-     * again through a second path.
-     */
-    lane?: Swimlane | null;
   },
 ): Promise<EarlyAgentHandle | null> {
   options?.signal?.throwIfAborted();
   const resolvedProjectPath = projectPath ?? context.currentProjectPath;
   if (!resolvedProjectPath) return null;
   const config = context.configManager.getEffectiveConfig(resolvedProjectPath);
-  const rawLane = options?.lane ?? readWorktreeCheckSwimlane(task, context, options?.projectId);
+  const rawLane = readWorktreeCheckSwimlane(task, context, options?.projectId);
   const lane = applyProfileToLane(rawLane, loadTaskProfile(context, task, resolvedProjectPath));
   const agentName = resolveWorktreeCheckAgentName(task, context, resolvedProjectPath, lane, options?.projectId);
   if (config.agent.execution[agentName]?.mode === 'remote') {
@@ -519,13 +513,7 @@ export async function ensureTaskWorktree(
   // Before a spare is claimed or "Creating worktree..." is shown. A live
   // worktree is reused below, not torn down. Planning is the raw board
   // column, not the profile-folded strategy.
-  const discussPlanSkip = !task.worktree_path && discussCardSkipsWorktreeInPlanning(task, rawLane);
-  if (isDiscussCard(task)) {
-    console.log(
-      `[WORKTREE] discuss-plan task=${task.id.slice(0, 8)} intent=${task.task_intent} kind=${task.card_kind} lane=${rawLane?.name ?? 'none'} perm=${rawLane?.permission_mode ?? 'none'} exit=${rawLane?.plan_exit_target_id ?? 'none'} skip=${discussPlanSkip}`,
-    );
-  }
-  if (discussPlanSkip) {
+  if (!task.worktree_path && discussCardSkipsWorktreeInPlanning(task, rawLane)) {
     recordWorktreeSkip(task, tasks, 'discuss-plan');
     return null;
   }

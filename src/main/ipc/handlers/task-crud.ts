@@ -130,9 +130,8 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
       // Folded through the task's Board Profile so a profile that turns
       // auto_spawn on (or off) for this column is honored at creation, exactly as
       // it is on the move path.
-      const rawLane = swimlanes.getById(task.swimlane_id);
       const toLane = applyProfileToLane(
-        rawLane,
+        swimlanes.getById(task.swimlane_id),
         loadTaskProfile(context, task, resolvedProjectPath),
       );
       if (toLane?.auto_spawn && resolvedProjectPath && resolvedProjectId) {
@@ -150,9 +149,7 @@ export function registerTaskCrudHandlers(context: IpcContext): void {
           const onProgress = createProgressCallback(context.mainWindow, task.id);
           try {
             try {
-              await ensureTaskWorktree(context, task, tasks, projectPath, {
-                onProgress, projectId, lane: rawLane ?? null,
-              });
+              await ensureTaskWorktree(context, task, tasks, projectPath, { onProgress, projectId });
             } catch (worktreeError) {
               console.error('[TASK_CREATE] Worktree creation failed:', worktreeError);
               notifySpawnBlocked(context, task, 'worktree', worktreeError, projectId);

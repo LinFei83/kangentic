@@ -1606,7 +1606,6 @@ export async function handleTaskMove(
         const hadWorktree = Boolean(task.worktree_path);
         earlyAgent = await ensureTaskWorktree(context, task, tasksPhase2, resolvedProjectPath, {
           signal, onProgress, onWaitProgress, projectId: resolvedProjectId, initScript: initScriptMode,
-          lane: toLane,
         });
         setupStillRunning = setupStillRunningFor(context, resolvedProjectPath, initScriptMode, hadWorktree ? null : task.worktree_path);
       } catch (error) {

@@ -1599,9 +1599,7 @@ export async function autoSpawnForTask(
         }));
         const hadWorktree = Boolean(fullTask.worktree_path);
         try {
-          earlyAgent = await ensureTaskWorktree(context, fullTask, tasks, projectPath, {
-            signal, onProgress, projectId, initScript: initScriptMode, lane: plan.toLane,
-          });
+          earlyAgent = await ensureTaskWorktree(context, fullTask, tasks, projectPath, { signal, onProgress, projectId, initScript: initScriptMode });
         } catch (worktreeError) {
           if (isAbortError(worktreeError)) throw worktreeError;
           console.error('[auto-spawn] Worktree creation failed:', worktreeError);
