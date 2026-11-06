@@ -17,8 +17,8 @@ import { runGitWithTimeout } from '../../git/git-spawn';
 import { setSpawnStaleNote, beginSpawnStaleProbe, touchSpawnStaleProbe } from '../../transition-engine/spawn-progress';
 import { isShuttingDown } from '../../shutdown-state';
 import { AgentCliNotFoundError } from '../../agent/shared/agent-cli-not-found';
-import { DEFAULT_AGENT, type ConversationExpiredNotice, type SpawnWarningKind, type Task, type WorktreeSkipReason } from '../../../shared/types';
-import { discussCardSkipsWorktreeInPlanning } from '../../../shared/worktree-choice';
+import { DEFAULT_AGENT, type ConversationExpiredNotice, type Project, type SpawnWarningKind, type Task, type WorktreeSkipReason } from '../../../shared/types';
+import { discussCardSkipsWorktreeInPlanning, isDiscussCard } from '../../../shared/worktree-choice';
 import { sendToRenderer } from '../send-to-renderer';
 import { queueConversationExpired } from './pending-conversation-expired';
 import { getProjectRepos } from './project-repos';
@@ -26,6 +26,25 @@ import { resolveProjectDefaultBaseBranch } from './default-base-branch';
 import { applyProfileToLane, type ColumnStrategy } from '../../transition-engine/column-strategy';
 import { loadTaskProfile } from './task-profile';
 import type { IpcContext } from '../ipc-context';
+
+/**
+ * The hosting project for a worktree skip check. `projectId` wins because
+ * every create/move/spawn already resolved it; the path is only a fallback,
+ * compared the way the platform does so a drive-letter or trailing-slash
+ * mismatch cannot miss the row and fail open into a worktree.
+ */
+function resolveWorktreeProject(
+  context: IpcContext,
+  projectPath: string,
+  projectId?: string | null,
+): Project | undefined {
+  const projects = context.projectRepo.list();
+  if (projectId) {
+    const byId = projects.find((candidate) => candidate.id === projectId);
+    if (byId) return byId;
+  }
+  return projects.find((candidate) => isSameDirectory(candidate.path, projectPath));
+}
 
 /**
  * The task's current column, folded through its Board Profile, or null when
@@ -40,8 +59,9 @@ function resolveWorktreeCheckLane(
   task: Task,
   context: IpcContext,
   projectPath: string,
+  projectId?: string | null,
 ): ColumnStrategy | null {
-  const project = context.projectRepo.list().find((candidate) => candidate.path === projectPath);
+  const project = resolveWorktreeProject(context, projectPath, projectId);
   if (!project?.id || !task.swimlane_id) return null;
   const { swimlanes } = getProjectRepos(context, project.id);
   return applyProfileToLane(
@@ -69,10 +89,11 @@ function resolveWorktreeCheckAgentName(
   context: IpcContext,
   projectPath: string,
   lane: ColumnStrategy | null,
+  projectId?: string | null,
 ): string {
   if (task.agent_override) return task.agent_override;
   if (lane?.agent_override) return lane.agent_override;
-  const project = context.projectRepo.list().find((candidate) => candidate.path === projectPath);
+  const project = resolveWorktreeProject(context, projectPath, projectId);
   return project?.default_agent ?? DEFAULT_AGENT;
 }
 
@@ -486,8 +507,8 @@ export async function ensureTaskWorktree(
   const resolvedProjectPath = projectPath ?? context.currentProjectPath;
   if (!resolvedProjectPath) return null;
   const config = context.configManager.getEffectiveConfig(resolvedProjectPath);
-  const lane = resolveWorktreeCheckLane(task, context, resolvedProjectPath);
-  const agentName = resolveWorktreeCheckAgentName(task, context, resolvedProjectPath, lane);
+  const lane = resolveWorktreeCheckLane(task, context, resolvedProjectPath, options?.projectId);
+  const agentName = resolveWorktreeCheckAgentName(task, context, resolvedProjectPath, lane, options?.projectId);
   if (config.agent.execution[agentName]?.mode === 'remote') {
     recordWorktreeSkip(task, tasks, 'remote-agent');
     return null;
@@ -497,6 +518,11 @@ export async function ensureTaskWorktree(
   if (!task.worktree_path && discussCardSkipsWorktreeInPlanning(task, lane)) {
     recordWorktreeSkip(task, tasks, 'discuss-plan');
     return null;
+  }
+  if (!task.worktree_path && isDiscussCard(task) && !lane) {
+    console.warn(
+      `[WORKTREE] Discuss card ${task.id.slice(0, 8)}: column not resolved, creating a worktree`,
+    );
   }
   const scriptMode = config.git.initScript?.trim() ? options?.initScript : undefined;
   // No-commits and base-branch-resolution guards live inside
@@ -932,7 +958,7 @@ export async function ensureTaskBranchCheckout(
   if (!projectPath) return;
   if (task.worktree_path) return;
   if (!isGitRepo(projectPath)) return;
-  if (discussCardSkipsWorktreeInPlanning(task, resolveWorktreeCheckLane(task, context, projectPath))) {
+  if (discussCardSkipsWorktreeInPlanning(task, resolveWorktreeCheckLane(task, context, projectPath, options?.projectId))) {
     return;
   }
 
