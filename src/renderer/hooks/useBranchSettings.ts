@@ -7,8 +7,8 @@ import type { ReactNode } from 'react';
 import { computeBranchHint, resolveWorktreeBlocker, type WorktreeBlocker } from '../utils/worktree-placement';
 import { isValidGitBranchName } from '../../shared/git-utils';
 import { slugify, computeAutoBranchName } from '../../shared/slugify';
-import { taskUsesWorktree } from '../../shared/worktree-choice';
-import type { ProjectPathProbe } from '../../shared/types';
+import { discussCardSkipsWorktreeInPlanning, taskUsesWorktree } from '../../shared/worktree-choice';
+import type { ProjectPathProbe, TaskCardKind, TaskIntent } from '../../shared/types';
 
 export interface BranchSettingsInitial {
   baseBranch: string;
@@ -39,6 +39,20 @@ export interface UseBranchSettingsOptions {
   projectId?: string | null;
   /** The resolved agent runs against a remote server directory. */
   remoteAgent: boolean;
+  /**
+   * Regular vs change card, and work vs discuss. Omitted, the skip does not
+   * fire. Change cards ignore discuss even if `taskIntent` is discuss.
+   */
+  cardKind?: TaskCardKind | null;
+  taskIntent?: TaskIntent | null;
+  /**
+   * The destination column, for the discuss-plan skip. Same fields
+   * `ensureTaskWorktree` reads after the profile fold.
+   */
+  destinationLane?: {
+    permission_mode?: string | null;
+    plan_exit_target_id?: string | null;
+  } | null;
 }
 
 /**
@@ -50,7 +64,10 @@ export interface UseBranchSettingsOptions {
  * board, so every project-scoped input arrives as an argument.
  */
 export function useBranchSettings(options: UseBranchSettingsOptions) {
-  const { title, initial, worktreesEnabled, defaultBaseBranch, active, projectPath, remoteAgent, projectId = null } = options;
+  const {
+    title, initial, worktreesEnabled, defaultBaseBranch, active, projectPath, remoteAgent,
+    projectId = null, cardKind, taskIntent, destinationLane,
+  } = options;
 
   const [baseBranch, setBaseBranch] = useState(initial.baseBranch);
   const [customBranchName, setCustomBranchName] = useState(initial.customBranchName);
@@ -58,9 +75,13 @@ export function useBranchSettings(options: UseBranchSettingsOptions) {
   const [knownBranches, setKnownBranches] = useState<Set<string>>(new Set());
   const [probe, setProbe] = useState<ProjectPathProbe | null>(null);
 
-  // The same rule `ensureWorktree` applies, so the hint never promises a
+  // The same rules `ensureTaskWorktree` applies, so the hint never promises a
   // worktree the spawn will skip.
-  const effectiveWorktree = taskUsesWorktree(worktreesEnabled, useWorktree);
+  const discussPlanSkip = discussCardSkipsWorktreeInPlanning(
+    { card_kind: cardKind, task_intent: taskIntent },
+    destinationLane,
+  );
+  const effectiveWorktree = !discussPlanSkip && taskUsesWorktree(worktreesEnabled, useWorktree);
   const effectiveBaseBranch = baseBranch.trim() || defaultBaseBranch || 'main';
 
   useEffect(() => {
@@ -82,8 +103,8 @@ export function useBranchSettings(options: UseBranchSettingsOptions) {
   }, [active, projectPath]);
 
   const blocker = useMemo<WorktreeBlocker | null>(
-    () => resolveWorktreeBlocker({ probe, remoteAgent }),
-    [probe, remoteAgent],
+    () => resolveWorktreeBlocker({ probe, remoteAgent, discussPlanSkip }),
+    [probe, remoteAgent, discussPlanSkip],
   );
 
   const branchExists = useMemo(

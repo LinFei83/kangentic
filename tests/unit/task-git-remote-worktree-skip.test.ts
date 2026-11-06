@@ -77,6 +77,21 @@ vi.mock('../../src/main/git/fetch-throttle', () => ({
   fetchIfStale: vi.fn(async (_git: unknown, _path: string, branch: string) => branch),
 }));
 
+const { swimlaneById } = vi.hoisted(() => ({
+  swimlaneById: vi.fn(() => ({
+    id: 'lane-1',
+    agent_override: null,
+    permission_mode: null as string | null,
+    plan_exit_target_id: null as string | null,
+  })),
+}));
+
+vi.mock('../../src/main/ipc/helpers/project-repos', () => ({
+  getProjectRepos: vi.fn(() => ({
+    swimlanes: { getById: (...args: unknown[]) => swimlaneById(...args) },
+  })),
+}));
+
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
     id: 'task-001',
@@ -623,6 +638,146 @@ describe('ensureTaskBranchCheckout - hasCommits guard', () => {
     const task = makeTask({ worktree_path: null, branch_name: null, base_branch: 'main' });
 
     await ensureTaskBranchCheckout(makeContext(makeConfig()), task, '/project');
+
+    expect(checkoutBranchMock).toHaveBeenCalledWith('main');
+  });
+});
+
+const PLANNING_LANE = {
+  id: 'lane-1',
+  agent_override: null,
+  permission_mode: 'plan' as const,
+  plan_exit_target_id: null as string | null,
+};
+const EXIT_TARGET_LANE = {
+  id: 'lane-1',
+  agent_override: null,
+  permission_mode: 'acceptEdits' as const,
+  plan_exit_target_id: 'lane-exec',
+};
+const EXECUTING_LANE = {
+  id: 'lane-1',
+  agent_override: null,
+  permission_mode: 'acceptEdits' as const,
+  plan_exit_target_id: null as string | null,
+};
+
+function makeHostProject(): Project {
+  return { id: 'proj-1', path: '/project' } as Project;
+}
+
+describe('ensureTaskWorktree - discuss-plan skip', () => {
+  beforeEach(() => {
+    ensureWorktreeMock.mockClear();
+    prepareStaleWorktreeForCreationMock.mockClear();
+    swimlaneById.mockReset().mockReturnValue(PLANNING_LANE);
+  });
+
+  it('skips worktree creation for a discuss card in a planning column, and does not claim a spare', async () => {
+    const claim = vi.fn();
+    const task = makeTask({ task_intent: 'discuss', card_kind: 'regular' });
+    const repo = makeTaskRepoStub(task);
+    const context = makeContext(makeConfig(), [makeHostProject()]);
+    (context as { spareWorktrees: { claim: typeof claim } }).spareWorktrees = { claim } as never;
+
+    await ensureTaskWorktree(context, task, repo as never, '/project');
+
+    expect(ensureWorktreeMock).not.toHaveBeenCalled();
+    expect(prepareStaleWorktreeForCreationMock).not.toHaveBeenCalled();
+    expect(claim).not.toHaveBeenCalled();
+    expect(repo.recoverLegacyWorktreeFolder).not.toHaveBeenCalled();
+    expect(repo.setWorktreeSkipReason).toHaveBeenCalledWith('task-001', 'discuss-plan');
+    expect(task.worktree_skip_reason).toBe('discuss-plan');
+  });
+
+  it('skips when Planning is acceptEdits plus a plan-exit target', async () => {
+    swimlaneById.mockReturnValue(EXIT_TARGET_LANE);
+    const task = makeTask({ task_intent: 'discuss', card_kind: 'regular' });
+    const repo = makeTaskRepoStub(task);
+
+    await ensureTaskWorktree(makeContext(makeConfig(), [makeHostProject()]), task, repo as never, '/project');
+
+    expect(ensureWorktreeMock).not.toHaveBeenCalled();
+    expect(repo.setWorktreeSkipReason).toHaveBeenCalledWith('task-001', 'discuss-plan');
+  });
+
+  it('creates a worktree for a work card in a planning column', async () => {
+    const task = makeTask({ task_intent: 'work', card_kind: 'regular' });
+
+    await ensureTaskWorktree(makeContext(makeConfig(), [makeHostProject()]), task, makeTaskRepoStub(task) as never, '/project');
+
+    expect(ensureWorktreeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a worktree for a change card in a planning column', async () => {
+    const task = makeTask({ task_intent: 'discuss', card_kind: 'change' });
+
+    await ensureTaskWorktree(makeContext(makeConfig(), [makeHostProject()]), task, makeTaskRepoStub(task) as never, '/project');
+
+    expect(ensureWorktreeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a worktree for a discuss card in Executing', async () => {
+    swimlaneById.mockReturnValue(EXECUTING_LANE);
+    const task = makeTask({ task_intent: 'discuss', card_kind: 'regular' });
+
+    await ensureTaskWorktree(makeContext(makeConfig(), [makeHostProject()]), task, makeTaskRepoStub(task) as never, '/project');
+
+    expect(ensureWorktreeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses a live worktree instead of skipping', async () => {
+    ensureWorktreeMock.mockResolvedValueOnce({ skipped: true, reason: 'reused' });
+    const task = makeTask({
+      task_intent: 'discuss',
+      card_kind: 'regular',
+      worktree_path: '/project/.kangentic/worktrees/1',
+      worktree_skip_reason: 'disabled',
+    });
+    const repo = makeTaskRepoStub(task);
+
+    await ensureTaskWorktree(makeContext(makeConfig(), [makeHostProject()]), task, repo as never, '/project');
+
+    expect(ensureWorktreeMock).toHaveBeenCalledTimes(1);
+    expect(repo.setWorktreeSkipReason).toHaveBeenCalledWith('task-001', null);
+    expect(task.worktree_skip_reason).toBeNull();
+  });
+});
+
+describe('ensureTaskBranchCheckout - discuss-plan skip', () => {
+  beforeEach(() => {
+    checkoutBranchMock.mockClear();
+    withLockMock.mockClear();
+    hasCommitsMock.mockReset().mockResolvedValue(true);
+    isGitRepoMock.mockReset().mockReturnValue(true);
+    swimlaneById.mockReset().mockReturnValue(PLANNING_LANE);
+  });
+
+  it('does not check out a pinned base branch for a discuss card in a planning column', async () => {
+    const task = makeTask({
+      task_intent: 'discuss',
+      card_kind: 'regular',
+      worktree_path: null,
+      branch_name: null,
+      base_branch: 'main',
+    });
+
+    await ensureTaskBranchCheckout(makeContext(makeConfig(), [makeHostProject()]), task, '/project');
+
+    expect(checkoutBranchMock).not.toHaveBeenCalled();
+    expect(withLockMock).not.toHaveBeenCalled();
+  });
+
+  it('still checks out a work card in a planning column', async () => {
+    const task = makeTask({
+      task_intent: 'work',
+      card_kind: 'regular',
+      worktree_path: null,
+      branch_name: null,
+      base_branch: 'main',
+    });
+
+    await ensureTaskBranchCheckout(makeContext(makeConfig(), [makeHostProject()]), task, '/project');
 
     expect(checkoutBranchMock).toHaveBeenCalledWith('main');
   });

@@ -207,6 +207,9 @@ export function NewTaskDialog({ swimlaneId, onClose, workflow }: NewTaskDialogPr
     projectPath: (workflow ? taskProject?.path : currentProject?.path) ?? null,
     projectId: workflow ? taskProjectId : null,
     remoteAgent: agentExecution[resolvedAgent]?.mode === 'remote',
+    cardKind: 'regular',
+    taskIntent,
+    destinationLane,
   });
 
   /** A new board for a workflow task: the base branch and the profile named the old board's, so both go back to its defaults. */

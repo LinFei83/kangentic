@@ -100,4 +100,29 @@ describe('useBranchSettings branchPlaceholder', () => {
     expect(settings.blocker).toBe('remote-agent');
     expect(settings.branchPlaceholder).toBe('develop');
   });
+
+  it('skips the worktree for a discuss card in a planning column', () => {
+    const settings = renderBranchSettings({
+      baseBranch: 'develop',
+      taskIntent: 'discuss',
+      cardKind: 'regular',
+      destinationLane: { permission_mode: 'plan', plan_exit_target_id: null },
+    });
+
+    expect(settings.effectiveWorktree).toBe(false);
+    expect(settings.blocker).toBe('discuss-plan');
+    expect(settings.branchPlaceholder).toBe('develop');
+  });
+
+  it('still previews a worktree for a work card in a planning column', () => {
+    const settings = renderBranchSettings({
+      taskIntent: 'work',
+      cardKind: 'regular',
+      destinationLane: { permission_mode: 'plan', plan_exit_target_id: null },
+    });
+
+    expect(settings.effectiveWorktree).toBe(true);
+    expect(settings.blocker).toBeNull();
+    expect(settings.branchPlaceholder).toBe('fix-login-bug-ab12cd34');
+  });
 });

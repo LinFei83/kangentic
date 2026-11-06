@@ -10,7 +10,7 @@ import { DEFAULT_AGENT, type Task } from '../../../../shared/types';
  * mode, never the open board's. The state machine itself is the shared
  * `useBranchSettings`, so the New Task dialog cannot drift from this form.
  */
-export function useBranchConfig(task: Task, title: string, isInTodo: boolean) {
+export function useBranchConfig(task: Task, title: string, isInTodo: boolean, taskIntent?: Task['task_intent']) {
   const {
     config: { worktreesEnabled, defaultBaseBranch, agentExecution },
     projectId,
@@ -22,7 +22,8 @@ export function useBranchConfig(task: Task, title: string, isInTodo: boolean) {
   // The agent this task would spawn on: its own override, else the column's,
   // else the project default. Same chain the spawn preamble resolves, minus
   // the profile fold; the main process records the real outcome after spawn.
-  const laneAgent = swimlanes.find((lane) => lane.id === task.swimlane_id)?.agent_override ?? null;
+  const destinationLane = swimlanes.find((lane) => lane.id === task.swimlane_id) ?? null;
+  const laneAgent = destinationLane?.agent_override ?? null;
   const resolvedAgent = task.agent_override ?? laneAgent ?? defaultAgent ?? DEFAULT_AGENT;
   const remoteAgent = agentExecution[resolvedAgent]?.mode === 'remote';
 
@@ -43,6 +44,9 @@ export function useBranchConfig(task: Task, title: string, isInTodo: boolean) {
     // The branch list too: a task opened from another project lists that
     // project's branches, not the open board's.
     projectId,
+    cardKind: task.card_kind,
+    taskIntent: taskIntent ?? task.task_intent,
+    destinationLane,
   });
 
   const { reset } = settings;

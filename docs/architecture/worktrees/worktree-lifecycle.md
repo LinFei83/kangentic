@@ -11,6 +11,7 @@ sources:
   - resource: src/main/git/git-fetch-scheduler.ts
   - resource: src/main/git/fetch-throttle.ts
   - resource: src/shared/slugify.ts
+  - resource: src/shared/worktree-choice.ts
   - resource: src/main/ipc/helpers/task-git.ts
   - resource: src/main/transition-engine/session-startup/missing-worktree.ts
   - resource: src/main/transition-engine/resource-cleanup.ts
@@ -191,11 +192,13 @@ persisted: the task keeps its worktree.
 | `nested-worktree` | The project path itself is inside a worktree (`isInsideWorktree(this.projectPath)`) | Prevents nesting a worktree inside a worktree - a worktree checkout is never itself a valid parent for another `git worktree add`. |
 | `no-commits` | The repository has **no commits** (`hasCommits` in `src/main/git/git-checks.ts`) | A freshly `git init`-ed repo has an unborn HEAD: the branch exists in name only, so `git worktree add` fails with `fatal: invalid reference: <branch>`. This is the state Kangentic produces itself when it initialises a repo for a folder that had none (see `ensureGitRepo`), and the user's next action is usually a task move. Worktrees start working on their own once there is a first commit. |
 | `remote-agent` | The resolved agent's execution mode is `remote` (checked in `ensureTaskWorktree`, before `ensureWorktree` runs) | The agent runs against a server-side directory instead, so a local worktree would be unused. Resolution mirrors `resolveTargetAgent` exactly (task override, column profile, column override, project default, global fallback) - if the two disagree, a local agent spawns into the main checkout. The agent is NOT in the project folder in this case. |
+| `discuss-plan` | A regular discuss card (`task_intent: 'discuss'`, not a change card) in a planning column (`permission_mode === 'plan'` or `plan_exit_target_id` set), checked in `ensureTaskWorktree` after remote-agent and before a spare is claimed | OpenSpec proposals must land in the project folder the default-branch scan reads. The card does not take a spare worktree, and `ensureTaskBranchCheckout` does not switch the main checkout. A live worktree is reused. Work cards and change cards in the same column still get a worktree. |
 | `worktree-missing` | Startup recovery found `task.worktree_path` no longer on disk (`session-startup/auto-spawn.ts`, `resume-suspended.ts`, both through `demoteMissingWorktree` in `session-startup/missing-worktree.ts`) | The checkout facts are dropped (`worktree_path`, `branch_name`, `resolved_base_branch`) and the agent falls back to the project path; the reason records that the fallback happened. The PR anchors that describe the WORK survive: `pushed_branch` is kept, and the surviving local branch ref's tip is captured into `head_sha` first (`readLocalBranchSha`), so the task can still link its PR. |
 
-The renderer decides the three structural reasons and the remote case up front as well, from the
-project path probe (`isGitRepo`, `isInsideWorktree`, `hasCommits`) and the agent execution map, so
-the Branch row's hint and its disabled Worktree option state the outcome before the spawn
+The renderer decides the three structural reasons, the remote case, and the discuss-plan skip up
+front as well, from the project path probe (`isGitRepo`, `isInsideWorktree`, `hasCommits`), the
+agent execution map, and the card's intent plus the destination column, so the Branch row's hint
+and its disabled Worktree option state the outcome before the spawn
 (`src/renderer/utils/worktree-placement.tsx`). The persisted reason is still the ground truth.
 
 The no-commits guard lives inside `WorktreeManager.ensureWorktree` (via `resolveWorktreeBase`), not
@@ -209,7 +212,8 @@ keeps its own separate no-commits guard, since it does not go through
 Every task that does not get a worktree runs in the same directory, the project path. Kangentic does
 not stop two agents from working there at once, but it does refuse to **change the branch** under a
 live one: `ensureTaskBranchCheckout` throws `BranchCheckoutBlockedError` when another task has a
-running or queued session whose `cwd` is that directory.
+running or queued session whose `cwd` is that directory. A discuss card in a planning column does
+not check out at all, even when a base branch is pinned, so it cannot switch the folder under you.
 
 The check lives in that function rather than in a caller, deliberately. It previously sat in
 `task-move.ts` keyed on `task.base_branch`, while the decision to check out is keyed on

@@ -168,7 +168,7 @@ stored rather than recomputed.
 
 `worktree_skip_reason` records WHY the task's last spawn ran without a worktree, i.e. in the shared
 project checkout: one of `'disabled' | 'not-a-repo' | 'nested-worktree' | 'no-commits' |
-'remote-agent' | 'worktree-missing'` (the `WorktreeSkipReason` union), or NULL while the task has a
+'remote-agent' | 'discuss-plan' | 'worktree-missing'` (the `WorktreeSkipReason` union), or NULL while the task has a
 worktree or no spawn has decided yet. Written only by `TaskRepository.setWorktreeSkipReason` (spawn
 telemetry, so no `updated_at` bump) and cleared by `recordWorktree`, a To Do reset, and a Done move;
 the generic `update()` never touches it. It is the ground truth for any surface that wants to say

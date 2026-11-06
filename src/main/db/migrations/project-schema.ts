@@ -1674,7 +1674,7 @@ export function runProjectMigrations(db: Database.Database): void {
 
   // Migration: record WHY a task's last spawn ran without a worktree (the
   // `WorktreeSkipReason` union: 'disabled' | 'not-a-repo' | 'nested-worktree' |
-  // 'no-commits' | 'remote-agent' | 'worktree-missing'). Null while the task has
+  // 'no-commits' | 'remote-agent' | 'discuss-plan' | 'worktree-missing'). Null while the task has
   // a worktree or no spawn has decided yet. `WorktreeManager.ensureWorktree`
   // used to collapse every guard into one silent null, so nothing could tell
   // the user their agent was running in the shared project checkout. It is the

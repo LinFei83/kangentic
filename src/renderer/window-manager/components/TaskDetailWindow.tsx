@@ -235,7 +235,7 @@ export function TaskDetailWindow({
   const laneRole = currentSwimlane?.role ?? null;
 
   const attachments = useAttachments(task.id, updateAttachmentCount);
-  const branchConfig = useBranchConfig(task, title, isInTodo);
+  const branchConfig = useBranchConfig(task, title, isInTodo, taskIntent);
 
   const sessionState = useTaskSessionState({
     task,

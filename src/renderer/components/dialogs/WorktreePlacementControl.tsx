@@ -47,7 +47,7 @@ const openOptions = cachePerCatalog((): readonly SegmentedControlOption<Worktree
  * plus a rebuilt `ResizeObserver`) on every keystroke in the dialog.
  *
  * A cache rather than `useMemo` because this component is deliberately hookless
- * (see below). It is bounded by `describeWorktreeBlocker`'s four fixed strings,
+ * (see below). It is bounded by `describeWorktreeBlocker`'s five fixed strings,
  * which is the only thing any caller passes.
  */
 const blockedOptionsFor = cachePerCatalogBy((reason: string): readonly SegmentedControlOption<WorktreePlacement>[] => {

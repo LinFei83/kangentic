@@ -18,13 +18,37 @@ import { setSpawnStaleNote, beginSpawnStaleProbe, touchSpawnStaleProbe } from '.
 import { isShuttingDown } from '../../shutdown-state';
 import { AgentCliNotFoundError } from '../../agent/shared/agent-cli-not-found';
 import { DEFAULT_AGENT, type ConversationExpiredNotice, type SpawnWarningKind, type Task, type WorktreeSkipReason } from '../../../shared/types';
+import { discussCardSkipsWorktreeInPlanning } from '../../../shared/worktree-choice';
 import { sendToRenderer } from '../send-to-renderer';
 import { queueConversationExpired } from './pending-conversation-expired';
 import { getProjectRepos } from './project-repos';
 import { resolveProjectDefaultBaseBranch } from './default-base-branch';
-import { applyProfileToLane } from '../../transition-engine/column-strategy';
+import { applyProfileToLane, type ColumnStrategy } from '../../transition-engine/column-strategy';
 import { loadTaskProfile } from './task-profile';
 import type { IpcContext } from '../ipc-context';
+
+/**
+ * The task's current column, folded through its Board Profile, or null when
+ * the project or lane cannot be resolved. Same lookup the spawn uses, so a
+ * discuss-plan skip and a remote-agent skip see the same permission mode,
+ * plan-exit target, and agent override. The column is the task's CURRENT
+ * swimlane, which is the destination lane at every call site (the
+ * move/create/promote/unarchive flows all commit the row to the destination
+ * before the worktree phase).
+ */
+function resolveWorktreeCheckLane(
+  task: Task,
+  context: IpcContext,
+  projectPath: string,
+): ColumnStrategy | null {
+  const project = context.projectRepo.list().find((candidate) => candidate.path === projectPath);
+  if (!project?.id || !task.swimlane_id) return null;
+  const { swimlanes } = getProjectRepos(context, project.id);
+  return applyProfileToLane(
+    swimlanes.getById(task.swimlane_id),
+    loadTaskProfile(context, task, projectPath),
+  );
+}
 
 /**
  * Resolution of the agent that will run this task, for the worktree-skip
@@ -38,23 +62,17 @@ import type { IpcContext } from '../ipc-context';
  *
  * The profile tier is why this is not just "read the lane": a task riding a
  * profile that re-points this column at a remote-execution agent must skip the
- * worktree here, exactly as the spawn will.
- *
- * The column layer is read from the task's CURRENT swimlane, which is the
- * destination lane at every call site (the move/create/promote/unarchive
- * flows all commit the row to the destination before the worktree phase).
+ * worktree here, exactly as the spawn will. `lane` is that folded column.
  */
-function resolveWorktreeCheckAgentName(task: Task, context: IpcContext, projectPath: string): string {
+function resolveWorktreeCheckAgentName(
+  task: Task,
+  context: IpcContext,
+  projectPath: string,
+  lane: ColumnStrategy | null,
+): string {
   if (task.agent_override) return task.agent_override;
+  if (lane?.agent_override) return lane.agent_override;
   const project = context.projectRepo.list().find((candidate) => candidate.path === projectPath);
-  if (project?.id && task.swimlane_id) {
-    const { swimlanes } = getProjectRepos(context, project.id);
-    const lane = applyProfileToLane(
-      swimlanes.getById(task.swimlane_id),
-      loadTaskProfile(context, task, projectPath),
-    );
-    if (lane?.agent_override) return lane.agent_override;
-  }
   return project?.default_agent ?? DEFAULT_AGENT;
 }
 
@@ -417,12 +435,15 @@ function recordWorktreeSkip(task: Task, tasks: TaskRepository, reason: WorktreeS
 /**
  * Create a worktree for a task if needed and update the DB + task object in place.
  * Creates nothing when worktrees are disabled, the project isn't a git repo, the repo has no
- * commits yet (unborn HEAD), or the resolved agent's execution mode for this project is 'remote'
+ * commits yet (unborn HEAD), the resolved agent's execution mode for this project is 'remote'
  * (the agent runs against a server-side directory instead - see `agent.execution` in AppConfig
- * and `ResolvedExecutionTarget`). In every one of those cases `task.worktree_path` stays null so
- * `cwd` falls back to the project path (per transition-engine.ts), and the REASON is written to
- * `task.worktree_skip_reason` so the board can say the agent is in the shared checkout, and why.
- * Throws on worktree creation failure (e.g. duplicate branch, or an unresolvable base branch).
+ * and `ResolvedExecutionTarget`), or a discuss card is in a planning column (`discuss-plan`:
+ * OpenSpec proposals must land in the project folder the default-branch scan reads). In every
+ * one of those cases `task.worktree_path` stays null so `cwd` falls back to the project path
+ * (per transition-engine.ts), and the REASON is written to `task.worktree_skip_reason` so the
+ * board can say the agent is in the shared checkout, and why. A discuss card that already has
+ * a live worktree keeps it. Throws on worktree creation failure (e.g. duplicate branch, or an
+ * unresolvable base branch).
  *
  * `initScript` lets the agent start while a NEW worktree runs its setup script
  * (`git.initScript`), in one of two modes. Without it, or with no script set,
@@ -465,9 +486,16 @@ export async function ensureTaskWorktree(
   const resolvedProjectPath = projectPath ?? context.currentProjectPath;
   if (!resolvedProjectPath) return null;
   const config = context.configManager.getEffectiveConfig(resolvedProjectPath);
-  const agentName = resolveWorktreeCheckAgentName(task, context, resolvedProjectPath);
+  const lane = resolveWorktreeCheckLane(task, context, resolvedProjectPath);
+  const agentName = resolveWorktreeCheckAgentName(task, context, resolvedProjectPath, lane);
   if (config.agent.execution[agentName]?.mode === 'remote') {
     recordWorktreeSkip(task, tasks, 'remote-agent');
+    return null;
+  }
+  // Before a spare is claimed or "Creating worktree..." is shown. A live
+  // worktree is reused below, not torn down.
+  if (!task.worktree_path && discussCardSkipsWorktreeInPlanning(task, lane)) {
+    recordWorktreeSkip(task, tasks, 'discuss-plan');
     return null;
   }
   const scriptMode = config.git.initScript?.trim() ? options?.initScript : undefined;
@@ -879,7 +907,10 @@ async function surfaceWorktreeBaseDrift(
  * the cooldown-guarded spawn warning instead of silently starting stale.
  *
  * No-ops when: no project path, task uses a worktree, not a git repo,
- * or task has neither a custom branch_name nor a base_branch.
+ * task has neither a custom branch_name nor a base_branch, or a discuss
+ * card is in a planning column (the agent stays on whatever branch the
+ * project folder already has; a pinned base must not switch the user's
+ * main checkout).
  * Throws on dirty repo or checkout failure so the caller can block agent spawn.
  *
  * Also throws `BranchCheckoutBlockedError` when another task already has a live
@@ -901,6 +932,9 @@ export async function ensureTaskBranchCheckout(
   if (!projectPath) return;
   if (task.worktree_path) return;
   if (!isGitRepo(projectPath)) return;
+  if (discussCardSkipsWorktreeInPlanning(task, resolveWorktreeCheckLane(task, context, projectPath))) {
+    return;
+  }
 
   const usesCustomBranch = Boolean(
     task.branch_name && !isAutoGeneratedBranch(task.branch_name, task.id, task.title),

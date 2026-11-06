@@ -745,6 +745,10 @@ msgstr "捨棄"
 msgid "Discard unsaved changes?"
 msgstr "要捨棄未儲存的變更嗎？"
 
+#: src/renderer/utils/worktree-placement.tsx
+msgid "Discuss cards write in the project folder"
+msgstr "討論卡片寫入專案資料夾"
+
 #: src/renderer/window-manager/bridge/useBrowserDownloadToast.ts
 msgid "Download didn't finish"
 msgstr "下載未完成"

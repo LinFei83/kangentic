@@ -736,6 +736,10 @@ msgstr "Discard"
 msgid "Discard unsaved changes?"
 msgstr "Discard unsaved changes?"
 
+#: src/renderer/utils/worktree-placement.tsx
+msgid "Discuss cards write in the project folder"
+msgstr "Discuss cards write in the project folder"
+
 #: src/renderer/window-manager/bridge/useBrowserDownloadToast.ts
 msgid "Download didn't finish"
 msgstr "Download didn't finish"

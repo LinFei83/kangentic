@@ -548,6 +548,8 @@ export type AutomationAppliesTo = 'regular' | 'change';
  *   - `no-commits`: unborn HEAD (a freshly initialised repo), so there is no ref to branch from.
  *   - `remote-agent`: the resolved agent runs against a server-side directory, so a local
  *     worktree would be unused. The agent is NOT in the project folder in this case.
+ *   - `discuss-plan`: a regular discuss card in a planning column. The agent writes
+ *     OpenSpec proposals in the project folder so the default-branch scan can see them.
  *   - `worktree-missing`: the worktree directory vanished between runs; startup recovery
  *     nulled the path and fell back to the project folder.
  *
@@ -560,6 +562,7 @@ export type WorktreeSkipReason =
   | 'nested-worktree'
   | 'no-commits'
   | 'remote-agent'
+  | 'discuss-plan'
   | 'worktree-missing';
 
 export interface Task {

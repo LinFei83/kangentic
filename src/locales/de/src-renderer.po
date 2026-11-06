@@ -910,6 +910,10 @@ msgstr "Verwerfen"
 msgid "Discard unsaved changes?"
 msgstr "Nicht gespeicherte Änderungen verwerfen?"
 
+#: src/renderer/utils/worktree-placement.tsx
+msgid "Discuss cards write in the project folder"
+msgstr ""
+
 #: src/renderer/window-manager/bridge/useBrowserDownloadToast.ts
 #, fuzzy
 msgid "Download didn't finish"

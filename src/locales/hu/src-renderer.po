@@ -910,6 +910,10 @@ msgstr "Elvetés"
 msgid "Discard unsaved changes?"
 msgstr "Elveti a nem mentett módosításokat?"
 
+#: src/renderer/utils/worktree-placement.tsx
+msgid "Discuss cards write in the project folder"
+msgstr ""
+
 #: src/renderer/window-manager/bridge/useBrowserDownloadToast.ts
 #, fuzzy
 msgid "Download didn't finish"

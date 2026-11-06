@@ -910,6 +910,10 @@ msgstr "삭제"
 msgid "Discard unsaved changes?"
 msgstr "저장되지 않은 변경 사항을 삭제할까요?"
 
+#: src/renderer/utils/worktree-placement.tsx
+msgid "Discuss cards write in the project folder"
+msgstr ""
+
 #: src/renderer/window-manager/bridge/useBrowserDownloadToast.ts
 #, fuzzy
 msgid "Download didn't finish"

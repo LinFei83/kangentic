@@ -910,6 +910,10 @@ msgstr "Scarta"
 msgid "Discard unsaved changes?"
 msgstr "Scartare le modifiche non salvate?"
 
+#: src/renderer/utils/worktree-placement.tsx
+msgid "Discuss cards write in the project folder"
+msgstr ""
+
 #: src/renderer/window-manager/bridge/useBrowserDownloadToast.ts
 #, fuzzy
 msgid "Download didn't finish"
