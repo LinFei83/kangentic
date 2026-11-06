@@ -17,7 +17,7 @@ import { runGitWithTimeout } from '../../git/git-spawn';
 import { setSpawnStaleNote, beginSpawnStaleProbe, touchSpawnStaleProbe } from '../../transition-engine/spawn-progress';
 import { isShuttingDown } from '../../shutdown-state';
 import { AgentCliNotFoundError } from '../../agent/shared/agent-cli-not-found';
-import { DEFAULT_AGENT, type ConversationExpiredNotice, type Project, type SpawnWarningKind, type Task, type WorktreeSkipReason } from '../../../shared/types';
+import { DEFAULT_AGENT, type ConversationExpiredNotice, type Project, type SpawnWarningKind, type Swimlane, type Task, type WorktreeSkipReason } from '../../../shared/types';
 import { discussCardSkipsWorktreeInPlanning, isDiscussCard } from '../../../shared/worktree-choice';
 import { sendToRenderer } from '../send-to-renderer';
 import { queueConversationExpired } from './pending-conversation-expired';
@@ -47,27 +47,23 @@ function resolveWorktreeProject(
 }
 
 /**
- * The task's current column, folded through its Board Profile, or null when
- * the project or lane cannot be resolved. Same lookup the spawn uses, so a
- * discuss-plan skip and a remote-agent skip see the same permission mode,
- * plan-exit target, and agent override. The column is the task's CURRENT
- * swimlane, which is the destination lane at every call site (the
- * move/create/promote/unarchive flows all commit the row to the destination
- * before the worktree phase).
+ * The task's current board column, read from that project's DB. Same source
+ * `kangentic_list_tasks` uses (`getProjectDb` via `getProjectRepos`): the
+ * request's project id, then the open project, never a path match against the
+ * global project list. A miss used to look like "not Planning" and create a
+ * worktree for a discuss card that was sitting in Planning.
  */
-function resolveWorktreeCheckLane(
+function readWorktreeCheckSwimlane(
   task: Task,
   context: IpcContext,
-  projectPath: string,
   projectId?: string | null,
-): ColumnStrategy | null {
-  const project = resolveWorktreeProject(context, projectPath, projectId);
-  if (!project?.id || !task.swimlane_id) return null;
-  const { swimlanes } = getProjectRepos(context, project.id);
-  return applyProfileToLane(
-    swimlanes.getById(task.swimlane_id),
-    loadTaskProfile(context, task, projectPath),
-  );
+): Swimlane | null {
+  if (!task.swimlane_id) return null;
+  try {
+    return getProjectRepos(context, projectId).swimlanes.getById(task.swimlane_id) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -501,28 +497,37 @@ export async function ensureTaskWorktree(
     onWaitProgress?: (info: GitWaitProgress) => void;
     projectId?: string | null;
     initScript?: InitScriptMode;
+    /**
+     * The destination column already loaded from this project's DB. Create and
+     * auto-spawn have it; pass it so discuss-plan does not look the column up
+     * again through a second path.
+     */
+    lane?: Swimlane | null;
   },
 ): Promise<EarlyAgentHandle | null> {
   options?.signal?.throwIfAborted();
   const resolvedProjectPath = projectPath ?? context.currentProjectPath;
   if (!resolvedProjectPath) return null;
   const config = context.configManager.getEffectiveConfig(resolvedProjectPath);
-  const lane = resolveWorktreeCheckLane(task, context, resolvedProjectPath, options?.projectId);
+  const rawLane = options?.lane ?? readWorktreeCheckSwimlane(task, context, options?.projectId);
+  const lane = applyProfileToLane(rawLane, loadTaskProfile(context, task, resolvedProjectPath));
   const agentName = resolveWorktreeCheckAgentName(task, context, resolvedProjectPath, lane, options?.projectId);
   if (config.agent.execution[agentName]?.mode === 'remote') {
     recordWorktreeSkip(task, tasks, 'remote-agent');
     return null;
   }
   // Before a spare is claimed or "Creating worktree..." is shown. A live
-  // worktree is reused below, not torn down.
-  if (!task.worktree_path && discussCardSkipsWorktreeInPlanning(task, lane)) {
+  // worktree is reused below, not torn down. Planning is the raw board
+  // column, not the profile-folded strategy.
+  const discussPlanSkip = !task.worktree_path && discussCardSkipsWorktreeInPlanning(task, rawLane);
+  if (isDiscussCard(task)) {
+    console.log(
+      `[WORKTREE] discuss-plan task=${task.id.slice(0, 8)} intent=${task.task_intent} kind=${task.card_kind} lane=${rawLane?.name ?? 'none'} perm=${rawLane?.permission_mode ?? 'none'} exit=${rawLane?.plan_exit_target_id ?? 'none'} skip=${discussPlanSkip}`,
+    );
+  }
+  if (discussPlanSkip) {
     recordWorktreeSkip(task, tasks, 'discuss-plan');
     return null;
-  }
-  if (!task.worktree_path && isDiscussCard(task) && !lane) {
-    console.warn(
-      `[WORKTREE] Discuss card ${task.id.slice(0, 8)}: column not resolved, creating a worktree`,
-    );
   }
   const scriptMode = config.git.initScript?.trim() ? options?.initScript : undefined;
   // No-commits and base-branch-resolution guards live inside
@@ -958,7 +963,7 @@ export async function ensureTaskBranchCheckout(
   if (!projectPath) return;
   if (task.worktree_path) return;
   if (!isGitRepo(projectPath)) return;
-  if (discussCardSkipsWorktreeInPlanning(task, resolveWorktreeCheckLane(task, context, projectPath, options?.projectId))) {
+  if (discussCardSkipsWorktreeInPlanning(task, readWorktreeCheckSwimlane(task, context, options?.projectId))) {
     return;
   }
 

@@ -726,6 +726,35 @@ describe('ensureTaskWorktree - discuss-plan skip', () => {
     expect(ensureWorktreeMock).toHaveBeenCalledTimes(1);
   });
 
+  it('skips from a lane the caller already loaded, even if a second lookup would miss Planning', async () => {
+    swimlaneById.mockReturnValue(EXECUTING_LANE);
+    const task = makeTask({ task_intent: 'discuss', card_kind: 'regular' });
+    const repo = makeTaskRepoStub(task);
+
+    await ensureTaskWorktree(
+      makeContext(makeConfig(), []),
+      task,
+      repo as never,
+      '/project',
+      { lane: EXIT_TARGET_LANE as never },
+    );
+
+    expect(ensureWorktreeMock).not.toHaveBeenCalled();
+    expect(repo.setWorktreeSkipReason).toHaveBeenCalledWith('task-001', 'discuss-plan');
+  });
+
+  it('skips from the project DB when the global project list has no matching path', async () => {
+    swimlaneById.mockReturnValue(EXIT_TARGET_LANE);
+    const task = makeTask({ task_intent: 'discuss', card_kind: 'regular' });
+    const repo = makeTaskRepoStub(task);
+    const context = makeContext(makeConfig(), []);
+
+    await ensureTaskWorktree(context, task, repo as never, '/project', { projectId: 'proj-1' });
+
+    expect(ensureWorktreeMock).not.toHaveBeenCalled();
+    expect(repo.setWorktreeSkipReason).toHaveBeenCalledWith('task-001', 'discuss-plan');
+  });
+
   it('skips when projectId matches even if the stored path string does not', async () => {
     swimlaneById.mockReturnValue(EXIT_TARGET_LANE);
     const task = makeTask({ task_intent: 'discuss', card_kind: 'regular' });
