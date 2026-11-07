@@ -56,7 +56,9 @@ sessions bypass all of this (not task agents).
 ## Engine spawn (board-driven path)
 
 1. `spawnAgent` runs the spawn preamble, executes the transition's actions, then falls back to
-   `resumeSuspendedSession` if no action created a session.
+   `resumeSuspendedSession` if no action created a session. A change card skips the default
+   task-description prompt even from To Do (`resolveSkipPromptTemplate`): the scan-copied Why
+   paragraph is not the opening instruction, the column's On task enter message is.
 2. `TransitionEngine.executeSpawnAgent()`:
    - Detect the agent CLI via the resolved adapter
    - Resolve permission mode via `resolveEffectivePermissionMode` (lane `plan` always wins,

@@ -13,7 +13,7 @@ export {
   BranchCheckoutBlockedError,
 } from './task-git';
 export type { SpawnFailureStep } from './task-git';
-export { createTransitionEngine, spawnAgent, autoSpawnForTask, resolveSpawnOverrides } from './agent-spawn';
+export { createTransitionEngine, spawnAgent, autoSpawnForTask, resolveSpawnOverrides, resolveSkipPromptTemplate } from './agent-spawn';
 export type { AgentSpawnOptions } from './agent-spawn';
 export {
   cleanupTaskSession,

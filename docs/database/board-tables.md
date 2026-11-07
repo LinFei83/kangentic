@@ -231,7 +231,8 @@ workflow.
 
 `card_kind` is `'regular'` (a New Task card, work or discuss) or `'change'` (created only by the
 OpenSpec scan). `task_intent` is `'work'` or `'discuss'` on a regular card; a change card ignores
-it. `openspec_change` is the change directory name on a change card, and the scan's de-dupe key
+it. A change card's first spawn also skips that description as the opening prompt. See
+[OpenSpec board cards](../integrations/openspec.md). `openspec_change` is the change directory name on a change card, and the scan's de-dupe key
 (`TaskRepository.getByOpenspecChange`). `openspec_note` is a stable status token (`ready`,
 `tasks:3/12`, `archived`, `invalid`, `missing`, `error`), never a sentence, parsed by
 `openspecNoteDescriptor`. Both OpenSpec columns are NULL on a regular card. Existing rows default

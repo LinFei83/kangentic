@@ -19,6 +19,7 @@ import { buildSessionHistoryReference } from '../../agent/handoff/session-histor
 import { DEFAULT_AGENT, NEVER_AUTO_SPAWN_ROLES } from '../../../shared/types';
 import type { Task, Swimlane, Project, AutoCommandMode } from '../../../shared/types';
 import { OPENSPEC_EXPLORE_COMMAND, OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE } from '../../../shared/openspec-commands';
+import { isDiscussCard } from '../../../shared/worktree-choice';
 import { loadOpenspecXmlForTask } from '../../openspec/openspec-xml';
 import { showAutomationNotification } from '../../automations/shared/show-automation-notification';
 import { reportAutomationFailures } from './automation-failures';
@@ -147,19 +148,36 @@ export function resolveSpawnOverrides(
 const OPENING_PROMPT_LABEL = 'its first prompt';
 
 /**
+ * Whether this spawn skips the default task-description prompt.
+ * A change card always skips: its description is the Why paragraph the scan
+ * copied from the proposal, and the column's On task enter message should
+ * open the agent instead.
+ */
+export function resolveSkipPromptTemplate(
+  requested: boolean | undefined,
+  cardKind: Task['card_kind'] | undefined,
+): boolean {
+  return requested === true || cardKind === 'change';
+}
+
+/**
  * Prefix the engine prepends to a discuss card's opening prompt
  * (`handoffPromptPrefix`). The interpolated task template owns the prompt slot
  * on a fresh spawn, so putting the command in `resumePrompt` would leave it
  * unsent. Resume and handoff leave the conversation as it is. A prompt that
  * already starts with the command is left alone so it is not sent twice.
+ * Change cards ignore `task_intent`, so they never get this prefix.
  */
 export function openspecExplorePromptPrefix(input: {
   taskIntent: Task['task_intent'] | undefined;
+  cardKind?: Task['card_kind'];
   isFreshSpawn: boolean;
   isHandoff: boolean;
   existingPrompt: string | undefined;
 }): string | undefined {
-  if (input.taskIntent !== 'discuss' || !input.isFreshSpawn || input.isHandoff) {
+  if (!isDiscussCard({ card_kind: input.cardKind, task_intent: input.taskIntent })
+    || !input.isFreshSpawn
+    || input.isHandoff) {
     return undefined;
   }
   const existing = input.existingPrompt ?? '';
@@ -238,6 +256,14 @@ export interface AgentSpawnOptions {
   task: Task;
   fromSwimlaneId: string;
   toLane: Swimlane;
+  /**
+   * When true, the spawn skips `DEFAULT_SPAWN_PROMPT_TEMPLATE`. A move from
+   * To Do passes false so a regular card's title and description open the
+   * agent. A change card skips even from To Do: the scan-copied Why paragraph
+   * is not the first instruction. `spawnAgent` also skips when
+   * `task.card_kind === 'change'`, so auto-spawn and create callers that omit
+   * this still behave the same.
+   */
   skipPromptTemplate?: boolean;
   signal?: AbortSignal;
   /** Project ID for handoff context resolution. Resolved from caller's context. */
@@ -366,7 +392,8 @@ export function setupStillRunningNote(initScript: string): string {
  * task was deleted mid-operation. AbortError always propagates for cancellation.
  */
 export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
-  const { context, engine, tasks, sessionRepo, task, fromSwimlaneId, skipPromptTemplate, signal } = options;
+  const { context, engine, tasks, sessionRepo, task, fromSwimlaneId, signal } = options;
+  const skipPromptTemplate = resolveSkipPromptTemplate(options.skipPromptTemplate, task.card_kind);
 
   // Board Profiles: fold the task's profile over the destination column ONCE,
   // here, and shadow `toLane` with the result. Everything below then reads the
@@ -945,6 +972,7 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       // `resumePrompt` unsent.
       const explorePrefix = openspecExplorePromptPrefix({
         taskIntent: beforeSpawn.task_intent,
+        cardKind: beforeSpawn.card_kind,
         isFreshSpawn: !canResumeDestination || resolveForceFresh(toLane),
         isHandoff,
         existingPrompt: opening.prompt,

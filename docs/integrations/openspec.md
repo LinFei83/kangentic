@@ -77,3 +77,11 @@ cards in that column. To Do and Planning keep Change empty on this board.
 Executing, Code Review, Testing, and Merge copy the regular lists onto Change,
 with Merge inserting archive before Done as above. A Board Profile does not
 overlay automations.
+
+A change card leaving To Do does not send its description as the opening
+prompt. That text is the Why paragraph the scan copied from `proposal.md`, and
+it is the wrong first instruction. The destination column's On task enter
+Send message to agent row, when it has one, opens the agent instead
+(`/opsx-apply` on Executing). A regular work card still opens on
+`{{task_xml}}{{workflow_xml}}{{attachments}}`. A discuss card still prepends
+`/opsx-explore`.

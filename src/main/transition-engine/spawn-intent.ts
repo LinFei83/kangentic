@@ -123,12 +123,13 @@ export function resolveSpawnIntent(options: SpawnIntentOptions): SpawnIntent {
     mode: 'fresh',
     agentSessionId: null,
     resumeFromCwd: null,
-    // When the spawn has no task template (skipPromptTemplate - e.g. an isolated
-    // review column that omits the "do this task" prompt), fall back to
-    // resumePrompt so a caller-supplied auto_command becomes the fresh session's
-    // initial prompt and runs immediately. With a template, the task description
-    // owns the prompt slot and the auto_command is injected as a post-spawn
-    // keystroke instead.
+    // When the spawn has no task template (skipPromptTemplate: a non-To-Do
+    // source, an isolated review column, or a change card whose extracted
+    // description must not open the agent), fall back to resumePrompt so a
+    // caller-supplied auto_command becomes the fresh session's initial prompt
+    // and runs immediately. With a template, the task description owns the
+    // prompt slot and the auto_command is injected as a post-spawn keystroke
+    // instead.
     prompt: promptTemplate
       ? interpolateTaskTemplate(promptTemplate, templateVars)
       : resumePrompt,

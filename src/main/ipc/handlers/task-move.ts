@@ -21,6 +21,7 @@ import {
   reportAutomationFailures,
   scheduleDoneWorktreeRemovalRetry,
   spawnAgent,
+  resolveSkipPromptTemplate,
 } from '../helpers';
 import { closeTaskWindows } from '../helpers/task-windows';
 import { showAutomationNotification } from '../../automations/shared/show-automation-notification';
@@ -517,7 +518,12 @@ export async function handleTaskMove(
       // Only send the full prompt template (title + description + attachments) when
       // starting from To Do. Non-To Do sources are resuming previously-started
       // work, so re-sending the original description would duplicate context.
-      const skipPromptTemplate = fromLane?.role !== 'todo';
+      // A change card skips even from To Do: the scan-copied Why paragraph is
+      // not the first instruction, the column's On task enter message is.
+      const skipPromptTemplate = resolveSkipPromptTemplate(
+        fromLane?.role !== 'todo',
+        task.card_kind,
+      );
 
       // Recovery move: the first move OUT of Done (whatever the destination)
       // resumes the session idle without injecting the destination column's

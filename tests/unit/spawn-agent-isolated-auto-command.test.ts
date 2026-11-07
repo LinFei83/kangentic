@@ -487,6 +487,27 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
+  it('CHANGE card + fresh from To Do: the column message is the INITIAL PROMPT, even when skipPromptTemplate is false', async () => {
+    // A change card's description is the Why paragraph the scan copied. It
+    // must not occupy the opening slot; the column's On task enter message
+    // does. spawnAgent ORs `card_kind === 'change'` onto skipPromptTemplate
+    // so a To Do drag (which still passes false) takes this path.
+    const isolatedLane = makeSwimlane(ISOLATED_LANE_ID, {
+      session_target: 'isolated',
+      auto_command: '/opsx-apply',
+    });
+    const deps = makeDeps({
+      manualPauseRecord: null,
+      resumeRecord: undefined,
+      taskFields: { card_kind: 'change' },
+    });
+
+    await runSpawn(isolatedLane, deps, false);
+
+    expect(resumePromptArg(deps.engine)).toBe('/opsx-apply');
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+  });
+
   it('ISOLATED + fresh from To Do (task prompt present): auto_command follows the task prompt as a keystroke', async () => {
     const isolatedLane = makeSwimlane(ISOLATED_LANE_ID, {
       session_target: 'isolated',

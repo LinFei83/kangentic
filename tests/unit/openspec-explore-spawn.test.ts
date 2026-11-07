@@ -26,7 +26,7 @@ vi.mock('../../src/main/agent/agent-registry', () => ({
   agentRegistry: { get: vi.fn(() => ({ sessionType: 'claude_agent' })) },
 }));
 
-import { openspecExplorePromptPrefix, spawnAgent } from '../../src/main/ipc/helpers/agent-spawn';
+import { openspecExplorePromptPrefix, resolveSkipPromptTemplate, spawnAgent } from '../../src/main/ipc/helpers/agent-spawn';
 import { resolveTargetAgent } from '../../src/main/transition-engine/agent-resolver';
 import { agentRegistry } from '../../src/main/agent/agent-registry';
 
@@ -63,9 +63,30 @@ describe('openspecExplorePromptPrefix', () => {
     expect(prefixFor({ taskIntent: 'work' })).toBeUndefined();
   });
 
+  it('does not prepend on a change card, even with discuss intent', () => {
+    expect(prefixFor({ cardKind: 'change', taskIntent: 'discuss' })).toBeUndefined();
+  });
+
   it('does not duplicate when the prompt already starts with the command', () => {
     expect(prefixFor({ existingPrompt: `${OPENSPEC_EXPLORE_COMMAND}\n\nLook at the auth flow.` })).toBeUndefined();
     expect(prefixFor({ existingPrompt: `  ${OPENSPEC_EXPLORE_COMMAND}` })).toBeUndefined();
+  });
+});
+
+describe('resolveSkipPromptTemplate', () => {
+  it('skips when the caller asked to skip', () => {
+    expect(resolveSkipPromptTemplate(true, 'regular')).toBe(true);
+  });
+
+  it('skips a change card even when the caller did not ask', () => {
+    expect(resolveSkipPromptTemplate(false, 'change')).toBe(true);
+    expect(resolveSkipPromptTemplate(undefined, 'change')).toBe(true);
+  });
+
+  it('keeps a regular card\'s To Do spawn on the task template', () => {
+    expect(resolveSkipPromptTemplate(false, 'regular')).toBe(false);
+    expect(resolveSkipPromptTemplate(undefined, 'regular')).toBe(false);
+    expect(resolveSkipPromptTemplate(undefined, undefined)).toBe(false);
   });
 });
 
