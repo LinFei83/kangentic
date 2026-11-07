@@ -168,7 +168,7 @@ stored rather than recomputed.
 
 `worktree_skip_reason` records WHY the task's last spawn ran without a worktree, i.e. in the shared
 project checkout: one of `'disabled' | 'not-a-repo' | 'nested-worktree' | 'no-commits' |
-'remote-agent' | 'discuss-plan' | 'worktree-missing'` (the `WorktreeSkipReason` union), or NULL while the task has a
+'remote-agent' | 'worktree-missing'` (the `WorktreeSkipReason` union), or NULL while the task has a
 worktree or no spawn has decided yet. Written only by `TaskRepository.setWorktreeSkipReason` (spawn
 telemetry, so no `updated_at` bump) and cleared by `recordWorktree`, a To Do reset, and a Done move;
 the generic `update()` never touches it. It is the ground truth for any surface that wants to say
@@ -231,7 +231,8 @@ workflow.
 
 `card_kind` is `'regular'` (a New Task card, work or discuss) or `'change'` (created only by the
 OpenSpec scan). `task_intent` is `'work'` or `'discuss'` on a regular card; a change card ignores
-it. A change card's first spawn also skips that description as the opening prompt. See
+it. Creating or updating a regular discuss card stores `use_worktree = 0` (Project), so the
+agent writes OpenSpec proposals in the project folder the default-branch scan reads. A change card's first spawn also skips that description as the opening prompt. See
 [OpenSpec board cards](../integrations/openspec.md). `openspec_change` is the change directory name on a change card, and the scan's de-dupe key
 (`TaskRepository.getByOpenspecChange`). `openspec_note` is a stable status token (`ready`,
 `tasks:3/12`, `archived`, `invalid`, `missing`, `error`), never a sentence, parsed by

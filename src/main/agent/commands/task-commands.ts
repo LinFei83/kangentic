@@ -37,6 +37,7 @@ import { isGitRepo } from '../../git/git-checks';
 import { isSafeBranchName } from '../../git/push-command';
 import type { CommandContext, CommandHandler, CommandResponse } from './types';
 import { NEVER_AUTO_SPAWN_ROLES, type Task, type TaskIntent, type TaskUpdateInput, type PermissionMode, type PlanApproval, type TaskRunMode, type Swimlane } from '../../../shared/types';
+import { persistedUseWorktree } from '../../../shared/worktree-choice';
 import { applyAutomationsHoldChange } from '../../workflows/workflow-task-hold';
 
 export const TASK_DESCRIPTION_MAX_LENGTH = 50_000;
@@ -347,13 +348,17 @@ export const handleCreateTask: CommandHandler = async (
     return { success: false, error: resolution.error };
   }
   const { swimlane: targetSwimlane } = resolution;
+  const persistedWorktree = persistedUseWorktree(
+    { task_intent: taskIntent === 'discuss' ? 'discuss' : 'work' },
+    typeof useWorktree === 'boolean' ? useWorktree : null,
+  );
 
   const task = taskRepo.create({
     title,
     description,
     swimlane_id: targetSwimlane.id,
     ...(baseBranch ? { baseBranch } : {}),
-    ...(useWorktree !== null ? { useWorktree } : {}),
+    ...(persistedWorktree !== null ? { useWorktree: persistedWorktree === 1 } : {}),
     ...(branchName ? { customBranchName: branchName } : {}),
     ...(labelNames.length > 0 ? { labels: labelNames } : {}),
     ...(priority !== null && priority !== undefined ? { priority } : {}),

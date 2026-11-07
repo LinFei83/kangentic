@@ -1674,7 +1674,7 @@ export function runProjectMigrations(db: Database.Database): void {
 
   // Migration: record WHY a task's last spawn ran without a worktree (the
   // `WorktreeSkipReason` union: 'disabled' | 'not-a-repo' | 'nested-worktree' |
-  // 'no-commits' | 'remote-agent' | 'discuss-plan' | 'worktree-missing'). Null while the task has
+  // 'no-commits' | 'remote-agent' | 'worktree-missing'). Null while the task has
   // a worktree or no spawn has decided yet. `WorktreeManager.ensureWorktree`
   // used to collapse every guard into one silent null, so nothing could tell
   // the user their agent was running in the shared project checkout. It is the
@@ -2197,6 +2197,23 @@ export function runProjectMigrations(db: Database.Database): void {
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_column_automations_name ON column_automations(swimlane_id, applies_to, name COLLATE NOCASE)',
     );
   }
+
+  // Discuss cards run in the project folder (`use_worktree = 0`). Rows created
+  // before that wrote a spawn-time skip and left the column null, which would
+  // now create a worktree. Rewrite leftover `discuss-plan` reasons to
+  // `disabled`, the skip `use_worktree = 0` already records. Idempotent.
+  db.prepare(`
+    UPDATE tasks
+    SET use_worktree = 0
+    WHERE task_intent = 'discuss'
+      AND IFNULL(card_kind, 'regular') != 'change'
+      AND IFNULL(use_worktree, 1) != 0
+  `).run();
+  db.prepare(`
+    UPDATE tasks
+    SET worktree_skip_reason = 'disabled'
+    WHERE worktree_skip_reason = 'discuss-plan'
+  `).run();
 }
 
 /**

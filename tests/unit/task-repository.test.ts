@@ -517,6 +517,30 @@ describe('TaskRepository SQL contracts', () => {
         expect(insertStatement!.args[columns.indexOf('openspec_note')]).toBeNull();
       });
 
+      it('stores a regular discuss card as Project even when a worktree was requested', () => {
+        const task = repo.create({
+          title: 'T', description: '', swimlane_id: 'lane-1',
+          task_intent: 'discuss', useWorktree: true,
+        });
+
+        expect(task.task_intent).toBe('discuss');
+        expect(task.use_worktree).toBe(0);
+
+        const insertStatement = tracker.statements.find((statement) => statement.sql.includes('INSERT INTO tasks'));
+        const columns = extractInsertColumns(insertStatement!.sql);
+        expect(insertStatement!.args[columns.indexOf('use_worktree')]).toBe(0);
+      });
+
+      it('leaves a work card\'s worktree choice alone', () => {
+        const unset = repo.create({ title: 'T', description: '', swimlane_id: 'lane-1' });
+        expect(unset.use_worktree).toBeNull();
+
+        const forced = repo.create({
+          title: 'U', description: '', swimlane_id: 'lane-1', useWorktree: true,
+        });
+        expect(forced.use_worktree).toBe(1);
+      });
+
       it('persists a change card and a discuss intent when asked', () => {
         const task = repo.create({
           title: 'T',
@@ -532,6 +556,7 @@ describe('TaskRepository SQL contracts', () => {
 
         expect(task.card_kind).toBe('change');
         expect(task.task_intent).toBe('discuss');
+        expect(task.use_worktree).toBeNull();
         expect(task.openspec_change).toBe('add-rate-limiting');
         expect(task.openspec_note).toBe('ready');
         expect(task.external_id).toBe('add-rate-limiting');
@@ -564,6 +589,15 @@ describe('TaskRepository SQL contracts', () => {
     });
 
     describe('update()', () => {
+      it('switching a work card to discuss stores Project', () => {
+        tracker.setExistingRow(makeTaskRow({ use_worktree: 1, task_intent: 'work', card_kind: 'regular' }));
+
+        const updated = repo.update({ id: 'task-1', task_intent: 'discuss' });
+
+        expect(updated.task_intent).toBe('discuss');
+        expect(updated.use_worktree).toBe(0);
+      });
+
       it('pinning a model on a task currently riding a profile switches it to Custom (clears profile_id)', () => {
         // This is the scenario the JSDoc calls out by name: deciding exclusivity
         // from the MERGED result (which still carries the inherited profile_id)

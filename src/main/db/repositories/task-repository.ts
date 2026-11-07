@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import type Database from 'better-sqlite3';
 import type { Task, TaskCreateInput, TaskUpdateInput, TaskMoveInput, TaskMoveProvenance, TaskWorkflowMembership, ArchivedTasksPreview, AutoCommandState, WorktreeSkipReason, PlanApproval } from '../../../shared/types';
+import { persistedUseWorktree, storedWorktreeChoice } from '../../../shared/worktree-choice';
 import { worktreeFolderUnderRoot } from '../../../shared/worktree-folder';
 import { devPortRepository } from './dev-port-repository';
 import { writeTransaction } from '../transaction';
@@ -445,7 +446,13 @@ export class TaskRepository {
       external_url: input.externalUrl ?? null,
       base_branch: input.baseBranch || null,
       resolved_base_branch: null,
-      use_worktree: input.useWorktree != null ? (input.useWorktree ? 1 : 0) : null,
+      use_worktree: persistedUseWorktree(
+        {
+          card_kind: input.card_kind === 'change' ? 'change' : 'regular',
+          task_intent: input.task_intent === 'discuss' ? 'discuss' : 'work',
+        },
+        input.useWorktree,
+      ),
       labels,
       priority,
       model_override: exclusive.model_override,
@@ -623,6 +630,13 @@ export class TaskRepository {
       ...merged,
       ...applyProfileExclusivity(merged, input),
     };
+    updated.use_worktree = persistedUseWorktree(
+      {
+        card_kind: updated.card_kind === 'change' ? 'change' : 'regular',
+        task_intent: updated.task_intent === 'discuss' ? 'discuss' : 'work',
+      },
+      storedWorktreeChoice(updated.use_worktree),
+    );
 
     // The fork point lives exactly as long as the branch it describes, so a
     // write that forgets the branch forgets it too, in the same statement so a

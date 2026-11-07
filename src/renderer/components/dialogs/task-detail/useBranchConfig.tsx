@@ -46,7 +46,6 @@ export function useBranchConfig(task: Task, title: string, isInTodo: boolean, ta
     projectId,
     cardKind: task.card_kind,
     taskIntent: taskIntent ?? task.task_intent,
-    destinationLane,
   });
 
   const { reset } = settings;

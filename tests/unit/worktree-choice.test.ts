@@ -3,8 +3,7 @@ import {
   taskUsesWorktree,
   storedWorktreeChoice,
   isDiscussCard,
-  isPlanningColumn,
-  discussCardSkipsWorktreeInPlanning,
+  persistedUseWorktree,
 } from '../../src/shared/worktree-choice';
 
 // The one rule main (`ensureWorktree`) and the renderer (the New Task dialog,
@@ -33,26 +32,29 @@ describe('storedWorktreeChoice', () => {
   });
 });
 
-describe('discussCardSkipsWorktreeInPlanning', () => {
-  const planLane = { permission_mode: 'plan', plan_exit_target_id: null };
-  const exitTargetLane = { permission_mode: 'acceptEdits', plan_exit_target_id: 'lane-exec' };
-  const executingLane = { permission_mode: 'acceptEdits', plan_exit_target_id: null };
-
-  it.each([
-    { name: 'discuss in permission-mode plan', card_kind: 'regular' as const, task_intent: 'discuss' as const, lane: planLane, skip: true },
-    { name: 'discuss in plan-exit-target column', card_kind: 'regular' as const, task_intent: 'discuss' as const, lane: exitTargetLane, skip: true },
-    { name: 'discuss in Executing', card_kind: 'regular' as const, task_intent: 'discuss' as const, lane: executingLane, skip: false },
-    { name: 'work card in Planning', card_kind: 'regular' as const, task_intent: 'work' as const, lane: planLane, skip: false },
-    { name: 'change card with discuss intent in Planning', card_kind: 'change' as const, task_intent: 'discuss' as const, lane: planLane, skip: false },
-    { name: 'change card in Planning', card_kind: 'change' as const, task_intent: 'work' as const, lane: planLane, skip: false },
-    { name: 'discuss with no column', card_kind: 'regular' as const, task_intent: 'discuss' as const, lane: null, skip: false },
-  ])('$name -> skip=$skip', ({ card_kind, task_intent, lane, skip }) => {
-    expect(discussCardSkipsWorktreeInPlanning({ card_kind, task_intent }, lane)).toBe(skip);
+describe('persistedUseWorktree', () => {
+  it('stores a regular discuss card as Project even when the caller asked for a worktree', () => {
+    expect(persistedUseWorktree({ card_kind: 'regular', task_intent: 'discuss' }, null)).toBe(0);
+    expect(persistedUseWorktree({ card_kind: 'regular', task_intent: 'discuss' }, true)).toBe(0);
+    expect(persistedUseWorktree({ task_intent: 'discuss' }, false)).toBe(0);
   });
 
-  it('treats an unset card_kind as regular, so a discuss intent still skips in Planning', () => {
+  it('keeps the requested tri-state for a work card', () => {
+    expect(persistedUseWorktree({ card_kind: 'regular', task_intent: 'work' }, null)).toBeNull();
+    expect(persistedUseWorktree({ task_intent: 'work' }, true)).toBe(1);
+    expect(persistedUseWorktree({ task_intent: 'work' }, false)).toBe(0);
+  });
+
+  it('ignores discuss on a change card', () => {
+    expect(persistedUseWorktree({ card_kind: 'change', task_intent: 'discuss' }, null)).toBeNull();
+    expect(persistedUseWorktree({ card_kind: 'change', task_intent: 'discuss' }, true)).toBe(1);
+  });
+});
+
+describe('isDiscussCard', () => {
+  it('treats an unset card_kind as regular', () => {
     expect(isDiscussCard({ task_intent: 'discuss' })).toBe(true);
-    expect(isPlanningColumn(planLane)).toBe(true);
-    expect(discussCardSkipsWorktreeInPlanning({ task_intent: 'discuss' }, planLane)).toBe(true);
+    expect(isDiscussCard({ card_kind: 'change', task_intent: 'discuss' })).toBe(false);
+    expect(isDiscussCard({ task_intent: 'work' })).toBe(false);
   });
 });

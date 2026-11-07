@@ -39,10 +39,10 @@ function hintInput(overrides: Partial<BranchHintInput> = {}): BranchHintInput {
 }
 
 describe('resolveWorktreeBlocker', () => {
-  it('mirrors the main-process guard order: remote agent, then discuss-plan, then repo, nesting, commits', () => {
+  it('mirrors the main-process guard order: remote agent, then discuss, then repo, nesting, commits', () => {
     const probe = { isGitRepo: false, isInsideWorktree: true, hasCommits: false };
-    expect(resolveWorktreeBlocker({ probe, remoteAgent: true, discussPlanSkip: true })).toBe('remote-agent');
-    expect(resolveWorktreeBlocker({ probe, remoteAgent: false, discussPlanSkip: true })).toBe('discuss-plan');
+    expect(resolveWorktreeBlocker({ probe, remoteAgent: true, discussCard: true })).toBe('remote-agent');
+    expect(resolveWorktreeBlocker({ probe, remoteAgent: false, discussCard: true })).toBe('discuss');
     expect(resolveWorktreeBlocker({ probe, remoteAgent: false })).toBe('not-a-repo');
     expect(resolveWorktreeBlocker({ probe: { ...probe, isGitRepo: true }, remoteAgent: false })).toBe('nested-worktree');
     expect(resolveWorktreeBlocker({ probe: { isGitRepo: true, isInsideWorktree: false, hasCommits: false }, remoteAgent: false })).toBe('no-commits');
@@ -84,7 +84,7 @@ describe('computeBranchHint', () => {
       .toBe('Runs in the project folder on feature-x');
   });
 
-  it.each(['not-a-repo', 'nested-worktree', 'no-commits', 'discuss-plan'] as const)(
+  it.each(['not-a-repo', 'nested-worktree', 'no-commits', 'discuss'] as const)(
     'structural blocker %s overrides the toggle and says only where (the chip tooltip says why)',
     (blocker) => {
       expect(text(computeBranchHint(hintInput({ blocker, effectiveWorktree: true })))).toBe('Runs in the project folder');
@@ -114,7 +114,7 @@ describe('computeBranchHint', () => {
 
 describe('describeWorktreeBlocker', () => {
   it('names every blocker as a short fragment', () => {
-    const blockers: WorktreeBlocker[] = ['not-a-repo', 'nested-worktree', 'no-commits', 'remote-agent', 'discuss-plan'];
+    const blockers: WorktreeBlocker[] = ['not-a-repo', 'nested-worktree', 'no-commits', 'remote-agent', 'discuss'];
     for (const blocker of blockers) {
       const fragment = describeWorktreeBlocker(blocker);
       expect(fragment.length).toBeLessThanOrEqual(50);

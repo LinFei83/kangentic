@@ -305,3 +305,25 @@ describe('fork_point_sha (main-only)', () => {
     expect(tasks.getForkPointSha('no-such-task')).toBeNull();
   });
 });
+
+describe('discuss cards persist Project placement', () => {
+  it('create stores use_worktree 0, and a leftover discuss-plan reason is rewritten on migrate', () => {
+    const database = migratedDatabase();
+    const tasks = new TaskRepository(database);
+    const task = tasks.create({
+      title: 'Talk through auth',
+      description: '',
+      swimlane_id: anyLaneId(database),
+      task_intent: 'discuss',
+    });
+    expect(task.use_worktree).toBe(0);
+
+    database.prepare("UPDATE tasks SET use_worktree = NULL, worktree_skip_reason = 'discuss-plan' WHERE id = ?")
+      .run(task.id);
+    runProjectMigrations(database);
+
+    const rewritten = tasks.getById(task.id)!;
+    expect(rewritten.use_worktree).toBe(0);
+    expect(rewritten.worktree_skip_reason).toBe('disabled');
+  });
+});

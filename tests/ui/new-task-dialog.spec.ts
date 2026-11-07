@@ -688,6 +688,7 @@ test.describe('Task intent', () => {
     const task = taskData.find((candidate: { title: string }) => candidate.title === 'Discuss Intent Task');
     expect(task).toBeDefined();
     expect(task.task_intent).toBe('discuss');
+    expect(task.use_worktree).toBe(0);
   });
 
   test('To Do edit shows the saved intent and persists a change', async () => {

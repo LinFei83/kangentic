@@ -26,12 +26,13 @@ import { Trans } from '@lingui/react/macro';
 /**
  * A structural reason the project cannot have a worktree, decidable in the
  * renderer before any spawn. Mirrors the order the main process checks them:
- * `ensureTaskWorktree` skips a remote agent first, then a discuss card in a
- * planning column (`discuss-plan`), then `WorktreeManager.ensureWorktree`
- * guards not-a-repo, nested-worktree, and the unborn HEAD. `'disabled'` is
- * not a blocker: it is the toggle's own state.
+ * `ensureTaskWorktree` skips a remote agent first, then
+ * `WorktreeManager.ensureWorktree` guards not-a-repo, nested-worktree, and the
+ * unborn HEAD. `'disabled'` is not a blocker: it is the toggle's own state.
+ * A discuss card is stored as Project (`use_worktree = 0`), so the Branch row
+ * disables Worktree here rather than inventing a spawn-time skip.
  */
-export type WorktreeBlocker = 'not-a-repo' | 'nested-worktree' | 'no-commits' | 'remote-agent' | 'discuss-plan';
+export type WorktreeBlocker = 'not-a-repo' | 'nested-worktree' | 'no-commits' | 'remote-agent' | 'discuss';
 
 export interface WorktreeBlockerInput {
   /** Null until the path probe answers; the hint then trusts the toggle alone. */
@@ -39,15 +40,15 @@ export interface WorktreeBlockerInput {
   /** The resolved agent runs against a server-side directory. */
   remoteAgent: boolean;
   /**
-   * A discuss card in a planning column writes OpenSpec proposals in the
-   * project folder. Same skip `ensureTaskWorktree` records as `discuss-plan`.
+   * A regular discuss card always runs in the project folder. Same outcome
+   * `TaskRepository` persists as `use_worktree = 0`.
    */
-  discussPlanSkip?: boolean;
+  discussCard?: boolean;
 }
 
-export function resolveWorktreeBlocker({ probe, remoteAgent, discussPlanSkip = false }: WorktreeBlockerInput): WorktreeBlocker | null {
+export function resolveWorktreeBlocker({ probe, remoteAgent, discussCard = false }: WorktreeBlockerInput): WorktreeBlocker | null {
   if (remoteAgent) return 'remote-agent';
-  if (discussPlanSkip) return 'discuss-plan';
+  if (discussCard) return 'discuss';
   if (!probe) return null;
   if (!probe.isGitRepo) return 'not-a-repo';
   if (probe.isInsideWorktree) return 'nested-worktree';
@@ -66,7 +67,7 @@ export function describeWorktreeBlocker(blocker: WorktreeBlocker): string {
       return i18n._(msg`No commits yet`);
     case 'remote-agent':
       return i18n._(msg`The agent runs on a remote server`);
-    case 'discuss-plan':
+    case 'discuss':
       return i18n._(msg`Discuss cards write in the project folder`);
   }
 }

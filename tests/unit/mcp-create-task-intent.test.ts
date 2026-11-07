@@ -75,13 +75,25 @@ describe('handleCreateTask - intent maps to task_intent', () => {
     }));
   });
 
-  it('forwards intent: "discuss" as task_intent', async () => {
+  it('forwards intent: "discuss" as task_intent and stores Project (useWorktree false)', async () => {
     const result = await handleCreateTask({ title: 'Talk through auth', intent: 'discuss' }, context);
 
     expect(result.success).toBe(true);
     expect(mockTaskRepoCreate).toHaveBeenCalledOnce();
     expect(mockTaskRepoCreate).toHaveBeenCalledWith(
-      expect.objectContaining({ task_intent: 'discuss' }),
+      expect.objectContaining({ task_intent: 'discuss', useWorktree: false }),
+    );
+  });
+
+  it('stores a discuss card as Project even when the caller asked for a worktree', async () => {
+    const result = await handleCreateTask(
+      { title: 'Talk through auth', intent: 'discuss', useWorktree: true },
+      context,
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockTaskRepoCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ task_intent: 'discuss', useWorktree: false }),
     );
   });
 

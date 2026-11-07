@@ -12,7 +12,7 @@ sources:
 
 ## Create a Task
 
-Click the **+** button on any column header, or **New Task** in the backlog toolbar. Enter a title and optional description. Choose **Work** (the default: implement on the current board path) or **Discuss** (explore first; a fresh spawn opens with `/opsx-explore`, and you propose the OpenSpec change yourself when the discussion is enough). A Discuss card in a planning column skips the worktree and runs in the project folder, so the proposal lands where the OpenSpec scan reads the default branch. Work cards and change cards still get a worktree. A **Name from prompt** button beside the title suggests one from the description, and a task still carrying a placeholder title such as `fix` is renamed for you the first time its agent stops for you after its first 30 seconds, with a Task renamed toast. Both work only when an Automation agent is set up in Settings > Workflows. You can set a priority level, add labels, and attach files (images, documents, or any file type) by pasting from the clipboard or dragging files onto the dialog. Attachments are included in the agent's prompt.
+Click the **+** button on any column header, or **New Task** in the backlog toolbar. Enter a title and optional description. Choose **Work** (the default: implement on the current board path) or **Discuss** (explore first; a fresh spawn opens with `/opsx-explore`, and you propose the OpenSpec change yourself when the discussion is enough). Choosing Discuss sets the branch placement to **Project**, so the agent writes in the project folder the OpenSpec scan reads. Work cards and change cards still get a worktree. A **Name from prompt** button beside the title suggests one from the description, and a task still carrying a placeholder title such as `fix` is renamed for you the first time its agent stops for you after its first 30 seconds, with a Task renamed toast. Both work only when an Automation agent is set up in Settings > Workflows. You can set a priority level, add labels, and attach files (images, documents, or any file type) by pasting from the clipboard or dragging files onto the dialog. Attachments are included in the agent's prompt.
 
 Pasted screenshots are capped at a 2000px long edge, which bounds a multi-monitor grab without costing the detail an agent needs to read small text. Oversized pastes are re-encoded as WebP, stepping quality down until each image lands under a ~1.5MB target, so a large grab is not rejected by the API. Small pastes (under 500KB), GIFs, SVGs, and PNGs already inside the cap are attached as-is.
 
@@ -80,7 +80,7 @@ When an agent is already running, the same Model / Effort pills appear in the li
 
 Drag a task from To Do to any active column (Planning, Executing, etc.). Kangentic will:
 
-1. Create a git worktree for the task (if worktrees are enabled). A Discuss card in a planning column skips this and runs in the project folder. Otherwise the agent runs in the project folder, and the task detail says so. See [Worktrees](sessions-and-worktrees.md#worktrees)
+1. Create a git worktree for the task (if worktrees are enabled). A Discuss card is stored as Project, so it skips this and runs in the project folder. Otherwise the agent runs in the project folder, and the task detail says so. See [Worktrees](sessions-and-worktrees.md#worktrees)
 2. Spawn an agent CLI session with the task title and description as the prompt
 3. The task card shows a spinner while the agent is thinking
 

@@ -12,9 +12,10 @@ import type { TaskCardKind, TaskIntent } from './types';
  * means Worktree. A task that already has a live worktree keeps it either way,
  * because `ensureWorktree` reuses a live directory before it asks this.
  *
- * A discuss card in a planning column is a separate skip (`discuss-plan`):
- * `discussCardSkipsWorktreeInPlanning` is the shared predicate, and
- * `ensureTaskWorktree` records it before it would create or claim a spare.
+ * A regular discuss card is stored as Project (`use_worktree = 0`) at create
+ * and update (`persistedUseWorktree`), so OpenSpec proposals land in the
+ * project folder the default-branch scan reads. That is the existing
+ * `disabled` skip, not a separate spawn-time reason.
  */
 export function taskUsesWorktree(worktreesEnabled: boolean, taskChoice: boolean | null | undefined): boolean {
   if (!worktreesEnabled) return false;
@@ -35,32 +36,19 @@ export function isDiscussCard(task: {
 }
 
 /**
- * A planning column: permission mode is `plan`, or a plan-exit target is set.
- * Covers the default seed Planning column and a custom board whose Planning
- * column is `acceptEdits` plus a plan-exit target. Not matched by column name.
+ * The `tasks.use_worktree` value a create or update should persist. A regular
+ * discuss card is always Project (`0`), even if the caller asked for a
+ * worktree. Change cards ignore discuss. Work cards keep the requested
+ * tri-state (`null` follows the project Worktrees switch).
  */
-export function isPlanningColumn(lane: {
-  permission_mode?: string | null;
-  plan_exit_target_id?: string | null;
-} | null | undefined): boolean {
-  if (!lane) return false;
-  return lane.permission_mode === 'plan' || Boolean(lane.plan_exit_target_id);
-}
-
-/**
- * A discuss card in a planning column writes OpenSpec proposals in the project
- * folder, where the default-branch scan can see them. Work and change cards
- * still get a worktree. A live worktree is reused at the call site, not here.
- */
-export function discussCardSkipsWorktreeInPlanning(
+export function persistedUseWorktree(
   task: {
     card_kind?: TaskCardKind | null;
     task_intent?: TaskIntent | null;
   },
-  lane: {
-    permission_mode?: string | null;
-    plan_exit_target_id?: string | null;
-  } | null | undefined,
-): boolean {
-  return isDiscussCard(task) && isPlanningColumn(lane);
+  requested: boolean | null | undefined,
+): 0 | 1 | null {
+  if (isDiscussCard(task)) return 0;
+  if (requested == null) return null;
+  return requested ? 1 : 0;
 }

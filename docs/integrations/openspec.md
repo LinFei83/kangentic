@@ -13,11 +13,11 @@ sources:
 Kangentic treats an OpenSpec change as a board card. The scan reads
 `openspec/changes/` on the **default branch** only. Uncommitted workspace files
 do not count, and neither does a proposal that still lives only in an isolated
-worktree. A discuss card in a planning column skips the worktree and runs in
+worktree. A discuss card is stored as Project (`use_worktree = 0`) and runs in
 the project folder, so the proposal is written where a commit to the default
 branch can make the next scan see it. A discuss card's fresh spawn says so
 after `/opsx-explore`. It is not a column automation and it is not stored in
-`description`. Work cards and change cards still get a worktree in Planning.
+`description`. Work cards and change cards still get a worktree.
 
 Kangentic does not ship the OpenSpec CLI. When the binary is missing, the scan
 still creates the card and stamps `openspec_note` `missing`. Cards are not
