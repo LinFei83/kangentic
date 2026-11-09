@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Cursor CLI
-description: Cursor CLI detection that probes cursor-agent before the agent alias Grok also installs, confirm-changes, --force skip-approval sessions, and -p --trust stream-json commands, --model ids resolved from display names, --resume=id quoting, the project .cursor/mcp.json with --approve-mcps, create-chat session ids before an interactive session opens, and structured transcripts read from agent-transcripts jsonl with the user_query wrapper removed and no clock.
+description: Cursor CLI detection that probes cursor-agent before the agent alias Grok also installs, confirm-changes, --force skip-approval sessions, and -p --trust stream-json commands, --model ids resolved from display names, --resume=id quoting, the project .cursor/mcp.json with --approve-mcps, create-chat session ids before an interactive session opens, and structured transcripts read from agent-transcripts jsonl with the user_query wrapper removed and the timestamp tag parsed onto each turn.
 tags: [agents, adapter, cursor]
 sources:
   - resource: src/main/agent/adapters/cursor/cursor-adapter.ts
@@ -112,12 +112,15 @@ A Knowledge Graph answer from a distro starts in a stable folder beside the shar
   `~/.cursor/projects/<cwd-slug>/agent-transcripts/<sessionId>/<sessionId>.jsonl` when that file
   exists, else the path the agent itself reported when that file exists. The slug is Cursor's own: non-alphanumeric characters become `-`, runs of dashes
   collapse, and case stays as the working directory was given. View conversation reads that
-  JSONL. A user line's `<timestamp>` tag is dropped and not shown as a clock (`ts: 0`,
-  `transcriptHasTimestamps` false), leading `<manually_attached_skills>` and
+  JSONL. A user line's `<timestamp>` tag is parsed into `ts` (minute precision, English
+  clock plus UTC offset) so the conversation window's Route tabs can place the turn, then
+  dropped from the displayed text. Assistant lines of that turn inherit it.
+  `transcriptHasTimestamps` stays false: there is no JSON timestamp field, so the viewer
+  pages by position and asks for no timeline. Leading `<manually_attached_skills>` and
   `<cursor_commands>` blocks are dropped, and the `<user_query>` wrapper is removed. A slash
   command the board typed is stored with the skill and a command wrapper in front of the
   query, so that drop is what starts the turn. A line whose
   whole body is one `<task>` element is unwrapped once more. There is still no
-  `command-injection` verifier: the records have no timestamp field, so a confirm cannot bound
+  `command-injection` verifier: the JSON records have no timestamp field, so a confirm cannot bound
   itself to "written after send", and the stored text is not the raw submitted text. See
   [Cursor](../../architecture/automations/command-injection-support-matrix.md#cursor-located-not-yet-verified).
