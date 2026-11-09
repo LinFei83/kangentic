@@ -745,7 +745,7 @@ Decisions:
 
 | Line | Effect |
 |---|---|
-| `{ role: "user", message: { content: [{ type: "text", text }] } }` with displayed text (`cursorDisplayedUserText`: a leading `<manually_attached_skills>` block dropped, then the `<user_query>` wrapper, a leading `<timestamp>` tag dropped) | Prompt. Starts the turn and turns the PTY silence timer off so a quiet compile cannot idle the session before `turn_ended` lands. A slash command the board typed is stored with the skill inlined in front of the query; dropping that block is what lets `/pull-request` start a turn. |
+| `{ role: "user", message: { content: [{ type: "text", text }] } }` with displayed text (`cursorDisplayedUserText`: leading `<manually_attached_skills>` and `<cursor_commands>` blocks dropped, then the `<user_query>` wrapper, a leading `<timestamp>` tag dropped) | Prompt. Starts the turn and turns the PTY silence timer off so a quiet compile cannot idle the session before `turn_ended` lands. A slash command the board typed is stored with the skill and a command wrapper in front of the query; dropping those blocks is what lets `/pull-request` and `/merge-pull-request` start a turn. |
 | `{ type: "turn_ended" }` | Idle. Ends the turn the way a Stop hook does, so `onTurnEnded` runs the column's On agent turn end automations. |
 | assistant lines, injected-context user lines (`<available_subagent_types>` and the like) | Ignored. Tool starts and ends stay with stream-json on a print start; emitting them here would double-count. |
 

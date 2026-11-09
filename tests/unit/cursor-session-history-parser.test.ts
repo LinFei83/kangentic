@@ -91,6 +91,31 @@ describe('CursorSessionHistoryParser.parse', () => {
     expect(result.events[0]).toMatchObject({ type: EventType.Prompt, detail: '/pull-request' });
   });
 
+  it('starts a turn on a slash command Cursor stored behind cursor_commands', () => {
+    const stored = [
+      '<manually_attached_skills>',
+      'The user has manually attached the following skills to their message.',
+      'Skill Name: merge-pull-request',
+      '</manually_attached_skills>',
+      '<cursor_commands>',
+      '--- Cursor Command: merge-pull-request ---',
+      'Read and follow the skill.',
+      '</cursor_commands>',
+      '<timestamp>Monday, Nov 9, 2026, 5:10 PM (UTC+8)</timestamp>',
+      '<user_query>',
+      '/merge-pull-request',
+      '</user_query>',
+    ].join('\n');
+    const content = [
+      userLine(stored),
+      assistantLine('Merging the pull request.'),
+      JSON.stringify({ type: 'turn_ended', status: 'success' }),
+    ].join('\n');
+    const result = CursorSessionHistoryParser.parse(content, 'append');
+    expect(result.events.map((event) => event.type)).toEqual([EventType.Prompt, EventType.Idle]);
+    expect(result.events[0]).toMatchObject({ type: EventType.Prompt, detail: '/merge-pull-request' });
+  });
+
   it('skips malformed lines without throwing', () => {
     const content = [
       '{this is not json}',

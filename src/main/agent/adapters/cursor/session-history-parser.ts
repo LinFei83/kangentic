@@ -17,8 +17,8 @@ import { cursorDisplayedUserText } from './transcript-parser';
  * started and ended. A user line with displayed text is a Prompt (starts
  * the turn and, through ingestEvents, turns the PTY silence timer off
  * before it can idle a still-running turn). Displayed text includes a
- * slash command Cursor stored behind `<manually_attached_skills>` (`/pull-request`
- * from a column). `{ type: "turn_ended" }` is an Idle, the same shape a
+ * slash command Cursor stored behind a skill block and a command wrapper
+ * (a column's /pull-request or /merge-pull-request). `{ type: "turn_ended" }` is an Idle, the same shape a
  * Stop hook uses, so `onTurnEnded` runs the column's On agent turn end
  * automations.
  *

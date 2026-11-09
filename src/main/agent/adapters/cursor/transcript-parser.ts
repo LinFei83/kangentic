@@ -22,18 +22,20 @@ const UUIDS_NUMBER_LINES = true;
  *
  * ```
  * <manually_attached_skills>...</manually_attached_skills>   (optional)
+ * <cursor_commands>...</cursor_commands>                     (optional)
  * <timestamp>...</timestamp>
  * <user_query>
  * the typed text
  * </user_query>
  * ```
  *
- * A slash command the board typed (`/pull-request`) is stored this way: Cursor
- * inlines the skill first, then the clock, then the query. The skill block, the
- * clock tag, and the `user_query` wrapper are removed. A board prompt whose
- * whole body is one `<task>` element is unwrapped once more. A user line that
- * is some other leading tag (injected context such as
- * `<available_subagent_types>`) is not a turn and is skipped.
+ * A slash command the board typed (`/pull-request`, `/merge-pull-request`) is
+ * stored this way: Cursor inlines the skill, then a command wrapper, then the
+ * clock, then the query. Those two leading blocks, the clock tag, and the
+ * `user_query` wrapper are removed. A board prompt whose whole body is one
+ * `<task>` element is unwrapped once more. A user line that is some other
+ * leading tag (injected context such as `<available_subagent_types>`) is not a
+ * turn and is skipped.
  */
 export async function parseCursorTranscript(
   agentSessionId: string,
@@ -72,15 +74,19 @@ export function readCursorTranscriptPage(
 }
 
 /**
+ * Cursor wrappers that sit in front of the clock and query on a slash-command
+ * line. Order varies; both are optional. Dropped so the query is what starts
+ * the turn. A leftover leading tag after this is injected context, not a turn.
+ */
+const LEADING_USER_WRAPPERS = ['manually_attached_skills', 'cursor_commands'] as const;
+
+/**
  * The text a user line should show. Null when the line is not a user turn.
  * Exported so the wrapper rules stay pinned without a full file read.
  */
 export function cursorDisplayedUserText(text: string): string | null {
-  const withoutSkills = text.replace(
-    /^\s*<manually_attached_skills>[\s\S]*?<\/manually_attached_skills>\s*/,
-    '',
-  );
-  const withoutClock = withoutSkills.replace(/^\s*<timestamp>[\s\S]*?<\/timestamp>\s*/, '');
+  const withoutWrappers = stripLeadingWrappers(text);
+  const withoutClock = withoutWrappers.replace(/^\s*<timestamp>[\s\S]*?<\/timestamp>\s*/, '');
   const query = unwrapTag(withoutClock, 'user_query');
   if (query === null) {
     const plain = withoutClock.trim();
@@ -90,6 +96,25 @@ export function cursorDisplayedUserText(text: string): string | null {
   const task = unwrapTag(query, 'task');
   const displayed = (task ?? query).trim();
   return displayed.length > 0 ? displayed : null;
+}
+
+function stripLeadingWrappers(text: string): string {
+  let remaining = text;
+  let stripped = true;
+  while (stripped) {
+    stripped = false;
+    for (const tag of LEADING_USER_WRAPPERS) {
+      const withoutThisWrapper = remaining.replace(
+        new RegExp(`^\\s*<${tag}>[\\s\\S]*?</${tag}>\\s*`),
+        '',
+      );
+      if (withoutThisWrapper !== remaining) {
+        remaining = withoutThisWrapper;
+        stripped = true;
+      }
+    }
+  }
+  return remaining;
 }
 
 function unwrapTag(text: string, tag: string): string | null {

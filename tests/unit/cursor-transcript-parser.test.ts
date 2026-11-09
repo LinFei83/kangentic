@@ -59,6 +59,37 @@ describe('cursorDisplayedUserText', () => {
     ].join('\n');
     expect(cursorDisplayedUserText(stored)).toBe('/pull-request');
   });
+
+  it('reads the query after Cursor wraps a slash command in cursor_commands', () => {
+    const stored = [
+      '<manually_attached_skills>',
+      'The user has manually attached the following skills to their message.',
+      'Skill Name: merge-pull-request',
+      '</manually_attached_skills>',
+      '<cursor_commands>',
+      '--- Cursor Command: merge-pull-request ---',
+      'Read and follow the skill.',
+      '</cursor_commands>',
+      '<timestamp>Monday, Nov 9, 2026, 5:10 PM (UTC+8)</timestamp>',
+      '<user_query>',
+      '/merge-pull-request',
+      '</user_query>',
+    ].join('\n');
+    expect(cursorDisplayedUserText(stored)).toBe('/merge-pull-request');
+  });
+
+  it('reads the query when only the command wrapper sits in front of the clock', () => {
+    const stored = [
+      '<cursor_commands>',
+      '--- Cursor Command: pull-request ---',
+      '</cursor_commands>',
+      '<timestamp>Monday, Nov 9, 2026, 5:10 PM (UTC+8)</timestamp>',
+      '<user_query>',
+      '/pull-request',
+      '</user_query>',
+    ].join('\n');
+    expect(cursorDisplayedUserText(stored)).toBe('/pull-request');
+  });
 });
 
 const SESSION_ID = 'aaaa-bbbb-cccc-dddd';
