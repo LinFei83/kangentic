@@ -64,7 +64,8 @@ What a column does when a task enters it, each time its agent finishes a turn th
 leaves. Each column owns two ordered lists, Regular and Change, each split into **On task enter**,
 **On agent turn end** and **On task exit**, and each row has its own switch. Regular runs for work
 and discuss cards. Change runs for OpenSpec change cards. An empty Change list means nothing
-auto-runs for those cards in that column. A row belongs to one column and one list; there is no
+auto-runs for those cards in that column. A card that arrives with its agent still running is
+typed the matching list's first On task enter message, not the other list's. A row belongs to one column and one list; there is no
 sharing and no library. A Board Profile does not overlay automations.
 
 Five types:

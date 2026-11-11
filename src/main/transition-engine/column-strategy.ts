@@ -24,6 +24,7 @@
 import { hasGuard } from '../automations/row-guards';
 import type {
   AutoCommandMode,
+  AutomationAppliesTo,
   BoardProfile,
   BoardProfileEntry,
   ColumnAutomation,
@@ -234,7 +235,7 @@ export function resolveEffectiveAutoCommand(
 
 /**
  * The message a column sends its agent on entry: the first enabled
- * `send_message` automation in its On enter group.
+ * `send_message` automation in the On enter group that matches `appliesTo`.
  *
  * This is what `swimlanes.auto_command` used to be, and it lives here for the
  * same reason that field's resolution did: two paths once disagreed about it,
@@ -242,20 +243,33 @@ export function resolveEffectiveAutoCommand(
  * cold spawn (through the runner), the handoff post-spawn delivery, and the
  * warm live injection.
  *
- * FIRST, not all of them, because these two callers are asking a question with
- * one answer: a spawn has a single prompt slot, and the live injection bundles
- * one command into the model/effort keystroke burst. Later message rows are the
- * runner's to deliver.
+ * FIRST of that list, not all of them, because these two callers are asking a
+ * question with one answer: a spawn has a single prompt slot, and the live
+ * injection bundles one command into the model/effort keystroke burst. Later
+ * message rows are the runner's to deliver.
+ *
+ * `appliesTo` is the same split the runner uses (`appliesToForTask`): Regular
+ * for work and discuss cards, Change for OpenSpec change cards. A delivery
+ * caller must pass it. Omitted, this defaults to `'regular'`, which is what a
+ * column read with no task (MCP `autoCommand`, analytics) still means. Without
+ * the filter, a warm move of a change card would inject Regular's enter
+ * message, then the Change enter group would send its own, so `/merge-pull-request`
+ * landed twice while the first was still running.
  *
  * A profile cannot re-point this row. Automations are shared by every profile,
  * which is what the Column Manager's pane says and why it is read-only under
  * one. `BoardProfileEntry.autoCommand` is the retired key that used to do it.
  */
 export function resolveColumnMessage(
-  automations: ReadonlyArray<Pick<ColumnAutomation, 'id' | 'type' | 'trigger' | 'enabled' | 'position' | 'config' | 'condition' | 'final_line' | 'max_runs'>>,
+  automations: ReadonlyArray<Pick<ColumnAutomation, 'id' | 'type' | 'trigger' | 'enabled' | 'position' | 'config' | 'condition' | 'final_line' | 'max_runs'> & { applies_to?: ColumnAutomation['applies_to'] | null }>,
+  appliesTo: AutomationAppliesTo = 'regular',
 ): { id: string; message: string; mode: AutoCommandMode; guarded: boolean } | null {
   const row = [...automations]
-    .filter((candidate) => candidate.type === 'send_message' && candidate.trigger === 'enter' && candidate.enabled)
+    .filter((candidate) =>
+      candidate.type === 'send_message'
+      && candidate.trigger === 'enter'
+      && candidate.enabled
+      && (candidate.applies_to === 'change' ? 'change' : 'regular') === appliesTo)
     .sort((left, right) => left.position - right.position)[0];
   if (!row) return null;
 

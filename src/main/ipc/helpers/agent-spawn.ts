@@ -719,7 +719,10 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       // A task with its automations disabled is sent no column message on a
       // handoff either; its own auto_command still goes.
       const resolvedColumnMessage = canTaskRunAutomations(currentTask).ok
-        ? resolveColumnMessage(getProjectRepos(context, options.projectId).automations.listForColumn(toLane.id))
+        ? resolveColumnMessage(
+          getProjectRepos(context, options.projectId).automations.listForColumn(toLane.id),
+          appliesToForTask(currentTask),
+        )
         : null;
       // A handoff runs no enter group, so nothing here can check a row's
       // Condition or Frequency. Sending a guarded row would skip both; it is

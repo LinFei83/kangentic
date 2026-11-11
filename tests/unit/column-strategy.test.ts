@@ -328,6 +328,37 @@ describe('resolveColumnMessage', () => {
     expect(message).toEqual({ id: 'row-1', message: '/first', mode: 'immediate', guarded: false });
   });
 
+  it('picks the matching list when Regular and Change both have a position-0 enter message', () => {
+    // Both lists number from 0. Without appliesTo, sort-by-position alone
+    // would pick whichever row listForColumn happened to return first, and a
+    // change card's warm move would inject Regular's /merge-pull-request, then
+    // send Change's too.
+    const rows = [
+      { id: 'regular', type: 'send_message' as const, trigger: 'enter' as const, enabled: true, position: 0, applies_to: 'regular' as const, config: { message: '/merge-pull-request' } },
+      { id: 'change', type: 'send_message' as const, trigger: 'enter' as const, enabled: true, position: 0, applies_to: 'change' as const, config: { message: '/merge-pull-request' } },
+    ];
+    expect(resolveColumnMessage(rows, 'change')?.id).toBe('change');
+    expect(resolveColumnMessage(rows, 'regular')?.id).toBe('regular');
+    expect(resolveColumnMessage(rows)?.id).toBe('regular');
+  });
+
+  it('does not pick a Change row for Regular even when the Change row is listed first', () => {
+    const rows = [
+      { id: 'change', type: 'send_message' as const, trigger: 'enter' as const, enabled: true, position: 0, applies_to: 'change' as const, config: { message: '/change' } },
+      { id: 'regular', type: 'send_message' as const, trigger: 'enter' as const, enabled: true, position: 0, applies_to: 'regular' as const, config: { message: '/regular' } },
+    ];
+    expect(resolveColumnMessage(rows, 'regular')?.message).toBe('/regular');
+    expect(resolveColumnMessage(rows, 'change')?.message).toBe('/change');
+  });
+
+  it('returns null for a Change card when only the Regular list has an enter message', () => {
+    const message = resolveColumnMessage(
+      [{ id: 'regular', type: 'send_message', trigger: 'enter', enabled: true, position: 0, applies_to: 'regular', config: { message: '/regular' } }],
+      'change',
+    );
+    expect(message).toBeNull();
+  });
+
   it('skips a switched-off row, an exit row, and another type', () => {
     const message = resolveColumnMessage([
       { id: 'off', type: 'send_message', trigger: 'enter', enabled: false, position: 0, config: { message: '/off' } },

@@ -53,6 +53,7 @@ import type { InjectionReport } from '../../transition-engine/terminal-submit-sc
 import { resolveIsolatedSwimlaneId, resolveForceFresh } from '../../transition-engine/session-isolation';
 import { resolveEffectiveAutoCommand, resolveColumnMessage, applyProfileToLane } from '../../transition-engine/column-strategy';
 import { canTaskRunAutomations } from '../../../shared/automation-manifest';
+import { appliesToForTask } from '../../automations/automation-runner';
 import { loadTaskProfile } from '../helpers/task-profile';
 import { reportAutoCommandOutcome } from '../helpers/auto-command-outcome';
 import { supersedeMessageDeliveries, supersedeTurnEndWork } from '../../automations/turn-end/turn-end-passes';
@@ -1271,11 +1272,13 @@ export async function handleTaskMove(
           // A task with its automations disabled types no column message: the
           // enter group records the row as skipped with the reason instead. Its
           // own auto_command still goes out below; that is the task's input.
-          const automationsRunnable = canTaskRunAutomations(
-            getProjectRepos(context, resolvedProjectId).tasks.getById(task.id) ?? task,
-          ).ok;
+          const liveTask = getProjectRepos(context, resolvedProjectId).tasks.getById(task.id) ?? task;
+          const automationsRunnable = canTaskRunAutomations(liveTask).ok;
           const resolvedColumnMessage = toLane && automationsRunnable
-            ? resolveColumnMessage(getProjectRepos(context, resolvedProjectId).automations.listForColumn(toLane.id))
+            ? resolveColumnMessage(
+              getProjectRepos(context, resolvedProjectId).automations.listForColumn(toLane.id),
+              appliesToForTask(liveTask),
+            )
             : null;
           // A row with a Condition or a Frequency limit rides no burst: the
           // enter group sends it after checking both.

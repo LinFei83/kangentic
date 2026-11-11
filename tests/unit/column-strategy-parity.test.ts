@@ -223,6 +223,38 @@ describe('column-strategy parity: the resolver stays the single source of truth'
     }
   });
 
+  it('the warm injection and the handoff ask resolveColumnMessage for the task\'s list', () => {
+    // A change card's Regular and Change enter messages share a name and a
+    // position. listForColumn returns both. Without appliesToForTask the warm
+    // move injects Regular's row, then the Change enter group sends its own.
+    const deliveryFiles = [
+      'src/main/ipc/handlers/task-move.ts',
+      'src/main/ipc/helpers/agent-spawn.ts',
+    ];
+    for (const relativePath of deliveryFiles) {
+      const source = fs.readFileSync(path.join(REPO_ROOT, relativePath), 'utf-8');
+      const callStarts: number[] = [];
+      let searchFrom = 0;
+      while (searchFrom < source.length) {
+        const foundAt = source.indexOf('resolveColumnMessage(', searchFrom);
+        if (foundAt === -1) break;
+        callStarts.push(foundAt);
+        searchFrom = foundAt + 1;
+      }
+      expect(
+        callStarts.length,
+        `${relativePath} must call resolveColumnMessage so a column message and the enter group stay one delivery`,
+      ).toBeGreaterThan(0);
+      for (const callStart of callStarts) {
+        const callSlice = source.slice(callStart, callStart + 400);
+        expect(
+          callSlice.includes('appliesToForTask('),
+          `${relativePath} resolveColumnMessage at index ${callStart} must pass appliesToForTask, or a change card gets Regular's enter message and then Change's`,
+        ).toBe(true);
+      }
+    }
+  });
+
   it('the first-spawn lock bails out in profile mode', () => {
     // A profile is a ladder, not a snapshot. Locking would freeze the task's
     // first column's values for its whole life - exactly the per-column
