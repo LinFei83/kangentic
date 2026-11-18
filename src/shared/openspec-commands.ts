@@ -16,4 +16,4 @@ export const OPENSPEC_ARCHIVE_COMMAND = '/opsx-archive';
  * never as a column automation and never in `description`.
  */
 export const OPENSPEC_PROPOSE_DEFAULT_BRANCH_NOTE =
-  'You are in the project folder. Write the proposal under openspec/changes/ and commit it to the default branch so the next scan can create a change card.';
+  ' ';
